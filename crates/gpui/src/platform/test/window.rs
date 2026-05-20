@@ -1,9 +1,10 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformInputSimulator,
+    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, SceneCapture, Size,
+    TestPlatform, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use image::RgbaImage;
@@ -122,6 +123,10 @@ impl TestWindow {
         self.0.lock().input_callback = Some(callback);
         !result.propagate
     }
+}
+
+fn simulate_window_input(window_state: &Rc<Mutex<TestWindowState>>, event: PlatformInput) -> bool {
+    TestWindow(window_state.clone()).simulate_input(event)
 }
 
 impl PlatformWindow for TestWindow {
@@ -263,6 +268,17 @@ impl PlatformWindow for TestWindow {
         self.0.lock().input_callback = Some(callback)
     }
 
+    fn simulate_input(&mut self, event: PlatformInput) -> bool {
+        TestWindow::simulate_input(self, event)
+    }
+
+    fn input_simulator(&self) -> Option<PlatformInputSimulator> {
+        let window_state = self.0.clone();
+        Some(PlatformInputSimulator::new(move |event| {
+            simulate_window_input(&window_state, event)
+        }))
+    }
+
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.0.lock().active_status_change_callback = Some(callback)
     }
@@ -292,6 +308,17 @@ impl PlatformWindow for TestWindow {
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn draw(&self, _scene: &Scene) {}
+
+    fn capture_scene(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
+        let image = self.render_to_image(scene)?;
+        let width_px = image.width();
+        let height_px = image.height();
+        Ok(SceneCapture {
+            rgba: image.into_raw(),
+            width_px,
+            height_px,
+        })
+    }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()

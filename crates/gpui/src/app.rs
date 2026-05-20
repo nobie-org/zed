@@ -2179,6 +2179,11 @@ impl App {
         self.platform.set_dock_menu(menus, &self.keymap.borrow())
     }
 
+    /// Sets the application's dock icon from encoded image bytes.
+    pub fn set_app_icon(&self, icon_bytes: &[u8]) {
+        self.platform.set_app_icon(icon_bytes);
+    }
+
     /// Performs the action associated with the given dock menu item, only used on Windows for now.
     pub fn perform_dock_menu_action(&self, action: usize) {
         self.platform.perform_dock_menu_action(action);
@@ -2356,6 +2361,20 @@ impl App {
     #[track_caller]
     pub fn focus_handle(&self) -> FocusHandle {
         FocusHandle::new(&self.focus_handles)
+    }
+
+    /// Mutate two distinct entities from a root app turn.
+    #[track_caller]
+    pub fn with_two_entities_mut<A: 'static, B: 'static, R>(
+        &mut self,
+        a: &Entity<A>,
+        b: &Entity<B>,
+        write: impl FnOnce(&mut A, &mut B) -> R,
+    ) -> Result<R> {
+        let result = self.update(|cx| cx.entities.with_two_mut(a, b, write))?;
+        self.notify(a.entity_id());
+        self.notify(b.entity_id());
+        Ok(result)
     }
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.

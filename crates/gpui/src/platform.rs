@@ -189,6 +189,8 @@ pub trait Platform: 'static {
     }
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap);
+    /// Sets the application's dock icon from encoded image bytes.
+    fn set_app_icon(&self, _icon_bytes: &[u8]) {}
     fn perform_dock_menu_action(&self, _action: usize) {}
     fn add_recent_document(&self, _path: &Path) {}
     fn update_jump_list(
@@ -600,6 +602,33 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// A handle for injecting normalized platform input into a GPUI window.
+///
+/// The event is delivered through the same input callback used by real platform
+/// windows. A clone of this handle can be kept after leaving an app/window
+/// update, which avoids re-entering the window while it is already borrowed.
+#[derive(Clone)]
+pub struct PlatformInputSimulator {
+    simulate_input: Rc<dyn Fn(PlatformInput) -> bool>,
+}
+
+impl PlatformInputSimulator {
+    /// Create a simulator that dispatches injected input through a platform window.
+    pub fn new(simulate_input: impl Fn(PlatformInput) -> bool + 'static) -> Self {
+        Self {
+            simulate_input: Rc::new(simulate_input),
+        }
+    }
+
+    /// Inject a platform input event.
+    ///
+    /// Returns true when the window input callback handled the event and stopped
+    /// propagation.
+    pub fn simulate_input(&self, event: PlatformInput) -> bool {
+        (self.simulate_input)(event)
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -628,12 +657,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    fn set_metal_hud_enabled(&self, _enabled: bool) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
+    fn simulate_input(&mut self, _event: PlatformInput) -> bool {
+        false
+    }
+    fn input_simulator(&self) -> Option<PlatformInputSimulator> {
+        None
+    }
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);
@@ -644,6 +680,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    fn capture_scene(&self, _scene: &Scene) -> Result<SceneCapture> {
+        anyhow::bail!("scene capture is not implemented for this platform window")
+    }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -712,6 +751,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+}
+
+/// CPU-readable capture of a rendered GPUI scene.
+pub struct SceneCapture {
+    /// Pixels encoded as RGBA8 in row-major order.
+    pub rgba: Vec<u8>,
+    /// Captured image width in physical pixels.
+    pub width_px: u32,
+    /// Captured image height in physical pixels.
+    pub height_px: u32,
 }
 
 /// A renderer for headless windows that can produce real rendered output.

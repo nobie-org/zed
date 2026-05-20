@@ -6,6 +6,8 @@ use cocoa::{
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
+#[cfg(any(test, feature = "test-support"))]
+use gpui::SceneCapture;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
@@ -16,16 +18,20 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
+use gpui::nobie_platform_trace;
 use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
     RenderPassColorAttachmentDescriptorRef,
 };
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
+
+use crate::quartzcore_time::ca_current_media_time;
 
 use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
 
@@ -125,6 +131,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    bgra_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -318,6 +325,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let bgra_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "bgra_surfaces",
+            "surface_vertex",
+            "surface_bgra_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -340,6 +355,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -438,6 +454,20 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        let metal_draw_id = nobie_platform_trace::next_metal_draw_id();
+        let draw_id = nobie_platform_trace::current_draw_id();
+        let present_id = nobie_platform_trace::current_present_id();
+        nobie_platform_trace::trace(
+            "metal_draw_start",
+            format_args!(
+                "metal_draw_id={} draw_id={} present_id={} scene_ops={} surfaces={}",
+                metal_draw_id,
+                draw_id,
+                present_id,
+                scene.len(),
+                scene.surfaces.len()
+            ),
+        );
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -453,11 +483,32 @@ impl MetalRenderer {
             (viewport_size.height.ceil() as i32).into(),
         );
         let drawable = if let Some(drawable) = layer.next_drawable() {
+            nobie_platform_trace::trace(
+                "metal_next_drawable",
+                format_args!(
+                    "metal_draw_id={} draw_id={} present_id={} drawable_id={}",
+                    metal_draw_id,
+                    draw_id,
+                    present_id,
+                    drawable.drawable_id()
+                ),
+            );
             drawable
         } else {
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
+            );
+            nobie_platform_trace::trace(
+                "metal_next_drawable_failed",
+                format_args!(
+                    "metal_draw_id={} draw_id={} present_id={} viewport_width={} viewport_height={}",
+                    metal_draw_id,
+                    draw_id,
+                    present_id,
+                    viewport_size.width.0,
+                    viewport_size.height.0
+                ),
             );
             return;
         };
@@ -475,28 +526,128 @@ impl MetalRenderer {
                 Ok(command_buffer) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
+                    let completed_metal_draw_id = metal_draw_id;
+                    let completed_draw_id = draw_id;
+                    let completed_present_id = present_id;
                     let block = ConcreteBlock::new(move |_| {
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
                         }
+                        nobie_platform_trace::trace(
+                            "metal_command_buffer_completed",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
+                                completed_metal_draw_id,
+                                completed_draw_id,
+                                completed_present_id,
+                                ca_current_media_time()
+                            ),
+                        );
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
+                    if nobie_platform_trace::enabled() {
+                        let presented_metal_draw_id = metal_draw_id;
+                        let presented_draw_id = draw_id;
+                        let presented_present_id = present_id;
+                        let presented_block = ConcreteBlock::new(
+                            move |drawable: &metal::DrawableRef| {
+                                let presented_time = drawable.presented_time();
+                                let callback_ca_time = ca_current_media_time();
+                                nobie_platform_trace::trace(
+                                    "metal_drawable_presented",
+                                    format_args!(
+                                        "metal_draw_id={} draw_id={} present_id={} drawable_id={} presented_time={:.9} callback_ca_time={:.9}",
+                                        presented_metal_draw_id,
+                                        presented_draw_id,
+                                        presented_present_id,
+                                        drawable.drawable_id(),
+                                        presented_time,
+                                        callback_ca_time
+                                    ),
+                                );
+                            },
+                        );
+                        let presented_block = presented_block.copy();
+                        drawable.add_presented_handler(&presented_block);
+                    }
+
                     if self.presents_with_transaction {
+                        nobie_platform_trace::trace(
+                            "metal_command_buffer_commit",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} present_mode=transaction drawable_id={} ca_time={:.9}",
+                                metal_draw_id,
+                                draw_id,
+                                present_id,
+                                drawable.drawable_id(),
+                                ca_current_media_time()
+                            ),
+                        );
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
+                        nobie_platform_trace::trace(
+                            "metal_drawable_present_schedule",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} present_mode=transaction drawable_id={} ca_time={:.9}",
+                                metal_draw_id,
+                                draw_id,
+                                present_id,
+                                drawable.drawable_id(),
+                                ca_current_media_time()
+                            ),
+                        );
                         drawable.present();
                     } else {
+                        nobie_platform_trace::trace(
+                            "metal_drawable_present_schedule",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} present_mode=command_buffer drawable_id={} ca_time={:.9}",
+                                metal_draw_id,
+                                draw_id,
+                                present_id,
+                                drawable.drawable_id(),
+                                ca_current_media_time()
+                            ),
+                        );
                         command_buffer.present_drawable(drawable);
+                        nobie_platform_trace::trace(
+                            "metal_command_buffer_commit",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} present_mode=command_buffer drawable_id={} ca_time={:.9}",
+                                metal_draw_id,
+                                draw_id,
+                                present_id,
+                                drawable.drawable_id(),
+                                ca_current_media_time()
+                            ),
+                        );
                         command_buffer.commit();
                     }
+                    nobie_platform_trace::trace(
+                        "metal_draw_finish",
+                        format_args!(
+                            "metal_draw_id={} draw_id={} present_id={} drawable_id={}",
+                            metal_draw_id,
+                            draw_id,
+                            present_id,
+                            drawable.drawable_id()
+                        ),
+                    );
                     return;
                 }
                 Err(err) => {
                     log::error!(
                         "failed to render: {}. retrying with larger instance buffer size",
                         err
+                    );
+                    nobie_platform_trace::trace(
+                        "metal_draw_retry",
+                        format_args!(
+                            "metal_draw_id={} draw_id={} present_id={} error={:?}",
+                            metal_draw_id, draw_id, present_id, err
+                        ),
                     );
                     let mut instance_buffer_pool = self.instance_buffer_pool.lock();
                     let buffer_size = instance_buffer_pool.buffer_size;
@@ -612,6 +763,28 @@ impl MetalRenderer {
                 }
             }
         }
+    }
+
+    /// Renders the full scene to CPU-readable RGBA bytes for deterministic automation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture_scene(&mut self, scene: &Scene) -> Result<SceneCapture> {
+        let layer = self
+            .layer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("capture_scene requires a layer-backed renderer"))?;
+        let drawable_size = layer.drawable_size();
+        let size: Size<DevicePixels> = size(
+            (drawable_size.width.ceil() as i32).into(),
+            (drawable_size.height.ceil() as i32).into(),
+        );
+        let image = self.render_scene_to_image(scene, size)?;
+        let width_px = image.width();
+        let height_px = image.height();
+        Ok(SceneCapture {
+            rgba: image.into_raw(),
+            width_px,
+            height_px,
+        })
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
@@ -1389,7 +1562,6 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1407,34 +1579,6 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
-
             align_offset(instance_offset);
             let next_offset = *instance_offset + mem::size_of::<Surface>();
             if next_offset > instance_buffer.size {
@@ -1451,15 +1595,75 @@ impl MetalRenderer {
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
+            let pixel_format = surface.image_buffer.get_pixel_format();
+            match pixel_format {
+                pixel_format if pixel_format == kCVPixelFormatType_32BGRA => {
+                    command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
+                    let bgra_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::BGRA8Unorm,
+                            surface.image_buffer.get_width(),
+                            surface.image_buffer.get_height(),
+                            0,
+                        )
+                        .unwrap();
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(bgra_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    command_encoder
+                        .set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, None);
+                }
+                pixel_format if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
+                    command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                    let y_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::R8Unorm,
+                            surface.image_buffer.get_width_of_plane(0),
+                            surface.image_buffer.get_height_of_plane(0),
+                            0,
+                        )
+                        .unwrap();
+                    let cb_cr_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::RG8Unorm,
+                            surface.image_buffer.get_width_of_plane(1),
+                            surface.image_buffer.get_height_of_plane(1),
+                            1,
+                        )
+                        .unwrap();
+
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::CbCrTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                }
+                pixel_format => panic!("unsupported CVPixelBuffer pixel format {pixel_format}"),
+            }
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)

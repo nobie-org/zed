@@ -28,10 +28,10 @@ use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalPaths,
     FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
-    px, size,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformInputSimulator, PlatformWindow,
+    Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
+    WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -977,22 +977,20 @@ impl MacWindow {
                 }
             }
 
-            if focus && show {
-                native_window.makeKeyAndOrderFront_(nil);
-            } else if show {
-                native_window.orderFront_(nil);
-            }
-
             // Set the initial position of the window to the specified origin.
             // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
             // the window position might be incorrect if the main screen (the screen that contains the window that has focus)
             //  is different from the primary screen.
             NSWindow::setFrameTopLeftPoint_(native_window, window_rect.origin);
-            {
-                let mut window_state = window.0.lock();
-                window_state.move_traffic_light();
-                window_state.sheet_parent = sheet_parent;
+            window.0.lock().move_traffic_light();
+
+            if focus && show {
+                native_window.makeKeyAndOrderFront_(nil);
+            } else if show {
+                let _: () = msg_send![native_window, orderBack: nil];
             }
+
+            window.0.lock().sheet_parent = sheet_parent;
 
             pool.drain();
 
@@ -1398,6 +1396,27 @@ impl PlatformWindow for MacWindow {
 
     fn set_app_id(&mut self, _app_id: &str) {}
 
+    fn set_metal_hud_enabled(&self, enabled: bool) {
+        // `CAMetalLayer.developerHUDProperties` is Apple's runtime toggle for
+        // the Metal performance HUD. `nil` restores the `MTL_HUD_ENABLED`
+        // environment default, so disabling must send an explicit mode.
+        let this = self.0.as_ref().lock();
+        if let Some(layer) = this.renderer.layer() {
+            unsafe {
+                let dict_class = class!(NSMutableDictionary);
+                let properties: id = msg_send![dict_class, dictionary];
+                let key = ns_string("mode");
+                let value = ns_string(if enabled { "default" } else { "disabled" });
+                let _: () = msg_send![properties, setObject: value forKey: key];
+                let _: () = msg_send![layer, setDeveloperHUDProperties: properties];
+            }
+        }
+        gpui::nobie_platform_trace::trace(
+            "mac_set_metal_hud_enabled",
+            format_args!("enabled={enabled}"),
+        );
+    }
+
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
         this.background_appearance = background_appearance;
@@ -1551,6 +1570,17 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().event_callback = Some(callback);
     }
 
+    fn simulate_input(&mut self, event: PlatformInput) -> bool {
+        simulate_window_input(&self.0, event)
+    }
+
+    fn input_simulator(&self) -> Option<PlatformInputSimulator> {
+        let window_state = self.0.clone();
+        Some(PlatformInputSimulator::new(move |event| {
+            simulate_window_input(&window_state, event)
+        }))
+    }
+
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.0.as_ref().lock().activate_callback = Some(callback);
     }
@@ -1641,6 +1671,19 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn capture_scene(&self, scene: &gpui::Scene) -> gpui::Result<gpui::SceneCapture> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut this = self.0.lock();
+            this.renderer.capture_scene(scene)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = scene;
+            anyhow::bail!("scene capture is not available without test-support")
+        }
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
@@ -1726,7 +1769,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn play_system_bell(&self) {
-        unsafe { NSBeep() }
+        NSBeep()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2798,6 +2841,17 @@ fn send_file_drop_event(
             lock.external_files_dragged = external_files_dragged;
         }
         true
+    } else {
+        false
+    }
+}
+
+fn simulate_window_input(window_state_lock: &Mutex<MacWindowState>, e: PlatformInput) -> bool {
+    let window_state = window_state_lock.lock().event_callback.take();
+    if let Some(mut callback) = window_state {
+        let result = callback(e);
+        window_state_lock.lock().event_callback = Some(callback);
+        !result.propagate
     } else {
         false
     }

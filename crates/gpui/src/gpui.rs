@@ -30,6 +30,8 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
+#[doc(hidden)]
+pub mod nobie_platform_trace;
 mod path_builder;
 mod platform;
 pub mod prelude;

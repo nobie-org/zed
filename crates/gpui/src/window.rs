@@ -9,16 +9,16 @@ use crate::{
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformInputSimulator, PlatformWindow,
+    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SceneCapture, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -68,6 +68,7 @@ pub use prompts::*;
 
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
+const INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET: Duration = Duration::from_millis(16);
 
 /// A 6:5 aspect ratio minimum window size to be used for functional,
 /// additional-to-main-Zed windows, like the settings and rules library windows.
@@ -119,6 +120,22 @@ pub(crate) struct WindowInvalidator {
     inner: Rc<RefCell<WindowInvalidatorInner>>,
 }
 
+/// Opaque authority to invalidate the view that was current when it was created.
+///
+/// This is for low-level element code that needs the precise "dirty this
+/// rendered view" behavior without exposing GPUI's internal entity keys.
+#[derive(Clone, Copy)]
+pub struct CurrentViewInvalidator {
+    raw_entity_id: EntityId,
+}
+
+impl CurrentViewInvalidator {
+    /// Mark the captured view dirty.
+    pub fn invalidate(self, cx: &mut App) {
+        cx.notify(self.raw_entity_id);
+    }
+}
+
 impl WindowInvalidator {
     pub fn new() -> Self {
         WindowInvalidator {
@@ -146,6 +163,10 @@ impl WindowInvalidator {
 
     pub fn is_dirty(&self) -> bool {
         self.inner.borrow().dirty
+    }
+
+    pub(crate) fn pending_dirty_view_count(&self) -> usize {
+        self.inner.borrow().dirty_views.len()
     }
 
     pub fn set_dirty(&self, dirty: bool) {
@@ -1001,6 +1022,11 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    present_epoch: Rc<Cell<u64>>,
+    input_boundary_present_epoch: Rc<Cell<Option<u64>>>,
+    draw_will_present: Cell<bool>,
+    nobie_trace_last_draw_id: Cell<u64>,
+    last_request_frame_timestamp: Rc<Cell<Instant>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1021,6 +1047,13 @@ pub struct Window {
     captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InputBoundaryPresentation {
+    eligible: bool,
+    present_epoch_at_start: u64,
+    request_frame_at_start: Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1311,9 +1344,12 @@ impl Window {
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let present_epoch = Rc::new(Cell::new(0));
+        let input_boundary_present_epoch = Rc::new(Cell::new(None));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        let last_request_frame_timestamp = Rc::new(Cell::new(Instant::now()));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1340,9 +1376,13 @@ impl Window {
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
+            let present_epoch = present_epoch.clone();
+            let input_boundary_present_epoch = input_boundary_present_epoch.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            let last_request_frame_timestamp = last_request_frame_timestamp.clone();
             move |request_frame_options| {
+                last_request_frame_timestamp.set(Instant::now());
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1394,9 +1434,12 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
-                let needs_present = request_frame_options.require_presentation
-                    || needs_present.get()
-                    || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
+                let stored_needs_present = needs_present.get();
+                let active_high_rate_input =
+                    active.get() && input_rate_tracker.borrow_mut().is_high_rate();
+                let should_present = request_frame_options.require_presentation
+                    || stored_needs_present
+                    || active_high_rate_input;
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {
@@ -1407,16 +1450,33 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
-                                let arena_clear_needed = window.draw(cx);
+                                let arena_clear_needed =
+                                    window.draw_with_presentation_intent(cx, true);
                                 window.present();
+                                input_boundary_present_epoch.set(None);
                                 arena_clear_needed.clear();
                             })
                             .log_err();
                     })
-                } else if needs_present {
-                    handle
-                        .update(&mut cx, |_, window, _| window.present())
-                        .log_err();
+                } else if should_present {
+                    let suppress_after_input_boundary = !request_frame_options.require_presentation
+                        && !stored_needs_present
+                        && active_high_rate_input
+                        && input_boundary_present_epoch.get() == Some(present_epoch.get());
+                    if suppress_after_input_boundary {
+                        crate::nobie_platform_trace::trace(
+                            "request_frame_present_only_suppressed_after_input_boundary",
+                            format_args!("present_epoch={}", present_epoch.get()),
+                        );
+                        input_boundary_present_epoch.set(None);
+                    } else {
+                        handle
+                            .update(&mut cx, |_, window, _| {
+                                window.present();
+                                input_boundary_present_epoch.set(None);
+                            })
+                            .log_err();
+                    }
                 }
 
                 handle
@@ -1493,10 +1553,24 @@ impl Window {
         platform_window.on_input({
             let mut cx = cx.to_async();
             Box::new(move |event| {
-                handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                let Some((dispatch_result, input_boundary)) = handle
+                    .update(&mut cx, |_, window, cx| {
+                        let input_boundary = window.input_boundary_presentation(&event);
+                        let dispatch_result = window.dispatch_event(event, cx);
+                        (dispatch_result, input_boundary)
+                    })
                     .log_err()
-                    .unwrap_or(DispatchEventResult::default())
+                else {
+                    return DispatchEventResult::default();
+                };
+
+                handle
+                    .update(&mut cx, |_, window, cx| {
+                        window.present_after_input_boundary_if_starved(input_boundary, cx);
+                    })
+                    .log_err();
+
+                dispatch_result
             })
         });
         platform_window.on_hit_test_window_control({
@@ -1616,6 +1690,11 @@ impl Window {
             active,
             hovered,
             needs_present,
+            present_epoch,
+            input_boundary_present_epoch,
+            draw_will_present: Cell::new(false),
+            nobie_trace_last_draw_id: Cell::new(0),
+            last_request_frame_timestamp,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -1761,6 +1840,42 @@ impl Window {
         }
     }
 
+    /// Draw and present this window immediately.
+    ///
+    /// Normal application code should prefer [`Window::refresh`] or
+    /// [`Window::request_animation_frame`]. This method is for cases where the
+    /// caller is already executing on a window turn and has an explicit
+    /// presentable frame, but the platform will not deliver a display-link
+    /// callback, such as deterministic inactive-window automation.
+    pub fn draw_and_present_immediately(&mut self, cx: &mut App) {
+        let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
+        self.present();
+        arena_clear_needed.clear();
+        self.complete_frame();
+    }
+
+    /// Draw, present, and capture this window's rendered scene immediately.
+    ///
+    /// This is for deterministic automation in inactive/background windows.
+    /// The normal platform window is still presented, and the returned image is
+    /// rendered from the same full GPUI scene without depending on OS window
+    /// capture state.
+    pub fn draw_present_and_capture_immediately(&mut self, cx: &mut App) -> Result<SceneCapture> {
+        let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
+        self.present();
+        let capture = self
+            .platform_window
+            .capture_scene(&self.rendered_frame.scene);
+        arena_clear_needed.clear();
+        self.complete_frame();
+        capture
+    }
+
+    /// Returns whether the current draw is expected to be presented.
+    pub fn current_draw_will_present(&self) -> bool {
+        self.draw_will_present.get()
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
@@ -1795,6 +1910,20 @@ impl Window {
         self.refresh();
     }
 
+    /// Move focus without app-level pending-input notification.
+    ///
+    /// This preserves Nobie's facade API shape for callers that only hold
+    /// `&mut Window`.
+    pub fn focus_without_app(&mut self, handle: &FocusHandle) {
+        if !self.focus_enabled || self.focus == Some(handle.id) {
+            return;
+        }
+
+        self.focus = Some(handle.id);
+        self.clear_pending_keystrokes();
+        self.refresh();
+    }
+
     /// Remove focus from all elements within this context's window.
     pub fn blur(&mut self) {
         if !self.focus_enabled {
@@ -1822,6 +1951,17 @@ impl Window {
         }
     }
 
+    /// Move focus to next tab stop without app-level pending-input notification.
+    pub fn focus_next_without_app(&mut self) {
+        if !self.focus_enabled {
+            return;
+        }
+
+        if let Some(handle) = self.rendered_frame.tab_stops.next(self.focus.as_ref()) {
+            self.focus_without_app(&handle)
+        }
+    }
+
     /// Move focus to previous tab stop.
     pub fn focus_prev(&mut self, cx: &mut App) {
         if !self.focus_enabled {
@@ -1830,6 +1970,17 @@ impl Window {
 
         if let Some(handle) = self.rendered_frame.tab_stops.prev(self.focus.as_ref()) {
             self.focus(&handle, cx)
+        }
+    }
+
+    /// Move focus to previous tab stop without app-level pending-input notification.
+    pub fn focus_prev_without_app(&mut self) {
+        if !self.focus_enabled {
+            return;
+        }
+
+        if let Some(handle) = self.rendered_frame.tab_stops.prev(self.focus.as_ref()) {
+            self.focus_without_app(&handle)
         }
     }
 
@@ -2236,6 +2387,11 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Toggle the platform Metal HUD when supported.
+    pub fn set_metal_hud_enabled(&self, enabled: bool) {
+        self.platform_window.set_metal_hud_enabled(enabled);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
@@ -2475,14 +2631,52 @@ impl Window {
         self.capslock
     }
 
+    /// Returns a cloneable handle that injects platform input into this window.
+    ///
+    /// Keep this handle and call it after leaving a GPUI window update. Calling
+    /// simulated input while the same window is already borrowed can re-enter
+    /// the window lease.
+    pub fn input_simulator(&self) -> Option<PlatformInputSimulator> {
+        self.platform_window.input_simulator()
+    }
+
     fn complete_frame(&self) {
         self.platform_window.completed_frame();
+    }
+
+    fn draw_with_presentation_intent(
+        &mut self,
+        cx: &mut App,
+        draw_will_present: bool,
+    ) -> ArenaClearNeeded {
+        let previous = self.draw_will_present.replace(draw_will_present);
+        let result = self.draw(cx);
+        self.draw_will_present.set(previous);
+        result
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let draw_id = crate::nobie_platform_trace::next_draw_id();
+        let draw_reason = crate::nobie_platform_trace::current_draw_reason();
+        self.nobie_trace_last_draw_id.set(draw_id);
+        crate::nobie_platform_trace::set_current_draw_id(draw_id);
+        crate::nobie_platform_trace::trace(
+            "window_draw_start",
+            format_args!(
+                "draw_id={} reason={} draw_will_present={} dirty_views={} pending_dirty_views={} invalidator_dirty={} refreshing={} needs_present_before={}",
+                draw_id,
+                draw_reason,
+                self.draw_will_present.get(),
+                self.dirty_views.len(),
+                self.invalidator.pending_dirty_view_count(),
+                self.invalidator.is_dirty(),
+                self.refreshing,
+                self.needs_present.get()
+            ),
+        );
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -2576,6 +2770,22 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
+        crate::nobie_platform_trace::trace(
+            "window_draw_finish",
+            format_args!(
+                "draw_id={} reason={} scene_ops={} surfaces={} quads={} sprites_mono={} sprites_poly={} needs_present_after={}",
+                draw_id,
+                draw_reason,
+                self.rendered_frame.scene.len(),
+                self.rendered_frame.scene.surfaces.len(),
+                self.rendered_frame.scene.quads.len(),
+                self.rendered_frame.scene.monochrome_sprites.len(),
+                self.rendered_frame.scene.polychrome_sprites.len(),
+                self.needs_present.get()
+            ),
+        );
+        crate::nobie_platform_trace::clear_current_draw_id();
+
         ArenaClearNeeded::new(&cx.element_arena)
     }
 
@@ -2603,11 +2813,139 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        let present_id = crate::nobie_platform_trace::next_present_id();
+        let draw_id = self.nobie_trace_last_draw_id.get();
+        crate::nobie_platform_trace::trace(
+            "window_present_start",
+            format_args!(
+                "present_id={} draw_id={} scene_ops={} surfaces={} needs_present_before={}",
+                present_id,
+                draw_id,
+                self.rendered_frame.scene.len(),
+                self.rendered_frame.scene.surfaces.len(),
+                self.needs_present.get()
+            ),
+        );
+        crate::nobie_platform_trace::set_current_draw_id(draw_id);
+        crate::nobie_platform_trace::set_current_present_id(present_id);
         self.platform_window.draw(&self.rendered_frame.scene);
+        crate::nobie_platform_trace::clear_current_present_id();
+        crate::nobie_platform_trace::clear_current_draw_id();
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
+        self.present_epoch
+            .set(self.present_epoch.get().saturating_add(1));
         self.needs_present.set(false);
+        crate::nobie_platform_trace::trace(
+            "window_present_finish",
+            format_args!(
+                "present_id={} draw_id={} present_epoch={} needs_present_after={}",
+                present_id,
+                draw_id,
+                self.present_epoch.get(),
+                self.needs_present.get()
+            ),
+        );
         profiling::finish_frame!();
+    }
+
+    fn input_boundary_presentation(&self, event: &PlatformInput) -> InputBoundaryPresentation {
+        InputBoundaryPresentation {
+            eligible: matches!(
+                event,
+                PlatformInput::KeyDown(_)
+                    | PlatformInput::MouseMove(_)
+                    | PlatformInput::MouseUp(_)
+                    | PlatformInput::ScrollWheel(_)
+            ),
+            present_epoch_at_start: self.present_epoch.get(),
+            request_frame_at_start: self.last_request_frame_timestamp.get(),
+        }
+    }
+
+    fn present_after_input_boundary_if_starved(
+        &mut self,
+        input_boundary: InputBoundaryPresentation,
+        cx: &mut App,
+    ) {
+        // High-frequency local input can continuously re-enter the input
+        // boundary while starving the request-frame callback that normally
+        // presents the dirty scene. This is an explicit framework fairness
+        // path: only visible-input kinds are eligible, normal request-frame
+        // callbacks win, and any presentation during dispatch suppresses it.
+        if !input_boundary.eligible {
+            return;
+        }
+
+        if self.present_epoch.get() != input_boundary.present_epoch_at_start {
+            crate::nobie_platform_trace::trace(
+                "input_boundary_present_skip",
+                format_args!(
+                    "reason=already_presented present_epoch_start={} present_epoch_now={}",
+                    input_boundary.present_epoch_at_start,
+                    self.present_epoch.get()
+                ),
+            );
+            return;
+        }
+
+        if self.last_request_frame_timestamp.get() != input_boundary.request_frame_at_start {
+            crate::nobie_platform_trace::trace(
+                "input_boundary_present_skip",
+                format_args!("reason=request_frame_ran"),
+            );
+            return;
+        }
+
+        let request_frame_age = self.last_request_frame_timestamp.get().elapsed();
+        if request_frame_age < INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET {
+            crate::nobie_platform_trace::trace(
+                "input_boundary_present_skip",
+                format_args!(
+                    "reason=request_frame_fresh request_frame_age_us={} budget_us={}",
+                    request_frame_age.as_micros(),
+                    INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET.as_micros()
+                ),
+            );
+            return;
+        }
+
+        if self.invalidator.is_dirty() {
+            crate::nobie_platform_trace::trace(
+                "input_boundary_present_draw_present",
+                format_args!(
+                    "request_frame_age_us={} present_epoch={}",
+                    request_frame_age.as_micros(),
+                    self.present_epoch.get()
+                ),
+            );
+            crate::nobie_platform_trace::set_current_draw_reason("input_boundary_present");
+            let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
+            crate::nobie_platform_trace::clear_current_draw_reason();
+            self.present();
+            self.input_boundary_present_epoch
+                .set(Some(self.present_epoch.get()));
+            arena_clear_needed.clear();
+            self.complete_frame();
+        } else if self.needs_present.get() {
+            crate::nobie_platform_trace::trace(
+                "input_boundary_present_present_only",
+                format_args!(
+                    "request_frame_age_us={} present_epoch={}",
+                    request_frame_age.as_micros(),
+                    self.present_epoch.get()
+                ),
+            );
+            self.present();
+            self.input_boundary_present_epoch
+                .set(Some(self.present_epoch.get()));
+            self.complete_frame();
+        } else {
+            crate::nobie_platform_trace::trace(
+                "input_boundary_present_skip",
+                format_args!("reason=clean"),
+            );
+        }
     }
 
     /// Returns a snapshot of the current input-latency histograms.
@@ -3877,6 +4215,22 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        crate::nobie_platform_trace::trace(
+            "window_paint_surface",
+            format_args!(
+                "draw_id={} surface_index={} bounds=({:.3},{:.3},{:.3},{:.3}) content_mask=({:.3},{:.3},{:.3},{:.3})",
+                crate::nobie_platform_trace::current_draw_id(),
+                self.next_frame.scene.surfaces.len().saturating_add(1),
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+                bounds.size.width.0,
+                bounds.size.height.0,
+                content_mask.bounds.origin.x.0,
+                content_mask.bounds.origin.y.0,
+                content_mask.bounds.size.width.0,
+                content_mask.bounds.size.height.0
+            ),
+        );
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
@@ -4050,6 +4404,13 @@ impl Window {
     pub fn current_view(&self) -> EntityId {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.rendered_entity_stack.last().copied().unwrap()
+    }
+
+    /// Capture precise invalidation authority for the currently rendering view.
+    pub fn current_view_invalidator(&self) -> CurrentViewInvalidator {
+        CurrentViewInvalidator {
+            raw_entity_id: self.current_view(),
+        }
     }
 
     #[inline]
@@ -5261,6 +5622,14 @@ impl Window {
         false
     }
 
+    /// Notify the inspector panel, if it is currently mounted.
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub fn notify_inspector(&mut self, cx: &mut App) {
+        if let Some(inspector) = self.inspector.clone() {
+            let _ = inspector.update(cx, |_, cx| cx.notify());
+        }
+    }
+
     /// Executes the provided function with mutable access to an inspector state.
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub fn with_inspector_state<T: 'static, R>(
@@ -5281,6 +5650,23 @@ impl Window {
             }
         }
         f(&mut None, self)
+    }
+
+    /// Queues inspector-state mutation from an entity-local context.
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub fn defer_inspector_state<Owner: 'static, T: 'static>(
+        &mut self,
+        _inspector_id: Option<&crate::InspectorElementId>,
+        cx: &mut Context<Owner>,
+        f: impl FnOnce(&mut Option<T>, &mut Self) + 'static,
+    ) {
+        let inspector_id = _inspector_id.cloned();
+        let handle = self.handle;
+        cx.defer(move |cx| {
+            _ = handle.update(cx, |_, window, cx| {
+                window.with_inspector_state::<T, _>(inspector_id.as_ref(), cx, f);
+            });
+        });
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]

@@ -59,6 +59,26 @@ pub(crate) struct EntityMap {
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
+impl Sealed for EntityMap {}
+
+/// Read-only authority for entity state without exposing the raw entity store.
+pub trait EntityReadContext: Sealed {
+    /// Read a dynamically typed entity.
+    ///
+    /// This method is intentionally type-erased so the trait remains object
+    /// safe for component trait objects. Typed callers should use
+    /// [`Entity::get`].
+    #[track_caller]
+    fn get_entity_any(&self, entity: &AnyEntity) -> &dyn Any;
+}
+
+impl EntityReadContext for EntityMap {
+    #[track_caller]
+    fn get_entity_any(&self, entity: &AnyEntity) -> &dyn Any {
+        self.get_any(entity)
+    }
+}
+
 #[doc(hidden)]
 pub(crate) struct EntityRefCounts {
     counts: SlotMap<EntityId, AtomicUsize>,
@@ -164,6 +184,58 @@ impl EntityMap {
             .unwrap_or_else(|| double_lease_panic::<T>("read"))
     }
 
+    #[track_caller]
+    pub(crate) fn with_two_mut<A: 'static, B: 'static, R>(
+        &mut self,
+        a: &Entity<A>,
+        b: &Entity<B>,
+        write: impl FnOnce(&mut A, &mut B) -> R,
+    ) -> Result<R> {
+        self.assert_valid_context(a);
+        self.assert_valid_context(b);
+
+        if a.entity_id == b.entity_id {
+            anyhow::bail!("cannot mutably lease the same entity twice");
+        }
+
+        self.accessed_entities.borrow_mut().insert(a.entity_id);
+        self.accessed_entities.borrow_mut().insert(b.entity_id);
+
+        let a_entity = self
+            .entities
+            .remove(a.entity_id)
+            .unwrap_or_else(|| double_lease_panic::<A>("write"));
+        let b_entity = match self.entities.remove(b.entity_id) {
+            Some(entity) => entity,
+            None => {
+                self.entities.insert(a.entity_id, a_entity);
+                double_lease_panic::<B>("write")
+            }
+        };
+        let mut lease = EntityPairWriteLease {
+            entities: &mut self.entities,
+            a_id: a.entity_id,
+            b_id: b.entity_id,
+            a_entity: Some(a_entity),
+            b_entity: Some(b_entity),
+        };
+
+        let (a, b) = lease.get_mut_pair();
+        Ok(write(a, b))
+    }
+
+    #[track_caller]
+    pub(crate) fn get_any(&self, entity: &AnyEntity) -> &dyn Any {
+        self.assert_valid_context(entity);
+        let mut accessed_entities = self.accessed_entities.borrow_mut();
+        accessed_entities.insert(entity.entity_id);
+
+        self.entities
+            .get(entity.entity_id)
+            .map(|entity| entity.as_ref())
+            .unwrap_or_else(|| double_lease_panic_for_type_name(entity.entity_type(), "read"))
+    }
+
     fn assert_valid_context(&self, entity: &AnyEntity) {
         debug_assert!(
             Weak::ptr_eq(&entity.entity_map, &Arc::downgrade(&self.ref_counts)),
@@ -211,10 +283,50 @@ fn double_lease_panic<T>(operation: &str) -> ! {
     )
 }
 
+#[track_caller]
+fn double_lease_panic_for_type_name(entity_type: TypeId, operation: &str) -> ! {
+    panic!("cannot {operation} entity type {entity_type:?} while it is already being updated")
+}
+
 pub(crate) struct Lease<T> {
     entity: Option<Box<dyn Any>>,
     pub id: EntityId,
     entity_type: PhantomData<T>,
+}
+
+struct EntityPairWriteLease<'a> {
+    entities: &'a mut SecondaryMap<EntityId, Box<dyn Any>>,
+    a_id: EntityId,
+    b_id: EntityId,
+    a_entity: Option<Box<dyn Any>>,
+    b_entity: Option<Box<dyn Any>>,
+}
+
+impl EntityPairWriteLease<'_> {
+    fn get_mut_pair<A: 'static, B: 'static>(&mut self) -> (&mut A, &mut B) {
+        let a = self
+            .a_entity
+            .as_mut()
+            .and_then(|entity| entity.downcast_mut())
+            .unwrap_or_else(|| double_lease_panic::<A>("write"));
+        let b = self
+            .b_entity
+            .as_mut()
+            .and_then(|entity| entity.downcast_mut())
+            .unwrap_or_else(|| double_lease_panic::<B>("write"));
+        (a, b)
+    }
+}
+
+impl Drop for EntityPairWriteLease<'_> {
+    fn drop(&mut self) {
+        if let Some(entity) = self.a_entity.take() {
+            self.entities.insert(self.a_id, entity);
+        }
+        if let Some(entity) = self.b_entity.take() {
+            self.entities.insert(self.b_id, entity);
+        }
+    }
 }
 
 impl<T: 'static> core::ops::Deref for Lease<T> {

@@ -972,6 +972,37 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn set_app_icon(&self, icon_bytes: &[u8]) {
+        if icon_bytes.is_empty() {
+            return;
+        }
+
+        unsafe {
+            let bundle: id = NSBundle::mainBundle();
+            if !bundle.is_null() {
+                let identifier: id = msg_send![bundle, bundleIdentifier];
+                if !identifier.is_null() {
+                    return;
+                }
+            }
+
+            let pool = NSAutoreleasePool::new(nil);
+            let data: id = msg_send![
+                class!(NSData),
+                dataWithBytes: icon_bytes.as_ptr() as *const c_void
+                length: icon_bytes.len() as NSUInteger
+            ];
+            let image: id = msg_send![class!(NSImage), alloc];
+            let image: id = msg_send![image, initWithData: data];
+            if !image.is_null() {
+                let app: id = msg_send![APP_CLASS, sharedApplication];
+                let _: () = msg_send![app, setApplicationIconImage: image];
+                let _: () = msg_send![image, release];
+            }
+            pool.drain();
+        }
+    }
+
     fn add_recent_document(&self, path: &Path) {
         if let Some(path_str) = path.to_str() {
             unsafe {

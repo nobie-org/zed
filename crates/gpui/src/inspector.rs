@@ -154,12 +154,12 @@ mod conditional {
 
         /// Renders elements for all registered inspector states of the active inspector element.
         pub fn render_inspector_states(
-            &mut self,
+            &self,
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Vec<AnyElement> {
             let mut elements = Vec::new();
-            if let Some(active_element) = self.active_element.take() {
+            if let Some(active_element) = self.active_element.as_ref() {
                 for (type_id, state) in &active_element.states {
                     if let Some(render_inspector) = cx
                         .inspector_element_registry
@@ -178,8 +178,6 @@ mod conditional {
                             .insert(*type_id, render_inspector);
                     }
                 }
-
-                self.active_element = Some(active_element);
             }
 
             elements

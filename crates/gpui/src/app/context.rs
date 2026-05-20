@@ -1,7 +1,8 @@
 use crate::{
-    AnyView, AnyWindowHandle, AppContext, AsyncApp, DispatchPhase, Effect, EntityId, EventEmitter,
-    FocusHandle, FocusOutEvent, Focusable, Global, KeystrokeObserver, Priority, Reservation,
-    SubscriberSet, Subscription, Task, WeakEntity, WeakFocusHandle, Window, WindowHandle,
+    AnyEntity, AnyView, AnyWindowHandle, AppContext, AsyncApp, DispatchPhase, Effect, ElementId,
+    EntityId, EntityReadContext, EventEmitter, FocusHandle, FocusOutEvent, Focusable, Global,
+    KeystrokeObserver, Priority, Reservation, SubscriberSet, Subscription, Task, TextSystem,
+    WeakEntity, WeakFocusHandle, Window, WindowHandle,
 };
 use anyhow::Result;
 use futures::FutureExt;
@@ -36,9 +37,124 @@ impl<'a, T> ops::DerefMut for Context<'a, T> {
     }
 }
 
+/// Read-only authority available while rendering an entity.
+pub struct RenderContext<'a, T> {
+    app: &'a mut App,
+    entity_state: WeakEntity<T>,
+    current_entity: &'a T,
+}
+
+impl<T> crate::seal::Sealed for Context<'_, T> {}
+
+impl<T> crate::seal::Sealed for RenderContext<'_, T> {}
+
+impl<T: 'static> EntityReadContext for RenderContext<'_, T> {
+    #[track_caller]
+    fn get_entity_any(&self, entity: &AnyEntity) -> &dyn Any {
+        if entity.entity_id() == self.entity_state.entity_id {
+            return self.current_entity;
+        }
+        self.app.entities.get_any(entity)
+    }
+}
+
+impl<'a, T: 'static> RenderContext<'a, T> {
+    pub(crate) fn new_context(
+        app: &'a mut App,
+        entity_state: WeakEntity<T>,
+        current_entity: &'a T,
+    ) -> Self {
+        Self {
+            app,
+            entity_state,
+            current_entity,
+        }
+    }
+
+    /// Read a global value from render.
+    pub fn global<G: Global>(&self) -> &G {
+        self.app.global::<G>()
+    }
+
+    /// Try to read a global value from render.
+    pub fn try_global<G: Global>(&self) -> Option<&G> {
+        self.app.try_global::<G>()
+    }
+
+    /// Read a child entity owned by the entity currently rendering.
+    #[track_caller]
+    pub fn read_child<U: 'static, R>(&self, entity: &Entity<U>, read: impl FnOnce(&U) -> R) -> R {
+        read(self.app.entities.read(entity))
+    }
+
+    /// Access the shared text system while rendering.
+    pub fn text_system(&self) -> &Arc<TextSystem> {
+        self.app.text_system()
+    }
+
+    /// Use window-owned element state while rendering an entity.
+    pub fn use_keyed_element_state<S: 'static>(
+        &mut self,
+        window: &mut Window,
+        key: impl Into<ElementId>,
+        init: impl FnOnce(&mut Window, &mut Context<S>) -> S,
+    ) -> Entity<S> {
+        window.use_keyed_state(key, self.app, init)
+    }
+
+    /// Observe the currently focused handle in a window while rendering.
+    pub fn focused(&self, window: &Window) -> Option<FocusHandle> {
+        window.focused(self.app)
+    }
+
+    /// Observe whether the window inspector is currently picking an element.
+    pub fn window_is_inspector_picking(&self, window: &Window) -> bool {
+        window.is_inspector_picking(self.app)
+    }
+
+    /// Returns a strong handle to the entity currently rendering.
+    pub fn entity(&self) -> Entity<T> {
+        self.weak_entity()
+            .upgrade()
+            .expect("The entity must be alive if we have a render context")
+    }
+
+    /// Returns a weak handle to the entity currently rendering.
+    pub fn weak_entity(&self) -> WeakEntity<T> {
+        self.entity_state.clone()
+    }
+
+    /// Convenience method for accessing view state in an event callback.
+    pub fn listener<E: ?Sized>(
+        &self,
+        f: impl Fn(&mut T, &E, &mut Window, &mut Context<T>) + 'static,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        let view = self.entity().downgrade();
+        move |e: &E, window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| f(view, e, window, cx)).ok();
+        }
+    }
+
+    /// Convenience method for producing view state in a later callback.
+    pub fn processor<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut Window, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut Window, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
+}
+
 impl<'a, T: 'static> Context<'a, T> {
     pub(crate) fn new_context(app: &'a mut App, entity_state: WeakEntity<T>) -> Self {
         Self { app, entity_state }
+    }
+
+    /// Temporarily view this update context through render-only authority.
+    pub fn render_context<'b>(&'b mut self, current_entity: &'b T) -> RenderContext<'b, T> {
+        RenderContext::new_context(self.app, self.entity_state.clone(), current_entity)
     }
 
     /// The entity id of the entity backing this context.

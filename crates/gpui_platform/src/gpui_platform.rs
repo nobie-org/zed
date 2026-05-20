@@ -49,7 +49,8 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        gpui_linux::current_platform(headless)
+        let _ = headless;
+        panic!("Nobie GPUI links only the macOS GPUI platform backend")
     }
 
     #[cfg(target_family = "wasm")]

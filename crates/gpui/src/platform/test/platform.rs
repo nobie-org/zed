@@ -454,7 +454,7 @@ impl Platform for TestPlatform {
     }
 
     fn register_url_scheme(&self, _: &str) -> Task<anyhow::Result<()>> {
-        unimplemented!()
+        Task::ready(Ok(()))
     }
 
     fn open_with_system(&self, _path: &Path) {

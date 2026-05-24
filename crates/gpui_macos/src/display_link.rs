@@ -37,23 +37,35 @@ impl DisplayLink {
             // of CV fires is invisible to the probe and the probe cannot
             // distinguish OS-level display-link throttling from main-queue
             // coalescing.
-            let callback_wall_us = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_micros().try_into().unwrap_or(u64::MAX))
-                .unwrap_or(0);
-            let callback_ca_time = ca_current_media_time();
-            // output_time predicts when the next vsync output will be
-            // visible. host_time is mach absolute units; converting to
-            // CA media time would require multiplying by the mach timebase
-            // ratio. The signal id and callback timing are enough for the
-            // OS-vs-coalescing question, so leave the output CA time at
-            // zero until we add a mach_timebase helper.
-            let _ = _output_time;
-            nobie_platform_trace::record_display_link_callback(
-                callback_wall_us,
-                callback_ca_time,
-                0.0,
-            );
+            //
+            // Gate the timing capture on `nobie_platform_trace::enabled()`
+            // so the SystemTime::now() syscall and CACurrentMediaTime FFI
+            // call don't fire on every CV tick (~120/s) in default builds.
+            // This matches the existing pattern in `metal_renderer.rs` and
+            // makes the PR's "behavior unchanged when
+            // NOBIE_GPUI_TRACE_PLATFORM_PRESENT is unset" claim true.
+            // `record_display_link_callback` also early-returns when
+            // disabled; the outer gate just spares the timing work.
+            if nobie_platform_trace::enabled() {
+                let callback_wall_us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_micros().try_into().unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                let callback_ca_time = ca_current_media_time();
+                // output_time predicts when the next vsync output will be
+                // visible. host_time is mach absolute units; converting to
+                // CA media time would require multiplying by the mach
+                // timebase ratio. The signal id and callback timing are
+                // enough for the OS-vs-coalescing question, so leave the
+                // output CA time at zero until we add a mach_timebase
+                // helper.
+                let _ = _output_time;
+                nobie_platform_trace::record_display_link_callback(
+                    callback_wall_us,
+                    callback_ca_time,
+                    0.0,
+                );
+            }
             unsafe {
                 let frame_requests = &*(frame_requests as *const DispatchSource);
                 frame_requests.merge_data(1);

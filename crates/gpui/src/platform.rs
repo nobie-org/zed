@@ -1491,6 +1491,29 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// When `true`, the request-frame closure caps frame delivery to ~30 Hz
+    /// while `Window::is_window_active()` is `false`. Introduced upstream in
+    /// `gpui: Throttle framerate to 30 for unfocused windows (#52970)` to
+    /// reduce energy use of background spinners. Default is `true` to preserve
+    /// that behavior; set to `false` for windows whose unfocused redraw rate
+    /// must match the display refresh (e.g. background-window automation
+    /// harnesses that need to observe true frame cadence, or apps where
+    /// background windows still display animated content the user cares
+    /// about). Can also be toggled at runtime via
+    /// `Window::set_throttle_inactive_frame_rate`.
+    pub throttle_inactive_frame_rate: bool,
+
+    /// When `true`, the request-frame closure caps frame delivery to ~60 Hz
+    /// while the system reports `ThermalState::Serious` or
+    /// `ThermalState::Critical`. Default is `true` to preserve the upstream
+    /// behavior; set to `false` for windows whose redraw rate must match the
+    /// display refresh regardless of thermal pressure (e.g. measurement
+    /// harnesses that need a stable cadence baseline, or apps that prefer
+    /// other energy-management strategies and want the throttle decision in
+    /// their own hands). Can also be toggled at runtime via
+    /// `Window::set_throttle_under_thermal_pressure`.
+    pub throttle_under_thermal_pressure: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -1604,6 +1627,8 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            throttle_inactive_frame_rate: true,
+            throttle_under_thermal_pressure: true,
         }
     }
 }

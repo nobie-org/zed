@@ -1020,6 +1020,8 @@ pub struct Window {
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
+    throttle_inactive_frame_rate: Rc<Cell<bool>>,
+    throttle_under_thermal_pressure: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     present_epoch: Rc<Cell<u64>>,
@@ -1303,6 +1305,8 @@ impl Window {
             icon,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            throttle_inactive_frame_rate,
+            throttle_under_thermal_pressure,
         } = options;
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
@@ -1342,6 +1346,8 @@ impl Window {
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
         let active = Rc::new(Cell::new(platform_window.is_active()));
+        let throttle_inactive_frame_rate = Rc::new(Cell::new(throttle_inactive_frame_rate));
+        let throttle_under_thermal_pressure = Rc::new(Cell::new(throttle_under_thermal_pressure));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let present_epoch = Rc::new(Cell::new(0));
@@ -1375,6 +1381,8 @@ impl Window {
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
             let active = active.clone();
+            let throttle_inactive_frame_rate = throttle_inactive_frame_rate.clone();
+            let throttle_under_thermal_pressure = throttle_under_thermal_pressure.clone();
             let needs_present = needs_present.clone();
             let present_epoch = present_epoch.clone();
             let input_boundary_present_epoch = input_boundary_present_epoch.clone();
@@ -1388,16 +1396,30 @@ impl Window {
                     .log_err();
 
                 // Throttle frame rate based on conditions:
-                // - Thermal pressure (Serious/Critical): cap to ~60fps
-                // - Inactive window (not focused): cap to ~30fps to save energy
+                // - Inactive window (not focused): cap to ~30fps to save
+                //   energy IF the caller asked for the inactive throttle.
+                // - Thermal pressure (Serious/Critical): cap to ~60fps IF
+                //   the caller asked for the thermal throttle.
+                // Hosts that need a stable cadence baseline (measurement
+                // harnesses, apps that animate unfocused content the user
+                // cares about, apps that manage thermal headroom on their
+                // own) opt out via
+                // `WindowOptions::throttle_inactive_frame_rate` /
+                // `WindowOptions::throttle_under_thermal_pressure` or the
+                // matching `Window::set_*` runtime setters.
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() {
+                } else if !active.get() && throttle_inactive_frame_rate.get() {
                     Some(Duration::from_micros(33333))
-                } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
+                } else if throttle_under_thermal_pressure.get()
+                    && matches!(
+                        thermal_state,
+                        Some(ThermalState::Critical | ThermalState::Serious)
+                    )
+                {
                     Some(Duration::from_micros(16667))
                 } else {
                     None
@@ -1688,6 +1710,8 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
+            throttle_inactive_frame_rate,
+            throttle_under_thermal_pressure,
             hovered,
             needs_present,
             present_epoch,
@@ -2315,6 +2339,39 @@ impl Window {
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// Returns whether this window's request-frame closure throttles to
+    /// ~30 Hz while `is_window_active()` is `false`. See
+    /// `WindowOptions::throttle_inactive_frame_rate` for the full contract.
+    pub fn throttle_inactive_frame_rate(&self) -> bool {
+        self.throttle_inactive_frame_rate.get()
+    }
+
+    /// Toggles the inactive-window 30 Hz frame-rate cap at runtime. Takes
+    /// effect on the next request-frame callback. Use to opt out of the
+    /// upstream-default unfocused throttle for windows whose unfocused
+    /// redraw rate must match the display refresh (automation harnesses,
+    /// animation-heavy backgrounds, etc.).
+    pub fn set_throttle_inactive_frame_rate(&self, throttle: bool) {
+        self.throttle_inactive_frame_rate.set(throttle);
+    }
+
+    /// Returns whether this window's request-frame closure throttles to
+    /// ~60 Hz while the system reports `ThermalState::Serious` or
+    /// `ThermalState::Critical`. See
+    /// `WindowOptions::throttle_under_thermal_pressure` for the contract.
+    pub fn throttle_under_thermal_pressure(&self) -> bool {
+        self.throttle_under_thermal_pressure.get()
+    }
+
+    /// Toggles the thermal-pressure 60 Hz frame-rate cap at runtime. Takes
+    /// effect on the next request-frame callback. Use to opt out for
+    /// windows whose redraw rate must match the display refresh
+    /// regardless of thermal pressure (measurement harnesses, apps that
+    /// own their own energy-management strategy).
+    pub fn set_throttle_under_thermal_pressure(&self, throttle: bool) {
+        self.throttle_under_thermal_pressure.set(throttle);
     }
 
     /// Returns whether this window is considered to be the window

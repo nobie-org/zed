@@ -4685,6 +4685,31 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    /// Dispatch a synthetic platform input that crossed the automation
+    /// boundary. Marks the entry into `dispatch_event` with a Nobie trace
+    /// event so present/draw events later in the frame can be correlated
+    /// back to the input that triggered them. Behavior is otherwise
+    /// identical to `dispatch_event`: this exists so consumers can
+    /// distinguish automation-injected inputs from real user input in the
+    /// trace stream without changing dispatch semantics.
+    pub fn dispatch_event_with_input_boundary_for_automation(
+        &mut self,
+        event: PlatformInput,
+        cx: &mut App,
+    ) -> DispatchEventResult {
+        let request_frame_id = crate::nobie_platform_trace::current_request_frame_id();
+        let display_link_signal_id =
+            crate::nobie_platform_trace::current_display_link_signal_id();
+        crate::nobie_platform_trace::trace(
+            "input_boundary_dispatch",
+            format_args!(
+                "request_frame_id={request_frame_id} \
+                 display_link_signal_id={display_link_signal_id}"
+            ),
+        );
+        self.dispatch_event(event, cx)
+    }
+
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {

@@ -31,7 +31,7 @@ use gpui::{
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformInputSimulator, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, point, px, size,
+    WindowParams, nobie_platform_trace, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -2532,9 +2532,58 @@ extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        // Snapshot the latest CV-thread observation BEFORE invoking the
+        // user callback so any tracing reads inside the callback see
+        // consistent display-link data. The coalesced count is the
+        // delta between the latest CV signal id and the one observed at
+        // the previous step -- N coalesced means the dispatch source
+        // collected N CV fires between two main-thread services. This
+        // is the field the request-frame cadence probe consumes via
+        // gpui::nobie_platform_trace::current_display_link_coalesced_count
+        // to answer "is CV throttled (delta == 1) or is the main queue
+        // coalescing (delta > 1)?".
+        let prior_signal_id = nobie_platform_trace::current_display_link_signal_id();
+        let latest_signal_id = nobie_platform_trace::latest_display_link_signal_id();
+        let coalesced = if latest_signal_id == 0 {
+            0
+        } else if prior_signal_id == 0 {
+            1
+        } else {
+            latest_signal_id.saturating_sub(prior_signal_id)
+        };
+        nobie_platform_trace::set_current_display_link_signal_id(latest_signal_id);
+        nobie_platform_trace::set_current_display_link_coalesced_count(coalesced);
+        nobie_platform_trace::set_current_display_link_callback_wall_us(
+            nobie_platform_trace::latest_display_link_callback_wall_us(),
+        );
+        nobie_platform_trace::set_current_display_link_callback_ca_time(
+            nobie_platform_trace::latest_display_link_callback_ca_time(),
+        );
+        nobie_platform_trace::set_current_display_link_output_ca_time(
+            nobie_platform_trace::latest_display_link_output_ca_time(),
+        );
+        // Mint a fresh request-frame id for the callback's lifetime so any
+        // tracing inside the callback can correlate its work with this
+        // specific step invocation. The request-frame cadence probe joins
+        // this id back to the display-link signal id above.
+        let request_frame_id = nobie_platform_trace::next_request_frame_id();
+        nobie_platform_trace::set_current_request_frame_id(request_frame_id);
+
         drop(lock);
         callback(Default::default());
         window_state.lock().request_frame_callback = Some(callback);
+
+        // Leave the signal id in the thread-local so the next step()
+        // can compute its own coalesced delta against this run. Other
+        // observation fields (wall_us, ca_time, request_frame_id) are
+        // scoped to this step's callback and zeroed so observers outside
+        // the callback do not read stale data attributed to a different
+        // step.
+        nobie_platform_trace::set_current_display_link_coalesced_count(0);
+        nobie_platform_trace::set_current_display_link_callback_wall_us(0);
+        nobie_platform_trace::set_current_display_link_callback_ca_time(0.0);
+        nobie_platform_trace::set_current_display_link_output_ca_time(0.0);
+        nobie_platform_trace::clear_current_request_frame_id();
     }
 }
 

@@ -665,6 +665,8 @@ pub struct App {
 
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
+    #[cfg(any(test, feature = "test-support"))]
+    auto_draw_test_windows: bool,
     pub(crate) cursor_hide_mode: CursorHideMode,
     flushing_effects: bool,
     pending_updates: usize,
@@ -706,6 +708,8 @@ impl App {
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
                 mode: GpuiMode::Production,
+                #[cfg(any(test, feature = "test-support"))]
+                auto_draw_test_windows: true,
                 actions: Rc::new(ActionRegistry::default()),
                 flushing_effects: false,
                 pending_updates: 0,
@@ -1404,6 +1408,13 @@ impl App {
         self.quit_mode = mode;
     }
 
+    /// Enables or disables the GPUI test harness' implicit dirty-window draw at
+    /// effect-flush boundaries. Production drawing is unaffected.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_auto_draw_test_windows(&mut self, enabled: bool) {
+        self.auto_draw_test_windows = enabled;
+    }
+
     /// Returns the SVG renderer used by the application.
     pub fn svg_renderer(&self) -> SvgRenderer {
         self.svg_renderer.clone()
@@ -1467,17 +1478,19 @@ impl App {
                 }
             } else {
                 #[cfg(any(test, feature = "test-support"))]
-                for window in self
-                    .windows
-                    .values()
-                    .filter_map(|window| {
-                        let window = window.as_deref()?;
-                        window.invalidator.is_dirty().then_some(window.handle)
-                    })
-                    .collect::<Vec<_>>()
-                {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear())
-                        .unwrap();
+                if self.auto_draw_test_windows {
+                    for window in self
+                        .windows
+                        .values()
+                        .filter_map(|window| {
+                            let window = window.as_deref()?;
+                            window.invalidator.is_dirty().then_some(window.handle)
+                        })
+                        .collect::<Vec<_>>()
+                    {
+                        self.update_window(window, |_, window, cx| window.draw(cx).clear())
+                            .unwrap();
+                    }
                 }
 
                 if self.pending_effects.is_empty() {

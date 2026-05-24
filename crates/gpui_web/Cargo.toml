@@ -19,7 +19,7 @@ path = "src/gpui_web.rs"
 [target.'cfg(target_family = "wasm")'.dependencies]
 gpui.workspace = true
 parking_lot = { workspace = true, features = ["nightly"] }
-gpui_wgpu.workspace = true
+gpui_wgpu = { workspace = true, features = ["web"] }
 http_client.workspace = true
 anyhow.workspace = true
 futures.workspace = true

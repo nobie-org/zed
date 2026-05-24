@@ -108,7 +108,9 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    /// `None` for a headless offscreen renderer (visual-regression capture),
+    /// which renders to its own offscreen texture and never presents to a window.
+    surface: Option<wgpu::Surface<'static>>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
@@ -234,7 +236,7 @@ impl WgpuRenderer {
         Self::new_internal(
             Some(Rc::clone(&gpu_context)),
             context,
-            surface,
+            Some(surface),
             config,
             compositor_gpu,
             atlas,
@@ -254,59 +256,95 @@ impl WgpuRenderer {
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
 
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(None, context, Some(surface), config, None, atlas)
     }
 
     fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
-        surface: wgpu::Surface<'static>,
+        surface: Option<wgpu::Surface<'static>>,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let surface_caps = surface.get_capabilities(&context.adapter);
-        let preferred_formats = [
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba8Unorm,
-        ];
-        let surface_format = preferred_formats
-            .iter()
-            .find(|f| surface_caps.formats.contains(f))
-            .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-            .or_else(|| surface_caps.formats.first().copied())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Surface reports no supported texture formats for adapter {:?}",
-                    context.adapter.get_info().name
-                )
-            })?;
-
-        let pick_alpha_mode =
-            |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
-                preferences
+        // A headless renderer (visual-regression capture) has no surface: it
+        // renders into its own offscreen texture and never presents. To keep
+        // capture byte-identical across backends (macOS Metal vs Linux
+        // Vulkan/lavapipe) it pins a fixed format and opaque alpha instead of
+        // negotiating capabilities with a surface.
+        let (surface_format, transparent_alpha_mode, opaque_alpha_mode, present_mode) =
+            if let Some(surface) = surface.as_ref() {
+                let surface_caps = surface.get_capabilities(&context.adapter);
+                let preferred_formats = [
+                    wgpu::TextureFormat::Bgra8Unorm,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ];
+                let surface_format = preferred_formats
                     .iter()
-                    .find(|p| surface_caps.alpha_modes.contains(p))
+                    .find(|f| surface_caps.formats.contains(f))
                     .copied()
-                    .or_else(|| surface_caps.alpha_modes.first().copied())
+                    .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+                    .or_else(|| surface_caps.formats.first().copied())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Surface reports no supported alpha modes for adapter {:?}",
+                            "Surface reports no supported texture formats for adapter {:?}",
                             context.adapter.get_info().name
                         )
-                    })
+                    })?;
+
+                let pick_alpha_mode = |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
+                    preferences
+                        .iter()
+                        .find(|p| surface_caps.alpha_modes.contains(p))
+                        .copied()
+                        .or_else(|| surface_caps.alpha_modes.first().copied())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Surface reports no supported alpha modes for adapter {:?}",
+                                context.adapter.get_info().name
+                            )
+                        })
+                };
+
+                let transparent_alpha_mode = pick_alpha_mode(&[
+                    wgpu::CompositeAlphaMode::PreMultiplied,
+                    wgpu::CompositeAlphaMode::Inherit,
+                ])?;
+                let opaque_alpha_mode = pick_alpha_mode(&[
+                    wgpu::CompositeAlphaMode::Opaque,
+                    wgpu::CompositeAlphaMode::Inherit,
+                ])?;
+                let present_mode = config
+                    .preferred_present_mode
+                    .filter(|mode| surface_caps.present_modes.contains(mode))
+                    .unwrap_or(wgpu::PresentMode::Fifo);
+                (
+                    surface_format,
+                    transparent_alpha_mode,
+                    opaque_alpha_mode,
+                    present_mode,
+                )
+            } else {
+                // Headless capture renders into an `Rgba32Float` target so all
+                // alpha compositing accumulates at full f32 precision. An 8-bit
+                // `Unorm` target re-quantizes after *every* blend, and that
+                // per-blend rounding is backend-defined: Metal and Vulkan/lavapipe
+                // round it differently, producing ±1 LSB cross-platform drift at
+                // every anti-aliased/blended edge. A 16-bit float target removes
+                // most of that but the blend itself is only specified to "at
+                // least f16" precision, so a backend that blends in a wider
+                // intermediate still differs by ±1 LSB. f32 is the widest blend
+                // precision, so both backends round identically. Quantization to
+                // 8-bit happens once, deterministically on the CPU, in
+                // `render_scene_to_image`. Requires `FLOAT32_BLENDABLE` (asserted
+                // in `WgpuContext::new_headless`).
+                (
+                    wgpu::TextureFormat::Rgba32Float,
+                    wgpu::CompositeAlphaMode::Opaque,
+                    wgpu::CompositeAlphaMode::Opaque,
+                    wgpu::PresentMode::Fifo,
+                )
             };
-
-        let transparent_alpha_mode = pick_alpha_mode(&[
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::Inherit,
-        ])?;
-
-        let opaque_alpha_mode = pick_alpha_mode(&[
-            wgpu::CompositeAlphaMode::Opaque,
-            wgpu::CompositeAlphaMode::Inherit,
-        ])?;
 
         let alpha_mode = if config.transparent {
             transparent_alpha_mode
@@ -335,22 +373,35 @@ impl WgpuRenderer {
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: config
-                .preferred_present_mode
-                .filter(|mode| surface_caps.present_modes.contains(mode))
-                .unwrap_or(wgpu::PresentMode::Fifo),
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
         };
-        // Configure the surface immediately. The adapter selection process already validated
-        // that this adapter can successfully configure this surface.
-        surface.configure(&context.device, &surface_config);
+        // Configure the surface immediately when present. The adapter selection
+        // process already validated that this adapter can configure this surface.
+        if let Some(surface) = surface.as_ref() {
+            surface.configure(&context.device, &surface_config);
+        }
 
         let queue = Arc::clone(&context.queue);
-        let dual_source_blending = context.supports_dual_source_blending();
+        let dual_source_blending = if surface.is_some() {
+            context.supports_dual_source_blending()
+        } else {
+            // Headless capture paints grayscale monochrome glyphs only
+            // (TestWindow reports subpixel rendering unsupported), so the
+            // subpixel pipeline and its adapter-dependence are dropped.
+            false
+        };
 
-        let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
+        let rendering_params = if surface.is_some() {
+            RenderingParameters::new(&context.adapter, surface_format)
+        } else {
+            // Fixed sample count (no MSAA): MSAA sample positions are
+            // backend-defined, and the render-parity contract forbids relying on
+            // backend-defined behavior for cross-platform byte-identity.
+            RenderingParameters::headless()
+        };
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
         let pipelines = Self::create_pipelines(
             &device,
@@ -446,6 +497,7 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
+        let surface_configured = surface.is_some();
         let resources = WgpuResources {
             device,
             queue,
@@ -486,9 +538,185 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
-            surface_configured: true,
+            surface_configured,
             needs_redraw: false,
         })
+    }
+
+    /// Build a surfaceless renderer for headless offscreen capture (visual
+    /// regression). `initial_size` only sizes the first allocation;
+    /// [`render_scene_to_image`](Self::render_scene_to_image) resizes per capture.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn new_headless(
+        context: &WgpuContext,
+        initial_size: Size<DevicePixels>,
+    ) -> anyhow::Result<Self> {
+        let atlas = Arc::new(WgpuAtlas::from_context(context));
+        Self::new_internal(
+            None,
+            context,
+            None,
+            WgpuSurfaceConfig {
+                size: initial_size,
+                transparent: false,
+                preferred_present_mode: None,
+            },
+            None,
+            atlas,
+        )
+    }
+
+    /// Render `scene` to an offscreen texture at `size` and read it back as an
+    /// RGBA image. The single canonical headless capture path: deterministic and
+    /// byte-identical across backends (macOS Metal, Linux Vulkan/lavapipe).
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("invalid headless capture size: {size:?}");
+        }
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+        let max = self.max_texture_size;
+        if width > max || height > max {
+            anyhow::bail!("headless capture size {width}x{height} exceeds max texture dim {max}");
+        }
+
+        // Size the globals viewport and intermediate path textures to this capture.
+        if width != self.surface_config.width || height != self.surface_config.height {
+            self.surface_config.width = width;
+            self.surface_config.height = height;
+            if let Some(res) = self.resources.as_mut() {
+                res.invalidate_intermediate_textures();
+            }
+        }
+
+        self.atlas.before_frame();
+        self.ensure_intermediate_textures();
+
+        let format = self.surface_config.format;
+        let target_texture =
+            self.resources()
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("headless_capture_target"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+        let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        if !self.encode_scene_to_view(scene, &target_view) {
+            anyhow::bail!("headless scene encode failed");
+        }
+
+        // Copy the rendered texture into a CPU-readable buffer with rows padded
+        // to COPY_BYTES_PER_ROW_ALIGNMENT, then read back, un-pad, and quantize
+        // to 8-bit RGBA.
+        let bytes_per_pixel: u32 = match format {
+            wgpu::TextureFormat::Rgba32Float => 16,
+            wgpu::TextureFormat::Rgba16Float => 8,
+            wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
+            other => anyhow::bail!("unsupported headless capture format {other:?}"),
+        };
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+
+        let read_buffer = self
+            .resources()
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("headless_capture_readback"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("headless_capture_copy"),
+                });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        read_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.resources()
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| anyhow::anyhow!("headless capture device poll failed: {e:?}"))?;
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("headless capture map channel disconnected"))?
+            .map_err(|e| anyhow::anyhow!("headless capture buffer map failed: {e:?}"))?;
+
+        let row = unpadded_bytes_per_row as usize;
+        let padded = padded_bytes_per_row as usize;
+        let mut raw = vec![0u8; row * height as usize];
+        {
+            let mapped = read_buffer.slice(..).get_mapped_range();
+            for y in 0..height as usize {
+                let src = y * padded;
+                let dst = y * row;
+                raw[dst..dst + row].copy_from_slice(&mapped[src..src + row]);
+            }
+        }
+        read_buffer.unmap();
+
+        // Quantize the captured texels to 8-bit RGBA with a single deterministic
+        // CPU rounding step. For the float capture target this is the *only*
+        // quantization, so the result never depends on backend-defined 8-bit
+        // blend rounding (Metal vs Vulkan/lavapipe).
+        let rgba = quantize_headless_capture_to_rgba8(&raw, format)?;
+        image::RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from headless capture"))
     }
 
     fn create_bind_group_layouts(device: &wgpu::Device) -> WgpuBindGroupLayouts {
@@ -980,9 +1208,9 @@ impl WgpuRenderer {
                 texture.destroy();
             }
 
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let Some(surface) = resources.surface.as_ref() {
+                surface.configure(&resources.device, &surface_config);
+            }
 
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
@@ -1036,9 +1264,9 @@ impl WgpuRenderer {
             let path_sample_count = self.rendering_params.path_sample_count;
             let dual_source_blending = self.dual_source_blending;
             let resources = self.resources_mut();
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let Some(surface) = resources.surface.as_ref() {
+                surface.configure(&resources.device, &surface_config);
+            }
             resources.pipelines = Self::create_pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
@@ -1060,6 +1288,12 @@ impl WgpuRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<WgpuAtlas> {
         &self.atlas
+    }
+
+    /// The wgpu backend of the adapter this renderer drives. Used by the
+    /// headless capture path to report which backend produced a screenshot.
+    pub fn adapter_backend(&self) -> wgpu::Backend {
+        self.adapter_info.backend
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
@@ -1114,24 +1348,30 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self.resources().surface.get_current_texture() {
+        let current = match self.resources().surface.as_ref() {
+            Some(surface) => surface.get_current_texture(),
+            // A headless renderer has no surface; it captures via
+            // `render_scene_to_image` and `draw()` is never called on it.
+            None => return false,
+        };
+        let frame = match current {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
                 let surface_config = self.surface_config.clone();
                 let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
+                if let Some(surface) = resources.surface.as_ref() {
+                    surface.configure(&resources.device, &surface_config);
+                }
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 let surface_config = self.surface_config.clone();
                 let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
+                if let Some(surface) = resources.surface.as_ref() {
+                    surface.configure(&resources.device, &surface_config);
+                }
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -1151,6 +1391,18 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let encoded = self.encode_scene_to_view(scene, &frame_view);
+        frame.present();
+        encoded
+    }
+
+    /// Encode `scene` into `target_view` and submit it (does **not** present).
+    /// Shared by the windowed `draw` path (target = surface texture; caller
+    /// presents) and the headless `render_scene_to_image` path (target =
+    /// offscreen texture; caller reads it back). Callers must run
+    /// `before_frame`/`ensure_intermediate_textures` and set `surface_config`
+    /// width/height before calling. Returns whether a frame was encoded.
+    fn encode_scene_to_view(&mut self, scene: &Scene, target_view: &wgpu::TextureView) -> bool {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1213,7 +1465,7 @@ impl WgpuRenderer {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
+                        view: target_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1252,7 +1504,7 @@ impl WgpuRenderer {
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
+                                    view: target_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1320,7 +1572,6 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    frame.present();
                     return true;
                 }
                 self.grow_instance_buffer();
@@ -1330,7 +1581,6 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
             return true;
         }
     }
@@ -1741,7 +1991,7 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
+            res.surface = Some(surface);
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
@@ -1836,7 +2086,7 @@ impl WgpuRenderer {
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            surface,
+            Some(surface),
             config,
             self.compositor_gpu,
             self.atlas.clone(),
@@ -1872,13 +2122,28 @@ struct RenderingParameters {
 
 impl RenderingParameters {
     fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
-        use std::env;
-
         let format_features = adapter.get_texture_format_features(surface_format);
         let path_sample_count = [4, 2, 1]
             .into_iter()
             .find(|&n| format_features.flags.sample_count_supported(n))
             .unwrap_or(1);
+
+        Self::from_env(path_sample_count)
+    }
+
+    /// Deterministic parameters for headless offscreen capture. Forces
+    /// `path_sample_count = 1`: MSAA sample positions are backend-defined, and
+    /// the render-parity contract forbids relying on backend-defined behavior,
+    /// so cross-platform byte-identity (macOS Metal vs Linux Vulkan/lavapipe)
+    /// requires single-sampled path rasterization. Gamma/contrast use the same
+    /// env-driven defaults as the windowed path.
+    #[cfg(any(test, feature = "test-support"))]
+    fn headless() -> Self {
+        Self::from_env(1)
+    }
+
+    fn from_env(path_sample_count: u32) -> Self {
+        use std::env;
 
         let gamma = env::var("ZED_FONTS_GAMMA")
             .ok()
@@ -1904,6 +2169,138 @@ impl RenderingParameters {
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
+        }
+    }
+}
+
+/// Convert tightly packed captured texels (no row padding) to 8-bit RGBA,
+/// quantizing the float capture target with a single deterministic round so the
+/// readback is byte-identical across GPU backends. 8-bit `Unorm` inputs are
+/// already quantized and pass through (with a BGRA→RGBA swizzle when needed).
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+fn quantize_headless_capture_to_rgba8(
+    raw: &[u8],
+    format: wgpu::TextureFormat,
+) -> anyhow::Result<Vec<u8>> {
+    match format {
+        wgpu::TextureFormat::Rgba32Float => {
+            let mut out = Vec::with_capacity(raw.len() / 4);
+            for texel in raw.chunks_exact(16) {
+                for channel in 0..4 {
+                    let base = channel * 4;
+                    let value = f32::from_le_bytes([
+                        texel[base],
+                        texel[base + 1],
+                        texel[base + 2],
+                        texel[base + 3],
+                    ]);
+                    out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+            Ok(out)
+        }
+        wgpu::TextureFormat::Rgba16Float => {
+            let mut out = Vec::with_capacity(raw.len() / 2);
+            for texel in raw.chunks_exact(8) {
+                for channel in 0..4 {
+                    let bits = u16::from_le_bytes([texel[channel * 2], texel[channel * 2 + 1]]);
+                    let value = half_bits_to_f32(bits);
+                    out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+            Ok(out)
+        }
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(raw.to_vec()),
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            let mut out = raw.to_vec();
+            for px in out.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            Ok(out)
+        }
+        other => anyhow::bail!("unsupported headless capture format {other:?}"),
+    }
+}
+
+/// Decode an IEEE 754 binary16 (half) bit pattern to `f32` using only integer
+/// arithmetic and `f32::from_bits`. Deterministic and identical across
+/// platforms — no transcendental or `powi` dependence.
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+fn half_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits as u32) & 0x8000) << 16;
+    let exponent = ((bits >> 10) & 0x1f) as u32;
+    let mantissa = (bits & 0x3ff) as u32;
+    if exponent == 0 {
+        if mantissa == 0 {
+            // Signed zero.
+            return f32::from_bits(sign);
+        }
+        // Subnormal half: normalize into a normal f32.
+        let mut exp = -1i32;
+        let mut mant = mantissa;
+        loop {
+            exp += 1;
+            mant <<= 1;
+            if mant & 0x400 != 0 {
+                break;
+            }
+        }
+        let f32_exponent = (127 - 15 - exp) as u32;
+        f32::from_bits(sign | (f32_exponent << 23) | ((mant & 0x3ff) << 13))
+    } else if exponent == 0x1f {
+        // Inf / NaN.
+        f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13))
+    } else {
+        let f32_exponent = exponent + (127 - 15);
+        f32::from_bits(sign | (f32_exponent << 23) | (mantissa << 13))
+    }
+}
+
+/// Headless renderer for visual-regression capture: renders a GPUI scene to an
+/// offscreen wgpu texture and reads it back as RGBA. This is the single canonical
+/// cross-platform headless capture backend (macOS Metal, Linux Vulkan/lavapipe),
+/// wired into `gpui_platform::current_headless_renderer`.
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+pub struct WgpuHeadlessRenderer {
+    renderer: WgpuRenderer,
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+impl WgpuHeadlessRenderer {
+    pub fn new() -> anyhow::Result<Self> {
+        let context = WgpuContext::new_headless()?;
+        let renderer = WgpuRenderer::new_headless(
+            &context,
+            Size {
+                width: DevicePixels(1),
+                height: DevicePixels(1),
+            },
+        )?;
+        Ok(Self { renderer })
+    }
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
+    fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        self.renderer.render_scene_to_image(scene, size)
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+        self.renderer.sprite_atlas().clone()
+    }
+
+    fn capture_backend(&self) -> gpui::SceneCaptureBackend {
+        match self.renderer.adapter_backend() {
+            wgpu::Backend::Metal => gpui::SceneCaptureBackend::Metal,
+            wgpu::Backend::Vulkan => gpui::SceneCaptureBackend::Vulkan,
+            wgpu::Backend::Dx12 => gpui::SceneCaptureBackend::Dx12,
+            wgpu::Backend::Gl => gpui::SceneCaptureBackend::Gl,
+            _ => gpui::SceneCaptureBackend::Other,
         }
     }
 }

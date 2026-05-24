@@ -60,19 +60,44 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
-/// Returns a new [`HeadlessRenderer`] for the current platform, if available.
+/// Returns the canonical headless offscreen renderer for visual-regression
+/// capture. This is a single cross-platform wgpu renderer (Metal on macOS,
+/// Vulkan/lavapipe on Linux) so baselines are byte-identical across platforms
+/// and assertable on Linux CI. There is no per-platform fallback: a missing
+/// headless GPU adapter is an environment misconfiguration and fails loudly.
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_family = "wasm"))]
     {
-        Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
+        match gpui_wgpu::WgpuHeadlessRenderer::new() {
+            Ok(renderer) => Some(Box::new(renderer)),
+            Err(error) => panic!("failed to create headless wgpu renderer: {error:#}"),
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    {
+        None
+    }
+}
+
+/// Returns the canonical headless text system for visual-regression capture: a
+/// cross-platform swash text system ([`gpui_wgpu::CosmicTextSystem`]) with no
+/// system fonts. Glyphs are byte-identical across platforms once the app
+/// registers its embedded fonts (e.g. Inter) via `App::text_system().add_fonts`;
+/// the fallback family name only matters before those fonts are registered.
+#[cfg(feature = "test-support")]
+pub fn current_headless_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::sync::Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+            "Inter",
         ))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_family = "wasm")]
     {
-        None
+        unimplemented!("headless text system is not available on wasm")
     }
 }
 

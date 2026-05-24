@@ -1769,7 +1769,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn play_system_bell(&self) {
-        NSBeep()
+        // SAFETY: `NSBeep` is a parameterless AppKit C function with no
+        // preconditions; it is marked `unsafe` only because it is an extern fn.
+        unsafe { NSBeep() }
     }
 
     #[cfg(any(test, feature = "test-support"))]

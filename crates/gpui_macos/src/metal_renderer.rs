@@ -7,7 +7,7 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 #[cfg(any(test, feature = "test-support"))]
-use gpui::SceneCapture;
+use gpui::{SceneCapture, SceneCaptureBackend};
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
@@ -176,16 +176,6 @@ impl MetalRenderer {
         }
 
         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
-    }
-
-    /// Creates a new headless MetalRenderer for offscreen rendering without a window.
-    ///
-    /// This renderer can render scenes to images without requiring a CAMetalLayer,
-    /// window, or AppKit. Use `render_scene_to_image()` to render scenes.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
-        let device = Self::create_device();
-        Self::new_internal(device, None, true, instance_buffer_pool)
     }
 
     fn create_device() -> metal::Device {
@@ -784,6 +774,7 @@ impl MetalRenderer {
             rgba: image.into_raw(),
             width_px,
             height_px,
+            backend: SceneCaptureBackend::Metal,
         })
     }
 
@@ -1881,33 +1872,4 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub struct MetalHeadlessRenderer {
-    renderer: MetalRenderer,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl MetalHeadlessRenderer {
-    pub fn new() -> Self {
-        let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let renderer = MetalRenderer::new_headless(instance_buffer_pool);
-        Self { renderer }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
-    fn render_scene_to_image(
-        &mut self,
-        scene: &Scene,
-        size: Size<DevicePixels>,
-    ) -> anyhow::Result<image::RgbaImage> {
-        self.renderer.render_scene_to_image(scene, size)
-    }
-
-    fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
-        self.renderer.sprite_atlas().clone()
-    }
 }

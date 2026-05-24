@@ -8,3 +8,6 @@ pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
 pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+pub use wgpu_renderer::WgpuHeadlessRenderer;

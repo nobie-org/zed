@@ -1231,7 +1231,7 @@ impl EmbeddedTestTextSystemState {
     }
 
     fn load_family(&mut self, requested_family: &str) -> Result<SmallVec<[FontId; 4]>> {
-        let family = embedded_test_family_alias(requested_family);
+        let family = self.embedded_test_family_alias(requested_family);
         if let Some(font_ids) = self.font_ids_by_family.get(family) {
             return Ok(font_ids.clone());
         }
@@ -1306,14 +1306,25 @@ impl EmbeddedTestTextSystemState {
             len: text.len(),
         }
     }
-}
 
-#[cfg(all(target_os = "macos", feature = "font-kit"))]
-fn embedded_test_family_alias(requested_family: &str) -> &str {
-    match requested_family {
-        ".AppleSystemUIFont" | ".SystemUIFont" | ".ZedSans" => "IBM Plex Sans",
-        ".ZedMono" => "Lilex",
-        family => family,
+    fn embedded_test_family_alias<'a>(&self, requested_family: &'a str) -> &'a str {
+        match requested_family {
+            ".AppleSystemUIFont" | ".SystemUIFont" | ".ZedSans" => {
+                if self.families.contains_key("Inter") {
+                    "Inter"
+                } else {
+                    "IBM Plex Sans"
+                }
+            }
+            ".ZedMono" => {
+                if self.families.contains_key("CommitMono") {
+                    "CommitMono"
+                } else {
+                    "Lilex"
+                }
+            }
+            family => family,
+        }
     }
 }
 

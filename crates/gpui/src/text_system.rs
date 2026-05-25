@@ -100,7 +100,12 @@ impl TextSystem {
 
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)
+        self.platform_text_system.add_fonts(fonts)?;
+        self.font_ids_by_font.write().clear();
+        self.font_metrics.write().clear();
+        self.raster_bounds.write().clear();
+        self.wrapper_pool.lock().clear();
+        Ok(())
     }
 
     /// Get the FontId for the configure font family and style.

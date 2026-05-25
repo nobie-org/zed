@@ -14,11 +14,33 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
+# Enables the headless offscreen capture renderer (`WgpuHeadlessRenderer`) used
+# by GPUI visual-regression tests. Pulls in `gpui/test-support` so the
+# `PlatformHeadlessRenderer` trait is available, plus `image` for RGBA output.
+test-support = ["dep:image", "gpui/test-support"]
+# Linux windowing backend. `wgpu` is built surfaceless by default (Metal +
+# Vulkan only); `gpui_linux` opts into the GLES backend, which pulls the
+# EGL/wayland/x11 system bindings needed for on-screen GL surfaces.
+gles = ["wgpu/gles"]
+# Web/wasm rendering support (`new_web`, `new_from_canvas`). The web bindings are
+# opt-in so non-web consumers (e.g. the macOS/Linux headless capture renderer,
+# which is wasm-free) don't drag `wasm-bindgen` into their dependency
+# resolution. Also enables the WebGPU/WebGL `wgpu` backends, which are excluded
+# from the surfaceless default set. `gpui_web` enables this.
+web = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:js-sys",
+    "wgpu/webgpu",
+    "wgpu/webgl",
+]
 
 [dependencies]
 gpui.workspace = true
 anyhow.workspace = true
 bytemuck = "1"
+image = { workspace = true, optional = true }
 collections.workspace = true
 cosmic-text = "0.17.0"
 etagere = "0.2"
@@ -31,7 +53,14 @@ smallvec.workspace = true
 swash = "0.2.6"
 unicode-segmentation.workspace = true
 gpui_util.workspace = true
-wgpu.workspace = true
+# Surfaceless renderer: only the native backends used for actual GPU work are
+# enabled (Metal on macOS, Vulkan on Linux/lavapipe) plus WGSL shader support.
+# The GLES backend is deliberately excluded because it drags in Linux windowing
+# system bindings (wayland-sys / x11) for EGL surface creation, and this crate's
+# Nobie consumers only ever render off-screen (no window surface). Consumers
+# that need a windowing backend (gpui_linux GLES, gpui_web WebGPU/WebGL) opt in
+# through the features below.
+wgpu = { workspace = true, features = ["metal", "vulkan", "wgsl", "std"] }
 
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)
 # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
@@ -41,10 +70,10 @@ font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f281
 pollster.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-wasm-bindgen.workspace = true
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
-js-sys = "0.3"
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"], optional = true }
+js-sys = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

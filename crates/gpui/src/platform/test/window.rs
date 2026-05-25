@@ -313,10 +313,18 @@ impl PlatformWindow for TestWindow {
         let image = self.render_to_image(scene)?;
         let width_px = image.width();
         let height_px = image.height();
+        let backend = {
+            let state = self.0.lock();
+            let renderer = state.renderer.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("capture_scene not available: no HeadlessRenderer configured")
+            })?;
+            renderer.capture_backend()
+        };
         Ok(SceneCapture {
             rgba: image.into_raw(),
             width_px,
             height_px,
+            backend,
         })
     }
 

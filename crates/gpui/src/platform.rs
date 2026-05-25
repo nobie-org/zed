@@ -753,6 +753,29 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
 }
 
+/// GPU backend that produced a [`SceneCapture`].
+///
+/// Cross-platform screenshot regressions use this to choose an exactness
+/// policy. GPU rasterizer interpolation and blend rounding are backend-defined,
+/// so the Metal backend (the baseline-minting backend on macOS) is asserted
+/// byte-exact while other backends (Linux Vulkan/lavapipe, GL) are allowed to
+/// differ by at most one least-significant bit per channel on anti-aliased
+/// edges. This mirrors the established cross-backend render-parity policy used
+/// by the `nobie-paint` renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneCaptureBackend {
+    /// Apple Metal (macOS).
+    Metal,
+    /// Vulkan, including the lavapipe/llvmpipe software ICD used in Linux CI.
+    Vulkan,
+    /// Direct3D 12 (Windows).
+    Dx12,
+    /// OpenGL / ANGLE.
+    Gl,
+    /// Any other or unidentified backend.
+    Other,
+}
+
 /// CPU-readable capture of a rendered GPUI scene.
 pub struct SceneCapture {
     /// Pixels encoded as RGBA8 in row-major order.
@@ -761,6 +784,8 @@ pub struct SceneCapture {
     pub width_px: u32,
     /// Captured image height in physical pixels.
     pub height_px: u32,
+    /// GPU backend that produced this capture.
+    pub backend: SceneCaptureBackend,
 }
 
 /// A renderer for headless windows that can produce real rendered output.
@@ -775,6 +800,9 @@ pub trait PlatformHeadlessRenderer {
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    /// The GPU backend this renderer captures through.
+    fn capture_backend(&self) -> SceneCaptureBackend;
 }
 
 /// Type alias for runnables with metadata.

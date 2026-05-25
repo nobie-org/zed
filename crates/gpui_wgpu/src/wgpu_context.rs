@@ -155,6 +155,17 @@ impl WgpuContext {
                 Subpixel text antialiasing will be disabled."
             );
         }
+        // Enable 32-bit float blending when the adapter supports it. The headless
+        // capture path renders into an `Rgba32Float` target and requires this so
+        // alpha compositing happens at full f32 precision — the cross-platform
+        // byte-identity contract forbids the backend-defined rounding of lower-
+        // precision blend targets.
+        if adapter
+            .features()
+            .contains(wgpu::Features::FLOAT32_BLENDABLE)
+        {
+            required_features |= wgpu::Features::FLOAT32_BLENDABLE;
+        }
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
 
@@ -188,6 +199,67 @@ impl WgpuContext {
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: Some(display),
+        })
+    }
+
+    /// Create a surfaceless context for headless offscreen rendering (visual
+    /// regression capture). Selects an adapter with no compatible surface — the
+    /// native analog of [`new_web`](Self::new_web) — so it works without a window
+    /// on CI Linux (lavapipe/Vulkan) and on macOS (Metal). `Backends::PRIMARY | GL`
+    /// lets adapter selection resolve Metal on macOS and Vulkan (lavapipe) on Linux.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn new_headless() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+
+        let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .map_err(|e| anyhow::anyhow!("Failed to request headless GPU adapter: {e}"))?;
+
+        log::info!(
+            "Selected headless GPU adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
+        // The headless capture target is `Rgba32Float`; blending into it requires
+        // `FLOAT32_BLENDABLE`. Requiring it here keeps every platform on the same
+        // float capture path (Metal on macOS, Vulkan/lavapipe on Linux) so the
+        // readback is byte-identical. A missing feature is an environment
+        // misconfiguration, not something to silently degrade to a lower-precision
+        // target (which would reintroduce backend-defined blend rounding).
+        if !adapter
+            .features()
+            .contains(wgpu::Features::FLOAT32_BLENDABLE)
+        {
+            anyhow::bail!(
+                "headless GPU adapter {:?} ({:?}) does not support FLOAT32_BLENDABLE, \
+                 required for deterministic float-target capture",
+                adapter.get_info().name,
+                adapter.get_info().backend,
+            );
+        }
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        let (device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::create_device(&adapter))?;
+
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
         })
     }
 

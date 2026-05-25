@@ -1054,13 +1054,45 @@ static EMBEDDED_TEST_FONT_CACHE: OnceLock<
 impl EmbeddedTestTextSystem {
     #[expect(missing_docs)]
     pub fn new() -> Self {
-        Self(RwLock::new(EmbeddedTestTextSystemState {
+        let mut state = EmbeddedTestTextSystemState {
             families: HashMap::new(),
             fonts: Vec::new(),
             font_selections: HashMap::new(),
             font_ids_by_family: HashMap::new(),
-        }))
+        };
+        state
+            .add_fonts(default_embedded_test_fonts())
+            .expect("embedded GPUI test fonts must load");
+        Self(RwLock::new(state))
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn default_embedded_test_fonts() -> Vec<Cow<'static, [u8]>> {
+    vec![
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+        )),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/lilex/Lilex-Italic.ttf"
+        )),
+        Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
+        Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/lilex/Lilex-BoldItalic.ttf"
+        )),
+    ]
 }
 
 #[cfg(all(target_os = "macos", feature = "font-kit"))]
@@ -1279,8 +1311,8 @@ impl EmbeddedTestTextSystemState {
 #[cfg(all(target_os = "macos", feature = "font-kit"))]
 fn embedded_test_family_alias(requested_family: &str) -> &str {
     match requested_family {
-        ".AppleSystemUIFont" | ".SystemUIFont" | ".ZedSans" => "Inter",
-        ".ZedMono" => "CommitMono",
+        ".AppleSystemUIFont" | ".SystemUIFont" | ".ZedSans" => "IBM Plex Sans",
+        ".ZedMono" => "Lilex",
         family => family,
     }
 }

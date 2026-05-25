@@ -1,7 +1,4 @@
-#[cfg(all(target_os = "macos", feature = "font-kit"))]
 use crate::EmbeddedTestTextSystem;
-#[cfg(not(all(target_os = "macos", feature = "font-kit")))]
-use crate::NoopTextSystem;
 use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, Platform, PlatformDisplay,
@@ -233,15 +230,7 @@ impl TestPlatform {
 }
 
 fn default_test_text_system() -> Arc<dyn PlatformTextSystem> {
-    #[cfg(all(target_os = "macos", feature = "font-kit"))]
-    {
-        Arc::new(EmbeddedTestTextSystem::new())
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "font-kit")))]
-    {
-        Arc::new(NoopTextSystem)
-    }
+    Arc::new(EmbeddedTestTextSystem::new())
 }
 
 impl Platform for TestPlatform {

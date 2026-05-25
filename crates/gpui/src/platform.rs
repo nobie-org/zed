@@ -31,8 +31,8 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
-    PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+    FontStyle, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout,
+    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
     SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
@@ -40,11 +40,22 @@ use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
 use async_task::Runnable;
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+use font_kit::{
+    font::Font as FontKitFont,
+    handle::Handle as FontKitHandle,
+    metrics::Metrics as FontKitMetrics,
+    properties::{Properties as FontKitProperties, Style as FontKitStyle, Weight as FontKitWeight},
+};
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+use parking_lot::{Mutex, RwLock};
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+use pathfinder_geometry::{rect::RectF, vector::Vector2F};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -53,9 +64,13 @@ use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::{
     fmt::{self, Debug},
@@ -1001,6 +1016,309 @@ impl PlatformTextSystem for NoopTextSystem {
         _font_size: Pixels,
     ) -> TextRenderingMode {
         TextRenderingMode::Grayscale
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+#[expect(missing_docs)]
+pub struct EmbeddedTestTextSystem(RwLock<EmbeddedTestTextSystemState>);
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+struct EmbeddedTestTextSystemState {
+    families: HashMap<String, Vec<FontKitFont>>,
+    fonts: Vec<FontKitFont>,
+    font_selections: HashMap<Font, FontId>,
+    font_ids_by_family: HashMap<String, SmallVec<[FontId; 4]>>,
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+#[derive(Clone)]
+struct CachedEmbeddedTestFont {
+    family_name: String,
+    font: FontKitFont,
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct EmbeddedTestFontKey {
+    ptr: usize,
+    len: usize,
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+static EMBEDDED_TEST_FONT_CACHE: OnceLock<
+    Mutex<HashMap<EmbeddedTestFontKey, CachedEmbeddedTestFont>>,
+> = OnceLock::new();
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+impl EmbeddedTestTextSystem {
+    #[expect(missing_docs)]
+    pub fn new() -> Self {
+        Self(RwLock::new(EmbeddedTestTextSystemState {
+            families: HashMap::new(),
+            fonts: Vec::new(),
+            font_selections: HashMap::new(),
+            font_ids_by_family: HashMap::new(),
+        }))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+impl Default for EmbeddedTestTextSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+impl PlatformTextSystem for EmbeddedTestTextSystem {
+    fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        self.0.write().add_fonts(fonts)
+    }
+
+    fn all_font_names(&self) -> Vec<String> {
+        let mut names = self.0.read().families.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+        self.0.write().font_id(descriptor)
+    }
+
+    fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+        font_kit_metrics_to_metrics(self.0.read().fonts[font_id.0].metrics())
+    }
+
+    fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+        Ok(bounds_from_rect(
+            self.0.read().fonts[font_id.0].typographic_bounds(glyph_id.0)?,
+        ))
+    }
+
+    fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+        Ok(size_from_vector2f(
+            self.0.read().fonts[font_id.0].advance(glyph_id.0)?,
+        ))
+    }
+
+    fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+        self.0.read().fonts[font_id.0]
+            .glyph_for_char(ch)
+            .map(GlyphId)
+    }
+
+    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+        let _ = params;
+        Ok(Default::default())
+    }
+
+    fn rasterize_glyph(
+        &self,
+        params: &RenderGlyphParams,
+        raster_bounds: Bounds<DevicePixels>,
+    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+        let _ = params;
+        Ok((raster_bounds.size, Vec::new()))
+    }
+
+    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        self.0.read().layout_line(text, font_size, font_runs)
+    }
+
+    fn recommended_rendering_mode(
+        &self,
+        _font_id: FontId,
+        _font_size: Pixels,
+    ) -> TextRenderingMode {
+        TextRenderingMode::Grayscale
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn cached_embedded_test_font(bytes: &[u8]) -> Result<CachedEmbeddedTestFont> {
+    let key = EmbeddedTestFontKey {
+        ptr: bytes.as_ptr() as usize,
+        len: bytes.len(),
+    };
+    let mut cache = EMBEDDED_TEST_FONT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock();
+    if let Some(font) = cache.get(&key) {
+        return Ok(font.clone());
+    }
+
+    let font = FontKitHandle::from_memory(Arc::new(bytes.to_vec()), 0).load()?;
+    let cached = CachedEmbeddedTestFont {
+        family_name: font.family_name(),
+        font,
+    };
+    cache.insert(key, cached.clone());
+    Ok(cached)
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+impl EmbeddedTestTextSystemState {
+    fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        for bytes in fonts {
+            let cached = cached_embedded_test_font(bytes.as_ref())?;
+            self.families
+                .entry(cached.family_name.clone())
+                .or_default()
+                .push(cached.font);
+        }
+        self.fonts.clear();
+        self.font_selections.clear();
+        self.font_ids_by_family.clear();
+        Ok(())
+    }
+
+    fn font_id(&mut self, descriptor: &Font) -> Result<FontId> {
+        if let Some(font_id) = self.font_selections.get(descriptor) {
+            return Ok(*font_id);
+        }
+
+        let candidates = self.load_family(&descriptor.family)?;
+        let candidate_properties = candidates
+            .iter()
+            .map(|font_id| self.fonts[font_id.0].properties())
+            .collect::<SmallVec<[_; 4]>>();
+        let ix = font_kit::matching::find_best_match(
+            &candidate_properties,
+            &FontKitProperties {
+                style: fontkit_style(descriptor.style),
+                weight: FontKitWeight(descriptor.weight.0),
+                stretch: Default::default(),
+            },
+        )?;
+
+        let font_id = candidates[ix];
+        self.font_selections.insert(descriptor.clone(), font_id);
+        Ok(font_id)
+    }
+
+    fn load_family(&mut self, requested_family: &str) -> Result<SmallVec<[FontId; 4]>> {
+        let family = embedded_test_family_alias(requested_family);
+        if let Some(font_ids) = self.font_ids_by_family.get(family) {
+            return Ok(font_ids.clone());
+        }
+
+        let family_fonts = self
+            .families
+            .get(family)
+            .ok_or_else(|| anyhow::anyhow!("embedded test font family '{family}' is not loaded"))?;
+        let mut font_ids = SmallVec::new();
+        for font in family_fonts {
+            let font_id = FontId(self.fonts.len());
+            self.fonts.push(font.clone());
+            font_ids.push(font_id);
+        }
+
+        if font_ids.is_empty() {
+            anyhow::bail!("embedded test font family '{family}' contains no loadable fonts");
+        }
+
+        self.font_ids_by_family
+            .insert(family.to_owned(), font_ids.clone());
+        Ok(font_ids)
+    }
+
+    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        let mut text_tail = text;
+        let mut shaped_runs = Vec::new();
+        let mut x = px(0.);
+        let mut max_ascent = px(0.);
+        let mut max_descent = px(0.);
+
+        for run in font_runs {
+            let (text_run, tail) = text_tail.split_at(run.len);
+            text_tail = tail;
+
+            let font = &self.fonts[run.font_id.0];
+            let metrics = font.metrics();
+            let scale = f32::from(font_size) / metrics.units_per_em as f32;
+            max_ascent = max_ascent.max(px(metrics.ascent * scale));
+            max_descent = max_descent.max(px(-metrics.descent * scale));
+
+            let mut glyphs = Vec::new();
+            for (index, ch) in text_run.char_indices() {
+                let Some(glyph_id) = font.glyph_for_char(ch) else {
+                    continue;
+                };
+                glyphs.push(ShapedGlyph {
+                    id: GlyphId(glyph_id),
+                    position: point(x, px(0.)),
+                    index: text.len() - text_tail.len() - text_run.len() + index,
+                    is_emoji: false,
+                });
+                if let Ok(advance) = font.advance(glyph_id) {
+                    x += px(advance.x() * scale);
+                }
+            }
+
+            if !glyphs.is_empty() {
+                shaped_runs.push(ShapedRun {
+                    font_id: run.font_id,
+                    glyphs,
+                });
+            }
+        }
+
+        LineLayout {
+            font_size,
+            width: x,
+            ascent: max_ascent,
+            descent: max_descent,
+            runs: shaped_runs,
+            len: text.len(),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn embedded_test_family_alias(requested_family: &str) -> &str {
+    match requested_family {
+        ".AppleSystemUIFont" | ".SystemUIFont" | ".ZedSans" => "Inter",
+        ".ZedMono" => "CommitMono",
+        family => family,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn font_kit_metrics_to_metrics(metrics: FontKitMetrics) -> FontMetrics {
+    FontMetrics {
+        units_per_em: metrics.units_per_em,
+        ascent: metrics.ascent,
+        descent: metrics.descent,
+        line_gap: metrics.line_gap,
+        underline_position: metrics.underline_position,
+        underline_thickness: metrics.underline_thickness,
+        cap_height: metrics.cap_height,
+        x_height: metrics.x_height,
+        bounding_box: bounds_from_rect(metrics.bounding_box),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn bounds_from_rect(rect: RectF) -> Bounds<f32> {
+    Bounds {
+        origin: point(rect.origin_x(), rect.origin_y()),
+        size: size(rect.width(), rect.height()),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn size_from_vector2f(vec: Vector2F) -> Size<f32> {
+    size(vec.x(), vec.y())
+}
+
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+fn fontkit_style(style: FontStyle) -> FontKitStyle {
+    match style {
+        FontStyle::Normal => FontKitStyle::Normal,
+        FontStyle::Italic => FontKitStyle::Italic,
+        FontStyle::Oblique => FontKitStyle::Oblique,
     }
 }
 

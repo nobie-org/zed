@@ -1,6 +1,10 @@
+#[cfg(all(target_os = "macos", feature = "font-kit"))]
+use crate::EmbeddedTestTextSystem;
+#[cfg(not(all(target_os = "macos", feature = "font-kit")))]
+use crate::NoopTextSystem;
 use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, Platform, PlatformDisplay,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, Platform, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SourceMetadata,
     Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
@@ -92,7 +96,7 @@ impl TestPlatform {
         Self::with_platform(
             executor,
             foreground_executor,
-            Arc::new(NoopTextSystem),
+            default_test_text_system(),
             None,
         )
     }
@@ -225,6 +229,18 @@ impl TestPlatform {
 
     pub(crate) fn did_prompt_for_new_path(&self) -> bool {
         !self.prompts.borrow().new_path.is_empty()
+    }
+}
+
+fn default_test_text_system() -> Arc<dyn PlatformTextSystem> {
+    #[cfg(all(target_os = "macos", feature = "font-kit"))]
+    {
+        Arc::new(EmbeddedTestTextSystem::new())
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "font-kit")))]
+    {
+        Arc::new(NoopTextSystem)
     }
 }
 

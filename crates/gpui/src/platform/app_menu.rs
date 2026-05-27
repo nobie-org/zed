@@ -326,6 +326,87 @@ pub enum OsAction {
 
     /// The 'redo' action
     Redo,
+
+    /// The 'quit' action
+    Quit,
+
+    /// The 'about' action (standard About panel)
+    About,
+
+    /// The 'settings' / preferences action
+    ShowPreferences,
+
+    /// The 'new document' action
+    NewDocument,
+
+    /// The 'open document' action
+    OpenDocument,
+
+    /// The 'save document' action
+    SaveDocument,
+
+    /// The 'save document as' action
+    SaveDocumentAs,
+
+    /// The 'close' action
+    Close,
+
+    /// Find / replace / search (`performTextFinderAction:`)
+    Find,
+
+    /// Delete / clear (`delete:`)
+    Delete,
+
+    /// Bold toggle (`toggleBold:`)
+    ToggleBold,
+
+    /// Italic toggle (`toggleItalic:`)
+    ToggleItalic,
+
+    /// Underline toggle (`underline:`)
+    ToggleUnderline,
+
+    /// Strikethrough toggle (`toggleStrikethrough:`)
+    ToggleStrikethrough,
+
+    /// Insert (`insertNewline:`)
+    Insert,
+
+    /// Move down (`moveDown:`)
+    MoveDown,
+
+    /// Move right (`moveRight:`)
+    MoveRight,
+
+    /// Zoom / text larger (`makeTextLarger:`)
+    MakeTextLarger,
+
+    /// Zoom / text smaller (`makeTextSmaller:`)
+    MakeTextSmaller,
+
+    /// Reset zoom / standard size (`makeTextStandardSize:`)
+    MakeTextStandardSize,
+
+    /// Reload (`reloadPage:`)
+    Reload,
+
+    /// Customize toolbar (`customizeToolbar:`)
+    CustomizeToolbar,
+
+    /// Toggle toolbar visibility (`toggleToolbarShown:`)
+    ToggleToolbarShown,
+
+    /// Go to selection (`centerSelectionInVisibleArea:`)
+    GoTo,
+
+    /// Help (`showHelp:`)
+    ShowHelp,
+
+    /// Revert / refresh document (`revertDocument:`)
+    RevertDocument,
+
+    /// Window zoom (`performZoom:`)
+    PerformZoom,
 }
 
 pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &App) {

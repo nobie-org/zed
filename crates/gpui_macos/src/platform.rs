@@ -120,6 +120,10 @@ unsafe fn build_classes() {
                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
             );
             decl.add_method(
+                sel!(terminate:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
                 sel!(undo:),
                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
             );
@@ -127,6 +131,40 @@ unsafe fn build_classes() {
                 sel!(redo:),
                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
             );
+            decl.add_method(
+                sel!(orderFrontStandardAboutPanel:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(orderFrontPreferencesPanel:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(newDocument:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(openDocument:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(saveDocument:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(saveDocumentAs:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(performClose:),
+                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            unsafe {
+                register_os_action_menu_selectors(
+                    &mut decl,
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+            }
             decl.add_method(
                 sel!(validateMenuItem:),
                 validate_menu_item as extern "C" fn(&mut Object, Sel, id) -> bool,
@@ -156,6 +194,75 @@ unsafe fn build_classes() {
 
             decl.register()
         }
+    }
+}
+
+unsafe fn register_os_action_menu_selectors(
+    decl: &mut ClassDecl,
+    handler: extern "C" fn(&mut Object, Sel, id),
+) {
+    for selector in [
+        sel!(performTextFinderAction:),
+        sel!(delete:),
+        sel!(toggleBold:),
+        sel!(toggleItalic:),
+        sel!(underline:),
+        sel!(toggleStrikethrough:),
+        sel!(insertNewline:),
+        sel!(moveDown:),
+        sel!(moveRight:),
+        sel!(makeTextLarger:),
+        sel!(makeTextSmaller:),
+        sel!(makeTextStandardSize:),
+        sel!(reloadPage:),
+        sel!(customizeToolbar:),
+        sel!(toggleToolbarShown:),
+        sel!(centerSelectionInVisibleArea:),
+        sel!(showHelp:),
+        sel!(revertDocument:),
+        sel!(performZoom:),
+    ] {
+        unsafe {
+            decl.add_method(selector, handler);
+        }
+    }
+}
+
+fn selector_for_os_action(os_action: gpui::OsAction) -> Sel {
+    match os_action {
+        gpui::OsAction::Cut => selector("cut:"),
+        gpui::OsAction::Copy => selector("copy:"),
+        gpui::OsAction::Paste => selector("paste:"),
+        gpui::OsAction::SelectAll => selector("selectAll:"),
+        gpui::OsAction::Quit => selector("terminate:"),
+        gpui::OsAction::Undo => selector("undo:"),
+        gpui::OsAction::Redo => selector("redo:"),
+        gpui::OsAction::About => selector("orderFrontStandardAboutPanel:"),
+        gpui::OsAction::ShowPreferences => selector("orderFrontPreferencesPanel:"),
+        gpui::OsAction::NewDocument => selector("newDocument:"),
+        gpui::OsAction::OpenDocument => selector("openDocument:"),
+        gpui::OsAction::SaveDocument => selector("saveDocument:"),
+        gpui::OsAction::SaveDocumentAs => selector("saveDocumentAs:"),
+        gpui::OsAction::Close => selector("performClose:"),
+        gpui::OsAction::Find => selector("performTextFinderAction:"),
+        gpui::OsAction::Delete => selector("delete:"),
+        gpui::OsAction::ToggleBold => selector("toggleBold:"),
+        gpui::OsAction::ToggleItalic => selector("toggleItalic:"),
+        gpui::OsAction::ToggleUnderline => selector("underline:"),
+        gpui::OsAction::ToggleStrikethrough => selector("toggleStrikethrough:"),
+        gpui::OsAction::Insert => selector("insertNewline:"),
+        gpui::OsAction::MoveDown => selector("moveDown:"),
+        gpui::OsAction::MoveRight => selector("moveRight:"),
+        gpui::OsAction::MakeTextLarger => selector("makeTextLarger:"),
+        gpui::OsAction::MakeTextSmaller => selector("makeTextSmaller:"),
+        gpui::OsAction::MakeTextStandardSize => selector("makeTextStandardSize:"),
+        gpui::OsAction::Reload => selector("reloadPage:"),
+        gpui::OsAction::CustomizeToolbar => selector("customizeToolbar:"),
+        gpui::OsAction::ToggleToolbarShown => selector("toggleToolbarShown:"),
+        gpui::OsAction::GoTo => selector("centerSelectionInVisibleArea:"),
+        gpui::OsAction::ShowHelp => selector("showHelp:"),
+        gpui::OsAction::RevertDocument => selector("revertDocument:"),
+        gpui::OsAction::PerformZoom => selector("performZoom:"),
     }
 }
 
@@ -329,17 +436,9 @@ impl MacPlatform {
                         })
                         .map(|binding| binding.keystrokes());
 
-                    let selector = match os_action {
-                        Some(gpui::OsAction::Cut) => selector("cut:"),
-                        Some(gpui::OsAction::Copy) => selector("copy:"),
-                        Some(gpui::OsAction::Paste) => selector("paste:"),
-                        Some(gpui::OsAction::SelectAll) => selector("selectAll:"),
-                        // "undo:" and "redo:" are always disabled in our case, as
-                        // we don't have a NSTextView/NSTextField to enable them on.
-                        Some(gpui::OsAction::Undo) => selector("handleGPUIMenuItem:"),
-                        Some(gpui::OsAction::Redo) => selector("handleGPUIMenuItem:"),
-                        None => selector("handleGPUIMenuItem:"),
-                    };
+                    let selector = os_action
+                        .map(selector_for_os_action)
+                        .unwrap_or_else(|| selector("handleGPUIMenuItem:"));
 
                     let item;
                     if let Some(keystrokes) = keystrokes {

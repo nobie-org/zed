@@ -838,6 +838,10 @@ struct GroupSpriteVertexOutput {
   float4 position [[position]];
   float2 texture_coords;
   float opacity;
+  float4 color_matrix_0;
+  float4 color_matrix_1;
+  float4 color_matrix_2;
+  float4 color_offset;
 };
 
 vertex GroupSpriteVertexOutput group_sprite_vertex(
@@ -858,8 +862,27 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
   return GroupSpriteVertexOutput{
     device_position,
     texture_coords,
-    sprite.opacity
+    sprite.opacity,
+    float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
+    float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
+    float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
+    float4(sprite.color_offset[0], sprite.color_offset[1], sprite.color_offset[2], sprite.color_offset[3])
   };
+}
+
+float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput input) {
+  if (sample.a <= 0.0) {
+    return sample;
+  }
+
+  float4 rgba = float4(sample.rgb / sample.a, sample.a);
+  float3 rgb = saturate(float3(
+    dot(input.color_matrix_0, rgba) + input.color_offset.x,
+    dot(input.color_matrix_1, rgba) + input.color_offset.y,
+    dot(input.color_matrix_2, rgba) + input.color_offset.z
+  ));
+
+  return float4(rgb * sample.a, sample.a);
 }
 
 fragment float4 group_sprite_fragment(
@@ -867,7 +890,8 @@ fragment float4 group_sprite_fragment(
   texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
 ) {
   constexpr sampler intermediate_texture_sampler(mag_filter::nearest, min_filter::nearest);
-  return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords) * input.opacity;
+  float4 sample = intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+  return apply_group_source_color_filter(sample, input) * input.opacity;
 }
 
 struct SurfaceVertexOutput {

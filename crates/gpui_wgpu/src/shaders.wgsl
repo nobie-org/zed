@@ -1126,13 +1126,15 @@ struct GroupSprite {
     pad0: f32,
     pad1: f32,
     pad2: f32,
+    color_matrix: array<vec4<f32>, 4>,
+    color_offset: vec4<f32>,
 }
 @group(1) @binding(0) var<storage, read> b_group_sprites: array<GroupSprite>;
 
 struct GroupVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_coords: vec2<f32>,
-    @location(1) opacity: f32,
+    @location(1) @interpolate(flat) sprite_id: u32,
 }
 
 @vertex
@@ -1146,15 +1148,31 @@ fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) inst
     var out = GroupVarying();
     out.position = device_position;
     out.texture_coords = texture_coords;
-    out.opacity = sprite.opacity;
+    out.sprite_id = instance_id;
 
     return out;
 }
 
+fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> vec4<f32> {
+    if (sample.a <= 0.0) {
+        return sample;
+    }
+
+    let rgba = vec4<f32>(sample.rgb / sample.a, sample.a);
+    let rgb = clamp(vec3<f32>(
+        dot(sprite.color_matrix[0], rgba) + sprite.color_offset.x,
+        dot(sprite.color_matrix[1], rgba) + sprite.color_offset.y,
+        dot(sprite.color_matrix[2], rgba) + sprite.color_offset.z,
+    ), vec3<f32>(0.0), vec3<f32>(1.0));
+
+    return vec4<f32>(rgb * sample.a, sample.a);
+}
+
 @fragment
 fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
+    let sprite = b_group_sprites[input.sprite_id];
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
-    return sample * input.opacity;
+    return apply_group_source_color_filter(sample, sprite) * sprite.opacity;
 }
 
 // --- underlines --- //

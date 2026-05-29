@@ -29,6 +29,36 @@ impl RenderGroupBuilder {
         self
     }
 
+    /// Multiplies the composited source color channels by `factor`.
+    pub fn brightness(mut self, factor: f32) -> Self {
+        self.effects.push(CompositeEffect::brightness(factor));
+        self
+    }
+
+    /// Scales composited source color distance from mid-gray by `factor`.
+    pub fn contrast(mut self, factor: f32) -> Self {
+        self.effects.push(CompositeEffect::contrast(factor));
+        self
+    }
+
+    /// Adjusts composited source color saturation by `factor`.
+    pub fn saturate(mut self, factor: f32) -> Self {
+        self.effects.push(CompositeEffect::saturate(factor));
+        self
+    }
+
+    /// Mixes the composited source color toward grayscale by `amount`.
+    pub fn grayscale(mut self, amount: f32) -> Self {
+        self.effects.push(CompositeEffect::grayscale(amount));
+        self
+    }
+
+    /// Mixes the composited source color toward its inverse by `amount`.
+    pub fn invert(mut self, amount: f32) -> Self {
+        self.effects.push(CompositeEffect::invert(amount));
+        self
+    }
+
     /// Attaches the child element that will be rendered as the group contents.
     pub fn child(self, child: impl IntoElement) -> RenderGroup {
         RenderGroup {
@@ -50,6 +80,36 @@ impl RenderGroup {
     /// Applies an opacity effect to the composited child.
     pub fn opacity(mut self, alpha: f32) -> Self {
         self.effects.push(CompositeEffect::opacity(alpha));
+        self
+    }
+
+    /// Multiplies the composited source color channels by `factor`.
+    pub fn brightness(mut self, factor: f32) -> Self {
+        self.effects.push(CompositeEffect::brightness(factor));
+        self
+    }
+
+    /// Scales composited source color distance from mid-gray by `factor`.
+    pub fn contrast(mut self, factor: f32) -> Self {
+        self.effects.push(CompositeEffect::contrast(factor));
+        self
+    }
+
+    /// Adjusts composited source color saturation by `factor`.
+    pub fn saturate(mut self, factor: f32) -> Self {
+        self.effects.push(CompositeEffect::saturate(factor));
+        self
+    }
+
+    /// Mixes the composited source color toward grayscale by `amount`.
+    pub fn grayscale(mut self, amount: f32) -> Self {
+        self.effects.push(CompositeEffect::grayscale(amount));
+        self
+    }
+
+    /// Mixes the composited source color toward its inverse by `amount`.
+    pub fn invert(mut self, amount: f32) -> Self {
+        self.effects.push(CompositeEffect::invert(amount));
         self
     }
 }

@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintGroup, Path,
-    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, CompositeEffectPlan, DevicePixels, GpuSpecs,
+    MonochromeSprite, PaintGroup, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -66,6 +66,8 @@ struct GroupSprite {
     bounds: Bounds<ScaledPixels>,
     opacity: f32,
     _pad: [f32; 3],
+    color_matrix: [[f32; 4]; 4],
+    color_offset: [f32; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -1958,8 +1960,9 @@ impl WgpuRenderer {
         retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
         for group in groups {
-            let opacity = Self::group_effective_opacity(group);
-            if opacity <= 0. {
+            let effect_plan =
+                CompositeEffectPlan::from_effects(group.boundary_opacity, &group.effects);
+            if effect_plan.opacity() <= 0. {
                 continue;
             }
 
@@ -1994,7 +1997,7 @@ impl WgpuRenderer {
 
             if !self.draw_group_from_intermediate(
                 group,
-                opacity,
+                effect_plan,
                 &group_view,
                 instance_offset,
                 &mut pass,
@@ -2029,15 +2032,18 @@ impl WgpuRenderer {
     fn draw_group_from_intermediate(
         &self,
         group: &PaintGroup,
-        opacity: f32,
+        effect_plan: CompositeEffectPlan,
         group_view: &wgpu::TextureView,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
+        let (color_matrix, color_offset) = Self::group_source_color_filter(effect_plan);
         let sprites = [GroupSprite {
             bounds: group.capture_bounds,
-            opacity,
+            opacity: effect_plan.opacity(),
             _pad: [0.; 3],
+            color_matrix,
+            color_offset,
         }];
         let sprite_data = unsafe { Self::instance_bytes(&sprites) };
         self.draw_instances_with_unfiltered_texture(
@@ -2051,14 +2057,17 @@ impl WgpuRenderer {
         )
     }
 
-    fn group_effective_opacity(group: &PaintGroup) -> f32 {
-        group
-            .effects
-            .iter()
-            .fold(group.boundary_opacity, |opacity, effect| {
-                opacity * effect.opacity_factor()
-            })
-            .clamp(0., 1.)
+    fn group_source_color_filter(effect_plan: CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+        let (matrix, offset) = effect_plan.source_color_filter().components();
+        (
+            [
+                [matrix[0][0], matrix[0][1], matrix[0][2], 0.],
+                [matrix[1][0], matrix[1][1], matrix[1][2], 0.],
+                [matrix[2][0], matrix[2][1], matrix[2][2], 0.],
+                [0., 0., 0., 1.],
+            ],
+            [offset[0], offset[1], offset[2], 0.],
+        )
     }
 
     fn draw_paths_from_intermediate(

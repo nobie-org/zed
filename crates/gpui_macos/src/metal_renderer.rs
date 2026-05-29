@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintGroup,
-    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
-    Size, Surface, Underline, point, size,
+    AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, DevicePixels,
+    MonochromeSprite, PaintGroup, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
+    Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use gpui::{SceneCapture, SceneCaptureBackend};
@@ -1109,8 +1109,9 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
-            let opacity = Self::group_effective_opacity(group);
-            if opacity <= 0. {
+            let effect_plan =
+                CompositeEffectPlan::from_effects(group.boundary_opacity, &group.effects);
+            if effect_plan.opacity() <= 0. {
                 continue;
             }
 
@@ -1140,7 +1141,7 @@ impl MetalRenderer {
             );
             let ok = self.draw_group_from_texture(
                 group,
-                opacity,
+                effect_plan,
                 &group_texture,
                 instance_buffer,
                 instance_offset,
@@ -1178,7 +1179,7 @@ impl MetalRenderer {
     fn draw_group_from_texture(
         &self,
         group: &PaintGroup,
-        opacity: f32,
+        effect_plan: CompositeEffectPlan,
         group_texture: &metal::TextureRef,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
@@ -1200,10 +1201,13 @@ impl MetalRenderer {
         command_encoder
             .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(group_texture));
 
+        let (color_matrix, color_offset) = Self::group_source_color_filter(effect_plan);
         let sprites = [GroupSprite {
             bounds: group.capture_bounds,
-            opacity,
+            opacity: effect_plan.opacity(),
             _pad: [0.; 3],
+            color_matrix,
+            color_offset,
         }];
 
         align_offset(instance_offset);
@@ -1240,14 +1244,17 @@ impl MetalRenderer {
         true
     }
 
-    fn group_effective_opacity(group: &PaintGroup) -> f32 {
-        group
-            .effects
-            .iter()
-            .fold(group.boundary_opacity, |opacity, effect| {
-                opacity * effect.opacity_factor()
-            })
-            .clamp(0., 1.)
+    fn group_source_color_filter(effect_plan: CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+        let (matrix, offset) = effect_plan.source_color_filter().components();
+        (
+            [
+                [matrix[0][0], matrix[0][1], matrix[0][2], 0.],
+                [matrix[1][0], matrix[1][1], matrix[1][2], 0.],
+                [matrix[2][0], matrix[2][1], matrix[2][2], 0.],
+                [0., 0., 0., 1.],
+            ],
+            [offset[0], offset[1], offset[2], 0.],
+        )
     }
 
     fn draw_paths_to_intermediate(
@@ -2087,6 +2094,8 @@ pub struct GroupSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub opacity: f32,
     pub _pad: [f32; 3],
+    pub color_matrix: [[f32; 4]; 4],
+    pub color_offset: [f32; 4],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

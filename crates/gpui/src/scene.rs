@@ -868,6 +868,7 @@ impl From<PaintGroup> for Primitive {
 #[allow(missing_docs)]
 pub enum CompositeEffect {
     Opacity(f32),
+    SourceColorFilter(SourceColorFilter),
 }
 
 impl CompositeEffect {
@@ -876,18 +877,185 @@ impl CompositeEffect {
         Self::Opacity(alpha.clamp(0., 1.))
     }
 
+    /// Multiplies the source color channels by `factor`.
+    pub fn brightness(factor: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::brightness(factor))
+    }
+
+    /// Scales source color distance from mid-gray by `factor`.
+    pub fn contrast(factor: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::contrast(factor))
+    }
+
+    /// Adjusts source color saturation by `factor`.
+    pub fn saturate(factor: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::saturate(factor))
+    }
+
+    /// Mixes the source color toward grayscale by `amount`.
+    pub fn grayscale(amount: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::grayscale(amount))
+    }
+
+    /// Mixes the source color toward its inverse by `amount`.
+    pub fn invert(amount: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::invert(amount))
+    }
+
     /// Returns whether this effect leaves the composited image unchanged.
     pub fn is_identity(&self) -> bool {
         match self {
             Self::Opacity(alpha) => (*alpha - 1.).abs() <= f32::EPSILON,
+            Self::SourceColorFilter(filter) => filter.is_identity(),
+        }
+    }
+}
+
+/// An affine source-color transform applied to an already-composited render
+/// group image.
+///
+/// The transform operates on unpremultiplied linear RGB and preserves alpha.
+/// This keeps coverage separate from source color effects and lets opacity
+/// remain a distinct group effect.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct SourceColorFilter {
+    matrix: [[f32; 3]; 3],
+    offset: [f32; 3],
+}
+
+impl SourceColorFilter {
+    /// Returns the identity source color filter.
+    pub fn identity() -> Self {
+        Self {
+            matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            offset: [0., 0., 0.],
         }
     }
 
-    /// Returns the alpha multiplier contributed by this effect.
-    pub fn opacity_factor(&self) -> f32 {
-        match self {
-            Self::Opacity(alpha) => *alpha,
+    /// Returns a filter that multiplies source color channels by `factor`.
+    pub fn brightness(factor: f32) -> Self {
+        let factor = factor.max(0.);
+        Self {
+            matrix: [[factor, 0., 0.], [0., factor, 0.], [0., 0., factor]],
+            offset: [0., 0., 0.],
         }
+    }
+
+    /// Returns a filter that scales source color distance from mid-gray by `factor`.
+    pub fn contrast(factor: f32) -> Self {
+        let factor = factor.max(0.);
+        let offset = 0.5 * (1. - factor);
+        Self {
+            matrix: [[factor, 0., 0.], [0., factor, 0.], [0., 0., factor]],
+            offset: [offset, offset, offset],
+        }
+    }
+
+    /// Returns a filter that adjusts source color saturation by `factor`.
+    pub fn saturate(factor: f32) -> Self {
+        let factor = factor.max(0.);
+        let luma = [0.2126, 0.7152, 0.0722];
+        let mut matrix = [[0.; 3]; 3];
+        for row in 0..3 {
+            for column in 0..3 {
+                matrix[row][column] = luma[column] * (1. - factor);
+            }
+            matrix[row][row] += factor;
+        }
+        Self {
+            matrix,
+            offset: [0., 0., 0.],
+        }
+    }
+
+    /// Returns a filter that mixes source color toward grayscale by `amount`.
+    pub fn grayscale(amount: f32) -> Self {
+        Self::saturate(1. - amount.clamp(0., 1.))
+    }
+
+    /// Returns a filter that mixes source color toward its inverse by `amount`.
+    pub fn invert(amount: f32) -> Self {
+        let amount = amount.clamp(0., 1.);
+        let scale = 1. - 2. * amount;
+        Self {
+            matrix: [[scale, 0., 0.], [0., scale, 0.], [0., 0., scale]],
+            offset: [amount, amount, amount],
+        }
+    }
+
+    /// Returns the filter produced by applying `self` and then `next`.
+    pub fn then(self, next: Self) -> Self {
+        let mut matrix = [[0.; 3]; 3];
+        for row in 0..3 {
+            for column in 0..3 {
+                matrix[row][column] = (0..3)
+                    .map(|index| next.matrix[row][index] * self.matrix[index][column])
+                    .sum();
+            }
+        }
+
+        let mut offset = [0.; 3];
+        for row in 0..3 {
+            offset[row] = next.offset[row]
+                + (0..3)
+                    .map(|index| next.matrix[row][index] * self.offset[index])
+                    .sum::<f32>();
+        }
+
+        Self { matrix, offset }
+    }
+
+    /// Returns whether this filter leaves source colors unchanged.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::identity()
+    }
+
+    /// Returns the affine matrix and offset for renderer consumption.
+    pub fn components(&self) -> ([[f32; 3]; 3], [f32; 3]) {
+        (self.matrix, self.offset)
+    }
+}
+
+/// Renderer-facing normalization of a render group's ordered effect list.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct CompositeEffectPlan {
+    opacity: f32,
+    source_color_filter: SourceColorFilter,
+}
+
+impl CompositeEffectPlan {
+    /// Normalizes an ordered render-group effect list for renderer consumption.
+    pub fn from_effects(boundary_opacity: f32, effects: &[CompositeEffect]) -> Self {
+        let mut plan = Self {
+            opacity: boundary_opacity,
+            source_color_filter: SourceColorFilter::identity(),
+        };
+
+        for effect in effects {
+            match effect {
+                CompositeEffect::Opacity(alpha) => {
+                    plan.opacity *= *alpha;
+                }
+                CompositeEffect::SourceColorFilter(filter) => {
+                    plan.source_color_filter = plan.source_color_filter.then(*filter);
+                }
+            }
+        }
+
+        plan.opacity = plan.opacity.clamp(0., 1.);
+        plan
+    }
+
+    /// Returns the normalized group opacity.
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    /// Returns the normalized source color filter.
+    pub fn source_color_filter(&self) -> SourceColorFilter {
+        self.source_color_filter
     }
 }
 
@@ -1093,6 +1261,15 @@ mod tests {
         }
     }
 
+    fn apply_filter(filter: SourceColorFilter, rgb: [f32; 3]) -> [f32; 3] {
+        let (matrix, offset) = filter.components();
+        [
+            matrix[0][0] * rgb[0] + matrix[0][1] * rgb[1] + matrix[0][2] * rgb[2] + offset[0],
+            matrix[1][0] * rgb[0] + matrix[1][1] * rgb[1] + matrix[1][2] * rgb[2] + offset[1],
+            matrix[2][0] * rgb[0] + matrix[2][1] * rgb[1] + matrix[2][2] * rgb[2] + offset[2],
+        ]
+    }
+
     #[test]
     fn group_batches_order_against_other_primitives() {
         let mut scene = Scene::default();
@@ -1136,5 +1313,43 @@ mod tests {
         scene.insert_primitive(group(bounds, capture_bounds, content_mask));
 
         assert_eq!(scene.visual_bounds(), Some(capture_bounds));
+    }
+
+    #[test]
+    fn composite_effect_plan_multiplies_group_opacity() {
+        let plan = CompositeEffectPlan::from_effects(
+            0.5,
+            &[CompositeEffect::opacity(0.5), CompositeEffect::opacity(0.5)],
+        );
+
+        assert_eq!(plan.opacity(), 0.125);
+        assert!(plan.source_color_filter().is_identity());
+    }
+
+    #[test]
+    fn composite_effect_plan_composes_source_color_filters_in_order() {
+        let brightness_then_invert = CompositeEffectPlan::from_effects(
+            1.,
+            &[
+                CompositeEffect::brightness(0.5),
+                CompositeEffect::invert(1.),
+            ],
+        );
+        let invert_then_brightness = CompositeEffectPlan::from_effects(
+            1.,
+            &[
+                CompositeEffect::invert(1.),
+                CompositeEffect::brightness(0.5),
+            ],
+        );
+
+        assert_eq!(
+            apply_filter(brightness_then_invert.source_color_filter(), [1., 0., 0.]),
+            [0.5, 1., 1.]
+        );
+        assert_eq!(
+            apply_filter(invert_then_brightness.source_color_filter(), [1., 0., 0.]),
+            [0., 0.5, 0.5]
+        );
     }
 }

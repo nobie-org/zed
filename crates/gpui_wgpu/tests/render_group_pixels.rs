@@ -54,13 +54,27 @@ fn paint_group(
     opacity: f32,
     scene: Scene,
 ) -> PaintGroup {
+    paint_group_with_effects(
+        order,
+        capture_bounds,
+        vec![CompositeEffect::opacity(opacity)],
+        scene,
+    )
+}
+
+fn paint_group_with_effects(
+    order: u32,
+    capture_bounds: Bounds<ScaledPixels>,
+    effects: Vec<CompositeEffect>,
+    scene: Scene,
+) -> PaintGroup {
     PaintGroup {
         order,
         bounds: capture_bounds,
         capture_bounds,
         content_mask: mask(),
         boundary_opacity: 1.,
-        effects: vec![CompositeEffect::opacity(opacity)],
+        effects,
         scene: Arc::new(scene),
     }
 }
@@ -79,6 +93,10 @@ fn half_white() -> Hsla {
 
 fn red_half() -> Hsla {
     rgba(0xff000080).into()
+}
+
+fn red() -> Hsla {
+    rgba(0xff0000ff).into()
 }
 
 fn blue_half() -> Hsla {
@@ -193,4 +211,79 @@ fn nested_render_group_opacities_multiply_at_group_boundaries() {
     outer.finish();
 
     assert_eq!(pixel(&render(&outer), 12, 12), [64, 64, 64, 255]);
+}
+
+#[test]
+fn render_group_source_color_filter_applies_to_composited_source() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::invert(1.)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    assert_eq!(pixel(&render(&grouped), 12, 12), [0, 255, 255, 255]);
+}
+
+#[test]
+fn render_group_source_color_filter_preserves_source_alpha() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red_half())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::invert(1.)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    assert_eq!(pixel(&render(&grouped), 12, 12), [0, 128, 128, 255]);
+}
+
+#[test]
+fn render_group_source_color_filters_are_ordered() {
+    let first_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+    let second_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+
+    let mut brightness_then_invert = Scene::default();
+    brightness_then_invert.insert_primitive(quad(0, viewport(), black()));
+    brightness_then_invert.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![
+            CompositeEffect::brightness(0.5),
+            CompositeEffect::invert(1.),
+        ],
+        first_scene,
+    ));
+    brightness_then_invert.finish();
+
+    let mut invert_then_brightness = Scene::default();
+    invert_then_brightness.insert_primitive(quad(0, viewport(), black()));
+    invert_then_brightness.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![
+            CompositeEffect::invert(1.),
+            CompositeEffect::brightness(0.5),
+        ],
+        second_scene,
+    ));
+    invert_then_brightness.finish();
+
+    assert_eq!(
+        pixel(&render(&brightness_then_invert), 12, 12),
+        [128, 255, 255, 255]
+    );
+    assert_eq!(
+        pixel(&render(&invert_then_brightness), 12, 12),
+        [0, 128, 128, 255]
+    );
 }

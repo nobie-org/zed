@@ -1118,6 +1118,45 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     return sample;
 }
 
+// --- render groups --- //
+
+struct GroupSprite {
+    bounds: Bounds,
+    opacity: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
+}
+@group(1) @binding(0) var<storage, read> b_group_sprites: array<GroupSprite>;
+
+struct GroupVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_coords: vec2<f32>,
+    @location(1) opacity: f32,
+}
+
+@vertex
+fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> GroupVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = b_group_sprites[instance_id];
+    let device_position = to_device_position(unit_vertex, sprite.bounds);
+    let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
+    let texture_coords = screen_position / globals.viewport_size;
+
+    var out = GroupVarying();
+    out.position = device_position;
+    out.texture_coords = texture_coords;
+    out.opacity = sprite.opacity;
+
+    return out;
+}
+
+@fragment
+fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
+    return sample * input.opacity;
+}
+
 // --- underlines --- //
 
 struct Underline {

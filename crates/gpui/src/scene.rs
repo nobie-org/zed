@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -36,6 +37,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub groups: Vec<PaintGroup>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +54,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.groups.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +122,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Group(group) => {
+                group.order = order;
+                self.groups.push(group.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +153,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.groups.sort_by_key(|group| group.order);
     }
 
     #[cfg_attr(
@@ -173,7 +181,93 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            groups_start: 0,
+            groups_iter: self.groups.iter().peekable(),
         }
+    }
+
+    pub(crate) fn visual_bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        let mut bounds = None;
+
+        for shadow in &self.shadows {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                shadow
+                    .bounds
+                    .dilate(shadow.blur_radius * 3.)
+                    .intersect(&shadow.content_mask.bounds),
+            );
+        }
+
+        for quad in &self.quads {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                quad.bounds.intersect(&quad.content_mask.bounds),
+            );
+        }
+
+        for path in &self.paths {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                path.bounds.intersect(&path.content_mask.bounds),
+            );
+        }
+
+        for underline in &self.underlines {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                underline.bounds.intersect(&underline.content_mask.bounds),
+            );
+        }
+
+        for sprite in &self.monochrome_sprites {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                sprite.bounds.intersect(&sprite.content_mask.bounds),
+            );
+        }
+
+        for sprite in &self.subpixel_sprites {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                sprite.bounds.intersect(&sprite.content_mask.bounds),
+            );
+        }
+
+        for sprite in &self.polychrome_sprites {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                sprite.bounds.intersect(&sprite.content_mask.bounds),
+            );
+        }
+
+        for surface in &self.surfaces {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                surface.bounds.intersect(&surface.content_mask.bounds),
+            );
+        }
+
+        for group in &self.groups {
+            Self::extend_visual_bounds(
+                &mut bounds,
+                group.capture_bounds.intersect(&group.content_mask.bounds),
+            );
+        }
+
+        bounds
+    }
+
+    fn extend_visual_bounds(bounds: &mut Option<Bounds<ScaledPixels>>, next: Bounds<ScaledPixels>) {
+        if next.is_empty() {
+            return;
+        }
+
+        *bounds = Some(if let Some(bounds) = *bounds {
+            bounds.union(&next)
+        } else {
+            next
+        });
     }
 }
 
@@ -195,6 +289,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Group,
 }
 
 pub(crate) enum PaintOperation {
@@ -214,6 +309,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Group(PaintGroup),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +324,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Group(group) => &group.capture_bounds,
         }
     }
 
@@ -241,6 +338,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Group(group) => &group.content_mask,
         }
     }
 }
@@ -269,6 +367,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    groups_start: usize,
+    groups_iter: Peekable<slice::Iter<'a, PaintGroup>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +401,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.groups_iter.peek().map(|s| s.order),
+                PrimitiveKind::Group,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +551,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Group => {
+                let groups_start = self.groups_start;
+                let mut groups_end = groups_start + 1;
+                self.groups_iter.next();
+                while self
+                    .groups_iter
+                    .next_if(|group| (group.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    groups_end += 1;
+                }
+                self.groups_start = groups_end;
+                Some(PrimitiveBatch::Groups(groups_start..groups_end))
+            }
         }
     }
 }
@@ -479,6 +597,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    Groups(Range<usize>),
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -726,6 +845,52 @@ impl From<PaintSurface> for Primitive {
     }
 }
 
+#[derive(Clone)]
+#[allow(missing_docs)]
+pub struct PaintGroup {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub capture_bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub boundary_opacity: f32,
+    pub effects: Vec<CompositeEffect>,
+    pub scene: Arc<Scene>,
+}
+
+impl From<PaintGroup> for Primitive {
+    fn from(group: PaintGroup) -> Self {
+        Primitive::Group(group)
+    }
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub enum CompositeEffect {
+    Opacity(f32),
+}
+
+impl CompositeEffect {
+    /// Creates an opacity effect for a render group.
+    pub fn opacity(alpha: f32) -> Self {
+        Self::Opacity(alpha.clamp(0., 1.))
+    }
+
+    /// Returns whether this effect leaves the composited image unchanged.
+    pub fn is_identity(&self) -> bool {
+        match self {
+            Self::Opacity(alpha) => (*alpha - 1.).abs() <= f32::EPSILON,
+        }
+    }
+
+    /// Returns the alpha multiplier contributed by this effect.
+    pub fn opacity_factor(&self) -> f32 {
+        match self {
+            Self::Opacity(alpha) => *alpha,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(missing_docs)]
 pub struct PathId(pub usize);
@@ -892,5 +1057,84 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::size;
+
+    fn sp(value: f32) -> ScaledPixels {
+        ScaledPixels(value)
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(point(sp(x), sp(y)), size(sp(width), sp(height)))
+    }
+
+    fn mask(bounds: Bounds<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask { bounds }
+    }
+
+    fn group(
+        bounds: Bounds<ScaledPixels>,
+        capture_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> PaintGroup {
+        PaintGroup {
+            order: 0,
+            bounds,
+            capture_bounds,
+            content_mask,
+            boundary_opacity: 0.5,
+            effects: vec![CompositeEffect::opacity(0.5)],
+            scene: Arc::new(Scene::default()),
+        }
+    }
+
+    #[test]
+    fn group_batches_order_against_other_primitives() {
+        let mut scene = Scene::default();
+        let bounds = scaled_bounds(0., 0., 10., 10.);
+        let content_mask = mask(scaled_bounds(0., 0., 100., 100.));
+
+        scene.insert_primitive(Quad {
+            order: 0,
+            bounds,
+            content_mask,
+            ..Default::default()
+        });
+        scene.insert_primitive(group(bounds, bounds, content_mask));
+        scene.finish();
+
+        let batches = scene.batches().collect::<Vec<_>>();
+        assert!(matches!(batches[0], PrimitiveBatch::Quads(_)));
+        assert!(matches!(batches[1], PrimitiveBatch::Groups(_)));
+    }
+
+    #[test]
+    fn replay_preserves_group_primitives() {
+        let mut scene = Scene::default();
+        let bounds = scaled_bounds(0., 0., 10., 10.);
+        scene.insert_primitive(group(bounds, bounds, mask(bounds)));
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..scene.len(), &scene);
+
+        assert_eq!(replayed.groups.len(), 1);
+        assert_eq!(replayed.groups[0].boundary_opacity, 0.5);
+        assert_eq!(replayed.groups[0].effects.len(), 1);
+    }
+
+    #[test]
+    fn visual_bounds_include_group_capture_bounds() {
+        let mut scene = Scene::default();
+        let bounds = scaled_bounds(10., 10., 20., 20.);
+        let capture_bounds = scaled_bounds(5., 5., 40., 40.);
+        let content_mask = mask(scaled_bounds(0., 0., 100., 100.));
+        scene.insert_primitive(group(bounds, capture_bounds, content_mask));
+
+        assert_eq!(scene.visual_bounds(), Some(capture_bounds));
     }
 }

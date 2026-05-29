@@ -59,6 +59,7 @@ mod macos_build {
             "MonochromeSprite".into(),
             "PolychromeSprite".into(),
             "PathSprite".into(),
+            "GroupSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
@@ -122,30 +123,40 @@ mod macos_build {
 
     #[cfg(not(feature = "runtime_shaders"))]
     fn compile_metal_shaders(header_path: &Path) {
-        use std::process::{self, Command};
+        use std::process::{self, Command, Output};
         let shader_path = "./src/shaders.metal";
         let air_output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.air");
         let metallib_output_path =
             PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
         println!("cargo:rerun-if-changed={}", shader_path);
 
-        let output = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-gline-tables-only",
-                "-mmacosx-version-min=10.15.7",
-                "-MO",
-                "-c",
-                shader_path,
-                "-include",
-                (header_path.to_str().unwrap()),
-                "-o",
-            ])
-            .arg(&air_output_path)
-            .output()
-            .unwrap();
+        fn run_xcrun(args: &[&str]) -> Output {
+            let output = Command::new("xcrun").args(args).output().unwrap();
+            if output.status.success()
+                || !String::from_utf8_lossy(&output.stderr).contains("missing Metal Toolchain")
+            {
+                return output;
+            }
+
+            let mut toolchain_args = vec!["--toolchain", "Metal"];
+            toolchain_args.extend_from_slice(args);
+            Command::new("xcrun").args(toolchain_args).output().unwrap()
+        }
+
+        let output = run_xcrun(&[
+            "-sdk",
+            "macosx",
+            "metal",
+            "-gline-tables-only",
+            "-mmacosx-version-min=10.15.7",
+            "-MO",
+            "-c",
+            shader_path,
+            "-include",
+            (header_path.to_str().unwrap()),
+            "-o",
+            air_output_path.to_str().unwrap(),
+        ]);
 
         if !output.status.success() {
             println!(
@@ -155,13 +166,14 @@ mod macos_build {
             process::exit(1);
         }
 
-        let output = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib"])
-            .arg(air_output_path)
-            .arg("-o")
-            .arg(metallib_output_path)
-            .output()
-            .unwrap();
+        let output = run_xcrun(&[
+            "-sdk",
+            "macosx",
+            "metallib",
+            air_output_path.to_str().unwrap(),
+            "-o",
+            metallib_output_path.to_str().unwrap(),
+        ]);
 
         if !output.status.success() {
             println!(

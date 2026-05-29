@@ -4,7 +4,7 @@ use std::{
 };
 
 use ::util::ResultExt;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -338,10 +338,11 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::Groups(_) => Err(anyhow!("render groups are not implemented for DirectX")),
             }
             .context(format!(
                 "scene too large:\
-                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} groups",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
@@ -350,6 +351,7 @@ impl DirectXRenderer {
                 scene.subpixel_sprites.len(),
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
+                scene.groups.len(),
             ))?;
         }
         self.present()

@@ -834,6 +834,42 @@ fragment float4 path_sprite_fragment(
   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
 }
 
+struct GroupSpriteVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+  float opacity;
+};
+
+vertex GroupSpriteVertexOutput group_sprite_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  uint sprite_id [[instance_id]],
+  constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
+  constant GroupSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+  constant Size_DevicePixels *viewport_size [[buffer(SpriteInputIndex_ViewportSize)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  GroupSprite sprite = sprites[sprite_id];
+  float4 device_position =
+      to_device_position(unit_vertex, sprite.bounds, viewport_size);
+
+  float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
+  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
+
+  return GroupSpriteVertexOutput{
+    device_position,
+    texture_coords,
+    sprite.opacity
+  };
+}
+
+fragment float4 group_sprite_fragment(
+  GroupSpriteVertexOutput input [[stage_in]],
+  texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
+) {
+  constexpr sampler intermediate_texture_sampler(mag_filter::nearest, min_filter::nearest);
+  return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords) * input.opacity;
+}
+
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;

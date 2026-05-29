@@ -3,12 +3,12 @@ use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    CompositeEffect, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformInputSimulator, PlatformWindow,
     Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
@@ -3494,6 +3494,54 @@ impl Window {
         result
     }
 
+    pub(crate) fn paint_group<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        effects: Vec<CompositeEffect>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let boundary_opacity = self.element_opacity;
+        let has_active_effect = (boundary_opacity - 1.).abs() > f32::EPSILON
+            || effects.iter().any(|effect| !effect.is_identity());
+        if !has_active_effect {
+            return f(self);
+        }
+
+        let parent_scene = mem::take(&mut self.next_frame.scene);
+        let previous_opacity = mem::replace(&mut self.element_opacity, 1.);
+
+        let result = f(self);
+
+        let mut group_scene = mem::take(&mut self.next_frame.scene);
+        group_scene.finish();
+        self.next_frame.scene = parent_scene;
+        self.element_opacity = previous_opacity;
+
+        let content_mask = self.snapped_content_mask();
+        let bounds = self.cover_bounds(bounds);
+        let capture_bounds = group_scene
+            .visual_bounds()
+            .unwrap_or(bounds)
+            .union(&bounds)
+            .intersect(&content_mask.bounds);
+
+        if !capture_bounds.is_empty() {
+            self.next_frame.scene.insert_primitive(PaintGroup {
+                order: 0,
+                bounds,
+                capture_bounds,
+                content_mask,
+                boundary_opacity,
+                effects,
+                scene: Arc::new(group_scene),
+            });
+        }
+
+        result
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -4698,8 +4746,7 @@ impl Window {
         cx: &mut App,
     ) -> DispatchEventResult {
         let request_frame_id = crate::nobie_platform_trace::current_request_frame_id();
-        let display_link_signal_id =
-            crate::nobie_platform_trace::current_display_link_signal_id();
+        let display_link_signal_id = crate::nobie_platform_trace::current_display_link_signal_id();
         crate::nobie_platform_trace::trace(
             "input_boundary_dispatch",
             format_args!(

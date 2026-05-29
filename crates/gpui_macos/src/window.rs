@@ -1980,6 +1980,30 @@ unsafe fn is_ime_input_source_active() -> bool {
 
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
+
+    // NOBS-5268 observability (Metal HUD first-responder displacement): an in-window
+    // Apple overlay (e.g. the Metal HUD detail popup) can steal the AppKit first
+    // responder from our GPUIView *without* deactivating the window. GPUI's own focus
+    // model stays intact, so nothing in GPUI notices; yet a typed `keyDown:` no longer
+    // reaches us and AppKit emits the "no responder" beep. Key equivalents (e.g. Cmd+K)
+    // still reach `handle_key_event` regardless of first responder, so this entry point
+    // is the one place that can observe the displacement at input time. This only
+    // OBSERVES — the repair is owned by the embedding app (re-asserting first responder
+    // on focus moves). The lock is held only long enough to copy the window handle out.
+    unsafe {
+        let native_window = window_state.as_ref().lock().native_window;
+        let view_id: id = this as *const Object as id;
+        let first_responder: id = msg_send![native_window, firstResponder];
+        let is_key = native_window.isKeyWindow() == YES;
+        if is_key && first_responder != view_id {
+            tracing::warn!(
+                target: "nobie_gpui::focus",
+                key_equivalent,
+                "key event reached GPUIView while it is not the window's first responder (window is key); a typed keyDown would not arrive — displaced first responder (NOBS-5268)",
+            );
+        }
+    }
+
     let mut lock = window_state.as_ref().lock();
 
     let window_height = lock.content_size().height;

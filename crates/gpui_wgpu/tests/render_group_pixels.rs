@@ -406,6 +406,23 @@ fn render_group_backdrop_tint_draws_material_without_source_fill() {
 }
 
 #[test]
+fn render_group_backdrop_tint_is_visible_behind_translucent_source() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), rgba(0x0000ff80))]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::backdrop_tint(rgba(0xffffff80).into())],
+        group_scene,
+    ));
+    grouped.finish();
+
+    assert_eq!(pixel(&render(&grouped), 12, 12), [64, 64, 192, 255]);
+}
+
+#[test]
 fn render_group_backdrop_blur_samples_parent_target_at_group_order() {
     let group_scene = Scene::default();
 
@@ -431,6 +448,35 @@ fn render_group_backdrop_blur_samples_parent_target_at_group_order() {
         "center {center:?} left_edge {left_edge:?}"
     );
     assert!(left_edge[0] > 0, "blur should pull white backdrop outward");
+}
+
+#[test]
+fn render_group_backdrop_blur_is_visible_behind_translucent_source() {
+    let group_scene = finished_scene([quad(0, rect(4., 8., 20., 8.), rgba(0x0000ff80))]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(quad(1, rect(8., 8., 8., 8.), white()));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(4., 8., 20., 8.),
+        vec![CompositeEffect::backdrop_blur(px(2.))],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let center = pixel(&image, 12, 12);
+    let left_edge = pixel(&image, 7, 12);
+
+    assert!(
+        center[0] > left_edge[0],
+        "blurred backdrop should still contribute through translucent source: center {center:?} left_edge {left_edge:?}"
+    );
+    assert!(
+        center[2] > center[0] && left_edge[2] > left_edge[0],
+        "translucent source should still contribute over the blurred backdrop: center {center:?} left_edge {left_edge:?}"
+    );
 }
 
 #[test]

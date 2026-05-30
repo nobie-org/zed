@@ -1,6 +1,6 @@
 use crate::{
-    AnyElement, App, Bounds, CompositeEffect, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Window,
+    AnyElement, App, Bounds, CompositeBlendMode, CompositeEffect, Corners, Element, ElementId,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
 };
 use std::{mem, panic};
 
@@ -23,6 +23,18 @@ pub struct RenderGroupBuilder {
 }
 
 impl RenderGroupBuilder {
+    /// Applies one composite effect to the group.
+    pub fn effect(mut self, effect: CompositeEffect) -> Self {
+        self.effects.push(effect);
+        self
+    }
+
+    /// Applies a sequence of composite effects to the group.
+    pub fn effects(mut self, effects: impl IntoIterator<Item = CompositeEffect>) -> Self {
+        self.effects.extend(effects);
+        self
+    }
+
     /// Applies an opacity effect to the composited child.
     pub fn opacity(mut self, alpha: f32) -> Self {
         self.effects.push(CompositeEffect::opacity(alpha));
@@ -63,6 +75,86 @@ impl RenderGroupBuilder {
     pub fn color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
         self.effects
             .push(CompositeEffect::color_matrix(matrix, offset));
+        self
+    }
+
+    /// Multiplies backdrop color channels by `factor`.
+    pub fn backdrop_brightness(mut self, factor: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_brightness(factor));
+        self
+    }
+
+    /// Scales backdrop color distance from mid-gray by `factor`.
+    pub fn backdrop_contrast(mut self, factor: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_contrast(factor));
+        self
+    }
+
+    /// Adjusts backdrop color saturation by `factor`.
+    pub fn backdrop_saturate(mut self, factor: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_saturate(factor));
+        self
+    }
+
+    /// Mixes backdrop color toward grayscale by `amount`.
+    pub fn backdrop_grayscale(mut self, amount: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_grayscale(amount));
+        self
+    }
+
+    /// Mixes backdrop color toward its inverse by `amount`.
+    pub fn backdrop_invert(mut self, amount: f32) -> Self {
+        self.effects.push(CompositeEffect::backdrop_invert(amount));
+        self
+    }
+
+    /// Applies an affine backdrop color matrix to unpremultiplied RGB.
+    pub fn backdrop_color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_color_matrix(matrix, offset));
+        self
+    }
+
+    /// Applies a Gaussian blur to the composited source image.
+    pub fn source_blur(mut self, radius: Pixels) -> Self {
+        self.effects.push(CompositeEffect::source_blur(radius));
+        self
+    }
+
+    /// Applies a Gaussian blur to the already-rendered backdrop under the group.
+    pub fn backdrop_blur(mut self, radius: Pixels) -> Self {
+        self.effects.push(CompositeEffect::backdrop_blur(radius));
+        self
+    }
+
+    /// Draws a translucent tint over the backdrop material under the group.
+    pub fn backdrop_tint(mut self, color: Hsla) -> Self {
+        self.effects.push(CompositeEffect::backdrop_tint(color));
+        self
+    }
+
+    /// Draws a drop shadow from the composited source image's alpha channel.
+    pub fn drop_shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        self.effects
+            .push(CompositeEffect::drop_shadow(offset, blur_radius, color));
+        self
+    }
+
+    /// Masks the composited source image with a rounded rectangle matching the
+    /// group layout bounds.
+    pub fn rounded_mask(mut self, corner_radii: Corners<Pixels>) -> Self {
+        self.effects
+            .push(CompositeEffect::rounded_mask(corner_radii));
+        self
+    }
+
+    /// Applies a final blend mode when compositing the group against its backdrop.
+    pub fn blend_mode(mut self, mode: CompositeBlendMode) -> Self {
+        self.effects.push(CompositeEffect::blend_mode(mode));
         self
     }
 
@@ -84,6 +176,18 @@ pub struct RenderGroup {
 }
 
 impl RenderGroup {
+    /// Applies one composite effect to the group.
+    pub fn effect(mut self, effect: CompositeEffect) -> Self {
+        self.effects.push(effect);
+        self
+    }
+
+    /// Applies a sequence of composite effects to the group.
+    pub fn effects(mut self, effects: impl IntoIterator<Item = CompositeEffect>) -> Self {
+        self.effects.extend(effects);
+        self
+    }
+
     /// Applies an opacity effect to the composited child.
     pub fn opacity(mut self, alpha: f32) -> Self {
         self.effects.push(CompositeEffect::opacity(alpha));
@@ -124,6 +228,86 @@ impl RenderGroup {
     pub fn color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
         self.effects
             .push(CompositeEffect::color_matrix(matrix, offset));
+        self
+    }
+
+    /// Multiplies backdrop color channels by `factor`.
+    pub fn backdrop_brightness(mut self, factor: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_brightness(factor));
+        self
+    }
+
+    /// Scales backdrop color distance from mid-gray by `factor`.
+    pub fn backdrop_contrast(mut self, factor: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_contrast(factor));
+        self
+    }
+
+    /// Adjusts backdrop color saturation by `factor`.
+    pub fn backdrop_saturate(mut self, factor: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_saturate(factor));
+        self
+    }
+
+    /// Mixes backdrop color toward grayscale by `amount`.
+    pub fn backdrop_grayscale(mut self, amount: f32) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_grayscale(amount));
+        self
+    }
+
+    /// Mixes backdrop color toward its inverse by `amount`.
+    pub fn backdrop_invert(mut self, amount: f32) -> Self {
+        self.effects.push(CompositeEffect::backdrop_invert(amount));
+        self
+    }
+
+    /// Applies an affine backdrop color matrix to unpremultiplied RGB.
+    pub fn backdrop_color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        self.effects
+            .push(CompositeEffect::backdrop_color_matrix(matrix, offset));
+        self
+    }
+
+    /// Applies a Gaussian blur to the composited source image.
+    pub fn source_blur(mut self, radius: Pixels) -> Self {
+        self.effects.push(CompositeEffect::source_blur(radius));
+        self
+    }
+
+    /// Applies a Gaussian blur to the already-rendered backdrop under the group.
+    pub fn backdrop_blur(mut self, radius: Pixels) -> Self {
+        self.effects.push(CompositeEffect::backdrop_blur(radius));
+        self
+    }
+
+    /// Draws a translucent tint over the backdrop material under the group.
+    pub fn backdrop_tint(mut self, color: Hsla) -> Self {
+        self.effects.push(CompositeEffect::backdrop_tint(color));
+        self
+    }
+
+    /// Draws a drop shadow from the composited source image's alpha channel.
+    pub fn drop_shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        self.effects
+            .push(CompositeEffect::drop_shadow(offset, blur_radius, color));
+        self
+    }
+
+    /// Masks the composited source image with a rounded rectangle matching the
+    /// group layout bounds.
+    pub fn rounded_mask(mut self, corner_radii: Corners<Pixels>) -> Self {
+        self.effects
+            .push(CompositeEffect::rounded_mask(corner_radii));
+        self
+    }
+
+    /// Applies a final blend mode when compositing the group against its backdrop.
+    pub fn blend_mode(mut self, mode: CompositeBlendMode) -> Self {
+        self.effects.push(CompositeEffect::blend_mode(mode));
         self
     }
 }

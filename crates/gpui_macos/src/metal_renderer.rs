@@ -7,7 +7,7 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, DevicePixels,
+    AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, Corners, DevicePixels,
     MonochromeSprite, PaintGroup, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
     Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
@@ -910,6 +910,57 @@ impl MetalRenderer {
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        if scene.requires_backdrop_effects() {
+            let Some(root_texture) = self.new_group_intermediate_texture(viewport_size) else {
+                anyhow::bail!("invalid viewport for backdrop render group: {viewport_size:?}");
+            };
+            let command_queue = self.command_queue.clone();
+            let command_buffer = command_queue.new_command_buffer();
+            let alpha = if self.opaque { 1. } else { 0. };
+            let mut instance_offset = 0;
+
+            let ok = self.encode_primitives_to_texture(
+                scene,
+                instance_buffer,
+                &mut instance_offset,
+                &root_texture,
+                viewport_size,
+                command_buffer,
+                Some(alpha),
+            ) && self.draw_texture_to_target(
+                &root_texture,
+                instance_buffer,
+                &mut instance_offset,
+                drawable.texture(),
+                viewport_size,
+                command_buffer,
+                Some(alpha),
+            );
+
+            if !ok {
+                anyhow::bail!(
+                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} groups",
+                    scene.paths.len(),
+                    scene.shadows.len(),
+                    scene.quads.len(),
+                    scene.underlines.len(),
+                    scene.monochrome_sprites.len(),
+                    scene.polychrome_sprites.len(),
+                    scene.surfaces.len(),
+                    scene.groups.len(),
+                );
+            }
+
+            if !self.is_unified_memory {
+                instance_buffer.metal_buffer.did_modify_range(NSRange {
+                    location: 0,
+                    length: instance_offset as NSUInteger,
+                });
+            }
+
+            return Ok(command_buffer.to_owned());
+        }
+
         self.draw_primitives_to_texture(scene, instance_buffer, drawable.texture(), viewport_size)
     }
 
@@ -1099,6 +1150,82 @@ impl MetalRenderer {
         true
     }
 
+    fn draw_texture_to_target(
+        &self,
+        source_texture: &metal::TextureRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        target_texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        clear_alpha: Option<f64>,
+    ) -> bool {
+        let command_encoder = new_command_encoder_for_texture(
+            command_buffer,
+            target_texture,
+            viewport_size,
+            |color_attachment| {
+                if let Some(alpha) = clear_alpha {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                } else {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                }
+            },
+        );
+        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            SpriteInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_bytes(
+            SpriteInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(source_texture));
+
+        let sprite = PathSprite {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(
+                    ScaledPixels(viewport_size.width.0 as f32),
+                    ScaledPixels(viewport_size.height.0 as f32),
+                ),
+            ),
+        };
+        align_offset(instance_offset);
+        let sprite_bytes_len = mem::size_of::<PathSprite>();
+        let next_offset = *instance_offset + sprite_bytes_len;
+        if next_offset > instance_buffer.size {
+            command_encoder.end_encoding();
+            return false;
+        }
+
+        command_encoder.set_vertex_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &sprite as *const PathSprite as *const u8,
+                buffer_contents,
+                sprite_bytes_len,
+            );
+        }
+
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
+        command_encoder.end_encoding();
+        *instance_offset = next_offset;
+        true
+    }
+
     fn draw_groups(
         &mut self,
         groups: &[PaintGroup],
@@ -1109,8 +1236,11 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
-            let effect_plan =
-                CompositeEffectPlan::from_effects(group.boundary_opacity, &group.effects);
+            let effect_plan = CompositeEffectPlan::from_effects(
+                group.scale_factor,
+                group.boundary_opacity,
+                &group.effects,
+            );
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -1131,6 +1261,19 @@ impl MetalRenderer {
                 return false;
             }
 
+            let backdrop_texture;
+            let backdrop_texture_ref = if effect_plan.reads_backdrop() {
+                let Some(texture) =
+                    self.copy_backdrop_texture(target_texture, viewport_size, command_buffer)
+                else {
+                    return false;
+                };
+                backdrop_texture = texture;
+                &backdrop_texture
+            } else {
+                &group_texture
+            };
+
             let command_encoder = new_command_encoder_for_texture(
                 command_buffer,
                 target_texture,
@@ -1143,6 +1286,7 @@ impl MetalRenderer {
                 group,
                 effect_plan,
                 &group_texture,
+                backdrop_texture_ref,
                 instance_buffer,
                 instance_offset,
                 viewport_size,
@@ -1156,6 +1300,33 @@ impl MetalRenderer {
         }
 
         true
+    }
+
+    fn copy_backdrop_texture(
+        &self,
+        target_texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Option<metal::Texture> {
+        let texture = self.new_group_intermediate_texture(viewport_size)?;
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            target_texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: viewport_size.width.0 as u64,
+                height: viewport_size.height.0 as u64,
+                depth: 1,
+            },
+            &texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        Some(texture)
     }
 
     fn new_group_intermediate_texture(
@@ -1181,6 +1352,7 @@ impl MetalRenderer {
         group: &PaintGroup,
         effect_plan: CompositeEffectPlan,
         group_texture: &metal::TextureRef,
+        backdrop_texture: &metal::TextureRef,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1200,15 +1372,76 @@ impl MetalRenderer {
 
         command_encoder
             .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(group_texture));
+        command_encoder.set_fragment_texture(
+            SpriteInputIndex::BackdropTexture as u64,
+            Some(backdrop_texture),
+        );
 
-        let (color_matrix, color_offset) = Self::group_source_color_filter(effect_plan);
-        let sprites = [GroupSprite {
+        let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
+        let (backdrop_color_matrix, backdrop_color_offset) =
+            Self::group_backdrop_color_filter(&effect_plan);
+        let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
+        let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
+        let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
+            Some(corner_radii) => (1., corner_radii),
+            None => (0., Corners::all(ScaledPixels(0.))),
+        };
+
+        for shadow in effect_plan.drop_shadows() {
+            let color = shadow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 1,
+                source_blur_radius: 0.,
+                mask_enabled,
+                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
+                shadow_blur_radius: shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                mask_bounds: group.bounds,
+                mask_corner_radii,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+            });
+        }
+
+        sprites.push(GroupSprite {
             bounds: group.capture_bounds,
             opacity: effect_plan.opacity(),
-            _pad: [0.; 3],
+            effect_kind: 0,
+            source_blur_radius: effect_plan.source_blur_radius().0,
+            mask_enabled,
+            shadow_offset: [0., 0.],
+            shadow_blur_radius: 0.,
+            backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
+            shadow_color: [0., 0., 0., 0.],
+            mask_bounds: group.bounds,
+            mask_corner_radii,
             color_matrix,
             color_offset,
-        }];
+            backdrop_active: if effect_plan.has_backdrop_material() {
+                1.
+            } else {
+                0.
+            },
+            blend_mode: effect_plan.blend_mode().shader_code(),
+            _pad0: [0; 2],
+            backdrop_tint: [
+                backdrop_tint.r,
+                backdrop_tint.g,
+                backdrop_tint.b,
+                backdrop_tint.a,
+            ],
+            backdrop_color_matrix,
+            backdrop_color_offset,
+        });
 
         align_offset(instance_offset);
         let sprite_bytes_len = mem::size_of_val(sprites.as_slice());
@@ -1244,8 +1477,21 @@ impl MetalRenderer {
         true
     }
 
-    fn group_source_color_filter(effect_plan: CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+    fn group_source_color_filter(effect_plan: &CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
         let (matrix, offset) = effect_plan.source_color_filter().components();
+        (
+            [
+                [matrix[0][0], matrix[0][1], matrix[0][2], 0.],
+                [matrix[1][0], matrix[1][1], matrix[1][2], 0.],
+                [matrix[2][0], matrix[2][1], matrix[2][2], 0.],
+                [0., 0., 0., 1.],
+            ],
+            [offset[0], offset[1], offset[2], 0.],
+        )
+    }
+
+    fn group_backdrop_color_filter(effect_plan: &CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+        let (matrix, offset) = effect_plan.backdrop_color_filter().components();
         (
             [
                 [matrix[0][0], matrix[0][1], matrix[0][2], 0.],
@@ -2064,6 +2310,7 @@ enum SpriteInputIndex {
     ViewportSize = 2,
     AtlasTextureSize = 3,
     AtlasTexture = 4,
+    BackdropTexture = 5,
 }
 
 #[repr(C)]
@@ -2093,9 +2340,23 @@ pub struct PathSprite {
 pub struct GroupSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub opacity: f32,
-    pub _pad: [f32; 3],
+    pub effect_kind: u32,
+    pub source_blur_radius: f32,
+    pub mask_enabled: f32,
+    pub shadow_offset: [f32; 2],
+    pub shadow_blur_radius: f32,
+    pub backdrop_blur_radius: f32,
+    pub shadow_color: [f32; 4],
+    pub mask_bounds: Bounds<ScaledPixels>,
+    pub mask_corner_radii: Corners<ScaledPixels>,
     pub color_matrix: [[f32; 4]; 4],
     pub color_offset: [f32; 4],
+    pub backdrop_active: f32,
+    pub blend_mode: u32,
+    pub _pad0: [u32; 2],
+    pub backdrop_tint: [f32; 4],
+    pub backdrop_color_matrix: [[f32; 4]; 4],
+    pub backdrop_color_offset: [f32; 4],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

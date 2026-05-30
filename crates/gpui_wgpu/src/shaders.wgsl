@@ -95,6 +95,7 @@ struct GammaParams {
 @group(0) @binding(1) var<uniform> gamma_params: GammaParams;
 @group(1) @binding(1) var t_sprite: texture_2d<f32>;
 @group(1) @binding(2) var s_sprite: sampler;
+@group(1) @binding(3) var t_backdrop: texture_2d<f32>;
 
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
@@ -1128,12 +1129,18 @@ struct GroupSprite {
     mask_enabled: f32,
     shadow_offset: vec2<f32>,
     shadow_blur_radius: f32,
-    pad0: f32,
+    backdrop_blur_radius: f32,
     shadow_color: vec4<f32>,
     mask_bounds: Bounds,
     mask_corner_radii: Corners,
     color_matrix: array<vec4<f32>, 4>,
     color_offset: vec4<f32>,
+    backdrop_active: f32,
+    blend_mode: u32,
+    pad0: vec2<u32>,
+    backdrop_tint: vec4<f32>,
+    backdrop_color_matrix: array<vec4<f32>, 4>,
+    backdrop_color_offset: vec4<f32>,
 }
 @group(1) @binding(0) var<storage, read> b_group_sprites: array<GroupSprite>;
 
@@ -1171,12 +1178,28 @@ fn group_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
     return clamp(0.5 - quad_sdf(point, sprite.mask_bounds, sprite.mask_corner_radii), 0.0, 1.0);
 }
 
+fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
+    var corner_radii = Corners(0.0, 0.0, 0.0, 0.0);
+    if (sprite.mask_enabled > 0.0) {
+        corner_radii = sprite.mask_corner_radii;
+    }
+    return clamp(0.5 - quad_sdf(point, sprite.mask_bounds, corner_radii), 0.0, 1.0);
+}
+
 fn sample_group_texture(coords: vec2<f32>) -> vec4<f32> {
     if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
         return vec4<f32>(0.0);
     }
 
     return textureSample(t_sprite, s_sprite, coords);
+}
+
+fn sample_backdrop_texture(coords: vec2<f32>) -> vec4<f32> {
+    if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+        return vec4<f32>(0.0);
+    }
+
+    return textureSample(t_backdrop, s_sprite, coords);
 }
 
 fn sample_group_source(coords: vec2<f32>, point: vec2<f32>, sprite: GroupSprite) -> vec4<f32> {
@@ -1209,6 +1232,38 @@ fn sample_group_source_blurred(
                         point + offset,
                         sprite,
                     ) * weight;
+                    total += weight;
+                }
+            }
+        }
+    }
+
+    if (total <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return color / total;
+}
+
+fn sample_backdrop_blurred(
+    coords: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+) -> vec4<f32> {
+    if (sigma <= 0.0) {
+        return sample_backdrop_texture(coords);
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var color = vec4<f32>(0.0);
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            for (var x = -24; x <= 24; x = x + 1) {
+                if (abs(x) <= radius) {
+                    let offset = vec2<f32>(f32(x), f32(y));
+                    let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                    color += sample_backdrop_texture(coords + offset * pixel_size) * weight;
                     total += weight;
                 }
             }
@@ -1274,6 +1329,72 @@ fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> ve
     return vec4<f32>(rgb * sample.a, sample.a);
 }
 
+fn apply_group_backdrop_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> vec4<f32> {
+    if (sample.a <= 0.0) {
+        return sample;
+    }
+
+    let rgba = vec4<f32>(sample.rgb / sample.a, sample.a);
+    let rgb = clamp(vec3<f32>(
+        dot(sprite.backdrop_color_matrix[0], rgba) + sprite.backdrop_color_offset.x,
+        dot(sprite.backdrop_color_matrix[1], rgba) + sprite.backdrop_color_offset.y,
+        dot(sprite.backdrop_color_matrix[2], rgba) + sprite.backdrop_color_offset.z,
+    ), vec3<f32>(0.0), vec3<f32>(1.0));
+
+    return vec4<f32>(rgb * sample.a, sample.a);
+}
+
+fn premul_over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
+    return above + below * (1.0 - above.a);
+}
+
+fn premul_from_straight(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+fn unpremul_rgb(color: vec4<f32>) -> vec3<f32> {
+    if (color.a <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    return color.rgb / color.a;
+}
+
+fn blend_rgb(mode: u32, source: vec3<f32>, backdrop: vec3<f32>) -> vec3<f32> {
+    if (mode == 1u) {
+        return source * backdrop;
+    }
+    if (mode == 2u) {
+        return source + backdrop - source * backdrop;
+    }
+    if (mode == 3u) {
+        return mix(
+            2.0 * source * backdrop,
+            1.0 - 2.0 * (1.0 - source) * (1.0 - backdrop),
+            step(vec3<f32>(0.5), backdrop),
+        );
+    }
+    if (mode == 4u) {
+        return min(source, backdrop);
+    }
+    if (mode == 5u) {
+        return max(source, backdrop);
+    }
+    if (mode == 6u) {
+        return min(source + backdrop, vec3<f32>(1.0));
+    }
+    return source;
+}
+
+fn apply_group_blend_mode(sample: vec4<f32>, backdrop: vec4<f32>, mode: u32) -> vec4<f32> {
+    if (mode == 0u || sample.a <= 0.0) {
+        return sample;
+    }
+
+    let source_rgb = unpremul_rgb(sample);
+    let backdrop_rgb = unpremul_rgb(backdrop);
+    return vec4<f32>(blend_rgb(mode, source_rgb, backdrop_rgb) * sample.a, sample.a);
+}
+
 @fragment
 fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
     let sprite = b_group_sprites[input.sprite_id];
@@ -1290,14 +1411,30 @@ fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
     }
 
-    let sample = sample_group_source_blurred(
+    var sample = sample_group_source_blurred(
         input.texture_coords,
         input.screen_position,
         input.texture_pixel_size,
         sprite.source_blur_radius,
         sprite,
     );
-    return apply_group_source_color_filter(sample, sprite) * sprite.opacity;
+    sample = apply_group_source_color_filter(sample, sprite);
+
+    if (sprite.backdrop_active > 0.0) {
+        var material = sample_backdrop_blurred(
+            input.texture_coords,
+            input.texture_pixel_size,
+            sprite.backdrop_blur_radius,
+        );
+        material = apply_group_backdrop_color_filter(material, sprite);
+        material = premul_over(material, premul_from_straight(sprite.backdrop_tint));
+        material *= group_material_alpha(input.screen_position, sprite);
+        sample = premul_over(material, sample);
+    }
+
+    sample *= sprite.opacity;
+    let backdrop = sample_backdrop_texture(input.texture_coords);
+    return apply_group_blend_mode(sample, backdrop, sprite.blend_mode);
 }
 
 // --- underlines --- //

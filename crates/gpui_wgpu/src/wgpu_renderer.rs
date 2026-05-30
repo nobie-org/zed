@@ -4,6 +4,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, CompositeEffectPlan, Corners, DevicePixels, GpuSpecs,
     MonochromeSprite, PaintGroup, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    point,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -70,12 +71,18 @@ struct GroupSprite {
     mask_enabled: f32,
     shadow_offset: [f32; 2],
     shadow_blur_radius: f32,
-    _pad: f32,
+    backdrop_blur_radius: f32,
     shadow_color: [f32; 4],
     mask_bounds: Bounds<ScaledPixels>,
     mask_corner_radii: Corners<ScaledPixels>,
     color_matrix: [[f32; 4]; 4],
     color_offset: [f32; 4],
+    backdrop_active: f32,
+    blend_mode: u32,
+    _pad0: [u32; 2],
+    backdrop_tint: [f32; 4],
+    backdrop_color_matrix: [[f32; 4]; 4],
+    backdrop_color_offset: [f32; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +124,7 @@ struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
-    instances_with_unfiltered_texture: wgpu::BindGroupLayout,
+    group_composite: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
 }
 
@@ -645,7 +652,7 @@ impl WgpuRenderer {
             });
         let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        if !self.encode_scene_to_view(scene, &target_view) {
+        if !self.encode_scene_to_view(scene, Some(&target_texture), true, &target_view) {
             anyhow::bail!("headless scene encode failed");
         }
 
@@ -823,29 +830,31 @@ impl WgpuRenderer {
                 ],
             });
 
-        let instances_with_unfiltered_texture =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("instances_with_unfiltered_texture_layout"),
-                entries: &[
-                    storage_buffer_entry(0),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-            });
+        let unfiltered_texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+
+        let group_composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("group_composite_layout"),
+            entries: &[
+                storage_buffer_entry(0),
+                unfiltered_texture_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                unfiltered_texture_entry(3),
+            ],
+        });
 
         let surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("surfaces_layout"),
@@ -895,7 +904,7 @@ impl WgpuRenderer {
             globals,
             instances,
             instances_with_texture,
-            instances_with_unfiltered_texture,
+            group_composite,
             surfaces,
         }
     }
@@ -1086,7 +1095,7 @@ impl WgpuRenderer {
             "vs_group",
             "fs_group",
             &layouts.globals,
-            &layouts.instances_with_unfiltered_texture,
+            &layouts.group_composite,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1465,7 +1474,14 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let encoded = self.encode_scene_to_view(scene, &frame_view);
+        let encoded = self.encode_scene_to_view(
+            scene,
+            Some(&frame.texture),
+            self.surface_config
+                .usage
+                .contains(wgpu::TextureUsages::COPY_SRC),
+            &frame_view,
+        );
         frame.present();
         encoded
     }
@@ -1476,7 +1492,13 @@ impl WgpuRenderer {
     /// offscreen texture; caller reads it back). Callers must run
     /// `before_frame`/`ensure_intermediate_textures` and set `surface_config`
     /// width/height before calling. Returns whether a frame was encoded.
-    fn encode_scene_to_view(&mut self, scene: &Scene, target_view: &wgpu::TextureView) -> bool {
+    fn encode_scene_to_view(
+        &mut self,
+        scene: &Scene,
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+    ) -> bool {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1535,14 +1557,41 @@ impl WgpuRenderer {
                     });
             let mut retained_textures = Vec::new();
 
-            let overflow = !self.encode_scene_batches_to_view(
-                scene,
-                target_view,
-                &mut encoder,
-                &mut instance_offset,
-                true,
-                &mut retained_textures,
-            );
+            let needs_root_intermediate = scene.requires_backdrop_effects() && !target_can_copy;
+            let overflow = if needs_root_intermediate {
+                let (root_texture, root_view) = self.create_group_intermediate();
+                let encoded_root = self.encode_scene_batches_to_view(
+                    scene,
+                    Some(&root_texture),
+                    true,
+                    &root_view,
+                    &mut encoder,
+                    &mut instance_offset,
+                    true,
+                    &mut retained_textures,
+                );
+                let drew_root = encoded_root
+                    && self.draw_texture_to_view(
+                        &root_view,
+                        target_view,
+                        &mut encoder,
+                        &mut instance_offset,
+                        true,
+                    );
+                retained_textures.push(root_texture);
+                !drew_root
+            } else {
+                !self.encode_scene_batches_to_view(
+                    scene,
+                    target_texture,
+                    target_can_copy,
+                    target_view,
+                    &mut encoder,
+                    &mut instance_offset,
+                    true,
+                    &mut retained_textures,
+                )
+            };
 
             if overflow {
                 drop(encoder);
@@ -1568,6 +1617,8 @@ impl WgpuRenderer {
     fn encode_scene_batches_to_view(
         &self,
         scene: &Scene,
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
         target_view: &wgpu::TextureView,
         encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
@@ -1665,6 +1716,8 @@ impl WgpuRenderer {
 
                     let did_draw = self.draw_groups(
                         &scene.groups[range],
+                        target_texture,
+                        target_can_copy,
                         target_view,
                         encoder,
                         instance_offset,
@@ -1904,11 +1957,12 @@ impl WgpuRenderer {
         true
     }
 
-    fn draw_instances_with_unfiltered_texture(
+    fn draw_group_instances(
         &self,
         data: &[u8],
         instance_count: u32,
-        texture_view: &wgpu::TextureView,
+        group_view: &wgpu::TextureView,
+        backdrop_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
         pipeline: &wgpu::RenderPipeline,
         instance_offset: &mut u64,
@@ -1925,9 +1979,7 @@ impl WgpuRenderer {
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
-                layout: &resources
-                    .bind_group_layouts
-                    .instances_with_unfiltered_texture,
+                layout: &resources.bind_group_layouts.group_composite,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1935,11 +1987,15 @@ impl WgpuRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
+                        resource: wgpu::BindingResource::TextureView(group_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(backdrop_view),
                     },
                 ],
             });
@@ -1959,9 +2015,59 @@ impl WgpuRenderer {
         }
     }
 
+    fn draw_texture_to_view(
+        &self,
+        texture_view: &wgpu::TextureView,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_offset: &mut u64,
+        clear: bool,
+    ) -> bool {
+        let sprite = PathSprite {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                Size {
+                    width: ScaledPixels(self.surface_config.width as f32),
+                    height: ScaledPixels(self.surface_config.height as f32),
+                },
+            ),
+        };
+        let sprite_data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("texture_to_view_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: if clear {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+
+        self.draw_instances_with_texture(
+            sprite_data,
+            1,
+            texture_view,
+            &self.resources().pipelines.paths,
+            instance_offset,
+            &mut pass,
+        )
+    }
+
     fn draw_groups(
         &self,
         groups: &[PaintGroup],
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
         target_view: &wgpu::TextureView,
         encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
@@ -1978,10 +2084,11 @@ impl WgpuRenderer {
             }
 
             let (group_texture, group_view) = self.create_group_intermediate();
-            retained_textures.push(group_texture);
 
             if !self.encode_scene_batches_to_view(
                 group.scene.as_ref(),
+                Some(&group_texture),
+                true,
                 &group_view,
                 encoder,
                 instance_offset,
@@ -1990,6 +2097,48 @@ impl WgpuRenderer {
             ) {
                 return false;
             }
+
+            let backdrop_view_storage;
+            let backdrop_view = if effect_plan.reads_backdrop() {
+                let Some(target_texture) = target_texture else {
+                    *self.last_error.lock().unwrap() =
+                        Some("Render-group backdrop effect has no readable target texture".into());
+                    return false;
+                };
+                if !target_can_copy {
+                    *self.last_error.lock().unwrap() = Some(
+                        "Render-group backdrop effect needs COPY_SRC support for the target texture"
+                            .into(),
+                    );
+                    return false;
+                }
+
+                let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &backdrop_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: self.surface_config.width.max(1),
+                        height: self.surface_config.height.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                retained_textures.push(backdrop_texture);
+                backdrop_view_storage = backdrop_view;
+                &backdrop_view_storage
+            } else {
+                &group_view
+            };
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("group_composite_pass"),
@@ -2010,11 +2159,14 @@ impl WgpuRenderer {
                 group,
                 effect_plan,
                 &group_view,
+                backdrop_view,
                 instance_offset,
                 &mut pass,
             ) {
                 return false;
             }
+
+            retained_textures.push(group_texture);
         }
 
         true
@@ -2033,7 +2185,10 @@ impl WgpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: self.surface_config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2045,10 +2200,14 @@ impl WgpuRenderer {
         group: &PaintGroup,
         effect_plan: CompositeEffectPlan,
         group_view: &wgpu::TextureView,
+        backdrop_view: &wgpu::TextureView,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
+        let (backdrop_color_matrix, backdrop_color_offset) =
+            Self::group_backdrop_color_filter(&effect_plan);
+        let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
         let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
             Some(corner_radii) => (1., corner_radii),
@@ -2065,12 +2224,18 @@ impl WgpuRenderer {
                 mask_enabled,
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
                 shadow_blur_radius: shadow.blur_radius.0,
-                _pad: 0.,
+                backdrop_blur_radius: 0.,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 mask_bounds: group.bounds,
                 mask_corner_radii,
                 color_matrix,
                 color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
             });
         }
 
@@ -2082,18 +2247,34 @@ impl WgpuRenderer {
             mask_enabled,
             shadow_offset: [0., 0.],
             shadow_blur_radius: 0.,
-            _pad: 0.,
+            backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
             shadow_color: [0., 0., 0., 0.],
             mask_bounds: group.bounds,
             mask_corner_radii,
             color_matrix,
             color_offset,
+            backdrop_active: if effect_plan.has_backdrop_material() {
+                1.
+            } else {
+                0.
+            },
+            blend_mode: effect_plan.blend_mode().shader_code(),
+            _pad0: [0; 2],
+            backdrop_tint: [
+                backdrop_tint.r,
+                backdrop_tint.g,
+                backdrop_tint.b,
+                backdrop_tint.a,
+            ],
+            backdrop_color_matrix,
+            backdrop_color_offset,
         });
         let sprite_data = unsafe { Self::instance_bytes(&sprites) };
-        self.draw_instances_with_unfiltered_texture(
+        self.draw_group_instances(
             sprite_data,
             sprites.len() as u32,
             group_view,
+            backdrop_view,
             &self.resources().group_sampler,
             &self.resources().pipelines.groups,
             instance_offset,
@@ -2103,6 +2284,19 @@ impl WgpuRenderer {
 
     fn group_source_color_filter(effect_plan: &CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
         let (matrix, offset) = effect_plan.source_color_filter().components();
+        (
+            [
+                [matrix[0][0], matrix[0][1], matrix[0][2], 0.],
+                [matrix[1][0], matrix[1][1], matrix[1][2], 0.],
+                [matrix[2][0], matrix[2][1], matrix[2][2], 0.],
+                [0., 0., 0., 1.],
+            ],
+            [offset[0], offset[1], offset[2], 0.],
+        )
+    }
+
+    fn group_backdrop_color_filter(effect_plan: &CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+        let (matrix, offset) = effect_plan.backdrop_color_filter().components();
         (
             [
                 [matrix[0][0], matrix[0][1], matrix[0][2], 0.],

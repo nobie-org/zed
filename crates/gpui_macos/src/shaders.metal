@@ -845,6 +845,7 @@ struct GroupSpriteVertexOutput {
   float mask_enabled;
   float2 shadow_offset;
   float shadow_blur_radius;
+  float backdrop_blur_radius;
   float4 shadow_color;
   float4 mask_bounds;
   float4 mask_corner_radii;
@@ -852,6 +853,13 @@ struct GroupSpriteVertexOutput {
   float4 color_matrix_1;
   float4 color_matrix_2;
   float4 color_offset;
+  float backdrop_active;
+  uint blend_mode [[flat]];
+  float4 backdrop_tint;
+  float4 backdrop_color_matrix_0;
+  float4 backdrop_color_matrix_1;
+  float4 backdrop_color_matrix_2;
+  float4 backdrop_color_offset;
 };
 
 vertex GroupSpriteVertexOutput group_sprite_vertex(
@@ -881,13 +889,21 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     sprite.mask_enabled,
     float2(sprite.shadow_offset[0], sprite.shadow_offset[1]),
     sprite.shadow_blur_radius,
+    sprite.backdrop_blur_radius,
     float4(sprite.shadow_color[0], sprite.shadow_color[1], sprite.shadow_color[2], sprite.shadow_color[3]),
     float4(sprite.mask_bounds.origin.x, sprite.mask_bounds.origin.y, sprite.mask_bounds.size.width, sprite.mask_bounds.size.height),
     float4(sprite.mask_corner_radii.top_left, sprite.mask_corner_radii.top_right, sprite.mask_corner_radii.bottom_right, sprite.mask_corner_radii.bottom_left),
     float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
     float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
     float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
-    float4(sprite.color_offset[0], sprite.color_offset[1], sprite.color_offset[2], sprite.color_offset[3])
+    float4(sprite.color_offset[0], sprite.color_offset[1], sprite.color_offset[2], sprite.color_offset[3]),
+    sprite.backdrop_active,
+    sprite.blend_mode,
+    float4(sprite.backdrop_tint[0], sprite.backdrop_tint[1], sprite.backdrop_tint[2], sprite.backdrop_tint[3]),
+    float4(sprite.backdrop_color_matrix[0][0], sprite.backdrop_color_matrix[0][1], sprite.backdrop_color_matrix[0][2], sprite.backdrop_color_matrix[0][3]),
+    float4(sprite.backdrop_color_matrix[1][0], sprite.backdrop_color_matrix[1][1], sprite.backdrop_color_matrix[1][2], sprite.backdrop_color_matrix[1][3]),
+    float4(sprite.backdrop_color_matrix[2][0], sprite.backdrop_color_matrix[2][1], sprite.backdrop_color_matrix[2][2], sprite.backdrop_color_matrix[2][3]),
+    float4(sprite.backdrop_color_offset[0], sprite.backdrop_color_offset[1], sprite.backdrop_color_offset[2], sprite.backdrop_color_offset[3])
   };
 }
 
@@ -916,6 +932,17 @@ float group_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
   return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
 }
 
+float group_material_alpha(float2 point, GroupSpriteVertexOutput input) {
+  if (input.mask_enabled > 0.0) {
+    return group_mask_alpha(point, input);
+  }
+
+  float2 half_size = input.mask_bounds.zw / 2.0;
+  float2 center = input.mask_bounds.xy + half_size;
+  float2 corner_to_point = abs(point - center) - half_size;
+  return saturate(0.5 - quad_sdf_impl(corner_to_point, 0.0));
+}
+
 float4 sample_group_texture(texture2d<float> intermediate_texture,
                             sampler intermediate_texture_sampler,
                             float2 coords) {
@@ -924,6 +951,16 @@ float4 sample_group_texture(texture2d<float> intermediate_texture,
   }
 
   return intermediate_texture.sample(intermediate_texture_sampler, coords);
+}
+
+float4 sample_backdrop_texture(texture2d<float> backdrop_texture,
+                               sampler texture_sampler,
+                               float2 coords) {
+  if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+    return float4(0.0);
+  }
+
+  return backdrop_texture.sample(texture_sampler, coords);
 }
 
 float4 sample_group_source(texture2d<float> intermediate_texture,
@@ -961,6 +998,40 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
               coords + offset * pixel_size,
               point + offset,
               input) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return float4(0.0);
+  }
+  return color / total;
+}
+
+float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,
+                               sampler texture_sampler,
+                               float2 coords,
+                               float2 pixel_size,
+                               float sigma) {
+  if (sigma <= 0.0) {
+    return sample_backdrop_texture(backdrop_texture, texture_sampler, coords);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float4 color = float4(0.0);
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          color += sample_backdrop_texture(
+              backdrop_texture,
+              texture_sampler,
+              coords + offset * pixel_size) * weight;
           total += weight;
         }
       }
@@ -1026,9 +1097,76 @@ float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput in
   return float4(rgb * sample.a, sample.a);
 }
 
+float4 apply_group_backdrop_color_filter(float4 sample, GroupSpriteVertexOutput input) {
+  if (sample.a <= 0.0) {
+    return sample;
+  }
+
+  float4 rgba = float4(sample.rgb / sample.a, sample.a);
+  float3 rgb = saturate(float3(
+    dot(input.backdrop_color_matrix_0, rgba) + input.backdrop_color_offset.x,
+    dot(input.backdrop_color_matrix_1, rgba) + input.backdrop_color_offset.y,
+    dot(input.backdrop_color_matrix_2, rgba) + input.backdrop_color_offset.z
+  ));
+
+  return float4(rgb * sample.a, sample.a);
+}
+
+float4 premul_over(float4 below, float4 above) {
+  return above + below * (1.0 - above.a);
+}
+
+float4 premul_from_straight(float4 color) {
+  return float4(color.rgb * color.a, color.a);
+}
+
+float3 unpremul_rgb(float4 color) {
+  if (color.a <= 0.0) {
+    return float3(0.0);
+  }
+  return color.rgb / color.a;
+}
+
+float3 blend_rgb(uint mode, float3 source, float3 backdrop) {
+  if (mode == 1) {
+    return source * backdrop;
+  }
+  if (mode == 2) {
+    return source + backdrop - source * backdrop;
+  }
+  if (mode == 3) {
+    return mix(
+      2.0 * source * backdrop,
+      1.0 - 2.0 * (1.0 - source) * (1.0 - backdrop),
+      step(float3(0.5), backdrop)
+    );
+  }
+  if (mode == 4) {
+    return min(source, backdrop);
+  }
+  if (mode == 5) {
+    return max(source, backdrop);
+  }
+  if (mode == 6) {
+    return min(source + backdrop, float3(1.0));
+  }
+  return source;
+}
+
+float4 apply_group_blend_mode(float4 sample, float4 backdrop, uint mode) {
+  if (mode == 0 || sample.a <= 0.0) {
+    return sample;
+  }
+
+  float3 source_rgb = unpremul_rgb(sample);
+  float3 backdrop_rgb = unpremul_rgb(backdrop);
+  return float4(blend_rgb(mode, source_rgb, backdrop_rgb) * sample.a, sample.a);
+}
+
 fragment float4 group_sprite_fragment(
   GroupSpriteVertexOutput input [[stage_in]],
-  texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
+  texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+  texture2d<float> backdrop_texture [[texture(SpriteInputIndex_BackdropTexture)]]
 ) {
   constexpr sampler intermediate_texture_sampler(mag_filter::nearest, min_filter::nearest);
   if (input.effect_kind == 1) {
@@ -1053,7 +1191,27 @@ fragment float4 group_sprite_fragment(
       input.texture_pixel_size,
       input.source_blur_radius,
       input);
-  return apply_group_source_color_filter(sample, input) * input.opacity;
+  sample = apply_group_source_color_filter(sample, input);
+
+  if (input.backdrop_active > 0.0) {
+    float4 material = sample_backdrop_blurred(
+        backdrop_texture,
+        intermediate_texture_sampler,
+        input.texture_coords,
+        input.texture_pixel_size,
+        input.backdrop_blur_radius);
+    material = apply_group_backdrop_color_filter(material, input);
+    material = premul_over(material, premul_from_straight(input.backdrop_tint));
+    material *= group_material_alpha(input.screen_position, input);
+    sample = premul_over(material, sample);
+  }
+
+  sample *= input.opacity;
+  float4 backdrop = sample_backdrop_texture(
+      backdrop_texture,
+      intermediate_texture_sampler,
+      input.texture_coords);
+  return apply_group_blend_mode(sample, backdrop, input.blend_mode);
 }
 
 struct SurfaceVertexOutput {

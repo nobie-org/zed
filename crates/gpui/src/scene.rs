@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point, transparent_black,
 };
 use std::{
     fmt::Debug,
@@ -154,6 +154,14 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.groups.sort_by_key(|group| group.order);
+    }
+
+    /// Returns whether any render group in this scene needs parent-target pixels.
+    pub fn requires_backdrop_effects(&self) -> bool {
+        self.groups.iter().any(|group| {
+            group.effects.iter().any(CompositeEffect::reads_backdrop)
+                || group.scene.requires_backdrop_effects()
+        })
     }
 
     #[cfg_attr(
@@ -871,8 +879,12 @@ pub enum CompositeEffect {
     Opacity(f32),
     SourceColorFilter(SourceColorFilter),
     SourceBlur(Pixels),
+    BackdropColorFilter(SourceColorFilter),
+    BackdropBlur(Pixels),
+    BackdropTint(Hsla),
     DropShadow(CompositeDropShadow<Pixels>),
     RoundedMask(Corners<Pixels>),
+    BlendMode(CompositeBlendMode),
 }
 
 impl CompositeEffect {
@@ -911,9 +923,49 @@ impl CompositeEffect {
         Self::SourceColorFilter(SourceColorFilter::color_matrix(matrix, offset))
     }
 
+    /// Multiplies backdrop color channels by `factor`.
+    pub fn backdrop_brightness(factor: f32) -> Self {
+        Self::BackdropColorFilter(SourceColorFilter::brightness(factor))
+    }
+
+    /// Scales backdrop color distance from mid-gray by `factor`.
+    pub fn backdrop_contrast(factor: f32) -> Self {
+        Self::BackdropColorFilter(SourceColorFilter::contrast(factor))
+    }
+
+    /// Adjusts backdrop color saturation by `factor`.
+    pub fn backdrop_saturate(factor: f32) -> Self {
+        Self::BackdropColorFilter(SourceColorFilter::saturate(factor))
+    }
+
+    /// Mixes backdrop color toward grayscale by `amount`.
+    pub fn backdrop_grayscale(amount: f32) -> Self {
+        Self::BackdropColorFilter(SourceColorFilter::grayscale(amount))
+    }
+
+    /// Mixes backdrop color toward its inverse by `amount`.
+    pub fn backdrop_invert(amount: f32) -> Self {
+        Self::BackdropColorFilter(SourceColorFilter::invert(amount))
+    }
+
+    /// Applies an affine backdrop color matrix to unpremultiplied RGB.
+    pub fn backdrop_color_matrix(matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        Self::BackdropColorFilter(SourceColorFilter::color_matrix(matrix, offset))
+    }
+
     /// Applies a Gaussian blur to the composited source image.
     pub fn source_blur(radius: Pixels) -> Self {
         Self::SourceBlur(Pixels(radius.0.max(0.)))
+    }
+
+    /// Applies a Gaussian blur to the already-rendered backdrop under the group.
+    pub fn backdrop_blur(radius: Pixels) -> Self {
+        Self::BackdropBlur(Pixels(radius.0.max(0.)))
+    }
+
+    /// Draws a translucent tint over the backdrop material under the group.
+    pub fn backdrop_tint(color: Hsla) -> Self {
+        Self::BackdropTint(color)
     }
 
     /// Draws a drop shadow from the composited source image's alpha channel.
@@ -931,14 +983,38 @@ impl CompositeEffect {
         Self::RoundedMask(corner_radii)
     }
 
+    /// Applies a final blend mode when compositing the group against its backdrop.
+    pub fn blend_mode(mode: CompositeBlendMode) -> Self {
+        Self::BlendMode(mode)
+    }
+
     /// Returns whether this effect leaves the composited image unchanged.
     pub fn is_identity(&self) -> bool {
         match self {
             Self::Opacity(alpha) => (*alpha - 1.).abs() <= f32::EPSILON,
             Self::SourceColorFilter(filter) => filter.is_identity(),
             Self::SourceBlur(radius) => radius.0 <= f32::EPSILON,
+            Self::BackdropColorFilter(filter) => filter.is_identity(),
+            Self::BackdropBlur(radius) => radius.0 <= f32::EPSILON,
+            Self::BackdropTint(color) => color.a <= f32::EPSILON,
             Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
             Self::RoundedMask(_) => false,
+            Self::BlendMode(mode) => *mode == CompositeBlendMode::Normal,
+        }
+    }
+
+    /// Returns whether this effect needs pixels from the parent render target.
+    pub fn reads_backdrop(&self) -> bool {
+        match self {
+            Self::BackdropColorFilter(filter) => !filter.is_identity(),
+            Self::BackdropBlur(radius) => radius.0 > f32::EPSILON,
+            Self::BackdropTint(color) => color.a > f32::EPSILON,
+            Self::BlendMode(mode) => *mode != CompositeBlendMode::Normal,
+            Self::Opacity(_)
+            | Self::SourceColorFilter(_)
+            | Self::SourceBlur(_)
+            | Self::DropShadow(_)
+            | Self::RoundedMask(_) => false,
         }
     }
 }
@@ -950,6 +1026,36 @@ pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
     pub offset: Point<P>,
     pub blur_radius: P,
     pub color: Hsla,
+}
+
+/// Final blend operation used when compositing a render group against its backdrop.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub enum CompositeBlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    PlusLighter,
+}
+
+impl CompositeBlendMode {
+    /// Returns the stable shader discriminant for this blend mode.
+    pub fn shader_code(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+            Self::Multiply => 1,
+            Self::Screen => 2,
+            Self::Overlay => 3,
+            Self::Darken => 4,
+            Self::Lighten => 5,
+            Self::PlusLighter => 6,
+        }
+    }
 }
 
 /// An affine source-color transform applied to an already-composited render
@@ -1070,8 +1176,35 @@ pub struct CompositeEffectPlan {
     opacity: f32,
     source_color_filter: SourceColorFilter,
     source_blur_radius: ScaledPixels,
+    backdrop_color_filter: SourceColorFilter,
+    backdrop_blur_radius: ScaledPixels,
+    backdrop_tint: Hsla,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
     rounded_mask: Option<Corners<ScaledPixels>>,
+    blend_mode: CompositeBlendMode,
+}
+
+fn composite_tint(below: Hsla, above: Hsla) -> Hsla {
+    if above.a <= f32::EPSILON {
+        return below;
+    }
+    if above.a >= 1. {
+        return above;
+    }
+
+    let below = below.to_rgb();
+    let above = above.to_rgb();
+    let alpha = above.a + below.a * (1. - above.a);
+    if alpha <= f32::EPSILON {
+        return transparent_black();
+    }
+
+    Hsla::from(Rgba {
+        r: (above.r * above.a + below.r * below.a * (1. - above.a)) / alpha,
+        g: (above.g * above.a + below.g * below.a * (1. - above.a)) / alpha,
+        b: (above.b * above.a + below.b * below.a * (1. - above.a)) / alpha,
+        a: alpha,
+    })
 }
 
 impl CompositeEffectPlan {
@@ -1085,8 +1218,12 @@ impl CompositeEffectPlan {
             opacity: boundary_opacity,
             source_color_filter: SourceColorFilter::identity(),
             source_blur_radius: ScaledPixels(0.),
+            backdrop_color_filter: SourceColorFilter::identity(),
+            backdrop_blur_radius: ScaledPixels(0.),
+            backdrop_tint: transparent_black(),
             drop_shadows: Vec::new(),
             rounded_mask: None,
+            blend_mode: CompositeBlendMode::Normal,
         };
 
         for effect in effects {
@@ -1102,6 +1239,18 @@ impl CompositeEffectPlan {
                     plan.source_blur_radius =
                         ScaledPixels((plan.source_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt());
                 }
+                CompositeEffect::BackdropColorFilter(filter) => {
+                    plan.backdrop_color_filter = plan.backdrop_color_filter.then(*filter);
+                }
+                CompositeEffect::BackdropBlur(radius) => {
+                    let radius = radius.scale(scale_factor);
+                    plan.backdrop_blur_radius = ScaledPixels(
+                        (plan.backdrop_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt(),
+                    );
+                }
+                CompositeEffect::BackdropTint(color) => {
+                    plan.backdrop_tint = composite_tint(plan.backdrop_tint, *color);
+                }
                 CompositeEffect::DropShadow(shadow) => {
                     plan.drop_shadows.push(CompositeDropShadow {
                         offset: shadow.offset.scale(scale_factor),
@@ -1111,6 +1260,9 @@ impl CompositeEffectPlan {
                 }
                 CompositeEffect::RoundedMask(corner_radii) => {
                     plan.rounded_mask = Some(corner_radii.scale(scale_factor));
+                }
+                CompositeEffect::BlendMode(mode) => {
+                    plan.blend_mode = *mode;
                 }
             }
         }
@@ -1132,6 +1284,38 @@ impl CompositeEffectPlan {
     /// Returns the normalized Gaussian source blur radius in device pixels.
     pub fn source_blur_radius(&self) -> ScaledPixels {
         self.source_blur_radius
+    }
+
+    /// Returns the normalized backdrop color filter.
+    pub fn backdrop_color_filter(&self) -> SourceColorFilter {
+        self.backdrop_color_filter
+    }
+
+    /// Returns the normalized Gaussian backdrop blur radius in device pixels.
+    pub fn backdrop_blur_radius(&self) -> ScaledPixels {
+        self.backdrop_blur_radius
+    }
+
+    /// Returns the normalized backdrop tint.
+    pub fn backdrop_tint(&self) -> Hsla {
+        self.backdrop_tint
+    }
+
+    /// Returns whether the plan needs a backdrop material layer.
+    pub fn has_backdrop_material(&self) -> bool {
+        self.backdrop_blur_radius.0 > f32::EPSILON
+            || !self.backdrop_color_filter.is_identity()
+            || self.backdrop_tint.a > f32::EPSILON
+    }
+
+    /// Returns the final blend mode.
+    pub fn blend_mode(&self) -> CompositeBlendMode {
+        self.blend_mode
+    }
+
+    /// Returns whether this plan needs pixels from the parent render target.
+    pub fn reads_backdrop(&self) -> bool {
+        self.has_backdrop_material() || self.blend_mode != CompositeBlendMode::Normal
     }
 
     /// Returns source-alpha drop shadows in declared order.
@@ -1158,8 +1342,14 @@ impl CompositeEffectPlan {
                     let shadow_outset = offset.x.0.abs().max(offset.y.0.abs()) + blur_outset;
                     outset = ScaledPixels(outset.0.max(shadow_outset));
                 }
+                CompositeEffect::BackdropBlur(radius) => {
+                    outset = ScaledPixels(outset.0.max(radius.scale(scale_factor).0 * 3.));
+                }
                 CompositeEffect::Opacity(_)
                 | CompositeEffect::SourceColorFilter(_)
+                | CompositeEffect::BackdropColorFilter(_)
+                | CompositeEffect::BackdropTint(_)
+                | CompositeEffect::BlendMode(_)
                 | CompositeEffect::RoundedMask(_) => {}
             }
         }

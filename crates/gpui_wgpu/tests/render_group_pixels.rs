@@ -231,6 +231,26 @@ fn render_group_source_color_filter_applies_to_composited_source() {
 }
 
 #[test]
+fn render_group_source_color_matrix_applies_to_composited_source() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::color_matrix(
+            [[0., 0., 0.], [1., 0., 0.], [0., 0., 0.]],
+            [0., 0., 0.],
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    assert_eq!(pixel(&render(&grouped), 12, 12), [0, 255, 0, 255]);
+}
+
+#[test]
 fn render_group_source_color_filter_preserves_source_alpha() {
     let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red_half())]);
 

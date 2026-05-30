@@ -59,6 +59,13 @@ impl RenderGroupBuilder {
         self
     }
 
+    /// Applies an affine source color matrix to unpremultiplied RGB.
+    pub fn color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        self.effects
+            .push(CompositeEffect::color_matrix(matrix, offset));
+        self
+    }
+
     /// Attaches the child element that will be rendered as the group contents.
     pub fn child(self, child: impl IntoElement) -> RenderGroup {
         RenderGroup {
@@ -110,6 +117,13 @@ impl RenderGroup {
     /// Mixes the composited source color toward its inverse by `amount`.
     pub fn invert(mut self, amount: f32) -> Self {
         self.effects.push(CompositeEffect::invert(amount));
+        self
+    }
+
+    /// Applies an affine source color matrix to unpremultiplied RGB.
+    pub fn color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        self.effects
+            .push(CompositeEffect::color_matrix(matrix, offset));
         self
     }
 }

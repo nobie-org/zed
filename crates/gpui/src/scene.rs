@@ -902,6 +902,11 @@ impl CompositeEffect {
         Self::SourceColorFilter(SourceColorFilter::invert(amount))
     }
 
+    /// Applies an affine source color matrix to unpremultiplied RGB.
+    pub fn color_matrix(matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::color_matrix(matrix, offset))
+    }
+
     /// Returns whether this effect leaves the composited image unchanged.
     pub fn is_identity(&self) -> bool {
         match self {
@@ -982,6 +987,11 @@ impl SourceColorFilter {
             matrix: [[scale, 0., 0.], [0., scale, 0.], [0., 0., scale]],
             offset: [amount, amount, amount],
         }
+    }
+
+    /// Returns an affine source-color matrix over unpremultiplied RGB.
+    pub fn color_matrix(matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
+        Self { matrix, offset }
     }
 
     /// Returns the filter produced by applying `self` and then `next`.
@@ -1350,6 +1360,26 @@ mod tests {
         assert_eq!(
             apply_filter(invert_then_brightness.source_color_filter(), [1., 0., 0.]),
             [0., 0.5, 0.5]
+        );
+    }
+
+    #[test]
+    fn source_color_matrix_composes_with_named_filters_in_order() {
+        let matrix = SourceColorFilter::color_matrix(
+            [[0., 0., 0.], [1., 0., 0.], [0., 0., 0.]],
+            [0., 0., 0.],
+        );
+        let plan = CompositeEffectPlan::from_effects(
+            1.,
+            &[
+                CompositeEffect::SourceColorFilter(matrix),
+                CompositeEffect::brightness(0.5),
+            ],
+        );
+
+        assert_eq!(
+            apply_filter(plan.source_color_filter(), [1., 0., 0.]),
+            [0., 0.5, 0.]
         );
     }
 }

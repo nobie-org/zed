@@ -196,9 +196,7 @@ impl TestAppContext {
     /// flushes effects. Tests that own their draw boundary can disable this and
     /// draw explicitly through their harness.
     pub fn set_auto_draw_test_windows(&self, enabled: bool) {
-        self.app
-            .borrow_mut()
-            .set_auto_draw_test_windows(enabled);
+        self.app.borrow_mut().set_auto_draw_test_windows(enabled);
     }
 
     /// Returns an executor (for running tasks in the background)

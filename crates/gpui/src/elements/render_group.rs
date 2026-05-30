@@ -1,6 +1,6 @@
 use crate::{
-    AnyElement, App, Bounds, CompositeEffect, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Window,
+    AnyElement, App, Bounds, CompositeEffect, Corners, Element, ElementId, GlobalElementId, Hsla,
+    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window,
 };
 use std::{mem, panic};
 
@@ -23,6 +23,18 @@ pub struct RenderGroupBuilder {
 }
 
 impl RenderGroupBuilder {
+    /// Applies one composite effect to the group.
+    pub fn effect(mut self, effect: CompositeEffect) -> Self {
+        self.effects.push(effect);
+        self
+    }
+
+    /// Applies a sequence of composite effects to the group.
+    pub fn effects(mut self, effects: impl IntoIterator<Item = CompositeEffect>) -> Self {
+        self.effects.extend(effects);
+        self
+    }
+
     /// Applies an opacity effect to the composited child.
     pub fn opacity(mut self, alpha: f32) -> Self {
         self.effects.push(CompositeEffect::opacity(alpha));
@@ -63,6 +75,27 @@ impl RenderGroupBuilder {
     pub fn color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
         self.effects
             .push(CompositeEffect::color_matrix(matrix, offset));
+        self
+    }
+
+    /// Applies a Gaussian blur to the composited source image.
+    pub fn source_blur(mut self, radius: Pixels) -> Self {
+        self.effects.push(CompositeEffect::source_blur(radius));
+        self
+    }
+
+    /// Draws a drop shadow from the composited source image's alpha channel.
+    pub fn drop_shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        self.effects
+            .push(CompositeEffect::drop_shadow(offset, blur_radius, color));
+        self
+    }
+
+    /// Masks the composited source image with a rounded rectangle matching the
+    /// group layout bounds.
+    pub fn rounded_mask(mut self, corner_radii: Corners<Pixels>) -> Self {
+        self.effects
+            .push(CompositeEffect::rounded_mask(corner_radii));
         self
     }
 
@@ -84,6 +117,18 @@ pub struct RenderGroup {
 }
 
 impl RenderGroup {
+    /// Applies one composite effect to the group.
+    pub fn effect(mut self, effect: CompositeEffect) -> Self {
+        self.effects.push(effect);
+        self
+    }
+
+    /// Applies a sequence of composite effects to the group.
+    pub fn effects(mut self, effects: impl IntoIterator<Item = CompositeEffect>) -> Self {
+        self.effects.extend(effects);
+        self
+    }
+
     /// Applies an opacity effect to the composited child.
     pub fn opacity(mut self, alpha: f32) -> Self {
         self.effects.push(CompositeEffect::opacity(alpha));
@@ -124,6 +169,27 @@ impl RenderGroup {
     pub fn color_matrix(mut self, matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
         self.effects
             .push(CompositeEffect::color_matrix(matrix, offset));
+        self
+    }
+
+    /// Applies a Gaussian blur to the composited source image.
+    pub fn source_blur(mut self, radius: Pixels) -> Self {
+        self.effects.push(CompositeEffect::source_blur(radius));
+        self
+    }
+
+    /// Draws a drop shadow from the composited source image's alpha channel.
+    pub fn drop_shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        self.effects
+            .push(CompositeEffect::drop_shadow(offset, blur_radius, color));
+        self
+    }
+
+    /// Masks the composited source image with a rounded rectangle matching the
+    /// group layout bounds.
+    pub fn rounded_mask(mut self, corner_radii: Corners<Pixels>) -> Self {
+        self.effects
+            .push(CompositeEffect::rounded_mask(corner_radii));
         self
     }
 }

@@ -852,6 +852,7 @@ pub struct PaintGroup {
     pub bounds: Bounds<ScaledPixels>,
     pub capture_bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub scale_factor: f32,
     pub boundary_opacity: f32,
     pub effects: Vec<CompositeEffect>,
     pub scene: Arc<Scene>,
@@ -869,6 +870,9 @@ impl From<PaintGroup> for Primitive {
 pub enum CompositeEffect {
     Opacity(f32),
     SourceColorFilter(SourceColorFilter),
+    SourceBlur(Pixels),
+    DropShadow(CompositeDropShadow<Pixels>),
+    RoundedMask(Corners<Pixels>),
 }
 
 impl CompositeEffect {
@@ -907,13 +911,45 @@ impl CompositeEffect {
         Self::SourceColorFilter(SourceColorFilter::color_matrix(matrix, offset))
     }
 
+    /// Applies a Gaussian blur to the composited source image.
+    pub fn source_blur(radius: Pixels) -> Self {
+        Self::SourceBlur(Pixels(radius.0.max(0.)))
+    }
+
+    /// Draws a drop shadow from the composited source image's alpha channel.
+    pub fn drop_shadow(offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        Self::DropShadow(CompositeDropShadow {
+            offset,
+            blur_radius: Pixels(blur_radius.0.max(0.)),
+            color,
+        })
+    }
+
+    /// Masks the composited source image by a rounded rectangle matching the
+    /// render group's layout bounds.
+    pub fn rounded_mask(corner_radii: Corners<Pixels>) -> Self {
+        Self::RoundedMask(corner_radii)
+    }
+
     /// Returns whether this effect leaves the composited image unchanged.
     pub fn is_identity(&self) -> bool {
         match self {
             Self::Opacity(alpha) => (*alpha - 1.).abs() <= f32::EPSILON,
             Self::SourceColorFilter(filter) => filter.is_identity(),
+            Self::SourceBlur(radius) => radius.0 <= f32::EPSILON,
+            Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
+            Self::RoundedMask(_) => false,
         }
     }
+}
+
+/// A drop shadow effect derived from a render group's composited source alpha.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
+    pub offset: Point<P>,
+    pub blur_radius: P,
+    pub color: Hsla,
 }
 
 /// An affine source-color transform applied to an already-composited render
@@ -1028,19 +1064,29 @@ impl SourceColorFilter {
 }
 
 /// Renderer-facing normalization of a render group's ordered effect list.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
 pub struct CompositeEffectPlan {
     opacity: f32,
     source_color_filter: SourceColorFilter,
+    source_blur_radius: ScaledPixels,
+    drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
+    rounded_mask: Option<Corners<ScaledPixels>>,
 }
 
 impl CompositeEffectPlan {
     /// Normalizes an ordered render-group effect list for renderer consumption.
-    pub fn from_effects(boundary_opacity: f32, effects: &[CompositeEffect]) -> Self {
+    pub fn from_effects(
+        scale_factor: f32,
+        boundary_opacity: f32,
+        effects: &[CompositeEffect],
+    ) -> Self {
         let mut plan = Self {
             opacity: boundary_opacity,
             source_color_filter: SourceColorFilter::identity(),
+            source_blur_radius: ScaledPixels(0.),
+            drop_shadows: Vec::new(),
+            rounded_mask: None,
         };
 
         for effect in effects {
@@ -1050,6 +1096,21 @@ impl CompositeEffectPlan {
                 }
                 CompositeEffect::SourceColorFilter(filter) => {
                     plan.source_color_filter = plan.source_color_filter.then(*filter);
+                }
+                CompositeEffect::SourceBlur(radius) => {
+                    let radius = radius.scale(scale_factor);
+                    plan.source_blur_radius =
+                        ScaledPixels((plan.source_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt());
+                }
+                CompositeEffect::DropShadow(shadow) => {
+                    plan.drop_shadows.push(CompositeDropShadow {
+                        offset: shadow.offset.scale(scale_factor),
+                        blur_radius: shadow.blur_radius.scale(scale_factor),
+                        color: shadow.color,
+                    });
+                }
+                CompositeEffect::RoundedMask(corner_radii) => {
+                    plan.rounded_mask = Some(corner_radii.scale(scale_factor));
                 }
             }
         }
@@ -1066,6 +1127,43 @@ impl CompositeEffectPlan {
     /// Returns the normalized source color filter.
     pub fn source_color_filter(&self) -> SourceColorFilter {
         self.source_color_filter
+    }
+
+    /// Returns the normalized Gaussian source blur radius in device pixels.
+    pub fn source_blur_radius(&self) -> ScaledPixels {
+        self.source_blur_radius
+    }
+
+    /// Returns source-alpha drop shadows in declared order.
+    pub fn drop_shadows(&self) -> &[CompositeDropShadow<ScaledPixels>] {
+        &self.drop_shadows
+    }
+
+    /// Returns the optional rounded group mask in device pixels.
+    pub fn rounded_mask(&self) -> Option<Corners<ScaledPixels>> {
+        self.rounded_mask
+    }
+
+    /// Returns the symmetric visual outset required by this effect plan.
+    pub fn visual_outset(scale_factor: f32, effects: &[CompositeEffect]) -> ScaledPixels {
+        let mut outset = ScaledPixels(0.);
+        for effect in effects {
+            match effect {
+                CompositeEffect::SourceBlur(radius) => {
+                    outset = ScaledPixels(outset.0.max(radius.scale(scale_factor).0 * 3.));
+                }
+                CompositeEffect::DropShadow(shadow) => {
+                    let offset = shadow.offset.scale(scale_factor);
+                    let blur_outset = shadow.blur_radius.scale(scale_factor).0 * 3.;
+                    let shadow_outset = offset.x.0.abs().max(offset.y.0.abs()) + blur_outset;
+                    outset = ScaledPixels(outset.0.max(shadow_outset));
+                }
+                CompositeEffect::Opacity(_)
+                | CompositeEffect::SourceColorFilter(_)
+                | CompositeEffect::RoundedMask(_) => {}
+            }
+        }
+        outset
     }
 }
 
@@ -1241,7 +1339,7 @@ impl PathVertex<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::size;
+    use crate::{red, size};
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels(value)
@@ -1265,6 +1363,7 @@ mod tests {
             bounds,
             capture_bounds,
             content_mask,
+            scale_factor: 1.,
             boundary_opacity: 0.5,
             effects: vec![CompositeEffect::opacity(0.5)],
             scene: Arc::new(Scene::default()),
@@ -1328,6 +1427,7 @@ mod tests {
     #[test]
     fn composite_effect_plan_multiplies_group_opacity() {
         let plan = CompositeEffectPlan::from_effects(
+            1.,
             0.5,
             &[CompositeEffect::opacity(0.5), CompositeEffect::opacity(0.5)],
         );
@@ -1340,12 +1440,14 @@ mod tests {
     fn composite_effect_plan_composes_source_color_filters_in_order() {
         let brightness_then_invert = CompositeEffectPlan::from_effects(
             1.,
+            1.,
             &[
                 CompositeEffect::brightness(0.5),
                 CompositeEffect::invert(1.),
             ],
         );
         let invert_then_brightness = CompositeEffectPlan::from_effects(
+            1.,
             1.,
             &[
                 CompositeEffect::invert(1.),
@@ -1371,6 +1473,7 @@ mod tests {
         );
         let plan = CompositeEffectPlan::from_effects(
             1.,
+            1.,
             &[
                 CompositeEffect::SourceColorFilter(matrix),
                 CompositeEffect::brightness(0.5),
@@ -1380,6 +1483,37 @@ mod tests {
         assert_eq!(
             apply_filter(plan.source_color_filter(), [1., 0., 0.]),
             [0., 0.5, 0.]
+        );
+    }
+
+    #[test]
+    fn composite_effect_plan_scales_source_effect_geometry() {
+        let plan = CompositeEffectPlan::from_effects(
+            2.,
+            1.,
+            &[
+                CompositeEffect::source_blur(Pixels(3.)),
+                CompositeEffect::drop_shadow(point(Pixels(4.), Pixels(-2.)), Pixels(5.), red()),
+                CompositeEffect::rounded_mask(Corners::all(Pixels(6.))),
+            ],
+        );
+
+        assert_eq!(plan.source_blur_radius(), ScaledPixels(6.));
+        assert_eq!(
+            plan.drop_shadows()[0].offset,
+            point(ScaledPixels(8.), ScaledPixels(-4.))
+        );
+        assert_eq!(plan.drop_shadows()[0].blur_radius, ScaledPixels(10.));
+        assert_eq!(plan.rounded_mask(), Some(Corners::all(ScaledPixels(12.))));
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(
+                2.,
+                &[
+                    CompositeEffect::source_blur(Pixels(3.)),
+                    CompositeEffect::drop_shadow(point(Pixels(4.), Pixels(-2.)), Pixels(5.), red()),
+                ],
+            ),
+            ScaledPixels(38.)
         );
     }
 }

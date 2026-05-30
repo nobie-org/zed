@@ -1,7 +1,7 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, CompositeEffectPlan, DevicePixels, GpuSpecs,
+    AtlasTextureId, Background, Bounds, CompositeEffectPlan, Corners, DevicePixels, GpuSpecs,
     MonochromeSprite, PaintGroup, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
@@ -65,7 +65,15 @@ struct PathSprite {
 struct GroupSprite {
     bounds: Bounds<ScaledPixels>,
     opacity: f32,
-    _pad: [f32; 3],
+    effect_kind: u32,
+    source_blur_radius: f32,
+    mask_enabled: f32,
+    shadow_offset: [f32; 2],
+    shadow_blur_radius: f32,
+    _pad: f32,
+    shadow_color: [f32; 4],
+    mask_bounds: Bounds<ScaledPixels>,
+    mask_corner_radii: Corners<ScaledPixels>,
     color_matrix: [[f32; 4]; 4],
     color_offset: [f32; 4],
 }
@@ -1960,8 +1968,11 @@ impl WgpuRenderer {
         retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
         for group in groups {
-            let effect_plan =
-                CompositeEffectPlan::from_effects(group.boundary_opacity, &group.effects);
+            let effect_plan = CompositeEffectPlan::from_effects(
+                group.scale_factor,
+                group.boundary_opacity,
+                &group.effects,
+            );
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -2037,14 +2048,47 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let (color_matrix, color_offset) = Self::group_source_color_filter(effect_plan);
-        let sprites = [GroupSprite {
+        let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
+        let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
+        let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
+            Some(corner_radii) => (1., corner_radii),
+            None => (0., Corners::all(ScaledPixels(0.))),
+        };
+
+        for shadow in effect_plan.drop_shadows() {
+            let color = shadow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 1,
+                source_blur_radius: 0.,
+                mask_enabled,
+                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
+                shadow_blur_radius: shadow.blur_radius.0,
+                _pad: 0.,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                mask_bounds: group.bounds,
+                mask_corner_radii,
+                color_matrix,
+                color_offset,
+            });
+        }
+
+        sprites.push(GroupSprite {
             bounds: group.capture_bounds,
             opacity: effect_plan.opacity(),
-            _pad: [0.; 3],
+            effect_kind: 0,
+            source_blur_radius: effect_plan.source_blur_radius().0,
+            mask_enabled,
+            shadow_offset: [0., 0.],
+            shadow_blur_radius: 0.,
+            _pad: 0.,
+            shadow_color: [0., 0., 0., 0.],
+            mask_bounds: group.bounds,
+            mask_corner_radii,
             color_matrix,
             color_offset,
-        }];
+        });
         let sprite_data = unsafe { Self::instance_bytes(&sprites) };
         self.draw_instances_with_unfiltered_texture(
             sprite_data,
@@ -2057,7 +2101,7 @@ impl WgpuRenderer {
         )
     }
 
-    fn group_source_color_filter(effect_plan: CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+    fn group_source_color_filter(effect_plan: &CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
         let (matrix, offset) = effect_plan.source_color_filter().components();
         (
             [

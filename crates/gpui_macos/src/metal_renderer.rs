@@ -7,7 +7,7 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, DevicePixels,
+    AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, Corners, DevicePixels,
     MonochromeSprite, PaintGroup, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
     Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
@@ -1109,8 +1109,11 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
-            let effect_plan =
-                CompositeEffectPlan::from_effects(group.boundary_opacity, &group.effects);
+            let effect_plan = CompositeEffectPlan::from_effects(
+                group.scale_factor,
+                group.boundary_opacity,
+                &group.effects,
+            );
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -1201,14 +1204,47 @@ impl MetalRenderer {
         command_encoder
             .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(group_texture));
 
-        let (color_matrix, color_offset) = Self::group_source_color_filter(effect_plan);
-        let sprites = [GroupSprite {
+        let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
+        let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
+        let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
+            Some(corner_radii) => (1., corner_radii),
+            None => (0., Corners::all(ScaledPixels(0.))),
+        };
+
+        for shadow in effect_plan.drop_shadows() {
+            let color = shadow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 1,
+                source_blur_radius: 0.,
+                mask_enabled,
+                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
+                shadow_blur_radius: shadow.blur_radius.0,
+                _pad: 0.,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                mask_bounds: group.bounds,
+                mask_corner_radii,
+                color_matrix,
+                color_offset,
+            });
+        }
+
+        sprites.push(GroupSprite {
             bounds: group.capture_bounds,
             opacity: effect_plan.opacity(),
-            _pad: [0.; 3],
+            effect_kind: 0,
+            source_blur_radius: effect_plan.source_blur_radius().0,
+            mask_enabled,
+            shadow_offset: [0., 0.],
+            shadow_blur_radius: 0.,
+            _pad: 0.,
+            shadow_color: [0., 0., 0., 0.],
+            mask_bounds: group.bounds,
+            mask_corner_radii,
             color_matrix,
             color_offset,
-        }];
+        });
 
         align_offset(instance_offset);
         let sprite_bytes_len = mem::size_of_val(sprites.as_slice());
@@ -1244,7 +1280,7 @@ impl MetalRenderer {
         true
     }
 
-    fn group_source_color_filter(effect_plan: CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
+    fn group_source_color_filter(effect_plan: &CompositeEffectPlan) -> ([[f32; 4]; 4], [f32; 4]) {
         let (matrix, offset) = effect_plan.source_color_filter().components();
         (
             [
@@ -2093,7 +2129,15 @@ pub struct PathSprite {
 pub struct GroupSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub opacity: f32,
-    pub _pad: [f32; 3],
+    pub effect_kind: u32,
+    pub source_blur_radius: f32,
+    pub mask_enabled: f32,
+    pub shadow_offset: [f32; 2],
+    pub shadow_blur_radius: f32,
+    pub _pad: f32,
+    pub shadow_color: [f32; 4],
+    pub mask_bounds: Bounds<ScaledPixels>,
+    pub mask_corner_radii: Corners<ScaledPixels>,
     pub color_matrix: [[f32; 4]; 4],
     pub color_offset: [f32; 4],
 }

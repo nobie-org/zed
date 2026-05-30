@@ -837,7 +837,17 @@ fragment float4 path_sprite_fragment(
 struct GroupSpriteVertexOutput {
   float4 position [[position]];
   float2 texture_coords;
+  float2 screen_position;
+  float2 texture_pixel_size;
   float opacity;
+  uint effect_kind [[flat]];
+  float source_blur_radius;
+  float mask_enabled;
+  float2 shadow_offset;
+  float shadow_blur_radius;
+  float4 shadow_color;
+  float4 mask_bounds;
+  float4 mask_corner_radii;
   float4 color_matrix_0;
   float4 color_matrix_1;
   float4 color_matrix_2;
@@ -858,16 +868,147 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
 
   float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
   float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
+  float2 texture_pixel_size = 1.0 / float2(viewport_size->width, viewport_size->height);
 
   return GroupSpriteVertexOutput{
     device_position,
     texture_coords,
+    screen_position,
+    texture_pixel_size,
     sprite.opacity,
+    sprite.effect_kind,
+    sprite.source_blur_radius,
+    sprite.mask_enabled,
+    float2(sprite.shadow_offset[0], sprite.shadow_offset[1]),
+    sprite.shadow_blur_radius,
+    float4(sprite.shadow_color[0], sprite.shadow_color[1], sprite.shadow_color[2], sprite.shadow_color[3]),
+    float4(sprite.mask_bounds.origin.x, sprite.mask_bounds.origin.y, sprite.mask_bounds.size.width, sprite.mask_bounds.size.height),
+    float4(sprite.mask_corner_radii.top_left, sprite.mask_corner_radii.top_right, sprite.mask_corner_radii.bottom_right, sprite.mask_corner_radii.bottom_left),
     float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
     float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
     float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
     float4(sprite.color_offset[0], sprite.color_offset[1], sprite.color_offset[2], sprite.color_offset[3])
   };
+}
+
+float group_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
+  if (input.mask_enabled <= 0.0) {
+    return 1.0;
+  }
+
+  float2 half_size = input.mask_bounds.zw / 2.0;
+  float2 center = input.mask_bounds.xy + half_size;
+  float2 center_to_point = point - center;
+  float corner_radius = input.mask_corner_radii.x;
+  if (center_to_point.x < 0.0) {
+    if (center_to_point.y >= 0.0) {
+      corner_radius = input.mask_corner_radii.w;
+    }
+  } else {
+    if (center_to_point.y < 0.0) {
+      corner_radius = input.mask_corner_radii.y;
+    } else {
+      corner_radius = input.mask_corner_radii.z;
+    }
+  }
+  float2 corner_to_point = abs(center_to_point) - half_size;
+  float2 corner_center_to_point = corner_to_point + corner_radius;
+  return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
+}
+
+float4 sample_group_texture(texture2d<float> intermediate_texture,
+                            sampler intermediate_texture_sampler,
+                            float2 coords) {
+  if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+    return float4(0.0);
+  }
+
+  return intermediate_texture.sample(intermediate_texture_sampler, coords);
+}
+
+float4 sample_group_source(texture2d<float> intermediate_texture,
+                           sampler intermediate_texture_sampler,
+                           float2 coords,
+                           float2 point,
+                           GroupSpriteVertexOutput input) {
+  return sample_group_texture(intermediate_texture, intermediate_texture_sampler, coords) *
+         group_mask_alpha(point, input);
+}
+
+float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
+                                   sampler intermediate_texture_sampler,
+                                   float2 coords,
+                                   float2 point,
+                                   float2 pixel_size,
+                                   float sigma,
+                                   GroupSpriteVertexOutput input) {
+  if (sigma <= 0.0) {
+    return sample_group_source(intermediate_texture, intermediate_texture_sampler, coords, point, input);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float4 color = float4(0.0);
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          color += sample_group_source(
+              intermediate_texture,
+              intermediate_texture_sampler,
+              coords + offset * pixel_size,
+              point + offset,
+              input) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return float4(0.0);
+  }
+  return color / total;
+}
+
+float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
+                                 sampler intermediate_texture_sampler,
+                                 float2 coords,
+                                 float2 point,
+                                 float2 pixel_size,
+                                 float sigma,
+                                 GroupSpriteVertexOutput input) {
+  if (sigma <= 0.0) {
+    return sample_group_source(intermediate_texture, intermediate_texture_sampler, coords, point, input).a;
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float alpha = 0.0;
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          alpha += sample_group_source(
+              intermediate_texture,
+              intermediate_texture_sampler,
+              coords + offset * pixel_size,
+              point + offset,
+              input).a * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  return alpha / total;
 }
 
 float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput input) {
@@ -890,7 +1031,28 @@ fragment float4 group_sprite_fragment(
   texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]]
 ) {
   constexpr sampler intermediate_texture_sampler(mag_filter::nearest, min_filter::nearest);
-  float4 sample = intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+  if (input.effect_kind == 1) {
+    float2 sample_coords = input.texture_coords - input.shadow_offset * input.texture_pixel_size;
+    float2 sample_point = input.screen_position - input.shadow_offset;
+    float alpha = sample_group_alpha_blurred(
+        intermediate_texture,
+        intermediate_texture_sampler,
+        sample_coords,
+        sample_point,
+        input.texture_pixel_size,
+        input.shadow_blur_radius,
+        input) * input.shadow_color.a * input.opacity;
+    return float4(input.shadow_color.rgb * alpha, alpha);
+  }
+
+  float4 sample = sample_group_source_blurred(
+      intermediate_texture,
+      intermediate_texture_sampler,
+      input.texture_coords,
+      input.screen_position,
+      input.texture_pixel_size,
+      input.source_blur_radius,
+      input);
   return apply_group_source_color_filter(sample, input) * input.opacity;
 }
 

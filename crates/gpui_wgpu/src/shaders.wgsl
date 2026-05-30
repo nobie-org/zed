@@ -1123,9 +1123,15 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
 struct GroupSprite {
     bounds: Bounds,
     opacity: f32,
+    effect_kind: u32,
+    source_blur_radius: f32,
+    mask_enabled: f32,
+    shadow_offset: vec2<f32>,
+    shadow_blur_radius: f32,
     pad0: f32,
-    pad1: f32,
-    pad2: f32,
+    shadow_color: vec4<f32>,
+    mask_bounds: Bounds,
+    mask_corner_radii: Corners,
     color_matrix: array<vec4<f32>, 4>,
     color_offset: vec4<f32>,
 }
@@ -1134,7 +1140,9 @@ struct GroupSprite {
 struct GroupVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_coords: vec2<f32>,
-    @location(1) @interpolate(flat) sprite_id: u32,
+    @location(1) screen_position: vec2<f32>,
+    @location(2) texture_pixel_size: vec2<f32>,
+    @location(3) @interpolate(flat) sprite_id: u32,
 }
 
 @vertex
@@ -1148,9 +1156,107 @@ fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) inst
     var out = GroupVarying();
     out.position = device_position;
     out.texture_coords = texture_coords;
+    out.screen_position = screen_position;
+    out.texture_pixel_size = vec2<f32>(1.0) / globals.viewport_size;
     out.sprite_id = instance_id;
 
     return out;
+}
+
+fn group_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
+    if (sprite.mask_enabled <= 0.0) {
+        return 1.0;
+    }
+
+    return clamp(0.5 - quad_sdf(point, sprite.mask_bounds, sprite.mask_corner_radii), 0.0, 1.0);
+}
+
+fn sample_group_texture(coords: vec2<f32>) -> vec4<f32> {
+    if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+        return vec4<f32>(0.0);
+    }
+
+    return textureSample(t_sprite, s_sprite, coords);
+}
+
+fn sample_group_source(coords: vec2<f32>, point: vec2<f32>, sprite: GroupSprite) -> vec4<f32> {
+    return sample_group_texture(coords) * group_mask_alpha(point, sprite);
+}
+
+fn sample_group_source_blurred(
+    coords: vec2<f32>,
+    point: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+    sprite: GroupSprite,
+) -> vec4<f32> {
+    if (sigma <= 0.0) {
+        return sample_group_source(coords, point, sprite);
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var color = vec4<f32>(0.0);
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            for (var x = -24; x <= 24; x = x + 1) {
+                if (abs(x) <= radius) {
+                    let offset = vec2<f32>(f32(x), f32(y));
+                    let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                    color += sample_group_source(
+                        coords + offset * pixel_size,
+                        point + offset,
+                        sprite,
+                    ) * weight;
+                    total += weight;
+                }
+            }
+        }
+    }
+
+    if (total <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return color / total;
+}
+
+fn sample_group_alpha_blurred(
+    coords: vec2<f32>,
+    point: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+    sprite: GroupSprite,
+) -> f32 {
+    if (sigma <= 0.0) {
+        return sample_group_source(coords, point, sprite).a;
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var alpha = 0.0;
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            for (var x = -24; x <= 24; x = x + 1) {
+                if (abs(x) <= radius) {
+                    let offset = vec2<f32>(f32(x), f32(y));
+                    let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                    alpha += sample_group_source(
+                        coords + offset * pixel_size,
+                        point + offset,
+                        sprite,
+                    ).a * weight;
+                    total += weight;
+                }
+            }
+        }
+    }
+
+    if (total <= 0.0) {
+        return 0.0;
+    }
+    return alpha / total;
 }
 
 fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> vec4<f32> {
@@ -1171,7 +1277,26 @@ fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> ve
 @fragment
 fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
     let sprite = b_group_sprites[input.sprite_id];
-    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
+    if (sprite.effect_kind == 1u) {
+        let sample_coords = input.texture_coords - sprite.shadow_offset * input.texture_pixel_size;
+        let sample_point = input.screen_position - sprite.shadow_offset;
+        let alpha = sample_group_alpha_blurred(
+            sample_coords,
+            sample_point,
+            input.texture_pixel_size,
+            sprite.shadow_blur_radius,
+            sprite,
+        ) * sprite.shadow_color.a * sprite.opacity;
+        return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
+    }
+
+    let sample = sample_group_source_blurred(
+        input.texture_coords,
+        input.screen_position,
+        input.texture_pixel_size,
+        sprite.source_blur_radius,
+        sprite,
+    );
     return apply_group_source_color_filter(sample, sprite) * sprite.opacity;
 }
 

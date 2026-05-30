@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use gpui::{
     Background, BorderStyle, Bounds, CompositeEffect, ContentMask, Corners, DevicePixels, Edges,
-    Hsla, PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene, point, rgba, size,
+    Hsla, PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene, point, px, rgba, size,
     transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
@@ -73,6 +73,7 @@ fn paint_group_with_effects(
         bounds: capture_bounds,
         capture_bounds,
         content_mask: mask(),
+        scale_factor: 1.,
         boundary_opacity: 1.,
         effects,
         scene: Arc::new(scene),
@@ -89,6 +90,10 @@ fn white() -> Hsla {
 
 fn half_white() -> Hsla {
     rgba(0xffffff80).into()
+}
+
+fn green() -> Hsla {
+    rgba(0x00ff00ff).into()
 }
 
 fn red_half() -> Hsla {
@@ -306,4 +311,74 @@ fn render_group_source_color_filters_are_ordered() {
         pixel(&render(&invert_then_brightness), 12, 12),
         [0, 128, 128, 255]
     );
+}
+
+#[test]
+fn render_group_source_blur_samples_composited_source() {
+    let group_scene = finished_scene([quad(0, rect(12., 12., 8., 8.), white())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(6., 6., 20., 20.),
+        vec![CompositeEffect::source_blur(px(2.))],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let center = pixel(&image, 16, 16);
+    let outside = pixel(&image, 10, 16);
+
+    assert!(
+        center[0] > outside[0],
+        "center {center:?} outside {outside:?}"
+    );
+    assert!(
+        outside[0] > 0,
+        "blur should extend source into expanded capture bounds"
+    );
+}
+
+#[test]
+fn render_group_drop_shadow_uses_composited_source_alpha() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::drop_shadow(
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    assert_eq!(pixel(&image, 12, 12), [255, 0, 0, 255]);
+    assert_eq!(pixel(&image, 19, 12), [128, 128, 128, 255]);
+}
+
+#[test]
+fn render_group_rounded_mask_clips_composited_source() {
+    let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(4., 4., 20., 20.),
+        vec![CompositeEffect::rounded_mask(Corners::all(px(8.)))],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    assert_eq!(pixel(&image, 14, 14), [0, 255, 0, 255]);
+    assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
 }

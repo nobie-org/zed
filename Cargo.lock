@@ -7843,6 +7843,7 @@ dependencies = [
  "semver",
  "smallvec",
  "strum 0.27.2",
+ "tracing",
  "util",
  "uuid",
  "zed-font-kit",

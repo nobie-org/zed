@@ -480,6 +480,42 @@ fn render_group_backdrop_blur_is_visible_behind_translucent_source() {
 }
 
 #[test]
+fn render_group_backdrop_lens_refracts_parent_target_near_material_edge() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), green()));
+    grouped.insert_primitive(quad(1, rect(0., 0., 8., 32.), red()));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(6.),
+            px(6.),
+            px(0.),
+            0.,
+            0.,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let refracted_edge = pixel(&image, 10, 16);
+    let stable_center = pixel(&image, 16, 16);
+
+    assert!(
+        refracted_edge[0] > refracted_edge[1],
+        "left rim should bend red backdrop pixels into the green group interior: {refracted_edge:?}"
+    );
+    assert!(
+        stable_center[1] > stable_center[0],
+        "center should remain the undisplaced green backdrop: {stable_center:?}"
+    );
+}
+
+#[test]
 fn render_group_blend_mode_applies_at_group_boundary() {
     let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]);
 

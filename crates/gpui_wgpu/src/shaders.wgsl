@@ -1141,6 +1141,8 @@ struct GroupSprite {
     backdrop_tint: vec4<f32>,
     backdrop_color_matrix: array<vec4<f32>, 4>,
     backdrop_color_offset: vec4<f32>,
+    backdrop_lens: vec4<f32>,
+    backdrop_lens_lighting: vec4<f32>,
 }
 @group(1) @binding(0) var<storage, read> b_group_sprites: array<GroupSprite>;
 
@@ -1179,11 +1181,37 @@ fn group_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
 }
 
 fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
+    return clamp(0.5 - group_material_sdf(point, sprite), 0.0, 1.0);
+}
+
+fn group_material_sdf(point: vec2<f32>, sprite: GroupSprite) -> f32 {
     var corner_radii = Corners(0.0, 0.0, 0.0, 0.0);
     if (sprite.mask_enabled > 0.0) {
         corner_radii = sprite.mask_corner_radii;
     }
-    return clamp(0.5 - quad_sdf(point, sprite.mask_bounds, corner_radii), 0.0, 1.0);
+    return quad_sdf(point, sprite.mask_bounds, corner_radii);
+}
+
+fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {
+    let dx = group_material_sdf(point + vec2<f32>(1.0, 0.0), sprite) -
+        group_material_sdf(point - vec2<f32>(1.0, 0.0), sprite);
+    let dy = group_material_sdf(point + vec2<f32>(0.0, 1.0), sprite) -
+        group_material_sdf(point - vec2<f32>(0.0, 1.0), sprite);
+    let gradient = vec2<f32>(dx, dy);
+    let gradient_length = length(gradient);
+    if (gradient_length <= 0.0001) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    return gradient / gradient_length;
+}
+
+fn group_lens_rim(point: vec2<f32>, sprite: GroupSprite) -> f32 {
+    if (sprite.backdrop_lens.w <= 0.0 || sprite.backdrop_lens.y <= 0.0) {
+        return 0.0;
+    }
+    let distance_to_edge = abs(group_material_sdf(point, sprite));
+    let rim = 1.0 - smoothstep(0.0, sprite.backdrop_lens.y, distance_to_edge);
+    return rim * group_material_alpha(point, sprite);
 }
 
 fn sample_group_texture(coords: vec2<f32>) -> vec4<f32> {
@@ -1274,6 +1302,46 @@ fn sample_backdrop_blurred(
         return vec4<f32>(0.0);
     }
     return color / total;
+}
+
+fn sample_backdrop_lensed(
+    coords: vec2<f32>,
+    point: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+    sprite: GroupSprite,
+) -> vec4<f32> {
+    let rim = group_lens_rim(point, sprite);
+    if (rim <= 0.0) {
+        return sample_backdrop_blurred(coords, pixel_size, sigma);
+    }
+
+    let normal = group_material_normal(point, sprite);
+    let refraction_offset = normal * sprite.backdrop_lens.x * rim * pixel_size;
+    let center_coords = coords + refraction_offset;
+    var sample = sample_backdrop_blurred(center_coords, pixel_size, sigma);
+
+    if (sprite.backdrop_lens.z > 0.0) {
+        let chroma_offset = normal * sprite.backdrop_lens.z * rim * pixel_size;
+        let red = sample_backdrop_blurred(center_coords + chroma_offset, pixel_size, sigma).r;
+        let blue = sample_backdrop_blurred(center_coords - chroma_offset, pixel_size, sigma).b;
+        sample = vec4<f32>(red, sample.g, blue, sample.a);
+    }
+
+    let light_length = length(sprite.backdrop_lens_lighting.zw);
+    if (sample.a <= 0.0 || light_length <= 0.0001) {
+        return sample;
+    }
+
+    let light_direction = sprite.backdrop_lens_lighting.zw / light_length;
+    let facing_light = max(dot(normal, light_direction), 0.0);
+    let facing_shadow = max(dot(-normal, light_direction), 0.0);
+    let highlight = clamp(rim * facing_light * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
+    let shadow = clamp(rim * facing_shadow * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
+    var straight_rgb = sample.rgb / sample.a;
+    straight_rgb = mix(straight_rgb, vec3<f32>(1.0), highlight);
+    straight_rgb *= 1.0 - shadow;
+    return vec4<f32>(straight_rgb * sample.a, sample.a);
 }
 
 fn sample_group_alpha_blurred(
@@ -1421,10 +1489,12 @@ fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
     sample = apply_group_source_color_filter(sample, sprite);
 
     if (sprite.backdrop_active > 0.0) {
-        var material = sample_backdrop_blurred(
+        var material = sample_backdrop_lensed(
             input.texture_coords,
+            input.screen_position,
             input.texture_pixel_size,
             sprite.backdrop_blur_radius,
+            sprite,
         );
         material = apply_group_backdrop_color_filter(material, sprite);
         material = premul_over(material, premul_from_straight(sprite.backdrop_tint));

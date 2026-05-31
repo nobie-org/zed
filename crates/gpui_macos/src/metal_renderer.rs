@@ -1381,6 +1381,7 @@ impl MetalRenderer {
         let (backdrop_color_matrix, backdrop_color_offset) =
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
+        let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
         let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
         let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
             Some(corner_radii) => (1., corner_radii),
@@ -1409,6 +1410,8 @@ impl MetalRenderer {
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
             });
         }
 
@@ -1441,6 +1444,8 @@ impl MetalRenderer {
             ],
             backdrop_color_matrix,
             backdrop_color_offset,
+            backdrop_lens,
+            backdrop_lens_lighting,
         });
 
         align_offset(instance_offset);
@@ -1500,6 +1505,27 @@ impl MetalRenderer {
                 [0., 0., 0., 1.],
             ],
             [offset[0], offset[1], offset[2], 0.],
+        )
+    }
+
+    fn group_backdrop_lens(effect_plan: &CompositeEffectPlan) -> ([f32; 4], [f32; 4]) {
+        let Some(lens) = effect_plan.backdrop_lens() else {
+            return ([0., 0., 0., 0.], [0., 0., 0., 0.]);
+        };
+        let light_direction = lens.light_direction();
+        (
+            [
+                lens.refraction_radius().0,
+                lens.rim_width().0,
+                lens.chromatic_aberration().0,
+                if lens.is_identity() { 0. } else { 1. },
+            ],
+            [
+                lens.highlight_strength(),
+                lens.shadow_strength(),
+                light_direction.x,
+                light_direction.y,
+            ],
         )
     }
 
@@ -2357,6 +2383,8 @@ pub struct GroupSprite {
     pub backdrop_tint: [f32; 4],
     pub backdrop_color_matrix: [[f32; 4]; 4],
     pub backdrop_color_offset: [f32; 4],
+    pub backdrop_lens: [f32; 4],
+    pub backdrop_lens_lighting: [f32; 4],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

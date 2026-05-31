@@ -860,6 +860,8 @@ struct GroupSpriteVertexOutput {
   float4 backdrop_color_matrix_1;
   float4 backdrop_color_matrix_2;
   float4 backdrop_color_offset;
+  float4 backdrop_lens;
+  float4 backdrop_lens_lighting;
 };
 
 vertex GroupSpriteVertexOutput group_sprite_vertex(
@@ -903,7 +905,9 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     float4(sprite.backdrop_color_matrix[0][0], sprite.backdrop_color_matrix[0][1], sprite.backdrop_color_matrix[0][2], sprite.backdrop_color_matrix[0][3]),
     float4(sprite.backdrop_color_matrix[1][0], sprite.backdrop_color_matrix[1][1], sprite.backdrop_color_matrix[1][2], sprite.backdrop_color_matrix[1][3]),
     float4(sprite.backdrop_color_matrix[2][0], sprite.backdrop_color_matrix[2][1], sprite.backdrop_color_matrix[2][2], sprite.backdrop_color_matrix[2][3]),
-    float4(sprite.backdrop_color_offset[0], sprite.backdrop_color_offset[1], sprite.backdrop_color_offset[2], sprite.backdrop_color_offset[3])
+    float4(sprite.backdrop_color_offset[0], sprite.backdrop_color_offset[1], sprite.backdrop_color_offset[2], sprite.backdrop_color_offset[3]),
+    float4(sprite.backdrop_lens[0], sprite.backdrop_lens[1], sprite.backdrop_lens[2], sprite.backdrop_lens[3]),
+    float4(sprite.backdrop_lens_lighting[0], sprite.backdrop_lens_lighting[1], sprite.backdrop_lens_lighting[2], sprite.backdrop_lens_lighting[3])
   };
 }
 
@@ -932,15 +936,57 @@ float group_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
   return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
 }
 
-float group_material_alpha(float2 point, GroupSpriteVertexOutput input) {
+float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
+  float4 corner_radii = float4(0.0);
   if (input.mask_enabled > 0.0) {
-    return group_mask_alpha(point, input);
+    corner_radii = input.mask_corner_radii;
   }
 
   float2 half_size = input.mask_bounds.zw / 2.0;
   float2 center = input.mask_bounds.xy + half_size;
-  float2 corner_to_point = abs(point - center) - half_size;
-  return saturate(0.5 - quad_sdf_impl(corner_to_point, 0.0));
+  float2 center_to_point = point - center;
+  float corner_radius = corner_radii.x;
+  if (center_to_point.x < 0.0) {
+    if (center_to_point.y >= 0.0) {
+      corner_radius = corner_radii.w;
+    }
+  } else {
+    if (center_to_point.y < 0.0) {
+      corner_radius = corner_radii.y;
+    } else {
+      corner_radius = corner_radii.z;
+    }
+  }
+  float2 corner_to_point = abs(center_to_point) - half_size;
+  float2 corner_center_to_point = corner_to_point + corner_radius;
+  return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+float group_material_alpha(float2 point, GroupSpriteVertexOutput input) {
+  return saturate(0.5 - group_material_sdf(point, input));
+}
+
+float2 group_material_normal(float2 point, GroupSpriteVertexOutput input) {
+  float dx = group_material_sdf(point + float2(1.0, 0.0), input) -
+             group_material_sdf(point - float2(1.0, 0.0), input);
+  float dy = group_material_sdf(point + float2(0.0, 1.0), input) -
+             group_material_sdf(point - float2(0.0, 1.0), input);
+  float2 gradient = float2(dx, dy);
+  float gradient_length = length(gradient);
+  if (gradient_length <= 0.0001) {
+    return float2(0.0);
+  }
+  return gradient / gradient_length;
+}
+
+float group_lens_rim(float2 point, GroupSpriteVertexOutput input) {
+  if (input.backdrop_lens.w <= 0.0 || input.backdrop_lens.y <= 0.0) {
+    return 0.0;
+  }
+
+  float distance_to_edge = abs(group_material_sdf(point, input));
+  float rim = 1.0 - smoothstep(0.0, input.backdrop_lens.y, distance_to_edge);
+  return rim * group_material_alpha(point, input);
 }
 
 float4 sample_group_texture(texture2d<float> intermediate_texture,
@@ -1042,6 +1088,58 @@ float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,
     return float4(0.0);
   }
   return color / total;
+}
+
+float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
+                              sampler texture_sampler,
+                              float2 coords,
+                              float2 point,
+                              float2 pixel_size,
+                              float sigma,
+                              GroupSpriteVertexOutput input) {
+  float rim = group_lens_rim(point, input);
+  if (rim <= 0.0) {
+    return sample_backdrop_blurred(
+        backdrop_texture, texture_sampler, coords, pixel_size, sigma);
+  }
+
+  float2 normal = group_material_normal(point, input);
+  float2 refraction_offset = normal * input.backdrop_lens.x * rim * pixel_size;
+  float2 center_coords = coords + refraction_offset;
+  float4 sample = sample_backdrop_blurred(
+      backdrop_texture, texture_sampler, center_coords, pixel_size, sigma);
+
+  if (input.backdrop_lens.z > 0.0) {
+    float2 chroma_offset = normal * input.backdrop_lens.z * rim * pixel_size;
+    float red = sample_backdrop_blurred(
+        backdrop_texture,
+        texture_sampler,
+        center_coords + chroma_offset,
+        pixel_size,
+        sigma).r;
+    float blue = sample_backdrop_blurred(
+        backdrop_texture,
+        texture_sampler,
+        center_coords - chroma_offset,
+        pixel_size,
+        sigma).b;
+    sample = float4(red, sample.g, blue, sample.a);
+  }
+
+  float light_length = length(input.backdrop_lens_lighting.zw);
+  if (sample.a <= 0.0 || light_length <= 0.0001) {
+    return sample;
+  }
+
+  float2 light_direction = input.backdrop_lens_lighting.zw / light_length;
+  float facing_light = max(dot(normal, light_direction), 0.0);
+  float facing_shadow = max(dot(-normal, light_direction), 0.0);
+  float highlight = saturate(rim * facing_light * input.backdrop_lens_lighting.x);
+  float shadow = saturate(rim * facing_shadow * input.backdrop_lens_lighting.y);
+  float3 straight_rgb = sample.rgb / sample.a;
+  straight_rgb = mix(straight_rgb, float3(1.0), highlight);
+  straight_rgb *= 1.0 - shadow;
+  return float4(straight_rgb * sample.a, sample.a);
 }
 
 float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
@@ -1194,12 +1292,14 @@ fragment float4 group_sprite_fragment(
   sample = apply_group_source_color_filter(sample, input);
 
   if (input.backdrop_active > 0.0) {
-    float4 material = sample_backdrop_blurred(
+    float4 material = sample_backdrop_lensed(
         backdrop_texture,
         intermediate_texture_sampler,
         input.texture_coords,
+        input.screen_position,
         input.texture_pixel_size,
-        input.backdrop_blur_radius);
+        input.backdrop_blur_radius,
+        input);
     material = apply_group_backdrop_color_filter(material, input);
     material = premul_over(material, premul_from_straight(input.backdrop_tint));
     material *= group_material_alpha(input.screen_position, input);

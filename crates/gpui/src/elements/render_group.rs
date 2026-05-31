@@ -131,6 +131,28 @@ impl RenderGroupBuilder {
         self
     }
 
+    /// Refracts already-rendered backdrop pixels through the group's material
+    /// shape, with lensing strongest near the group edge.
+    pub fn backdrop_lens(
+        mut self,
+        refraction_radius: Pixels,
+        rim_width: Pixels,
+        chromatic_aberration: Pixels,
+        highlight_strength: f32,
+        shadow_strength: f32,
+        light_direction: Point<f32>,
+    ) -> Self {
+        self.effects.push(CompositeEffect::backdrop_lens(
+            refraction_radius,
+            rim_width,
+            chromatic_aberration,
+            highlight_strength,
+            shadow_strength,
+            light_direction,
+        ));
+        self
+    }
+
     /// Draws a translucent tint over the backdrop material under the group.
     pub fn backdrop_tint(mut self, color: Hsla) -> Self {
         self.effects.push(CompositeEffect::backdrop_tint(color));
@@ -281,6 +303,28 @@ impl RenderGroup {
     /// Applies a Gaussian blur to the already-rendered backdrop under the group.
     pub fn backdrop_blur(mut self, radius: Pixels) -> Self {
         self.effects.push(CompositeEffect::backdrop_blur(radius));
+        self
+    }
+
+    /// Refracts already-rendered backdrop pixels through the group's material
+    /// shape, with lensing strongest near the group edge.
+    pub fn backdrop_lens(
+        mut self,
+        refraction_radius: Pixels,
+        rim_width: Pixels,
+        chromatic_aberration: Pixels,
+        highlight_strength: f32,
+        shadow_strength: f32,
+        light_direction: Point<f32>,
+    ) -> Self {
+        self.effects.push(CompositeEffect::backdrop_lens(
+            refraction_radius,
+            rim_width,
+            chromatic_aberration,
+            highlight_strength,
+            shadow_strength,
+            light_direction,
+        ));
         self
     }
 

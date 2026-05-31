@@ -881,6 +881,7 @@ pub enum CompositeEffect {
     SourceBlur(Pixels),
     BackdropColorFilter(SourceColorFilter),
     BackdropBlur(Pixels),
+    BackdropLens(CompositeBackdropLens<Pixels>),
     BackdropTint(Hsla),
     DropShadow(CompositeDropShadow<Pixels>),
     RoundedMask(Corners<Pixels>),
@@ -963,6 +964,26 @@ impl CompositeEffect {
         Self::BackdropBlur(Pixels(radius.0.max(0.)))
     }
 
+    /// Refracts already-rendered backdrop pixels through the group's material
+    /// shape, producing lensing that is strongest near the group edge.
+    pub fn backdrop_lens(
+        refraction_radius: Pixels,
+        rim_width: Pixels,
+        chromatic_aberration: Pixels,
+        highlight_strength: f32,
+        shadow_strength: f32,
+        light_direction: Point<f32>,
+    ) -> Self {
+        Self::BackdropLens(CompositeBackdropLens::new(
+            refraction_radius,
+            rim_width,
+            chromatic_aberration,
+            highlight_strength,
+            shadow_strength,
+            light_direction,
+        ))
+    }
+
     /// Draws a translucent tint over the backdrop material under the group.
     pub fn backdrop_tint(color: Hsla) -> Self {
         Self::BackdropTint(color)
@@ -996,6 +1017,7 @@ impl CompositeEffect {
             Self::SourceBlur(radius) => radius.0 <= f32::EPSILON,
             Self::BackdropColorFilter(filter) => filter.is_identity(),
             Self::BackdropBlur(radius) => radius.0 <= f32::EPSILON,
+            Self::BackdropLens(lens) => lens.is_identity(),
             Self::BackdropTint(color) => color.a <= f32::EPSILON,
             Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
             Self::RoundedMask(_) => false,
@@ -1008,6 +1030,7 @@ impl CompositeEffect {
         match self {
             Self::BackdropColorFilter(filter) => !filter.is_identity(),
             Self::BackdropBlur(radius) => radius.0 > f32::EPSILON,
+            Self::BackdropLens(lens) => !lens.is_identity(),
             Self::BackdropTint(color) => color.a > f32::EPSILON,
             Self::BlendMode(mode) => *mode != CompositeBlendMode::Normal,
             Self::Opacity(_)
@@ -1026,6 +1049,106 @@ pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
     pub offset: Point<P>,
     pub blur_radius: P,
     pub color: Hsla,
+}
+
+/// Backdrop lensing derived from a render group's material shape.
+///
+/// The lens displaces parent-target samples along the material shape's signed
+/// distance gradient. Refraction and chromatic-aberration radii are strongest
+/// within `rim_width` of the shape edge and fade toward the center.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct CompositeBackdropLens<P: Clone + Copy + Debug + Default + PartialEq> {
+    refraction_radius: P,
+    rim_width: P,
+    chromatic_aberration: P,
+    highlight_strength: f32,
+    shadow_strength: f32,
+    light_direction: Point<f32>,
+}
+
+impl CompositeBackdropLens<Pixels> {
+    /// Creates a backdrop lens effect.
+    pub fn new(
+        refraction_radius: Pixels,
+        rim_width: Pixels,
+        chromatic_aberration: Pixels,
+        highlight_strength: f32,
+        shadow_strength: f32,
+        light_direction: Point<f32>,
+    ) -> Self {
+        Self {
+            refraction_radius: Pixels(refraction_radius.0.max(0.)),
+            rim_width: Pixels(rim_width.0.max(0.)),
+            chromatic_aberration: Pixels(chromatic_aberration.0.max(0.)),
+            highlight_strength: highlight_strength.max(0.),
+            shadow_strength: shadow_strength.max(0.),
+            light_direction,
+        }
+    }
+
+    fn scale(self, scale_factor: f32) -> CompositeBackdropLens<ScaledPixels> {
+        CompositeBackdropLens {
+            refraction_radius: self.refraction_radius.scale(scale_factor),
+            rim_width: self.rim_width.scale(scale_factor),
+            chromatic_aberration: self.chromatic_aberration.scale(scale_factor),
+            highlight_strength: self.highlight_strength,
+            shadow_strength: self.shadow_strength,
+            light_direction: self.light_direction,
+        }
+    }
+
+    /// Returns whether this lens leaves backdrop pixels unchanged.
+    pub fn is_identity(&self) -> bool {
+        self.rim_width.0 <= f32::EPSILON
+            || (self.refraction_radius.0 <= f32::EPSILON
+                && self.chromatic_aberration.0 <= f32::EPSILON
+                && self.highlight_strength <= f32::EPSILON
+                && self.shadow_strength <= f32::EPSILON)
+    }
+}
+
+impl CompositeBackdropLens<ScaledPixels> {
+    /// Returns whether this lens leaves backdrop pixels unchanged.
+    pub fn is_identity(&self) -> bool {
+        self.rim_width.0 <= f32::EPSILON
+            || (self.refraction_radius.0 <= f32::EPSILON
+                && self.chromatic_aberration.0 <= f32::EPSILON
+                && self.highlight_strength <= f32::EPSILON
+                && self.shadow_strength <= f32::EPSILON)
+    }
+}
+
+impl<P: Clone + Copy + Debug + Default + PartialEq> CompositeBackdropLens<P> {
+    /// Returns the maximum backdrop-sample displacement.
+    pub fn refraction_radius(&self) -> P {
+        self.refraction_radius
+    }
+
+    /// Returns the edge band over which lensing fades in.
+    pub fn rim_width(&self) -> P {
+        self.rim_width
+    }
+
+    /// Returns the per-channel displacement around the refracted sample.
+    pub fn chromatic_aberration(&self) -> P {
+        self.chromatic_aberration
+    }
+
+    /// Returns the rim highlight strength.
+    pub fn highlight_strength(&self) -> f32 {
+        self.highlight_strength
+    }
+
+    /// Returns the opposite-edge darkening strength.
+    pub fn shadow_strength(&self) -> f32 {
+        self.shadow_strength
+    }
+
+    /// Returns the screen-space light direction.
+    pub fn light_direction(&self) -> Point<f32> {
+        self.light_direction
+    }
 }
 
 /// Final blend operation used when compositing a render group against its backdrop.
@@ -1178,6 +1301,7 @@ pub struct CompositeEffectPlan {
     source_blur_radius: ScaledPixels,
     backdrop_color_filter: SourceColorFilter,
     backdrop_blur_radius: ScaledPixels,
+    backdrop_lens: Option<CompositeBackdropLens<ScaledPixels>>,
     backdrop_tint: Hsla,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
     rounded_mask: Option<Corners<ScaledPixels>>,
@@ -1220,6 +1344,7 @@ impl CompositeEffectPlan {
             source_blur_radius: ScaledPixels(0.),
             backdrop_color_filter: SourceColorFilter::identity(),
             backdrop_blur_radius: ScaledPixels(0.),
+            backdrop_lens: None,
             backdrop_tint: transparent_black(),
             drop_shadows: Vec::new(),
             rounded_mask: None,
@@ -1247,6 +1372,9 @@ impl CompositeEffectPlan {
                     plan.backdrop_blur_radius = ScaledPixels(
                         (plan.backdrop_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt(),
                     );
+                }
+                CompositeEffect::BackdropLens(lens) => {
+                    plan.backdrop_lens = Some(lens.scale(scale_factor));
                 }
                 CompositeEffect::BackdropTint(color) => {
                     plan.backdrop_tint = composite_tint(plan.backdrop_tint, *color);
@@ -1296,6 +1424,11 @@ impl CompositeEffectPlan {
         self.backdrop_blur_radius
     }
 
+    /// Returns the optional normalized backdrop lens in device pixels.
+    pub fn backdrop_lens(&self) -> Option<CompositeBackdropLens<ScaledPixels>> {
+        self.backdrop_lens
+    }
+
     /// Returns the normalized backdrop tint.
     pub fn backdrop_tint(&self) -> Hsla {
         self.backdrop_tint
@@ -1305,6 +1438,7 @@ impl CompositeEffectPlan {
     pub fn has_backdrop_material(&self) -> bool {
         self.backdrop_blur_radius.0 > f32::EPSILON
             || !self.backdrop_color_filter.is_identity()
+            || self.backdrop_lens.is_some_and(|lens| !lens.is_identity())
             || self.backdrop_tint.a > f32::EPSILON
     }
 
@@ -1345,6 +1479,7 @@ impl CompositeEffectPlan {
                 CompositeEffect::BackdropBlur(radius) => {
                     outset = ScaledPixels(outset.0.max(radius.scale(scale_factor).0 * 3.));
                 }
+                CompositeEffect::BackdropLens(_) => {}
                 CompositeEffect::Opacity(_)
                 | CompositeEffect::SourceColorFilter(_)
                 | CompositeEffect::BackdropColorFilter(_)
@@ -1705,5 +1840,31 @@ mod tests {
             ),
             ScaledPixels(38.)
         );
+    }
+
+    #[test]
+    fn composite_effect_plan_scales_backdrop_lens_geometry() {
+        let plan = CompositeEffectPlan::from_effects(
+            2.,
+            1.,
+            &[CompositeEffect::backdrop_lens(
+                Pixels(4.),
+                Pixels(8.),
+                Pixels(1.5),
+                0.4,
+                0.2,
+                point(-0.5, -1.),
+            )],
+        );
+
+        let lens = plan.backdrop_lens().expect("backdrop lens");
+        assert_eq!(lens.refraction_radius(), ScaledPixels(8.));
+        assert_eq!(lens.rim_width(), ScaledPixels(16.));
+        assert_eq!(lens.chromatic_aberration(), ScaledPixels(3.));
+        assert_eq!(lens.highlight_strength(), 0.4);
+        assert_eq!(lens.shadow_strength(), 0.2);
+        assert_eq!(lens.light_direction(), point(-0.5, -1.));
+        assert!(plan.reads_backdrop());
+        assert!(plan.has_backdrop_material());
     }
 }

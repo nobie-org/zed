@@ -1024,12 +1024,10 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
         if (abs(x) <= radius) {
           float2 offset = float2(float(x), float(y));
           float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
-          color += sample_group_source(
+          color += sample_group_texture(
               intermediate_texture,
               intermediate_texture_sampler,
-              coords + offset * pixel_size,
-              point + offset,
-              input) * weight;
+              coords + offset * pixel_size) * weight;
           total += weight;
         }
       }
@@ -1039,7 +1037,7 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
   if (total <= 0.0) {
     return float4(0.0);
   }
-  return color / total;
+  return (color / total) * group_source_mask_alpha(point, input);
 }
 
 float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,

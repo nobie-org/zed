@@ -1253,11 +1253,7 @@ fn sample_group_source_blurred(
                 if (abs(x) <= radius) {
                     let offset = vec2<f32>(f32(x), f32(y));
                     let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
-                    color += sample_group_source(
-                        coords + offset * pixel_size,
-                        point + offset,
-                        sprite,
-                    ) * weight;
+                    color += sample_group_texture(coords + offset * pixel_size) * weight;
                     total += weight;
                 }
             }
@@ -1267,7 +1263,7 @@ fn sample_group_source_blurred(
     if (total <= 0.0) {
         return vec4<f32>(0.0);
     }
-    return color / total;
+    return (color / total) * group_source_mask_alpha(point, sprite);
 }
 
 fn sample_backdrop_blurred(

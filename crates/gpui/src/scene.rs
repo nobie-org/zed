@@ -1695,6 +1695,10 @@ fn composite_tint(below: Hsla, above: Hsla) -> Hsla {
     })
 }
 
+fn gaussian_kernel_outset(sigma: ScaledPixels) -> ScaledPixels {
+    ScaledPixels((sigma.0 * 3.).min(24.))
+}
+
 impl CompositeEffectPlan {
     /// Normalizes an ordered render-group effect list for renderer consumption.
     pub fn from_effects(
@@ -1853,16 +1857,25 @@ impl CompositeEffectPlan {
         for effect in effects {
             match effect {
                 CompositeEffect::SourceBlur(radius) => {
-                    outset = ScaledPixels(outset.0.max(radius.scale(scale_factor).0 * 3.));
+                    outset = ScaledPixels(
+                        outset
+                            .0
+                            .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
+                    );
                 }
                 CompositeEffect::DropShadow(shadow) => {
                     let offset = shadow.offset.scale(scale_factor);
-                    let blur_outset = shadow.blur_radius.scale(scale_factor).0 * 3.;
+                    let blur_outset =
+                        gaussian_kernel_outset(shadow.blur_radius.scale(scale_factor)).0;
                     let shadow_outset = offset.x.0.abs().max(offset.y.0.abs()) + blur_outset;
                     outset = ScaledPixels(outset.0.max(shadow_outset));
                 }
                 CompositeEffect::BackdropBlur(radius) => {
-                    outset = ScaledPixels(outset.0.max(radius.scale(scale_factor).0 * 3.));
+                    outset = ScaledPixels(
+                        outset
+                            .0
+                            .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
+                    );
                 }
                 CompositeEffect::BackdropLens(_) => {}
                 CompositeEffect::Opacity(_)
@@ -2227,7 +2240,7 @@ mod tests {
                     CompositeEffect::drop_shadow(point(Pixels(4.), Pixels(-2.)), Pixels(5.), red()),
                 ],
             ),
-            ScaledPixels(38.)
+            ScaledPixels(32.)
         );
     }
 
@@ -2271,6 +2284,29 @@ mod tests {
                 CompositeEffect::material_shape(shape),
                 CompositeEffect::backdrop_blur(Pixels(4.))
             ]
+        );
+    }
+
+    #[test]
+    fn visual_outset_matches_capped_shader_blur_kernel() {
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(1., &[CompositeEffect::source_blur(Pixels(20.))]),
+            ScaledPixels(24.)
+        );
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(1., &[CompositeEffect::backdrop_blur(Pixels(20.))]),
+            ScaledPixels(24.)
+        );
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(
+                1.,
+                &[CompositeEffect::drop_shadow(
+                    point(Pixels(5.), Pixels(-3.)),
+                    Pixels(20.),
+                    red(),
+                )],
+            ),
+            ScaledPixels(29.)
         );
     }
 

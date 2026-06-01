@@ -388,6 +388,28 @@ fn render_group_rounded_mask_clips_composited_source() {
 }
 
 #[test]
+fn render_group_rounded_mask_clips_blurred_source_body() {
+    let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(4., 4., 20., 20.),
+        vec![
+            CompositeEffect::source_blur(px(4.)),
+            CompositeEffect::rounded_mask(Corners::all(px(8.))),
+        ],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    assert!(pixel(&image, 14, 14)[1] > 200);
+    assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
+}
+
+#[test]
 fn render_group_backdrop_tint_draws_material_without_source_fill() {
     let group_scene = Scene::default();
 

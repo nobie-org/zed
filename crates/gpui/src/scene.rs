@@ -916,8 +916,7 @@ impl GroupShape {
         }
     }
 
-    /// Returns the rounded-rectangle corner radii.
-    pub fn corner_radii(&self) -> Corners<Pixels> {
+    fn corner_radii(&self) -> Corners<Pixels> {
         self.corner_radii
     }
 }
@@ -1064,7 +1063,7 @@ impl CompositeEffect {
             Self::BackdropBlur(radius) => radius.0 <= f32::EPSILON,
             Self::BackdropLens(lens) => lens.is_identity(),
             Self::BackdropTint(color) => color.a <= f32::EPSILON,
-            Self::MaterialShape(_) => false,
+            Self::MaterialShape(_) => true,
             Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
             Self::RoundedMask(_) => false,
             Self::BlendMode(mode) => *mode == CompositeBlendMode::Normal,
@@ -1264,6 +1263,10 @@ impl GlassLens {
             self.light_direction,
         )
     }
+
+    fn is_identity(&self) -> bool {
+        self.into_composite_lens().is_identity()
+    }
 }
 
 /// A backdrop-sampling glass surface for a render group.
@@ -1339,6 +1342,14 @@ impl GlassSurface {
     }
 
     pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
+        let has_material = self.frost_radius.0 > f32::EPSILON
+            || !self.color_filter.is_identity()
+            || self.lens.is_some_and(|lens| !lens.is_identity())
+            || self.tint.a > f32::EPSILON;
+        if !has_material {
+            return;
+        }
+
         effects.push(CompositeEffect::material_shape(self.shape));
         if self.frost_radius.0 > f32::EPSILON {
             effects.push(CompositeEffect::backdrop_blur(self.frost_radius));
@@ -2234,6 +2245,33 @@ mod tests {
         assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(8.))));
         assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(18.))));
         assert_eq!(plan.rounded_mask(), None);
+    }
+
+    #[test]
+    fn material_shape_is_identity_without_a_material_effect() {
+        assert!(
+            CompositeEffect::material_shape(GroupShape::rounded_rect(Corners::all(Pixels(9.))))
+                .is_identity()
+        );
+    }
+
+    #[test]
+    fn empty_glass_surface_lowers_to_no_effects() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(9.)));
+        let mut effects = Vec::new();
+        GlassSurface::for_shape(shape).push_effects(&mut effects);
+        assert_eq!(effects, []);
+
+        GlassSurface::for_shape(shape)
+            .frost(Pixels(4.))
+            .push_effects(&mut effects);
+        assert_eq!(
+            effects,
+            [
+                CompositeEffect::material_shape(shape),
+                CompositeEffect::backdrop_blur(Pixels(4.))
+            ]
+        );
     }
 
     #[test]

@@ -526,6 +526,51 @@ fn render_group_staged_clip_then_blur_spreads_past_mask_edge() {
 }
 
 #[test]
+fn nested_source_blur_inside_outer_mask_clips_finished_inner_group() {
+    let inner_group_scene = finished_scene([quad(0, rect(12., 12., 8., 8.), green())]);
+
+    let mut outer_group_scene = Scene::default();
+    outer_group_scene.insert_primitive(paint_group_with_bounds(
+        0,
+        rect(12., 12., 8., 8.),
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::source_blur(px(4.))],
+        inner_group_scene,
+    ));
+    outer_group_scene.finish();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(10., 10., 12., 12.),
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::source_mask(GroupShape::rectangle())],
+        outer_group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let outside_outer_mask = pixel(&image, 9, 16);
+    let inside_blur = pixel(&image, 10, 16);
+    let center = pixel(&image, 16, 16);
+
+    assert_eq!(
+        outside_outer_mask,
+        [0, 0, 0, 255],
+        "outer mask must clip the already-blurred inner group at its boundary"
+    );
+    assert!(
+        inside_blur[1] > outside_outer_mask[1],
+        "inner blur should survive up to the inside of the outer mask: inside={inside_blur:?} outside={outside_outer_mask:?}"
+    );
+    assert!(
+        center[1] > inside_blur[1],
+        "center source should remain stronger than the blur fringe: center={center:?} fringe={inside_blur:?}"
+    );
+}
+
+#[test]
 fn render_group_processed_content_glow_follows_bright_pixels() {
     let group_scene = finished_scene([quad(0, rect(13., 13., 4., 4.), white())]);
 

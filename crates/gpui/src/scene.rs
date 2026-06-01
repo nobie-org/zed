@@ -3979,6 +3979,150 @@ mod tests {
         );
     }
 
+    fn semantic_plan(
+        surface: Option<GlassSurface>,
+        content: ContentLayer,
+        derived_layers: impl IntoIterator<Item = DerivedLayer>,
+    ) -> LogicalVisualPlan {
+        let input = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            surface,
+            content,
+            derived_layers,
+            Composite::normal(),
+        ));
+        LogicalVisualPlan::from_input(1., 1., &input)
+    }
+
+    fn assert_single_exact_limit_rejection(
+        plan: &LogicalVisualPlan,
+        rejected_effect: RenderGroupRejectedEffect,
+        requested: f32,
+    ) {
+        assert_eq!(plan.planning_rejections().len(), 1);
+        assert_eq!(
+            plan.planning_rejections()[0],
+            RenderGroupPlanningRejection {
+                effect: rejected_effect,
+                reason: RenderGroupPlanningRejectionReason::LimitExceeded {
+                    limit: ScaledPixels(8.),
+                    requested: ScaledPixels(requested),
+                    unit: RenderGroupLimitUnit::GaussianSigma,
+                },
+                suggestion: "use an explicitly approximate blur tier or reduce the exact blur radius",
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_content_blur_rejects_exact_radius_beyond_kernel_limit() {
+        let plan = semantic_plan(None, ContentLayer::unclipped().blur(Pixels(9.)), []);
+
+        assert_single_exact_limit_rejection(&plan, RenderGroupRejectedEffect::SourceBlur, 9.);
+        assert!(
+            !plan
+                .accepted_effects()
+                .iter()
+                .any(|effect| matches!(effect, CompositeEffect::SourceBlur(_)))
+        );
+        assert_eq!(
+            plan.normalized_effects().source_blur_radius(),
+            ScaledPixels(0.)
+        );
+    }
+
+    #[test]
+    fn semantic_surface_frost_rejects_exact_radius_beyond_kernel_limit() {
+        let shape = GroupShape::rectangle();
+        let plan = semantic_plan(
+            Some(GlassSurface::for_shape(shape).frost(Pixels(9.))),
+            ContentLayer::default(),
+            [],
+        );
+
+        assert_single_exact_limit_rejection(&plan, RenderGroupRejectedEffect::BackdropBlur, 9.);
+        assert!(
+            !plan
+                .accepted_effects()
+                .iter()
+                .any(|effect| matches!(effect, CompositeEffect::BackdropBlur(_)))
+        );
+        assert_eq!(
+            plan.normalized_effects().backdrop_blur_radius(),
+            ScaledPixels(0.)
+        );
+    }
+
+    #[test]
+    fn semantic_content_alpha_shadow_rejects_exact_radius_beyond_kernel_limit() {
+        let plan = semantic_plan(
+            None,
+            ContentLayer::default(),
+            [DerivedLayer::from_content_alpha().shadow(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(9.),
+                red(),
+            )],
+        );
+
+        assert_single_exact_limit_rejection(&plan, RenderGroupRejectedEffect::DropShadow, 9.);
+        assert!(
+            !plan
+                .accepted_effects()
+                .iter()
+                .any(|effect| matches!(effect, CompositeEffect::DropShadow(_)))
+        );
+        assert_eq!(plan.normalized_effects().drop_shadows(), []);
+    }
+
+    #[test]
+    fn semantic_surface_shape_shadow_rejects_exact_radius_beyond_kernel_limit() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
+        let plan = semantic_plan(
+            None,
+            ContentLayer::default(),
+            [DerivedLayer::from_surface_shape(shape).shadow(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(9.),
+                red(),
+            )],
+        );
+
+        assert_single_exact_limit_rejection(&plan, RenderGroupRejectedEffect::SurfaceShadow, 9.);
+        assert!(
+            !plan
+                .accepted_effects()
+                .iter()
+                .any(|effect| matches!(effect, CompositeEffect::SurfaceShadow(_)))
+        );
+        assert_eq!(plan.normalized_effects().surface_shadows(), []);
+    }
+
+    #[test]
+    fn semantic_processed_content_glow_rejects_exact_radius_beyond_kernel_limit() {
+        let plan = semantic_plan(
+            None,
+            ContentLayer::default(),
+            [DerivedLayer::from_processed_content([
+                DerivedStage::threshold_luma(LumaThreshold::above(0.8)),
+                DerivedStage::exact_blur(Pixels(9.)),
+            ])
+            .glow(Glow::tinted(red()))],
+        );
+
+        assert_single_exact_limit_rejection(
+            &plan,
+            RenderGroupRejectedEffect::ProcessedContentGlow,
+            9.,
+        );
+        assert!(
+            !plan
+                .accepted_effects()
+                .iter()
+                .any(|effect| matches!(effect, CompositeEffect::ProcessedContentGlow(_)))
+        );
+        assert_eq!(plan.normalized_effects().processed_content_glows(), []);
+    }
+
     #[test]
     fn logical_visual_plan_rejects_exact_blur_beyond_kernel_limit() {
         let shape = GroupShape::rectangle();

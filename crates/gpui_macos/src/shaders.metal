@@ -842,13 +842,17 @@ struct GroupSpriteVertexOutput {
   float opacity;
   uint effect_kind [[flat]];
   float source_blur_radius;
-  float mask_enabled;
+  float source_mask_enabled;
   float2 shadow_offset;
   float shadow_blur_radius;
   float backdrop_blur_radius;
+  uint source_mask_blur_order [[flat]];
+  float derived_luma_threshold;
   float4 shadow_color;
-  float4 mask_bounds;
-  float4 mask_corner_radii;
+  float4 source_mask_bounds;
+  float4 source_mask_corner_radii;
+  float4 material_shape_bounds;
+  float4 material_shape_corner_radii;
   float4 color_matrix_0;
   float4 color_matrix_1;
   float4 color_matrix_2;
@@ -888,13 +892,17 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     sprite.opacity,
     sprite.effect_kind,
     sprite.source_blur_radius,
-    sprite.mask_enabled,
+    sprite.source_mask_enabled,
     float2(sprite.shadow_offset[0], sprite.shadow_offset[1]),
     sprite.shadow_blur_radius,
     sprite.backdrop_blur_radius,
+    sprite.source_mask_blur_order,
+    sprite.derived_luma_threshold,
     float4(sprite.shadow_color[0], sprite.shadow_color[1], sprite.shadow_color[2], sprite.shadow_color[3]),
-    float4(sprite.mask_bounds.origin.x, sprite.mask_bounds.origin.y, sprite.mask_bounds.size.width, sprite.mask_bounds.size.height),
-    float4(sprite.mask_corner_radii.top_left, sprite.mask_corner_radii.top_right, sprite.mask_corner_radii.bottom_right, sprite.mask_corner_radii.bottom_left),
+    float4(sprite.source_mask_bounds.origin.x, sprite.source_mask_bounds.origin.y, sprite.source_mask_bounds.size.width, sprite.source_mask_bounds.size.height),
+    float4(sprite.source_mask_corner_radii.top_left, sprite.source_mask_corner_radii.top_right, sprite.source_mask_corner_radii.bottom_right, sprite.source_mask_corner_radii.bottom_left),
+    float4(sprite.material_shape_bounds.origin.x, sprite.material_shape_bounds.origin.y, sprite.material_shape_bounds.size.width, sprite.material_shape_bounds.size.height),
+    float4(sprite.material_shape_corner_radii.top_left, sprite.material_shape_corner_radii.top_right, sprite.material_shape_corner_radii.bottom_right, sprite.material_shape_corner_radii.bottom_left),
     float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
     float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
     float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
@@ -911,39 +919,9 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
   };
 }
 
-float group_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
-  if (input.mask_enabled <= 0.0) {
-    return 1.0;
-  }
-
-  float2 half_size = input.mask_bounds.zw / 2.0;
-  float2 center = input.mask_bounds.xy + half_size;
-  float2 center_to_point = point - center;
-  float corner_radius = input.mask_corner_radii.x;
-  if (center_to_point.x < 0.0) {
-    if (center_to_point.y >= 0.0) {
-      corner_radius = input.mask_corner_radii.w;
-    }
-  } else {
-    if (center_to_point.y < 0.0) {
-      corner_radius = input.mask_corner_radii.y;
-    } else {
-      corner_radius = input.mask_corner_radii.z;
-    }
-  }
-  float2 corner_to_point = abs(center_to_point) - half_size;
-  float2 corner_center_to_point = corner_to_point + corner_radius;
-  return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
-}
-
-float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
-  float4 corner_radii = float4(0.0);
-  if (input.mask_enabled > 0.0) {
-    corner_radii = input.mask_corner_radii;
-  }
-
-  float2 half_size = input.mask_bounds.zw / 2.0;
-  float2 center = input.mask_bounds.xy + half_size;
+float group_rounded_shape_sdf(float2 point, float4 bounds, float4 corner_radii) {
+  float2 half_size = bounds.zw / 2.0;
+  float2 center = bounds.xy + half_size;
   float2 center_to_point = point - center;
   float corner_radius = corner_radii.x;
   if (center_to_point.x < 0.0) {
@@ -960,6 +938,18 @@ float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
   float2 corner_to_point = abs(center_to_point) - half_size;
   float2 corner_center_to_point = corner_to_point + corner_radius;
   return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+float group_source_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
+  if (input.source_mask_enabled <= 0.0) {
+    return 1.0;
+  }
+
+  return saturate(0.5 - group_rounded_shape_sdf(point, input.source_mask_bounds, input.source_mask_corner_radii));
+}
+
+float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
+  return group_rounded_shape_sdf(point, input.material_shape_bounds, input.material_shape_corner_radii);
 }
 
 float group_material_alpha(float2 point, GroupSpriteVertexOutput input) {
@@ -979,14 +969,14 @@ float2 group_material_normal(float2 point, GroupSpriteVertexOutput input) {
   return gradient / gradient_length;
 }
 
-float group_lens_rim(float2 point, GroupSpriteVertexOutput input) {
-  if (input.backdrop_lens.w <= 0.0 || input.backdrop_lens.y <= 0.0) {
-    return 0.0;
-  }
-
-  float distance_to_edge = abs(group_material_sdf(point, input));
-  float rim = 1.0 - smoothstep(0.0, input.backdrop_lens.y, distance_to_edge);
-  return rim * group_material_alpha(point, input);
+float3 group_lens_rounded_side(float edge_position, float material_alpha) {
+  float bevel_t = smoothstep(0.0, 1.0, edge_position);
+  float center_gate = 1.0 - smoothstep(0.94, 1.0, edge_position);
+  float wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha * center_gate;
+  float body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha * center_gate;
+  float ridge_position = (edge_position - 0.68) / 0.34;
+  float ridge = exp(-(ridge_position * ridge_position)) * body;
+  return float3(wall, body, ridge);
 }
 
 float4 sample_group_texture(texture2d<float> intermediate_texture,
@@ -1009,13 +999,46 @@ float4 sample_backdrop_texture(texture2d<float> backdrop_texture,
   return backdrop_texture.sample(texture_sampler, coords);
 }
 
+float4 load_backdrop_texel_clamped(texture2d<float> backdrop_texture,
+                                   int2 texel) {
+  int2 max_texel = int2(
+      int(backdrop_texture.get_width()) - 1,
+      int(backdrop_texture.get_height()) - 1);
+  int2 clamped_texel = clamp(texel, int2(0), max_texel);
+  return backdrop_texture.read(uint2(clamped_texel));
+}
+
+float4 sample_backdrop_texture_linear(texture2d<float> backdrop_texture,
+                                      float2 coords) {
+  if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+    return float4(0.0);
+  }
+
+  float2 dimensions = float2(
+      float(backdrop_texture.get_width()),
+      float(backdrop_texture.get_height()));
+  float2 texel = coords * dimensions - float2(0.5);
+  float2 texel_floor = floor(texel);
+  int2 base = int2(texel_floor);
+  float2 fraction = texel - texel_floor;
+
+  float4 top_left = load_backdrop_texel_clamped(backdrop_texture, base);
+  float4 top_right = load_backdrop_texel_clamped(backdrop_texture, base + int2(1, 0));
+  float4 bottom_left = load_backdrop_texel_clamped(backdrop_texture, base + int2(0, 1));
+  float4 bottom_right = load_backdrop_texel_clamped(backdrop_texture, base + int2(1, 1));
+
+  float4 top = mix(top_left, top_right, fraction.x);
+  float4 bottom = mix(bottom_left, bottom_right, fraction.x);
+  return mix(top, bottom, fraction.y);
+}
+
 float4 sample_group_source(texture2d<float> intermediate_texture,
                            sampler intermediate_texture_sampler,
                            float2 coords,
                            float2 point,
                            GroupSpriteVertexOutput input) {
   return sample_group_texture(intermediate_texture, intermediate_texture_sampler, coords) *
-         group_mask_alpha(point, input);
+         group_source_mask_alpha(point, input);
 }
 
 float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
@@ -1038,12 +1061,19 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
         if (abs(x) <= radius) {
           float2 offset = float2(float(x), float(y));
           float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
-          color += sample_group_source(
-              intermediate_texture,
-              intermediate_texture_sampler,
-              coords + offset * pixel_size,
-              point + offset,
-              input) * weight;
+          if (input.source_mask_blur_order == 1) {
+            color += sample_group_source(
+                intermediate_texture,
+                intermediate_texture_sampler,
+                coords + offset * pixel_size,
+                point + offset,
+                input) * weight;
+          } else {
+            color += sample_group_texture(
+                intermediate_texture,
+                intermediate_texture_sampler,
+                coords + offset * pixel_size) * weight;
+          }
           total += weight;
         }
       }
@@ -1053,7 +1083,11 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
   if (total <= 0.0) {
     return float4(0.0);
   }
-  return color / total;
+  float4 blurred = color / total;
+  if (input.source_mask_blur_order == 1) {
+    return blurred;
+  }
+  return blurred * group_source_mask_alpha(point, input);
 }
 
 float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,
@@ -1090,6 +1124,38 @@ float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,
   return color / total;
 }
 
+float4 sample_backdrop_blurred_linear(texture2d<float> backdrop_texture,
+                                      float2 coords,
+                                      float2 pixel_size,
+                                      float sigma) {
+  if (sigma <= 0.0) {
+    return sample_backdrop_texture_linear(backdrop_texture, coords);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float4 color = float4(0.0);
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          color += sample_backdrop_texture_linear(
+              backdrop_texture,
+              coords + offset * pixel_size) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return float4(0.0);
+  }
+  return color / total;
+}
+
 float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
                               sampler texture_sampler,
                               float2 coords,
@@ -1097,29 +1163,44 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
                               float2 pixel_size,
                               float sigma,
                               GroupSpriteVertexOutput input) {
-  float rim = group_lens_rim(point, input);
-  if (rim <= 0.0) {
+  if (input.backdrop_lens.w <= 0.0 || input.backdrop_lens.y <= 0.0) {
     return sample_backdrop_blurred(
         backdrop_texture, texture_sampler, coords, pixel_size, sigma);
   }
 
+  float material_sdf = group_material_sdf(point, input);
+  float material_alpha = saturate(0.5 - material_sdf);
+  float rim_width = max(input.backdrop_lens.y, 0.0001);
+  float edge_position = saturate(max(-material_sdf, 0.0) / rim_width);
+  float3 rounded_side = group_lens_rounded_side(edge_position, material_alpha);
+  float wall = rounded_side.x;
+  float body = rounded_side.y;
+  float focus_ridge = rounded_side.z;
+  if (wall + body + focus_ridge <= 0.0) {
+    return sample_backdrop_blurred_linear(
+        backdrop_texture, coords, pixel_size, sigma);
+  }
+
+  float refraction_profile = saturate(
+      wall * 0.72 + body * 0.42 + focus_ridge * 0.10);
+  float chroma_profile = saturate(
+      wall * 0.54 + body * 0.22 + focus_ridge * 0.22);
+
   float2 normal = group_material_normal(point, input);
-  float2 refraction_offset = normal * input.backdrop_lens.x * rim * pixel_size;
+  float2 refraction_offset = normal * input.backdrop_lens.x * refraction_profile * pixel_size;
   float2 center_coords = coords + refraction_offset;
-  float4 sample = sample_backdrop_blurred(
-      backdrop_texture, texture_sampler, center_coords, pixel_size, sigma);
+  float4 sample = sample_backdrop_blurred_linear(
+      backdrop_texture, center_coords, pixel_size, sigma);
 
   if (input.backdrop_lens.z > 0.0) {
-    float2 chroma_offset = normal * input.backdrop_lens.z * rim * pixel_size;
-    float red = sample_backdrop_blurred(
+    float2 chroma_offset = normal * input.backdrop_lens.z * chroma_profile * pixel_size;
+    float red = sample_backdrop_blurred_linear(
         backdrop_texture,
-        texture_sampler,
         center_coords + chroma_offset,
         pixel_size,
         sigma).r;
-    float blue = sample_backdrop_blurred(
+    float blue = sample_backdrop_blurred_linear(
         backdrop_texture,
-        texture_sampler,
         center_coords - chroma_offset,
         pixel_size,
         sigma).b;
@@ -1134,9 +1215,43 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
   float2 light_direction = input.backdrop_lens_lighting.zw / light_length;
   float facing_light = max(dot(normal, light_direction), 0.0);
   float facing_shadow = max(dot(-normal, light_direction), 0.0);
-  float highlight = saturate(rim * facing_light * input.backdrop_lens_lighting.x);
-  float shadow = saturate(rim * facing_shadow * input.backdrop_lens_lighting.y);
+  float2 tangent = float2(-normal.y, normal.x);
+  float guided_light = pow(abs(dot(tangent, light_direction)), 2.0);
+  float highlight_profile =
+      wall * (0.18 + 0.46 * facing_light) +
+      body * (0.08 + 0.14 * facing_light) +
+      focus_ridge * (0.08 + 0.24 * guided_light);
+  float shadow_profile =
+      wall * 0.24 * facing_shadow +
+      body * 0.12 * facing_shadow +
+      focus_ridge * 0.18 * facing_shadow;
+  float highlight = saturate(highlight_profile * input.backdrop_lens_lighting.x);
+  float shadow = saturate(shadow_profile * input.backdrop_lens_lighting.y);
   float3 straight_rgb = sample.rgb / sample.a;
+  float reflection_profile = saturate(
+      (wall * 0.30 +
+       body * 0.18 +
+       focus_ridge * (0.18 + 0.32 * guided_light)) *
+      input.backdrop_lens_lighting.x);
+  reflection_profile = min(reflection_profile, 0.60);
+  if (reflection_profile > 0.0) {
+    float reflection_distance = max(input.backdrop_lens.x, rim_width * 0.55);
+    float reflection_envelope = saturate(wall * 0.70 + body * 0.42 + focus_ridge * 0.24);
+    float2 reflection_offset =
+        (tangent * reflection_distance * (0.45 + 0.35 * guided_light) -
+         normal * reflection_distance * 0.14) * reflection_envelope * pixel_size;
+    float4 reflection_sample = sample_backdrop_blurred_linear(
+        backdrop_texture,
+        coords + reflection_offset,
+        pixel_size,
+        sigma);
+    if (reflection_sample.a > 0.0) {
+      straight_rgb = mix(
+          straight_rgb,
+          reflection_sample.rgb / reflection_sample.a,
+          reflection_profile);
+    }
+  }
   straight_rgb = mix(straight_rgb, float3(1.0), highlight);
   straight_rgb *= 1.0 - shadow;
   return float4(straight_rgb * sample.a, sample.a);
@@ -1180,6 +1295,35 @@ float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
   return alpha / total;
 }
 
+float sample_material_alpha_blurred(float2 point,
+                                    float sigma,
+                                    GroupSpriteVertexOutput input) {
+  if (sigma <= 0.0) {
+    return group_material_alpha(point, input);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float alpha = 0.0;
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          alpha += group_material_alpha(point + offset, input) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  return alpha / total;
+}
+
 float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput input) {
   if (sample.a <= 0.0) {
     return sample;
@@ -1193,6 +1337,78 @@ float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput in
   ));
 
   return float4(rgb * sample.a, sample.a);
+}
+
+float4 sample_processed_content(texture2d<float> intermediate_texture,
+                                sampler intermediate_texture_sampler,
+                                float2 coords,
+                                float2 point,
+                                float2 pixel_size,
+                                GroupSpriteVertexOutput input) {
+  float4 sample = sample_group_source_blurred(
+      intermediate_texture,
+      intermediate_texture_sampler,
+      coords,
+      point,
+      pixel_size,
+      input.source_blur_radius,
+      input);
+  return apply_group_source_color_filter(sample, input);
+}
+
+float4 sample_processed_content_glow(texture2d<float> intermediate_texture,
+                                     sampler intermediate_texture_sampler,
+                                     float2 coords,
+                                     float2 point,
+                                     float2 pixel_size,
+                                     GroupSpriteVertexOutput input) {
+  float sigma = input.shadow_blur_radius;
+  if (sigma <= 0.0) {
+    float4 sample = sample_processed_content(
+        intermediate_texture,
+        intermediate_texture_sampler,
+        coords,
+        point,
+        pixel_size,
+        input);
+    float3 straight_rgb = sample.rgb / max(sample.a, 0.0001);
+    float luma = dot(straight_rgb, float3(0.2126, 0.7152, 0.0722));
+    float alpha = sample.a * step(input.derived_luma_threshold, luma) *
+                  input.shadow_color.a * input.opacity;
+    return float4(input.shadow_color.rgb * alpha, alpha);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float extracted_alpha = 0.0;
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          float4 sample = sample_processed_content(
+              intermediate_texture,
+              intermediate_texture_sampler,
+              coords + offset * pixel_size,
+              point + offset,
+              pixel_size,
+              input);
+          float3 straight_rgb = sample.rgb / max(sample.a, 0.0001);
+          float luma = dot(straight_rgb, float3(0.2126, 0.7152, 0.0722));
+          extracted_alpha += sample.a * step(input.derived_luma_threshold, luma) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return float4(0.0);
+  }
+
+  float alpha = (extracted_alpha / total) * input.shadow_color.a * input.opacity;
+  return float4(input.shadow_color.rgb * alpha, alpha);
 }
 
 float4 apply_group_backdrop_color_filter(float4 sample, GroupSpriteVertexOutput input) {
@@ -1279,6 +1495,23 @@ fragment float4 group_sprite_fragment(
         input.shadow_blur_radius,
         input) * input.shadow_color.a * input.opacity;
     return float4(input.shadow_color.rgb * alpha, alpha);
+  }
+  if (input.effect_kind == 2) {
+    float2 sample_point = input.screen_position - input.shadow_offset;
+    float alpha = sample_material_alpha_blurred(
+        sample_point,
+        input.shadow_blur_radius,
+        input) * input.shadow_color.a * input.opacity;
+    return float4(input.shadow_color.rgb * alpha, alpha);
+  }
+  if (input.effect_kind == 3) {
+    return sample_processed_content_glow(
+        intermediate_texture,
+        intermediate_texture_sampler,
+        input.texture_coords,
+        input.screen_position,
+        input.texture_pixel_size,
+        input);
   }
 
   float4 sample = sample_group_source_blurred(

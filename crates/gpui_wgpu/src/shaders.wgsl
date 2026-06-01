@@ -1126,13 +1126,18 @@ struct GroupSprite {
     opacity: f32,
     effect_kind: u32,
     source_blur_radius: f32,
-    mask_enabled: f32,
+    source_mask_enabled: f32,
     shadow_offset: vec2<f32>,
     shadow_blur_radius: f32,
     backdrop_blur_radius: f32,
+    source_mask_blur_order: u32,
+    derived_luma_threshold: f32,
+    pad1: vec2<u32>,
     shadow_color: vec4<f32>,
-    mask_bounds: Bounds,
-    mask_corner_radii: Corners,
+    source_mask_bounds: Bounds,
+    source_mask_corner_radii: Corners,
+    material_shape_bounds: Bounds,
+    material_shape_corner_radii: Corners,
     color_matrix: array<vec4<f32>, 4>,
     color_offset: vec4<f32>,
     backdrop_active: f32,
@@ -1172,12 +1177,12 @@ fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) inst
     return out;
 }
 
-fn group_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    if (sprite.mask_enabled <= 0.0) {
+fn group_source_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
+    if (sprite.source_mask_enabled <= 0.0) {
         return 1.0;
     }
 
-    return clamp(0.5 - quad_sdf(point, sprite.mask_bounds, sprite.mask_corner_radii), 0.0, 1.0);
+    return clamp(0.5 - quad_sdf(point, sprite.source_mask_bounds, sprite.source_mask_corner_radii), 0.0, 1.0);
 }
 
 fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
@@ -1185,11 +1190,7 @@ fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
 }
 
 fn group_material_sdf(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    var corner_radii = Corners(0.0, 0.0, 0.0, 0.0);
-    if (sprite.mask_enabled > 0.0) {
-        corner_radii = sprite.mask_corner_radii;
-    }
-    return quad_sdf(point, sprite.mask_bounds, corner_radii);
+    return quad_sdf(point, sprite.material_shape_bounds, sprite.material_shape_corner_radii);
 }
 
 fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {
@@ -1205,13 +1206,14 @@ fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {
     return gradient / gradient_length;
 }
 
-fn group_lens_rim(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    if (sprite.backdrop_lens.w <= 0.0 || sprite.backdrop_lens.y <= 0.0) {
-        return 0.0;
-    }
-    let distance_to_edge = abs(group_material_sdf(point, sprite));
-    let rim = 1.0 - smoothstep(0.0, sprite.backdrop_lens.y, distance_to_edge);
-    return rim * group_material_alpha(point, sprite);
+fn group_lens_rounded_side(edge_position: f32, material_alpha: f32) -> vec3<f32> {
+    let bevel_t = smoothstep(0.0, 1.0, edge_position);
+    let center_gate = 1.0 - smoothstep(0.94, 1.0, edge_position);
+    let wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha * center_gate;
+    let body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha * center_gate;
+    let ridge_position = (edge_position - 0.68) / 0.34;
+    let ridge = exp(-(ridge_position * ridge_position)) * body;
+    return vec3<f32>(wall, body, ridge);
 }
 
 fn sample_group_texture(coords: vec2<f32>) -> vec4<f32> {
@@ -1230,8 +1232,35 @@ fn sample_backdrop_texture(coords: vec2<f32>) -> vec4<f32> {
     return textureSample(t_backdrop, s_sprite, coords);
 }
 
+fn load_backdrop_texel_clamped(texel: vec2<i32>) -> vec4<f32> {
+    let dimensions = textureDimensions(t_backdrop);
+    let max_texel = vec2<i32>(i32(dimensions.x) - 1, i32(dimensions.y) - 1);
+    let clamped_texel = clamp(texel, vec2<i32>(0), max_texel);
+    return textureLoad(t_backdrop, clamped_texel, 0);
+}
+
+fn sample_backdrop_texture_linear(coords: vec2<f32>) -> vec4<f32> {
+    if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let dimensions = vec2<f32>(textureDimensions(t_backdrop));
+    let texel = coords * dimensions - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(texel));
+    let fraction = texel - floor(texel);
+
+    let top_left = load_backdrop_texel_clamped(base);
+    let top_right = load_backdrop_texel_clamped(base + vec2<i32>(1, 0));
+    let bottom_left = load_backdrop_texel_clamped(base + vec2<i32>(0, 1));
+    let bottom_right = load_backdrop_texel_clamped(base + vec2<i32>(1, 1));
+
+    let top = mix(top_left, top_right, fraction.x);
+    let bottom = mix(bottom_left, bottom_right, fraction.x);
+    return mix(top, bottom, fraction.y);
+}
+
 fn sample_group_source(coords: vec2<f32>, point: vec2<f32>, sprite: GroupSprite) -> vec4<f32> {
-    return sample_group_texture(coords) * group_mask_alpha(point, sprite);
+    return sample_group_texture(coords) * group_source_mask_alpha(point, sprite);
 }
 
 fn sample_group_source_blurred(
@@ -1255,11 +1284,15 @@ fn sample_group_source_blurred(
                 if (abs(x) <= radius) {
                     let offset = vec2<f32>(f32(x), f32(y));
                     let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
-                    color += sample_group_source(
-                        coords + offset * pixel_size,
-                        point + offset,
-                        sprite,
-                    ) * weight;
+                    if (sprite.source_mask_blur_order == 1u) {
+                        color += sample_group_source(
+                            coords + offset * pixel_size,
+                            point + offset,
+                            sprite,
+                        ) * weight;
+                    } else {
+                        color += sample_group_texture(coords + offset * pixel_size) * weight;
+                    }
                     total += weight;
                 }
             }
@@ -1269,7 +1302,11 @@ fn sample_group_source_blurred(
     if (total <= 0.0) {
         return vec4<f32>(0.0);
     }
-    return color / total;
+    let blurred = color / total;
+    if (sprite.source_mask_blur_order == 1u) {
+        return blurred;
+    }
+    return blurred * group_source_mask_alpha(point, sprite);
 }
 
 fn sample_backdrop_blurred(
@@ -1304,6 +1341,38 @@ fn sample_backdrop_blurred(
     return color / total;
 }
 
+fn sample_backdrop_blurred_linear(
+    coords: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+) -> vec4<f32> {
+    if (sigma <= 0.0) {
+        return sample_backdrop_texture_linear(coords);
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var color = vec4<f32>(0.0);
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            for (var x = -24; x <= 24; x = x + 1) {
+                if (abs(x) <= radius) {
+                    let offset = vec2<f32>(f32(x), f32(y));
+                    let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                    color += sample_backdrop_texture_linear(coords + offset * pixel_size) * weight;
+                    total += weight;
+                }
+            }
+        }
+    }
+
+    if (total <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return color / total;
+}
+
 fn sample_backdrop_lensed(
     coords: vec2<f32>,
     point: vec2<f32>,
@@ -1311,20 +1380,42 @@ fn sample_backdrop_lensed(
     sigma: f32,
     sprite: GroupSprite,
 ) -> vec4<f32> {
-    let rim = group_lens_rim(point, sprite);
-    if (rim <= 0.0) {
+    if (sprite.backdrop_lens.w <= 0.0 || sprite.backdrop_lens.y <= 0.0) {
         return sample_backdrop_blurred(coords, pixel_size, sigma);
     }
 
+    let material_sdf = group_material_sdf(point, sprite);
+    let material_alpha = clamp(0.5 - material_sdf, 0.0, 1.0);
+    let rim_width = max(sprite.backdrop_lens.y, 0.0001);
+    let edge_position = clamp(max(-material_sdf, 0.0) / rim_width, 0.0, 1.0);
+    let rounded_side = group_lens_rounded_side(edge_position, material_alpha);
+    let wall = rounded_side.x;
+    let body = rounded_side.y;
+    let focus_ridge = rounded_side.z;
+    if (wall + body + focus_ridge <= 0.0) {
+        return sample_backdrop_blurred_linear(coords, pixel_size, sigma);
+    }
+
+    let refraction_profile = clamp(
+        wall * 0.72 + body * 0.42 + focus_ridge * 0.10,
+        0.0,
+        1.0,
+    );
+    let chroma_profile = clamp(
+        wall * 0.54 + body * 0.22 + focus_ridge * 0.22,
+        0.0,
+        1.0,
+    );
+
     let normal = group_material_normal(point, sprite);
-    let refraction_offset = normal * sprite.backdrop_lens.x * rim * pixel_size;
+    let refraction_offset = normal * sprite.backdrop_lens.x * refraction_profile * pixel_size;
     let center_coords = coords + refraction_offset;
-    var sample = sample_backdrop_blurred(center_coords, pixel_size, sigma);
+    var sample = sample_backdrop_blurred_linear(center_coords, pixel_size, sigma);
 
     if (sprite.backdrop_lens.z > 0.0) {
-        let chroma_offset = normal * sprite.backdrop_lens.z * rim * pixel_size;
-        let red = sample_backdrop_blurred(center_coords + chroma_offset, pixel_size, sigma).r;
-        let blue = sample_backdrop_blurred(center_coords - chroma_offset, pixel_size, sigma).b;
+        let chroma_offset = normal * sprite.backdrop_lens.z * chroma_profile * pixel_size;
+        let red = sample_backdrop_blurred_linear(center_coords + chroma_offset, pixel_size, sigma).r;
+        let blue = sample_backdrop_blurred_linear(center_coords - chroma_offset, pixel_size, sigma).b;
         sample = vec4<f32>(red, sample.g, blue, sample.a);
     }
 
@@ -1336,9 +1427,44 @@ fn sample_backdrop_lensed(
     let light_direction = sprite.backdrop_lens_lighting.zw / light_length;
     let facing_light = max(dot(normal, light_direction), 0.0);
     let facing_shadow = max(dot(-normal, light_direction), 0.0);
-    let highlight = clamp(rim * facing_light * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
-    let shadow = clamp(rim * facing_shadow * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
+    let tangent = vec2<f32>(-normal.y, normal.x);
+    let guided_light = pow(abs(dot(tangent, light_direction)), 2.0);
+    let highlight_profile =
+        wall * (0.18 + 0.46 * facing_light) +
+        body * (0.08 + 0.14 * facing_light) +
+        focus_ridge * (0.08 + 0.24 * guided_light);
+    let shadow_profile =
+        wall * 0.24 * facing_shadow +
+        body * 0.12 * facing_shadow +
+        focus_ridge * 0.18 * facing_shadow;
+    let highlight = clamp(highlight_profile * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
+    let shadow = clamp(shadow_profile * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
     var straight_rgb = sample.rgb / sample.a;
+    let reflection_profile = clamp(
+        (
+            wall * 0.30 +
+            body * 0.18 +
+            focus_ridge * (0.18 + 0.32 * guided_light)
+        ) * sprite.backdrop_lens_lighting.x,
+        0.0,
+        0.60,
+    );
+    if (reflection_profile > 0.0) {
+        let reflection_distance = max(sprite.backdrop_lens.x, rim_width * 0.55);
+        let reflection_envelope = clamp(wall * 0.70 + body * 0.42 + focus_ridge * 0.24, 0.0, 1.0);
+        let reflection_offset =
+            (tangent * reflection_distance * (0.45 + 0.35 * guided_light) -
+            normal * reflection_distance * 0.14) * reflection_envelope * pixel_size;
+        let reflection_sample =
+            sample_backdrop_blurred_linear(coords + reflection_offset, pixel_size, sigma);
+        if (reflection_sample.a > 0.0) {
+            straight_rgb = mix(
+                straight_rgb,
+                reflection_sample.rgb / reflection_sample.a,
+                reflection_profile,
+            );
+        }
+    }
     straight_rgb = mix(straight_rgb, vec3<f32>(1.0), highlight);
     straight_rgb *= 1.0 - shadow;
     return vec4<f32>(straight_rgb * sample.a, sample.a);
@@ -1382,6 +1508,34 @@ fn sample_group_alpha_blurred(
     return alpha / total;
 }
 
+fn sample_material_alpha_blurred(point: vec2<f32>, sigma: f32, sprite: GroupSprite) -> f32 {
+    if (sigma <= 0.0) {
+        return group_material_alpha(point, sprite);
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var alpha = 0.0;
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            for (var x = -24; x <= 24; x = x + 1) {
+                if (abs(x) <= radius) {
+                    let offset = vec2<f32>(f32(x), f32(y));
+                    let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                    alpha += group_material_alpha(point + offset, sprite) * weight;
+                    total += weight;
+                }
+            }
+        }
+    }
+
+    if (total <= 0.0) {
+        return 0.0;
+    }
+    return alpha / total;
+}
+
 fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> vec4<f32> {
     if (sample.a <= 0.0) {
         return sample;
@@ -1395,6 +1549,71 @@ fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> ve
     ), vec3<f32>(0.0), vec3<f32>(1.0));
 
     return vec4<f32>(rgb * sample.a, sample.a);
+}
+
+fn sample_processed_content(
+    coords: vec2<f32>,
+    point: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sprite: GroupSprite,
+) -> vec4<f32> {
+    let sample = sample_group_source_blurred(
+        coords,
+        point,
+        pixel_size,
+        sprite.source_blur_radius,
+        sprite,
+    );
+    return apply_group_source_color_filter(sample, sprite);
+}
+
+fn sample_processed_content_glow(
+    coords: vec2<f32>,
+    point: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sprite: GroupSprite,
+) -> vec4<f32> {
+    let sigma = sprite.shadow_blur_radius;
+    if (sigma <= 0.0) {
+        let sample = sample_processed_content(coords, point, pixel_size, sprite);
+        let straight_rgb = sample.rgb / max(sample.a, 0.0001);
+        let luma = dot(straight_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let extracted = sample.a * step(sprite.derived_luma_threshold, luma);
+        let alpha = extracted * sprite.shadow_color.a * sprite.opacity;
+        return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var extracted_alpha = 0.0;
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            for (var x = -24; x <= 24; x = x + 1) {
+                if (abs(x) <= radius) {
+                    let offset = vec2<f32>(f32(x), f32(y));
+                    let weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+                    let sample = sample_processed_content(
+                        coords + offset * pixel_size,
+                        point + offset,
+                        pixel_size,
+                        sprite,
+                    );
+                    let straight_rgb = sample.rgb / max(sample.a, 0.0001);
+                    let luma = dot(straight_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+                    extracted_alpha += sample.a * step(sprite.derived_luma_threshold, luma) * weight;
+                    total += weight;
+                }
+            }
+        }
+    }
+
+    if (total <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+
+    let alpha = (extracted_alpha / total) * sprite.shadow_color.a * sprite.opacity;
+    return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
 }
 
 fn apply_group_backdrop_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> vec4<f32> {
@@ -1477,6 +1696,23 @@ fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
             sprite,
         ) * sprite.shadow_color.a * sprite.opacity;
         return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
+    }
+    if (sprite.effect_kind == 2u) {
+        let sample_point = input.screen_position - sprite.shadow_offset;
+        let alpha = sample_material_alpha_blurred(
+            sample_point,
+            sprite.shadow_blur_radius,
+            sprite,
+        ) * sprite.shadow_color.a * sprite.opacity;
+        return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
+    }
+    if (sprite.effect_kind == 3u) {
+        return sample_processed_content_glow(
+            input.texture_coords,
+            input.screen_position,
+            input.texture_pixel_size,
+            sprite,
+        );
     }
 
     var sample = sample_group_source_blurred(

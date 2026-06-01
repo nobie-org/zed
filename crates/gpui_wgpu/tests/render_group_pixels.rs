@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use gpui::{
     Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect, ContentMask, Corners,
-    DevicePixels, Edges, Hsla, PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene,
-    point, px, rgba, size, transparent_black,
+    DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, LogicalVisualPlan, LumaThreshold,
+    PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene, point, px, rgba, size,
+    transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 use image::RgbaImage;
@@ -74,8 +75,25 @@ fn paint_group_with_effects(
         capture_bounds,
         content_mask: mask(),
         scale_factor: 1.,
-        boundary_opacity: 1.,
-        effects,
+        plan: LogicalVisualPlan::from_effects(1., 1., effects),
+        scene: Arc::new(scene),
+    }
+}
+
+fn paint_group_with_bounds(
+    order: u32,
+    bounds: Bounds<ScaledPixels>,
+    capture_bounds: Bounds<ScaledPixels>,
+    effects: Vec<CompositeEffect>,
+    scene: Scene,
+) -> PaintGroup {
+    PaintGroup {
+        order,
+        bounds,
+        capture_bounds,
+        content_mask: mask(),
+        scale_factor: 1.,
+        plan: LogicalVisualPlan::from_effects(1., 1., effects),
         scene: Arc::new(scene),
     }
 }
@@ -110,6 +128,11 @@ fn blue_half() -> Hsla {
 
 fn gray() -> Hsla {
     rgba(0x808080ff).into()
+}
+
+fn gray_byte(value: u8) -> Hsla {
+    let value = u32::from(value);
+    rgba((value << 24) | (value << 16) | (value << 8) | 0xff).into()
 }
 
 fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
@@ -369,6 +392,57 @@ fn render_group_drop_shadow_uses_composited_source_alpha() {
 }
 
 #[test]
+fn render_group_surface_shadow_uses_material_shape_without_source_alpha() {
+    let mut source_alpha_shadow = Scene::default();
+    source_alpha_shadow.insert_primitive(quad(0, viewport(), black()));
+    source_alpha_shadow.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::drop_shadow(
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+        )],
+        Scene::default(),
+    ));
+    source_alpha_shadow.finish();
+
+    let mut surface_shadow = Scene::default();
+    surface_shadow.insert_primitive(quad(0, viewport(), black()));
+    surface_shadow.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::surface_shadow(
+            GroupShape::rectangle(),
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+        )],
+        Scene::default(),
+    ));
+    surface_shadow.finish();
+
+    let source_alpha_image = render(&source_alpha_shadow);
+    let surface_image = render(&surface_shadow);
+
+    assert_eq!(
+        pixel(&source_alpha_image, 19, 12),
+        [0, 0, 0, 255],
+        "content-alpha shadow must stay absent when the captured source is empty"
+    );
+    assert_eq!(
+        pixel(&surface_image, 12, 12),
+        [0, 0, 0, 255],
+        "offset surface shadow should not fill the original material body"
+    );
+    assert_eq!(
+        pixel(&surface_image, 19, 12),
+        [128, 128, 128, 255],
+        "surface shadow should be generated from the material shape even with no source alpha"
+    );
+}
+
+#[test]
 fn render_group_rounded_mask_clips_composited_source() {
     let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
 
@@ -385,6 +459,146 @@ fn render_group_rounded_mask_clips_composited_source() {
     let image = render(&grouped);
     assert_eq!(pixel(&image, 14, 14), [0, 255, 0, 255]);
     assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
+}
+
+#[test]
+fn render_group_rounded_mask_clips_blurred_source_body() {
+    let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(4., 4., 20., 20.),
+        vec![
+            CompositeEffect::source_blur(px(4.)),
+            CompositeEffect::rounded_mask(Corners::all(px(8.))),
+        ],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    assert!(pixel(&image, 14, 14)[1] > 200);
+    assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
+}
+
+#[test]
+fn render_group_staged_clip_then_blur_spreads_past_mask_edge() {
+    let shape = GroupShape::rounded_rect(Corners::all(px(8.)));
+
+    let mut blur_then_clip = Scene::default();
+    blur_then_clip.insert_primitive(quad(0, viewport(), black()));
+    blur_then_clip.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(8., 8., 16., 16.),
+        rect(4., 4., 24., 24.),
+        vec![
+            CompositeEffect::source_blur(px(4.)),
+            CompositeEffect::source_mask(shape),
+        ],
+        finished_scene([quad(0, rect(8., 8., 16., 16.), green())]),
+    ));
+    blur_then_clip.finish();
+
+    let mut clip_then_blur = Scene::default();
+    clip_then_blur.insert_primitive(quad(0, viewport(), black()));
+    clip_then_blur.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(8., 8., 16., 16.),
+        rect(4., 4., 24., 24.),
+        vec![
+            CompositeEffect::source_mask_before_blur(shape),
+            CompositeEffect::source_blur(px(4.)),
+        ],
+        finished_scene([quad(0, rect(8., 8., 16., 16.), green())]),
+    ));
+    clip_then_blur.finish();
+
+    let after_mask = pixel(&render(&blur_then_clip), 7, 12);
+    let before_mask = pixel(&render(&clip_then_blur), 7, 12);
+
+    assert_eq!(after_mask, [0, 0, 0, 255]);
+    assert!(
+        before_mask[1] > after_mask[1],
+        "clip-then-blur should spread green past the mask edge: before={before_mask:?} after={after_mask:?}"
+    );
+}
+
+#[test]
+fn nested_source_blur_inside_outer_mask_clips_finished_inner_group() {
+    let inner_group_scene = finished_scene([quad(0, rect(12., 12., 8., 8.), green())]);
+
+    let mut outer_group_scene = Scene::default();
+    outer_group_scene.insert_primitive(paint_group_with_bounds(
+        0,
+        rect(12., 12., 8., 8.),
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::source_blur(px(4.))],
+        inner_group_scene,
+    ));
+    outer_group_scene.finish();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(10., 10., 12., 12.),
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::source_mask(GroupShape::rectangle())],
+        outer_group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let outside_outer_mask = pixel(&image, 9, 16);
+    let inside_blur = pixel(&image, 10, 16);
+    let center = pixel(&image, 16, 16);
+
+    assert_eq!(
+        outside_outer_mask,
+        [0, 0, 0, 255],
+        "outer mask must clip the already-blurred inner group at its boundary"
+    );
+    assert!(
+        inside_blur[1] > outside_outer_mask[1],
+        "inner blur should survive up to the inside of the outer mask: inside={inside_blur:?} outside={outside_outer_mask:?}"
+    );
+    assert!(
+        center[1] > inside_blur[1],
+        "center source should remain stronger than the blur fringe: center={center:?} fringe={inside_blur:?}"
+    );
+}
+
+#[test]
+fn render_group_processed_content_glow_follows_bright_pixels() {
+    let group_scene = finished_scene([quad(0, rect(13., 13., 4., 4.), white())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(12., 12., 8., 8.),
+        rect(6., 6., 20., 20.),
+        vec![CompositeEffect::processed_content_glow(
+            [
+                DerivedStage::threshold_luma(LumaThreshold::above(0.8)),
+                DerivedStage::exact_blur(px(3.)),
+            ],
+            Glow::tinted(red()),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let glow_sample = pixel(&image, 11, 15);
+    let far_sample = pixel(&image, 4, 4);
+
+    assert!(
+        glow_sample[0] > far_sample[0],
+        "processed-content glow should add red near bright content: glow={glow_sample:?} far={far_sample:?}"
+    );
 }
 
 #[test]
@@ -512,6 +726,272 @@ fn render_group_backdrop_lens_refracts_parent_target_near_material_edge() {
     assert!(
         stable_center[1] > stable_center[0],
         "center should remain the undisplaced green backdrop: {stable_center:?}"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), rgba(0x404040ff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(0.),
+            px(6.),
+            px(0.),
+            0.8,
+            0.,
+            point(0., -1.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let outer_edge = pixel(&image, 8, 16);
+    let outer_shoulder = pixel(&image, 9, 16);
+    let mid_bevel = pixel(&image, 10, 16);
+    let focus_ridge = pixel(&image, 11, 16);
+    let inner_falloff = pixel(&image, 12, 16);
+    let stable_center = pixel(&image, 16, 16);
+    let bevel_samples = [
+        outer_edge[0],
+        outer_shoulder[0],
+        mid_bevel[0],
+        focus_ridge[0],
+        inner_falloff[0],
+        stable_center[0],
+    ];
+
+    assert!(
+        outer_edge[0] > stable_center[0],
+        "outer edge should catch glancing light: outer_edge {outer_edge:?} center {stable_center:?}"
+    );
+    assert!(
+        outer_shoulder[0] > stable_center[0],
+        "rounded side should stay lit after the outer edge instead of collapsing into a dark band: outer_shoulder {outer_shoulder:?} center {stable_center:?}"
+    );
+    assert!(
+        mid_bevel[0] > stable_center[0],
+        "mid-bevel should stay optically active between the outer wall and inner focus ridge: mid_bevel {mid_bevel:?} center {stable_center:?}"
+    );
+    assert!(
+        focus_ridge[0] > mid_bevel[0],
+        "inner focus ridge should concentrate more light than the rounded bevel body for tangent-guided light: focus_ridge {focus_ridge:?} mid_bevel {mid_bevel:?}"
+    );
+    assert!(
+        inner_falloff[0] > stable_center[0],
+        "rounded side should decay back to the stable pane after the focus ridge: inner_falloff {inner_falloff:?} center {stable_center:?}"
+    );
+    assert!(
+        bevel_samples
+            .windows(2)
+            .all(|samples| samples[0].abs_diff(samples[1]) <= 48),
+        "rounded side should ramp continuously instead of forming separate visual rails: {bevel_samples:?}"
+    );
+    assert_eq!(
+        stable_center,
+        [64, 64, 64, 255],
+        "center should stay the unchanged backdrop when the edge band is outside the sample point"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_reflects_backdrop_color_along_material_edge() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(quad(1, rect(8., 11., 16., 3.), rgba(0x0000ffff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(0.),
+            px(6.),
+            px(0.),
+            0.7,
+            0.,
+            point(0., -1.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let reflected_edge = pixel(&image, 9, 16);
+    let stable_center = pixel(&image, 16, 16);
+
+    assert!(
+        reflected_edge[2] > reflected_edge[0] + 16 && reflected_edge[2] > reflected_edge[1] + 16,
+        "edge reflection should carry backdrop color along the tangent instead of only whitening the bevel: {reflected_edge:?}"
+    );
+    assert_eq!(
+        stable_center,
+        [0, 0, 0, 255],
+        "center pane should not pick up the edge reflection sample"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_reconstructs_subpixel_backdrop_samples() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    for x in 0..IMAGE_SIZE {
+        let color = if x % 2 == 0 {
+            gray_byte(0)
+        } else {
+            gray_byte(255)
+        };
+        grouped.insert_primitive(quad(x as u32, rect(x as f32, 0., 1., 32.), color));
+    }
+    grouped.insert_primitive(paint_group_with_effects(
+        IMAGE_SIZE as u32,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(2.5),
+            px(6.),
+            px(0.),
+            0.,
+            0.,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let reconstructed = (10..14)
+        .map(|x| pixel(&image, x, 16)[0])
+        .collect::<Vec<_>>();
+
+    assert!(
+        reconstructed
+            .iter()
+            .any(|channel| (32..=223).contains(channel)),
+        "subpixel lens sampling should reconstruct the backdrop between texels instead of stepping between nearest-neighbor stripes: {reconstructed:?}"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_splits_chromatic_channels_at_material_edge() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(quad(1, rect(6., 0., 2., 32.), red()));
+    grouped.insert_primitive(quad(2, rect(13., 0., 2., 32.), rgba(0x0000ffff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        3,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(0.),
+            px(6.),
+            px(4.),
+            0.,
+            0.,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let split_edge = pixel(&image, 10, 16);
+    let stable_center = pixel(&image, 16, 16);
+
+    assert!(
+        split_edge[0] > 128 && split_edge[2] > 128,
+        "chromatic split should sample red and blue from opposite sides of the material normal: split_edge {split_edge:?}"
+    );
+    assert!(
+        split_edge[1] < 16,
+        "green should come from the undisplaced center sample on the black backdrop: split_edge {split_edge:?}"
+    );
+    assert_eq!(
+        stable_center,
+        [0, 0, 0, 255],
+        "center should not chromatically split once outside the material edge band"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_uses_material_shape_not_source_mask() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 16., 16.), rgba(0x0000ffff))]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), green()));
+    grouped.insert_primitive(quad(1, rect(0., 0., 8., 32.), red()));
+    grouped.insert_primitive(quad(2, rect(0., 0., 32., 8.), red()));
+    grouped.insert_primitive(paint_group_with_effects(
+        3,
+        rect(8., 8., 16., 16.),
+        vec![
+            CompositeEffect::source_mask(GroupShape::rounded_rect(Corners::all(px(8.)))),
+            CompositeEffect::material_shape(GroupShape::rectangle()),
+            CompositeEffect::backdrop_lens(px(6.), px(6.), px(0.), 0., 0., point(-1., -1.)),
+        ],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let masked_corner_material = pixel(&image, 9, 9);
+    let unmasked_source = pixel(&image, 16, 16);
+
+    assert!(
+        masked_corner_material[0] > masked_corner_material[1],
+        "material lens should still refract red backdrop in a corner where the separate source mask clips source content: {masked_corner_material:?}"
+    );
+    assert!(
+        masked_corner_material[2] < 16,
+        "blue source should be clipped by source mask and must not define material optics: {masked_corner_material:?}"
+    );
+    assert_eq!(
+        unmasked_source,
+        [0, 0, 255, 255],
+        "source mask should still allow opaque source in the unmasked body"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_does_not_distort_opaque_source_content() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 16.), rgba(0x0000ffff))]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), green()));
+    grouped.insert_primitive(quad(1, rect(0., 0., 8., 32.), red()));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(6.),
+            px(6.),
+            px(4.),
+            0.8,
+            0.4,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let opaque_source_edge = pixel(&image, 10, 16);
+    let lensed_material_edge = pixel(&image, 18, 16);
+
+    assert_eq!(
+        opaque_source_edge,
+        [0, 0, 255, 255],
+        "opaque source content should composite over glass without being refracted, lit, or chromatically split"
+    );
+    assert!(
+        lensed_material_edge != opaque_source_edge,
+        "uncovered material should still show the backdrop lens so this test exercises both layers: material {lensed_material_edge:?}"
     );
 }
 

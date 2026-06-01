@@ -68,13 +68,18 @@ struct GroupSprite {
     opacity: f32,
     effect_kind: u32,
     source_blur_radius: f32,
-    mask_enabled: f32,
+    source_mask_enabled: f32,
     shadow_offset: [f32; 2],
     shadow_blur_radius: f32,
     backdrop_blur_radius: f32,
+    source_mask_blur_order: u32,
+    derived_luma_threshold: f32,
+    _pad1: [u32; 2],
     shadow_color: [f32; 4],
-    mask_bounds: Bounds<ScaledPixels>,
-    mask_corner_radii: Corners<ScaledPixels>,
+    source_mask_bounds: Bounds<ScaledPixels>,
+    source_mask_corner_radii: Corners<ScaledPixels>,
+    material_shape_bounds: Bounds<ScaledPixels>,
+    material_shape_corner_radii: Corners<ScaledPixels>,
     color_matrix: [[f32; 4]; 4],
     color_offset: [f32; 4],
     backdrop_active: f32,
@@ -2076,11 +2081,7 @@ impl WgpuRenderer {
         retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
         for group in groups {
-            let effect_plan = CompositeEffectPlan::from_effects(
-                group.scale_factor,
-                group.boundary_opacity,
-                &group.effects,
-            );
+            let effect_plan = group.plan.normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -2211,11 +2212,19 @@ impl WgpuRenderer {
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
-        let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
-        let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
+        let mut sprites = Vec::with_capacity(
+            effect_plan.drop_shadows().len()
+                + effect_plan.surface_shadows().len()
+                + effect_plan.processed_content_glows().len()
+                + 1,
+        );
+        let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
+        let material_shape_corner_radii = effect_plan
+            .material_shape()
+            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -2224,13 +2233,82 @@ impl WgpuRenderer {
                 opacity: effect_plan.opacity(),
                 effect_kind: 1,
                 source_blur_radius: 0.,
-                mask_enabled,
+                source_mask_enabled,
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
                 shadow_blur_radius: shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                _pad1: [0; 2],
                 shadow_color: [color.r, color.g, color.b, color.a],
-                mask_bounds: group.bounds,
-                mask_corner_radii,
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii,
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for shadow in effect_plan.surface_shadows() {
+            let color = shadow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 2,
+                source_blur_radius: 0.,
+                source_mask_enabled: 0.,
+                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
+                shadow_blur_radius: shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                _pad1: [0; 2],
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii: shadow.shape,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for glow in effect_plan.processed_content_glows() {
+            let color = glow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 3,
+                source_blur_radius: effect_plan.source_blur_radius().0,
+                source_mask_enabled,
+                shadow_offset: [0., 0.],
+                shadow_blur_radius: glow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: glow.luma_threshold,
+                _pad1: [0; 2],
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii,
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2249,13 +2327,18 @@ impl WgpuRenderer {
             opacity: effect_plan.opacity(),
             effect_kind: 0,
             source_blur_radius: effect_plan.source_blur_radius().0,
-            mask_enabled,
+            source_mask_enabled,
             shadow_offset: [0., 0.],
             shadow_blur_radius: 0.,
             backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
+            source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+            derived_luma_threshold: 0.,
+            _pad1: [0; 2],
             shadow_color: [0., 0., 0., 0.],
-            mask_bounds: group.bounds,
-            mask_corner_radii,
+            source_mask_bounds: group.bounds,
+            source_mask_corner_radii,
+            material_shape_bounds: group.bounds,
+            material_shape_corner_radii,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {
@@ -2693,7 +2776,6 @@ impl RenderingParameters {
     /// so cross-platform byte-identity (macOS Metal vs Linux Vulkan/lavapipe)
     /// requires single-sampled path rasterization. Gamma/contrast use the same
     /// env-driven defaults as the windowed path.
-    #[cfg(any(test, feature = "test-support"))]
     fn headless() -> Self {
         Self::from_env(1)
     }

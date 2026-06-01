@@ -1236,11 +1236,7 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
-            let effect_plan = CompositeEffectPlan::from_effects(
-                group.scale_factor,
-                group.boundary_opacity,
-                &group.effects,
-            );
+            let effect_plan = group.plan.normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -1382,11 +1378,19 @@ impl MetalRenderer {
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
-        let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
-        let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
+        let mut sprites = Vec::with_capacity(
+            effect_plan.drop_shadows().len()
+                + effect_plan.surface_shadows().len()
+                + effect_plan.processed_content_glows().len()
+                + 1,
+        );
+        let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
+        let material_shape_corner_radii = effect_plan
+            .material_shape()
+            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -1395,13 +1399,82 @@ impl MetalRenderer {
                 opacity: effect_plan.opacity(),
                 effect_kind: 1,
                 source_blur_radius: 0.,
-                mask_enabled,
+                source_mask_enabled,
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
                 shadow_blur_radius: shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                _pad1: [0; 2],
                 shadow_color: [color.r, color.g, color.b, color.a],
-                mask_bounds: group.bounds,
-                mask_corner_radii,
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii,
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for shadow in effect_plan.surface_shadows() {
+            let color = shadow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 2,
+                source_blur_radius: 0.,
+                source_mask_enabled: 0.,
+                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
+                shadow_blur_radius: shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                _pad1: [0; 2],
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii: shadow.shape,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for glow in effect_plan.processed_content_glows() {
+            let color = glow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 3,
+                source_blur_radius: effect_plan.source_blur_radius().0,
+                source_mask_enabled,
+                shadow_offset: [0., 0.],
+                shadow_blur_radius: glow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: glow.luma_threshold,
+                _pad1: [0; 2],
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii,
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1420,13 +1493,18 @@ impl MetalRenderer {
             opacity: effect_plan.opacity(),
             effect_kind: 0,
             source_blur_radius: effect_plan.source_blur_radius().0,
-            mask_enabled,
+            source_mask_enabled,
             shadow_offset: [0., 0.],
             shadow_blur_radius: 0.,
             backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
+            source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+            derived_luma_threshold: 0.,
+            _pad1: [0; 2],
             shadow_color: [0., 0., 0., 0.],
-            mask_bounds: group.bounds,
-            mask_corner_radii,
+            source_mask_bounds: group.bounds,
+            source_mask_corner_radii,
+            material_shape_bounds: group.bounds,
+            material_shape_corner_radii,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {
@@ -2368,13 +2446,18 @@ pub struct GroupSprite {
     pub opacity: f32,
     pub effect_kind: u32,
     pub source_blur_radius: f32,
-    pub mask_enabled: f32,
+    pub source_mask_enabled: f32,
     pub shadow_offset: [f32; 2],
     pub shadow_blur_radius: f32,
     pub backdrop_blur_radius: f32,
+    pub source_mask_blur_order: u32,
+    pub derived_luma_threshold: f32,
+    pub _pad1: [u32; 2],
     pub shadow_color: [f32; 4],
-    pub mask_bounds: Bounds<ScaledPixels>,
-    pub mask_corner_radii: Corners<ScaledPixels>,
+    pub source_mask_bounds: Bounds<ScaledPixels>,
+    pub source_mask_corner_radii: Corners<ScaledPixels>,
+    pub material_shape_bounds: Bounds<ScaledPixels>,
+    pub material_shape_corner_radii: Corners<ScaledPixels>,
     pub color_matrix: [[f32; 4]; 4],
     pub color_offset: [f32; 4],
     pub backdrop_active: f32,
@@ -2392,4 +2475,191 @@ pub struct GroupSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        BorderStyle, CompositeEffect, Edges, Hsla, LogicalVisualPlan, PaintGroup, px, rgba,
+        transparent_black,
+    };
+    use image::RgbaImage;
+    use std::sync::Arc;
+
+    const IMAGE_SIZE: i32 = 32;
+
+    fn sp(value: f32) -> ScaledPixels {
+        ScaledPixels(value)
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(point(sp(x), sp(y)), size(sp(width), sp(height)))
+    }
+
+    fn viewport() -> Bounds<ScaledPixels> {
+        rect(0., 0., IMAGE_SIZE as f32, IMAGE_SIZE as f32)
+    }
+
+    fn mask() -> ContentMask<ScaledPixels> {
+        ContentMask { bounds: viewport() }
+    }
+
+    fn quad(order: u32, bounds: Bounds<ScaledPixels>, background: impl Into<Background>) -> Quad {
+        Quad {
+            order,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: mask(),
+            background: background.into(),
+            border_color: transparent_black(),
+            corner_radii: Corners::all(sp(0.)),
+            border_widths: Edges::all(sp(0.)),
+        }
+    }
+
+    fn paint_group_with_effects(
+        order: u32,
+        capture_bounds: Bounds<ScaledPixels>,
+        effects: Vec<CompositeEffect>,
+        scene: Scene,
+    ) -> PaintGroup {
+        PaintGroup {
+            order,
+            bounds: capture_bounds,
+            capture_bounds,
+            content_mask: mask(),
+            scale_factor: 1.,
+            plan: LogicalVisualPlan::from_effects(1., 1., effects),
+            scene: Arc::new(scene),
+        }
+    }
+
+    fn black() -> Hsla {
+        rgba(0x000000ff).into()
+    }
+
+    fn render(scene: &Scene) -> RgbaImage {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let device = MetalRenderer::create_device();
+        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
+        renderer
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render metal scene")
+    }
+
+    fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        image.get_pixel(x, y).0
+    }
+
+    #[test]
+    fn render_group_backdrop_lens_metal_lights_continuous_bevel_profile() {
+        let group_scene = Scene::default();
+
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), rgba(0x404040ff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 16., 16.),
+            vec![CompositeEffect::backdrop_lens(
+                px(0.),
+                px(6.),
+                px(0.),
+                0.8,
+                0.,
+                point(0., -1.),
+            )],
+            group_scene,
+        ));
+        grouped.finish();
+
+        let image = render(&grouped);
+        let outer_edge = pixel(&image, 8, 16);
+        let outer_shoulder = pixel(&image, 9, 16);
+        let mid_bevel = pixel(&image, 10, 16);
+        let focus_ridge = pixel(&image, 11, 16);
+        let inner_falloff = pixel(&image, 12, 16);
+        let stable_center = pixel(&image, 16, 16);
+        let bevel_samples = [
+            outer_edge[0],
+            outer_shoulder[0],
+            mid_bevel[0],
+            focus_ridge[0],
+            inner_falloff[0],
+            stable_center[0],
+        ];
+
+        assert!(
+            outer_edge[0] > stable_center[0],
+            "outer edge should catch glancing light: outer_edge {outer_edge:?} center {stable_center:?}"
+        );
+        assert!(
+            outer_shoulder[0] > stable_center[0],
+            "rounded side should stay lit after the outer edge instead of collapsing into a dark band: outer_shoulder {outer_shoulder:?} center {stable_center:?}"
+        );
+        assert!(
+            mid_bevel[0] > stable_center[0],
+            "mid-bevel should stay optically active between the outer wall and inner focus ridge: mid_bevel {mid_bevel:?} center {stable_center:?}"
+        );
+        assert!(
+            focus_ridge[0] > mid_bevel[0],
+            "inner focus ridge should concentrate more light than the rounded bevel body for tangent-guided light: focus_ridge {focus_ridge:?} mid_bevel {mid_bevel:?}"
+        );
+        assert!(
+            inner_falloff[0] > stable_center[0],
+            "rounded side should decay back to the stable pane after the focus ridge: inner_falloff {inner_falloff:?} center {stable_center:?}"
+        );
+        assert!(
+            bevel_samples
+                .windows(2)
+                .all(|samples| samples[0].abs_diff(samples[1]) <= 48),
+            "rounded side should ramp continuously instead of forming separate visual rails: {bevel_samples:?}"
+        );
+        assert_eq!(
+            stable_center,
+            [64, 64, 64, 255],
+            "center should stay the unchanged backdrop when the edge band is outside the sample point"
+        );
+    }
+
+    #[test]
+    fn render_group_backdrop_lens_metal_reflects_backdrop_color_along_material_edge() {
+        let group_scene = Scene::default();
+
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(quad(1, rect(8., 11., 16., 3.), rgba(0x0000ffff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            2,
+            rect(8., 8., 16., 16.),
+            vec![CompositeEffect::backdrop_lens(
+                px(0.),
+                px(6.),
+                px(0.),
+                0.7,
+                0.,
+                point(0., -1.),
+            )],
+            group_scene,
+        ));
+        grouped.finish();
+
+        let image = render(&grouped);
+        let reflected_edge = pixel(&image, 9, 16);
+        let stable_center = pixel(&image, 16, 16);
+
+        assert!(
+            reflected_edge[2] > reflected_edge[0] + 16
+                && reflected_edge[2] > reflected_edge[1] + 16,
+            "edge reflection should carry backdrop color along the tangent instead of only whitening the bevel: {reflected_edge:?}"
+        );
+        assert_eq!(
+            stable_center,
+            [0, 0, 0, 255],
+            "center pane should not pick up the edge reflection sample"
+        );
+    }
 }

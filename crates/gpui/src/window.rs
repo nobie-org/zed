@@ -3,22 +3,23 @@ use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    CompositeEffect, CompositeEffectPlan, Context, Corners, CursorHideMode, CursorStyle,
-    Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId,
-    Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId,
-    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, LogicalVisualPlan, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
-    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderGroupInput, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SceneCapture, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -3497,14 +3498,14 @@ impl Window {
     pub(crate) fn paint_group<R>(
         &mut self,
         bounds: Bounds<Pixels>,
-        effects: Vec<CompositeEffect>,
+        input: RenderGroupInput,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint();
 
         let boundary_opacity = self.element_opacity;
-        let has_active_effect = (boundary_opacity - 1.).abs() > f32::EPSILON
-            || effects.iter().any(|effect| !effect.is_identity());
+        let has_active_effect =
+            (boundary_opacity - 1.).abs() > f32::EPSILON || input.has_active_effect();
         if !has_active_effect {
             return f(self);
         }
@@ -3521,7 +3522,8 @@ impl Window {
 
         let content_mask = self.snapped_content_mask();
         let bounds = self.cover_bounds(bounds);
-        let effect_outset = CompositeEffectPlan::visual_outset(self.scale_factor(), &effects);
+        let plan = LogicalVisualPlan::from_input(self.scale_factor(), boundary_opacity, &input);
+        let effect_outset = plan.requirements().output_outset;
         let capture_bounds = group_scene
             .visual_bounds()
             .unwrap_or(bounds)
@@ -3536,8 +3538,7 @@ impl Window {
                 capture_bounds,
                 content_mask,
                 scale_factor: self.scale_factor(),
-                boundary_opacity,
-                effects,
+                plan,
                 scene: Arc::new(group_scene),
             });
         }

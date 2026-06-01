@@ -1568,6 +1568,25 @@ impl Default for SemanticRenderGroupSpec {
 }
 
 impl SemanticRenderGroupSpec {
+    /// Builds a semantic render-group input value from authored layers.
+    ///
+    /// This is primarily useful for inspectors and tests that need to ask the
+    /// planner how semantic authoring lowers, without duplicating private
+    /// lowering rules.
+    pub fn from_layers(
+        surface: Option<GlassSurface>,
+        content: ContentLayer,
+        derived_layers: impl IntoIterator<Item = DerivedLayer>,
+        composite: Composite,
+    ) -> Self {
+        Self {
+            surface,
+            content,
+            derived_layers: derived_layers.into_iter().collect(),
+            composite,
+        }
+    }
+
     pub(crate) fn surface(&mut self, surface: GlassSurface) {
         self.surface = Some(surface);
     }
@@ -2558,16 +2577,12 @@ mod tests {
     #[test]
     fn logical_visual_plan_lowers_semantic_input_once() {
         let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
-        let mut input = RenderGroupInput::default();
-        input
-            .semantic_mut()
-            .surface(GlassSurface::for_shape(shape).frost(Pixels(4.)));
-        input
-            .semantic_mut()
-            .content(ContentLayer::clipped_to(shape).blur(Pixels(2.)));
-        input
-            .semantic_mut()
-            .composite(Composite::normal().opacity(0.5));
+        let input = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            Some(GlassSurface::for_shape(shape).frost(Pixels(4.))),
+            ContentLayer::clipped_to(shape).blur(Pixels(2.)),
+            [],
+            Composite::normal().opacity(0.5),
+        ));
 
         let plan = LogicalVisualPlan::from_input(2., 0.75, &input);
 

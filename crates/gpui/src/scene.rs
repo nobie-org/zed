@@ -1692,6 +1692,8 @@ impl RenderGroupInput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalVisualPlan {
     effects: Vec<CompositeEffect>,
+    accepted_effects: Vec<CompositeEffect>,
+    planning_rejections: Vec<RenderGroupPlanningRejection>,
     normalized: CompositeEffectPlan,
     requirements: RenderGroupRequirements,
     physical: PhysicalRenderGroupPlan,
@@ -1709,13 +1711,17 @@ impl LogicalVisualPlan {
         boundary_opacity: f32,
         effects: Vec<CompositeEffect>,
     ) -> Self {
+        let (accepted_effects, planning_rejections) =
+            reject_unsupported_exact_effects(scale_factor, &effects);
         let normalized =
-            CompositeEffectPlan::from_effects(scale_factor, boundary_opacity, &effects);
+            CompositeEffectPlan::from_effects(scale_factor, boundary_opacity, &accepted_effects);
         let requirements =
-            RenderGroupRequirements::from_effect_plan(scale_factor, &effects, &normalized);
+            RenderGroupRequirements::from_effect_plan(scale_factor, &accepted_effects, &normalized);
         let physical = PhysicalRenderGroupPlan::from_requirements(&requirements);
         Self {
             effects,
+            accepted_effects,
+            planning_rejections,
             normalized,
             requirements,
             physical,
@@ -1725,6 +1731,16 @@ impl LogicalVisualPlan {
     /// Returns the raw syntax that produced this plan.
     pub fn effects(&self) -> &[CompositeEffect] {
         &self.effects
+    }
+
+    /// Returns the raw effects accepted into the current backend plan.
+    pub fn accepted_effects(&self) -> &[CompositeEffect] {
+        &self.accepted_effects
+    }
+
+    /// Returns typed planning rejections produced while lowering this plan.
+    pub fn planning_rejections(&self) -> &[RenderGroupPlanningRejection] {
+        &self.planning_rejections
     }
 
     /// Returns the normalized current physical slice consumed by backends.
@@ -1741,6 +1757,53 @@ impl LogicalVisualPlan {
     pub fn physical_plan(&self) -> PhysicalRenderGroupPlan {
         self.physical
     }
+}
+
+/// A typed reason why an authored render-group effect could not enter the exact plan.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct RenderGroupPlanningRejection {
+    pub effect: RenderGroupRejectedEffect,
+    pub reason: RenderGroupPlanningRejectionReason,
+    pub suggestion: &'static str,
+}
+
+/// Render-group effect provenance for typed planning rejection metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum RenderGroupRejectedEffect {
+    SourceBlur,
+    BackdropBlur,
+    DropShadow,
+}
+
+impl RenderGroupRejectedEffect {
+    /// Returns a stable author-facing provenance string for diagnostics.
+    pub fn provenance(self) -> &'static str {
+        match self {
+            Self::SourceBlur => "content.blur",
+            Self::BackdropBlur => "surface.frost",
+            Self::DropShadow => "derived.content_alpha.shadow",
+        }
+    }
+}
+
+/// Machine-readable planning rejection details.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub enum RenderGroupPlanningRejectionReason {
+    LimitExceeded {
+        limit: ScaledPixels,
+        requested: ScaledPixels,
+        unit: RenderGroupLimitUnit,
+    },
+}
+
+/// Unit for a render-group planning limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum RenderGroupLimitUnit {
+    GaussianSigma,
 }
 
 /// Backend-independent requirements implied by a logical visual plan.
@@ -1828,6 +1891,80 @@ impl PhysicalRenderGroupPlan {
             intermediate_textures: requirements.intermediate_textures,
             backdrop_copies: requirements.backdrop_copies,
         }
+    }
+}
+
+const MAX_EXACT_GAUSSIAN_SIGMA: f32 = 8.;
+
+fn reject_unsupported_exact_effects(
+    scale_factor: f32,
+    effects: &[CompositeEffect],
+) -> (Vec<CompositeEffect>, Vec<RenderGroupPlanningRejection>) {
+    let mut accepted_effects = Vec::with_capacity(effects.len());
+    let mut planning_rejections = Vec::new();
+    let mut accepted_source_sigma = ScaledPixels(0.);
+    let mut accepted_backdrop_sigma = ScaledPixels(0.);
+
+    for effect in effects {
+        match effect {
+            CompositeEffect::SourceBlur(radius) => {
+                let requested =
+                    combined_gaussian_sigma(accepted_source_sigma, radius.scale(scale_factor));
+                if requested.0 > MAX_EXACT_GAUSSIAN_SIGMA {
+                    planning_rejections.push(exact_blur_limit_rejection(
+                        RenderGroupRejectedEffect::SourceBlur,
+                        requested,
+                    ));
+                    continue;
+                }
+                accepted_source_sigma = requested;
+            }
+            CompositeEffect::BackdropBlur(radius) => {
+                let requested =
+                    combined_gaussian_sigma(accepted_backdrop_sigma, radius.scale(scale_factor));
+                if requested.0 > MAX_EXACT_GAUSSIAN_SIGMA {
+                    planning_rejections.push(exact_blur_limit_rejection(
+                        RenderGroupRejectedEffect::BackdropBlur,
+                        requested,
+                    ));
+                    continue;
+                }
+                accepted_backdrop_sigma = requested;
+            }
+            CompositeEffect::DropShadow(shadow) => {
+                let requested = shadow.blur_radius.scale(scale_factor);
+                if requested.0 > MAX_EXACT_GAUSSIAN_SIGMA {
+                    planning_rejections.push(exact_blur_limit_rejection(
+                        RenderGroupRejectedEffect::DropShadow,
+                        requested,
+                    ));
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        accepted_effects.push(effect.clone());
+    }
+
+    (accepted_effects, planning_rejections)
+}
+
+fn combined_gaussian_sigma(current: ScaledPixels, next: ScaledPixels) -> ScaledPixels {
+    ScaledPixels((current.0.powi(2) + next.0.powi(2)).sqrt())
+}
+
+fn exact_blur_limit_rejection(
+    effect: RenderGroupRejectedEffect,
+    requested: ScaledPixels,
+) -> RenderGroupPlanningRejection {
+    RenderGroupPlanningRejection {
+        effect,
+        reason: RenderGroupPlanningRejectionReason::LimitExceeded {
+            limit: ScaledPixels(MAX_EXACT_GAUSSIAN_SIGMA),
+            requested,
+            unit: RenderGroupLimitUnit::GaussianSigma,
+        },
+        suggestion: "use an explicitly approximate blur tier or reduce the exact blur radius",
     }
 }
 
@@ -2655,6 +2792,83 @@ mod tests {
                 )],
             ),
             ScaledPixels(29.)
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_rejects_exact_blur_beyond_kernel_limit() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![
+                CompositeEffect::source_blur(Pixels(20.)),
+                CompositeEffect::backdrop_blur(Pixels(9.)),
+                CompositeEffect::drop_shadow(point(Pixels(0.), Pixels(4.)), Pixels(12.), red()),
+                CompositeEffect::opacity(0.5),
+            ],
+        );
+
+        assert_eq!(plan.accepted_effects(), &[CompositeEffect::opacity(0.5)]);
+        assert_eq!(
+            plan.normalized_effects().source_blur_radius(),
+            ScaledPixels(0.)
+        );
+        assert_eq!(
+            plan.normalized_effects().backdrop_blur_radius(),
+            ScaledPixels(0.)
+        );
+        assert_eq!(plan.requirements().source_outset, ScaledPixels(0.));
+        assert_eq!(plan.requirements().backdrop_outset, ScaledPixels(0.));
+        assert_eq!(plan.planning_rejections().len(), 3);
+        assert_eq!(
+            plan.planning_rejections()[0].effect.provenance(),
+            "content.blur"
+        );
+        assert_eq!(
+            plan.planning_rejections()[0].reason,
+            RenderGroupPlanningRejectionReason::LimitExceeded {
+                limit: ScaledPixels(8.),
+                requested: ScaledPixels(20.),
+                unit: RenderGroupLimitUnit::GaussianSigma,
+            }
+        );
+        assert_eq!(
+            plan.planning_rejections()[1].effect.provenance(),
+            "surface.frost"
+        );
+        assert_eq!(
+            plan.planning_rejections()[2].effect.provenance(),
+            "derived.content_alpha.shadow"
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_rejects_cumulative_exact_blur_limit() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![
+                CompositeEffect::source_blur(Pixels(6.)),
+                CompositeEffect::source_blur(Pixels(6.)),
+            ],
+        );
+
+        assert_eq!(
+            plan.accepted_effects(),
+            &[CompositeEffect::source_blur(Pixels(6.))]
+        );
+        assert_eq!(
+            plan.normalized_effects().source_blur_radius(),
+            ScaledPixels(6.)
+        );
+        assert_eq!(plan.planning_rejections().len(), 1);
+        assert_eq!(
+            plan.planning_rejections()[0].reason,
+            RenderGroupPlanningRejectionReason::LimitExceeded {
+                limit: ScaledPixels(8.),
+                requested: ScaledPixels(72_f32.sqrt()),
+                unit: RenderGroupLimitUnit::GaussianSigma,
+            }
         );
     }
 

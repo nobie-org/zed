@@ -68,13 +68,15 @@ struct GroupSprite {
     opacity: f32,
     effect_kind: u32,
     source_blur_radius: f32,
-    mask_enabled: f32,
+    source_mask_enabled: f32,
     shadow_offset: [f32; 2],
     shadow_blur_radius: f32,
     backdrop_blur_radius: f32,
     shadow_color: [f32; 4],
-    mask_bounds: Bounds<ScaledPixels>,
-    mask_corner_radii: Corners<ScaledPixels>,
+    source_mask_bounds: Bounds<ScaledPixels>,
+    source_mask_corner_radii: Corners<ScaledPixels>,
+    material_shape_bounds: Bounds<ScaledPixels>,
+    material_shape_corner_radii: Corners<ScaledPixels>,
     color_matrix: [[f32; 4]; 4],
     color_offset: [f32; 4],
     backdrop_active: f32,
@@ -2212,10 +2214,13 @@ impl WgpuRenderer {
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
         let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
-        let (mask_enabled, mask_corner_radii) = match effect_plan.rounded_mask() {
+        let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
+        let material_shape_corner_radii = effect_plan
+            .material_shape()
+            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -2224,13 +2229,15 @@ impl WgpuRenderer {
                 opacity: effect_plan.opacity(),
                 effect_kind: 1,
                 source_blur_radius: 0.,
-                mask_enabled,
+                source_mask_enabled,
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
                 shadow_blur_radius: shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                mask_bounds: group.bounds,
-                mask_corner_radii,
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii,
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2249,13 +2256,15 @@ impl WgpuRenderer {
             opacity: effect_plan.opacity(),
             effect_kind: 0,
             source_blur_radius: effect_plan.source_blur_radius().0,
-            mask_enabled,
+            source_mask_enabled,
             shadow_offset: [0., 0.],
             shadow_blur_radius: 0.,
             backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
             shadow_color: [0., 0., 0., 0.],
-            mask_bounds: group.bounds,
-            mask_corner_radii,
+            source_mask_bounds: group.bounds,
+            source_mask_corner_radii,
+            material_shape_bounds: group.bounds,
+            material_shape_corner_radii,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {

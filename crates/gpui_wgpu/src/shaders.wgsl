@@ -1126,13 +1126,15 @@ struct GroupSprite {
     opacity: f32,
     effect_kind: u32,
     source_blur_radius: f32,
-    mask_enabled: f32,
+    source_mask_enabled: f32,
     shadow_offset: vec2<f32>,
     shadow_blur_radius: f32,
     backdrop_blur_radius: f32,
     shadow_color: vec4<f32>,
-    mask_bounds: Bounds,
-    mask_corner_radii: Corners,
+    source_mask_bounds: Bounds,
+    source_mask_corner_radii: Corners,
+    material_shape_bounds: Bounds,
+    material_shape_corner_radii: Corners,
     color_matrix: array<vec4<f32>, 4>,
     color_offset: vec4<f32>,
     backdrop_active: f32,
@@ -1172,12 +1174,12 @@ fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) inst
     return out;
 }
 
-fn group_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    if (sprite.mask_enabled <= 0.0) {
+fn group_source_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
+    if (sprite.source_mask_enabled <= 0.0) {
         return 1.0;
     }
 
-    return clamp(0.5 - quad_sdf(point, sprite.mask_bounds, sprite.mask_corner_radii), 0.0, 1.0);
+    return clamp(0.5 - quad_sdf(point, sprite.source_mask_bounds, sprite.source_mask_corner_radii), 0.0, 1.0);
 }
 
 fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
@@ -1185,11 +1187,7 @@ fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
 }
 
 fn group_material_sdf(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    var corner_radii = Corners(0.0, 0.0, 0.0, 0.0);
-    if (sprite.mask_enabled > 0.0) {
-        corner_radii = sprite.mask_corner_radii;
-    }
-    return quad_sdf(point, sprite.mask_bounds, corner_radii);
+    return quad_sdf(point, sprite.material_shape_bounds, sprite.material_shape_corner_radii);
 }
 
 fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {
@@ -1231,7 +1229,7 @@ fn sample_backdrop_texture(coords: vec2<f32>) -> vec4<f32> {
 }
 
 fn sample_group_source(coords: vec2<f32>, point: vec2<f32>, sprite: GroupSprite) -> vec4<f32> {
-    return sample_group_texture(coords) * group_mask_alpha(point, sprite);
+    return sample_group_texture(coords) * group_source_mask_alpha(point, sprite);
 }
 
 fn sample_group_source_blurred(

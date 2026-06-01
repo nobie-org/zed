@@ -872,20 +872,54 @@ impl From<PaintGroup> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum CompositeEffect {
     Opacity(f32),
     SourceColorFilter(SourceColorFilter),
     SourceBlur(Pixels),
+    SourceMask(Corners<Pixels>),
     BackdropColorFilter(SourceColorFilter),
     BackdropBlur(Pixels),
     BackdropLens(CompositeBackdropLens<Pixels>),
     BackdropTint(Hsla),
+    MaterialShape(Corners<Pixels>),
     DropShadow(CompositeDropShadow<Pixels>),
     RoundedMask(Corners<Pixels>),
     BlendMode(CompositeBlendMode),
+}
+
+/// A render-group shape in group layout coordinates.
+///
+/// V1 supports rounded rectangles matching the group's layout bounds. The type
+/// is intentionally distinct from child border styling: a recipe may choose to
+/// use the same radii for child style, content clipping, and surface material,
+/// but raw render groups do not infer that coupling from children.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupShape {
+    corner_radii: Corners<Pixels>,
+}
+
+impl GroupShape {
+    /// Returns a rectangular group shape.
+    pub fn rectangle() -> Self {
+        Self {
+            corner_radii: Corners::all(Pixels(0.)),
+        }
+    }
+
+    /// Returns a rounded-rectangle group shape.
+    pub fn rounded_rect(corner_radii: Corners<Pixels>) -> Self {
+        Self {
+            corner_radii: corner_radii.map(|radius| Pixels(radius.0.max(0.))),
+        }
+    }
+
+    /// Returns the rounded-rectangle corner radii.
+    pub fn corner_radii(&self) -> Corners<Pixels> {
+        self.corner_radii
+    }
 }
 
 impl CompositeEffect {
@@ -959,6 +993,11 @@ impl CompositeEffect {
         Self::SourceBlur(Pixels(radius.0.max(0.)))
     }
 
+    /// Clips the composited source/content image by a group shape.
+    pub fn source_mask(shape: GroupShape) -> Self {
+        Self::SourceMask(shape.corner_radii())
+    }
+
     /// Applies a Gaussian blur to the already-rendered backdrop under the group.
     pub fn backdrop_blur(radius: Pixels) -> Self {
         Self::BackdropBlur(Pixels(radius.0.max(0.)))
@@ -989,6 +1028,11 @@ impl CompositeEffect {
         Self::BackdropTint(color)
     }
 
+    /// Defines the material domain used by backdrop materials and lens normals.
+    pub fn material_shape(shape: GroupShape) -> Self {
+        Self::MaterialShape(shape.corner_radii())
+    }
+
     /// Draws a drop shadow from the composited source image's alpha channel.
     pub fn drop_shadow(offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
         Self::DropShadow(CompositeDropShadow {
@@ -1015,10 +1059,12 @@ impl CompositeEffect {
             Self::Opacity(alpha) => (*alpha - 1.).abs() <= f32::EPSILON,
             Self::SourceColorFilter(filter) => filter.is_identity(),
             Self::SourceBlur(radius) => radius.0 <= f32::EPSILON,
+            Self::SourceMask(_) => false,
             Self::BackdropColorFilter(filter) => filter.is_identity(),
             Self::BackdropBlur(radius) => radius.0 <= f32::EPSILON,
             Self::BackdropLens(lens) => lens.is_identity(),
             Self::BackdropTint(color) => color.a <= f32::EPSILON,
+            Self::MaterialShape(_) => false,
             Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
             Self::RoundedMask(_) => false,
             Self::BlendMode(mode) => *mode == CompositeBlendMode::Normal,
@@ -1036,7 +1082,9 @@ impl CompositeEffect {
             Self::Opacity(_)
             | Self::SourceColorFilter(_)
             | Self::SourceBlur(_)
+            | Self::SourceMask(_)
             | Self::DropShadow(_)
+            | Self::MaterialShape(_)
             | Self::RoundedMask(_) => false,
         }
     }
@@ -1151,6 +1199,271 @@ impl<P: Clone + Copy + Debug + Default + PartialEq> CompositeBackdropLens<P> {
     }
 }
 
+/// Lens parameters for a glass surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassLens {
+    refraction_radius: Pixels,
+    rim_width: Pixels,
+    chromatic_aberration: Pixels,
+    highlight_strength: f32,
+    shadow_strength: f32,
+    light_direction: Point<f32>,
+}
+
+impl GlassLens {
+    /// Creates an edge refraction lens.
+    pub fn edge_refraction(refraction_radius: Pixels) -> Self {
+        let refraction_radius = Pixels(refraction_radius.0.max(0.));
+        Self {
+            refraction_radius,
+            rim_width: refraction_radius,
+            chromatic_aberration: Pixels(0.),
+            highlight_strength: 0.,
+            shadow_strength: 0.,
+            light_direction: Point { x: -0.55, y: -0.85 },
+        }
+    }
+
+    /// Creates a soft edge refraction lens.
+    pub fn soft_edge_refraction(refraction_radius: Pixels) -> Self {
+        Self::edge_refraction(refraction_radius)
+    }
+
+    /// Sets the rim width over which the lens fades in.
+    pub fn rim(mut self, rim_width: Pixels) -> Self {
+        self.rim_width = Pixels(rim_width.0.max(0.));
+        self
+    }
+
+    /// Sets per-channel chromatic split around the refracted sample.
+    pub fn chromatic_split(mut self, chromatic_aberration: Pixels) -> Self {
+        self.chromatic_aberration = Pixels(chromatic_aberration.0.max(0.));
+        self
+    }
+
+    /// Sets rim lighting strengths.
+    pub fn lighting(mut self, highlight_strength: f32, shadow_strength: f32) -> Self {
+        self.highlight_strength = highlight_strength.max(0.);
+        self.shadow_strength = shadow_strength.max(0.);
+        self
+    }
+
+    /// Sets the screen-space light direction.
+    pub fn light_direction(mut self, light_direction: Point<f32>) -> Self {
+        self.light_direction = light_direction;
+        self
+    }
+
+    fn into_composite_lens(self) -> CompositeBackdropLens<Pixels> {
+        CompositeBackdropLens::new(
+            self.refraction_radius,
+            self.rim_width,
+            self.chromatic_aberration,
+            self.highlight_strength,
+            self.shadow_strength,
+            self.light_direction,
+        )
+    }
+}
+
+/// A backdrop-sampling glass surface for a render group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlassSurface {
+    shape: GroupShape,
+    frost_radius: Pixels,
+    color_filter: SourceColorFilter,
+    tint: Hsla,
+    lens: Option<GlassLens>,
+}
+
+impl GlassSurface {
+    /// Creates a glass surface for the given material shape.
+    pub fn for_shape(shape: GroupShape) -> Self {
+        Self {
+            shape,
+            frost_radius: Pixels(0.),
+            color_filter: SourceColorFilter::identity(),
+            tint: transparent_black(),
+            lens: None,
+        }
+    }
+
+    /// Applies backdrop frost/blur to the surface.
+    pub fn frost(mut self, radius: Pixels) -> Self {
+        self.frost_radius = Pixels(radius.0.max(0.));
+        self
+    }
+
+    /// Applies a backdrop tint over the surface.
+    pub fn tint(mut self, color: Hsla) -> Self {
+        self.tint = color;
+        self
+    }
+
+    /// Applies a lens to the surface.
+    pub fn lens(mut self, lens: GlassLens) -> Self {
+        self.lens = Some(lens);
+        self
+    }
+
+    /// Multiplies backdrop color channels by `factor`.
+    pub fn brightness(mut self, factor: f32) -> Self {
+        self.color_filter = self
+            .color_filter
+            .then(SourceColorFilter::brightness(factor));
+        self
+    }
+
+    /// Scales backdrop color distance from mid-gray by `factor`.
+    pub fn contrast(mut self, factor: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::contrast(factor));
+        self
+    }
+
+    /// Adjusts backdrop color saturation by `factor`.
+    pub fn saturate(mut self, factor: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::saturate(factor));
+        self
+    }
+
+    /// Mixes backdrop color toward grayscale by `amount`.
+    pub fn grayscale(mut self, amount: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::grayscale(amount));
+        self
+    }
+
+    /// Mixes backdrop color toward its inverse by `amount`.
+    pub fn invert(mut self, amount: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::invert(amount));
+        self
+    }
+
+    pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
+        effects.push(CompositeEffect::material_shape(self.shape));
+        if self.frost_radius.0 > f32::EPSILON {
+            effects.push(CompositeEffect::backdrop_blur(self.frost_radius));
+        }
+        if !self.color_filter.is_identity() {
+            effects.push(CompositeEffect::BackdropColorFilter(self.color_filter));
+        }
+        if let Some(lens) = self.lens {
+            effects.push(CompositeEffect::BackdropLens(lens.into_composite_lens()));
+        }
+        if self.tint.a > f32::EPSILON {
+            effects.push(CompositeEffect::backdrop_tint(self.tint));
+        }
+    }
+}
+
+/// Content/source effects for a render group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContentLayer {
+    source_mask: Option<GroupShape>,
+    source_blur: Pixels,
+    color_filter: SourceColorFilter,
+}
+
+impl Default for ContentLayer {
+    fn default() -> Self {
+        Self {
+            source_mask: None,
+            source_blur: Pixels(0.),
+            color_filter: SourceColorFilter::identity(),
+        }
+    }
+}
+
+impl ContentLayer {
+    /// Creates a content layer clipped to the given shape.
+    pub fn clipped_to(shape: GroupShape) -> Self {
+        Self {
+            source_mask: Some(shape),
+            ..Self::default()
+        }
+    }
+
+    /// Creates an unclipped content layer.
+    pub fn unclipped() -> Self {
+        Self::default()
+    }
+
+    /// Applies a source/content blur.
+    pub fn blur(mut self, radius: Pixels) -> Self {
+        self.source_blur = Pixels(radius.0.max(0.));
+        self
+    }
+
+    /// Multiplies content color channels by `factor`.
+    pub fn brightness(mut self, factor: f32) -> Self {
+        self.color_filter = self
+            .color_filter
+            .then(SourceColorFilter::brightness(factor));
+        self
+    }
+
+    /// Scales content color distance from mid-gray by `factor`.
+    pub fn contrast(mut self, factor: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::contrast(factor));
+        self
+    }
+
+    /// Adjusts content color saturation by `factor`.
+    pub fn saturate(mut self, factor: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::saturate(factor));
+        self
+    }
+
+    /// Mixes content color toward grayscale by `amount`.
+    pub fn grayscale(mut self, amount: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::grayscale(amount));
+        self
+    }
+
+    /// Mixes content color toward its inverse by `amount`.
+    pub fn invert(mut self, amount: f32) -> Self {
+        self.color_filter = self.color_filter.then(SourceColorFilter::invert(amount));
+        self
+    }
+
+    pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
+        if let Some(mask) = self.source_mask {
+            effects.push(CompositeEffect::source_mask(mask));
+        }
+        if self.source_blur.0 > f32::EPSILON {
+            effects.push(CompositeEffect::source_blur(self.source_blur));
+        }
+        if !self.color_filter.is_identity() {
+            effects.push(CompositeEffect::SourceColorFilter(self.color_filter));
+        }
+    }
+}
+
+/// Extra layers derived from render-group content.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DerivedLayer {
+    effects: Vec<CompositeEffect>,
+}
+
+impl DerivedLayer {
+    /// Creates an empty content-alpha derived layer builder.
+    pub fn from_content_alpha() -> Self {
+        Self {
+            effects: Vec::new(),
+        }
+    }
+
+    /// Adds a shadow derived from content/source alpha.
+    pub fn shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        self.effects
+            .push(CompositeEffect::drop_shadow(offset, blur_radius, color));
+        self
+    }
+
+    pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
+        effects.extend(self.effects.iter().cloned());
+    }
+}
+
 /// Final blend operation used when compositing a render group against its backdrop.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1177,6 +1490,44 @@ impl CompositeBlendMode {
             Self::Darken => 4,
             Self::Lighten => 5,
             Self::PlusLighter => 6,
+        }
+    }
+}
+
+/// Final render-group compositing options.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Composite {
+    opacity: f32,
+    blend_mode: CompositeBlendMode,
+}
+
+impl Composite {
+    /// Returns normal final compositing.
+    pub fn normal() -> Self {
+        Self {
+            opacity: 1.,
+            blend_mode: CompositeBlendMode::Normal,
+        }
+    }
+
+    /// Sets whole-group opacity at the parent boundary.
+    pub fn opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity.clamp(0., 1.);
+        self
+    }
+
+    /// Sets the final blend mode.
+    pub fn blend_mode(mut self, blend_mode: CompositeBlendMode) -> Self {
+        self.blend_mode = blend_mode;
+        self
+    }
+
+    pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
+        if (self.opacity - 1.).abs() > f32::EPSILON {
+            effects.push(CompositeEffect::opacity(self.opacity));
+        }
+        if self.blend_mode != CompositeBlendMode::Normal {
+            effects.push(CompositeEffect::blend_mode(self.blend_mode));
         }
     }
 }
@@ -1299,10 +1650,12 @@ pub struct CompositeEffectPlan {
     opacity: f32,
     source_color_filter: SourceColorFilter,
     source_blur_radius: ScaledPixels,
+    source_mask: Option<Corners<ScaledPixels>>,
     backdrop_color_filter: SourceColorFilter,
     backdrop_blur_radius: ScaledPixels,
     backdrop_lens: Option<CompositeBackdropLens<ScaledPixels>>,
     backdrop_tint: Hsla,
+    material_shape: Option<Corners<ScaledPixels>>,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
     rounded_mask: Option<Corners<ScaledPixels>>,
     blend_mode: CompositeBlendMode,
@@ -1342,10 +1695,12 @@ impl CompositeEffectPlan {
             opacity: boundary_opacity,
             source_color_filter: SourceColorFilter::identity(),
             source_blur_radius: ScaledPixels(0.),
+            source_mask: None,
             backdrop_color_filter: SourceColorFilter::identity(),
             backdrop_blur_radius: ScaledPixels(0.),
             backdrop_lens: None,
             backdrop_tint: transparent_black(),
+            material_shape: None,
             drop_shadows: Vec::new(),
             rounded_mask: None,
             blend_mode: CompositeBlendMode::Normal,
@@ -1364,6 +1719,9 @@ impl CompositeEffectPlan {
                     plan.source_blur_radius =
                         ScaledPixels((plan.source_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt());
                 }
+                CompositeEffect::SourceMask(corner_radii) => {
+                    plan.source_mask = Some(corner_radii.scale(scale_factor));
+                }
                 CompositeEffect::BackdropColorFilter(filter) => {
                     plan.backdrop_color_filter = plan.backdrop_color_filter.then(*filter);
                 }
@@ -1379,6 +1737,9 @@ impl CompositeEffectPlan {
                 CompositeEffect::BackdropTint(color) => {
                     plan.backdrop_tint = composite_tint(plan.backdrop_tint, *color);
                 }
+                CompositeEffect::MaterialShape(corner_radii) => {
+                    plan.material_shape = Some(corner_radii.scale(scale_factor));
+                }
                 CompositeEffect::DropShadow(shadow) => {
                     plan.drop_shadows.push(CompositeDropShadow {
                         offset: shadow.offset.scale(scale_factor),
@@ -1387,7 +1748,10 @@ impl CompositeEffectPlan {
                     });
                 }
                 CompositeEffect::RoundedMask(corner_radii) => {
-                    plan.rounded_mask = Some(corner_radii.scale(scale_factor));
+                    let corner_radii = corner_radii.scale(scale_factor);
+                    plan.source_mask = Some(corner_radii);
+                    plan.material_shape = Some(corner_radii);
+                    plan.rounded_mask = Some(corner_radii);
                 }
                 CompositeEffect::BlendMode(mode) => {
                     plan.blend_mode = *mode;
@@ -1414,6 +1778,11 @@ impl CompositeEffectPlan {
         self.source_blur_radius
     }
 
+    /// Returns the optional source/content mask in device pixels.
+    pub fn source_mask(&self) -> Option<Corners<ScaledPixels>> {
+        self.source_mask
+    }
+
     /// Returns the normalized backdrop color filter.
     pub fn backdrop_color_filter(&self) -> SourceColorFilter {
         self.backdrop_color_filter
@@ -1432,6 +1801,11 @@ impl CompositeEffectPlan {
     /// Returns the normalized backdrop tint.
     pub fn backdrop_tint(&self) -> Hsla {
         self.backdrop_tint
+    }
+
+    /// Returns the optional material shape in device pixels.
+    pub fn material_shape(&self) -> Option<Corners<ScaledPixels>> {
+        self.material_shape
     }
 
     /// Returns whether the plan needs a backdrop material layer.
@@ -1482,9 +1856,11 @@ impl CompositeEffectPlan {
                 CompositeEffect::BackdropLens(_) => {}
                 CompositeEffect::Opacity(_)
                 | CompositeEffect::SourceColorFilter(_)
+                | CompositeEffect::SourceMask(_)
                 | CompositeEffect::BackdropColorFilter(_)
                 | CompositeEffect::BackdropTint(_)
                 | CompositeEffect::BlendMode(_)
+                | CompositeEffect::MaterialShape(_)
                 | CompositeEffect::RoundedMask(_) => {}
             }
         }
@@ -1829,6 +2205,8 @@ mod tests {
             point(ScaledPixels(8.), ScaledPixels(-4.))
         );
         assert_eq!(plan.drop_shadows()[0].blur_radius, ScaledPixels(10.));
+        assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(12.))));
+        assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(12.))));
         assert_eq!(plan.rounded_mask(), Some(Corners::all(ScaledPixels(12.))));
         assert_eq!(
             CompositeEffectPlan::visual_outset(
@@ -1840,6 +2218,22 @@ mod tests {
             ),
             ScaledPixels(38.)
         );
+    }
+
+    #[test]
+    fn composite_effect_plan_keeps_source_mask_and_material_shape_distinct() {
+        let plan = CompositeEffectPlan::from_effects(
+            2.,
+            1.,
+            &[
+                CompositeEffect::source_mask(GroupShape::rounded_rect(Corners::all(Pixels(4.)))),
+                CompositeEffect::material_shape(GroupShape::rounded_rect(Corners::all(Pixels(9.)))),
+            ],
+        );
+
+        assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(8.))));
+        assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(18.))));
+        assert_eq!(plan.rounded_mask(), None);
     }
 
     #[test]

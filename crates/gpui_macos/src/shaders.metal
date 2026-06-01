@@ -842,13 +842,15 @@ struct GroupSpriteVertexOutput {
   float opacity;
   uint effect_kind [[flat]];
   float source_blur_radius;
-  float mask_enabled;
+  float source_mask_enabled;
   float2 shadow_offset;
   float shadow_blur_radius;
   float backdrop_blur_radius;
   float4 shadow_color;
-  float4 mask_bounds;
-  float4 mask_corner_radii;
+  float4 source_mask_bounds;
+  float4 source_mask_corner_radii;
+  float4 material_shape_bounds;
+  float4 material_shape_corner_radii;
   float4 color_matrix_0;
   float4 color_matrix_1;
   float4 color_matrix_2;
@@ -888,13 +890,15 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     sprite.opacity,
     sprite.effect_kind,
     sprite.source_blur_radius,
-    sprite.mask_enabled,
+    sprite.source_mask_enabled,
     float2(sprite.shadow_offset[0], sprite.shadow_offset[1]),
     sprite.shadow_blur_radius,
     sprite.backdrop_blur_radius,
     float4(sprite.shadow_color[0], sprite.shadow_color[1], sprite.shadow_color[2], sprite.shadow_color[3]),
-    float4(sprite.mask_bounds.origin.x, sprite.mask_bounds.origin.y, sprite.mask_bounds.size.width, sprite.mask_bounds.size.height),
-    float4(sprite.mask_corner_radii.top_left, sprite.mask_corner_radii.top_right, sprite.mask_corner_radii.bottom_right, sprite.mask_corner_radii.bottom_left),
+    float4(sprite.source_mask_bounds.origin.x, sprite.source_mask_bounds.origin.y, sprite.source_mask_bounds.size.width, sprite.source_mask_bounds.size.height),
+    float4(sprite.source_mask_corner_radii.top_left, sprite.source_mask_corner_radii.top_right, sprite.source_mask_corner_radii.bottom_right, sprite.source_mask_corner_radii.bottom_left),
+    float4(sprite.material_shape_bounds.origin.x, sprite.material_shape_bounds.origin.y, sprite.material_shape_bounds.size.width, sprite.material_shape_bounds.size.height),
+    float4(sprite.material_shape_corner_radii.top_left, sprite.material_shape_corner_radii.top_right, sprite.material_shape_corner_radii.bottom_right, sprite.material_shape_corner_radii.bottom_left),
     float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
     float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
     float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
@@ -911,39 +915,9 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
   };
 }
 
-float group_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
-  if (input.mask_enabled <= 0.0) {
-    return 1.0;
-  }
-
-  float2 half_size = input.mask_bounds.zw / 2.0;
-  float2 center = input.mask_bounds.xy + half_size;
-  float2 center_to_point = point - center;
-  float corner_radius = input.mask_corner_radii.x;
-  if (center_to_point.x < 0.0) {
-    if (center_to_point.y >= 0.0) {
-      corner_radius = input.mask_corner_radii.w;
-    }
-  } else {
-    if (center_to_point.y < 0.0) {
-      corner_radius = input.mask_corner_radii.y;
-    } else {
-      corner_radius = input.mask_corner_radii.z;
-    }
-  }
-  float2 corner_to_point = abs(center_to_point) - half_size;
-  float2 corner_center_to_point = corner_to_point + corner_radius;
-  return saturate(0.5 - quad_sdf_impl(corner_center_to_point, corner_radius));
-}
-
-float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
-  float4 corner_radii = float4(0.0);
-  if (input.mask_enabled > 0.0) {
-    corner_radii = input.mask_corner_radii;
-  }
-
-  float2 half_size = input.mask_bounds.zw / 2.0;
-  float2 center = input.mask_bounds.xy + half_size;
+float group_rounded_shape_sdf(float2 point, float4 bounds, float4 corner_radii) {
+  float2 half_size = bounds.zw / 2.0;
+  float2 center = bounds.xy + half_size;
   float2 center_to_point = point - center;
   float corner_radius = corner_radii.x;
   if (center_to_point.x < 0.0) {
@@ -960,6 +934,18 @@ float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
   float2 corner_to_point = abs(center_to_point) - half_size;
   float2 corner_center_to_point = corner_to_point + corner_radius;
   return quad_sdf_impl(corner_center_to_point, corner_radius);
+}
+
+float group_source_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
+  if (input.source_mask_enabled <= 0.0) {
+    return 1.0;
+  }
+
+  return saturate(0.5 - group_rounded_shape_sdf(point, input.source_mask_bounds, input.source_mask_corner_radii));
+}
+
+float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
+  return group_rounded_shape_sdf(point, input.material_shape_bounds, input.material_shape_corner_radii);
 }
 
 float group_material_alpha(float2 point, GroupSpriteVertexOutput input) {
@@ -1015,7 +1001,7 @@ float4 sample_group_source(texture2d<float> intermediate_texture,
                            float2 point,
                            GroupSpriteVertexOutput input) {
   return sample_group_texture(intermediate_texture, intermediate_texture_sampler, coords) *
-         group_mask_alpha(point, input);
+         group_source_mask_alpha(point, input);
 }
 
 float4 sample_group_source_blurred(texture2d<float> intermediate_texture,

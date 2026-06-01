@@ -537,7 +537,7 @@ fn render_group_backdrop_lens_refracts_parent_target_near_material_edge() {
 }
 
 #[test]
-fn render_group_backdrop_lens_lights_inner_edge_band() {
+fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
     let group_scene = Scene::default();
 
     let mut grouped = Scene::default();
@@ -547,7 +547,7 @@ fn render_group_backdrop_lens_lights_inner_edge_band() {
         rect(8., 8., 16., 16.),
         vec![CompositeEffect::backdrop_lens(
             px(0.),
-            px(8.),
+            px(6.),
             px(0.),
             0.8,
             0.,
@@ -559,7 +559,8 @@ fn render_group_backdrop_lens_lights_inner_edge_band() {
 
     let image = render(&grouped);
     let outer_wall = pixel(&image, 8, 16);
-    let inner_caustic = pixel(&image, 13, 16);
+    let mid_bevel = pixel(&image, 10, 16);
+    let focus_ridge = pixel(&image, 11, 16);
     let stable_center = pixel(&image, 16, 16);
 
     assert!(
@@ -567,8 +568,12 @@ fn render_group_backdrop_lens_lights_inner_edge_band() {
         "outer edge wall should catch light: outer_wall {outer_wall:?} center {stable_center:?}"
     );
     assert!(
-        inner_caustic[0] > outer_wall[0],
-        "inner caustic band should concentrate more light than the outer wall for tangent-guided light: inner_caustic {inner_caustic:?} outer_wall {outer_wall:?}"
+        mid_bevel[0] > stable_center[0],
+        "mid-bevel should stay optically active between the outer wall and inner focus ridge: mid_bevel {mid_bevel:?} center {stable_center:?}"
+    );
+    assert!(
+        focus_ridge[0] > mid_bevel[0],
+        "inner focus ridge should concentrate more light than the rounded bevel body for tangent-guided light: focus_ridge {focus_ridge:?} mid_bevel {mid_bevel:?}"
     );
     assert_eq!(
         stable_center,

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use gpui::{
     Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect, ContentMask, Corners,
-    DevicePixels, Edges, Hsla, LogicalVisualPlan, PaintGroup, PlatformHeadlessRenderer, Quad,
-    ScaledPixels, Scene, point, px, rgba, size, transparent_black,
+    DevicePixels, Edges, GroupShape, Hsla, LogicalVisualPlan, PaintGroup, PlatformHeadlessRenderer,
+    Quad, ScaledPixels, Scene, point, px, rgba, size, transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 use image::RgbaImage;
@@ -579,6 +579,124 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
         stable_center,
         [64, 64, 64, 255],
         "center should stay the unchanged backdrop when the edge band is outside the sample point"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_splits_chromatic_channels_at_material_edge() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(quad(1, rect(6., 0., 2., 32.), red()));
+    grouped.insert_primitive(quad(2, rect(13., 0., 2., 32.), rgba(0x0000ffff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        3,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(0.),
+            px(6.),
+            px(4.),
+            0.,
+            0.,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let split_edge = pixel(&image, 10, 16);
+    let stable_center = pixel(&image, 16, 16);
+
+    assert!(
+        split_edge[0] > 128 && split_edge[2] > 128,
+        "chromatic split should sample red and blue from opposite sides of the material normal: split_edge {split_edge:?}"
+    );
+    assert!(
+        split_edge[1] < 16,
+        "green should come from the undisplaced center sample on the black backdrop: split_edge {split_edge:?}"
+    );
+    assert_eq!(
+        stable_center,
+        [0, 0, 0, 255],
+        "center should not chromatically split once outside the material edge band"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_uses_material_shape_not_source_mask() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 16., 16.), rgba(0x0000ffff))]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), green()));
+    grouped.insert_primitive(quad(1, rect(0., 0., 8., 32.), red()));
+    grouped.insert_primitive(quad(2, rect(0., 0., 32., 8.), red()));
+    grouped.insert_primitive(paint_group_with_effects(
+        3,
+        rect(8., 8., 16., 16.),
+        vec![
+            CompositeEffect::source_mask(GroupShape::rounded_rect(Corners::all(px(8.)))),
+            CompositeEffect::material_shape(GroupShape::rectangle()),
+            CompositeEffect::backdrop_lens(px(6.), px(6.), px(0.), 0., 0., point(-1., -1.)),
+        ],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let masked_corner_material = pixel(&image, 9, 9);
+    let unmasked_source = pixel(&image, 16, 16);
+
+    assert!(
+        masked_corner_material[0] > masked_corner_material[1],
+        "material lens should still refract red backdrop in a corner where the separate source mask clips source content: {masked_corner_material:?}"
+    );
+    assert!(
+        masked_corner_material[2] < 16,
+        "blue source should be clipped by source mask and must not define material optics: {masked_corner_material:?}"
+    );
+    assert_eq!(
+        unmasked_source,
+        [0, 0, 255, 255],
+        "source mask should still allow opaque source in the unmasked body"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_does_not_distort_opaque_source_content() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 16.), rgba(0x0000ffff))]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), green()));
+    grouped.insert_primitive(quad(1, rect(0., 0., 8., 32.), red()));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(6.),
+            px(6.),
+            px(4.),
+            0.8,
+            0.4,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let opaque_source_edge = pixel(&image, 10, 16);
+    let lensed_material_edge = pixel(&image, 18, 16);
+
+    assert_eq!(
+        opaque_source_edge,
+        [0, 0, 255, 255],
+        "opaque source content should composite over glass without being refracted, lit, or chromatically split"
+    );
+    assert!(
+        lensed_material_edge != opaque_source_edge,
+        "uncovered material should still show the backdrop lens so this test exercises both layers: material {lensed_material_edge:?}"
     );
 }
 

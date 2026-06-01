@@ -1808,6 +1808,69 @@ impl LogicalVisualPlan {
     pub fn physical_plan(&self) -> PhysicalRenderGroupPlan {
         self.physical
     }
+
+    /// Returns stable support counters for this plan over an already computed capture region.
+    pub fn support_counters(
+        &self,
+        capture_bounds: Bounds<ScaledPixels>,
+    ) -> RenderGroupSupportCounters {
+        let has_rejections = !self.planning_rejections.is_empty();
+        let has_accepted_visual_work = self
+            .accepted_effects
+            .iter()
+            .any(|effect| !effect.is_identity())
+            || (self.normalized.opacity() - 1.).abs() > f32::EPSILON;
+        let renders_pixels = has_accepted_visual_work
+            && self.normalized.opacity() > f32::EPSILON
+            && !capture_bounds.is_empty();
+        let source_capture_pixels = if renders_pixels && self.requirements.requires_source_capture {
+            bounds_pixel_area(capture_bounds)
+        } else {
+            0
+        };
+        let backdrop_read_pixels = if renders_pixels && self.requirements.reads_backdrop {
+            bounds_pixel_area(capture_bounds.dilate(self.requirements.backdrop_outset))
+        } else {
+            0
+        };
+
+        RenderGroupSupportCounters {
+            rendered_groups: u32::from(renders_pixels),
+            elided_groups: u32::from(!renders_pixels && !has_rejections),
+            rejected_groups: u32::from(has_rejections),
+            source_capture_pixels,
+            backdrop_read_pixels,
+            logical_passes: u32::from(self.requirements.pass_count) * u32::from(renders_pixels),
+            physical_passes: u32::from(self.physical.pass_count) * u32::from(renders_pixels),
+            intermediate_textures: u32::from(self.physical.intermediate_textures)
+                * u32::from(renders_pixels),
+            backdrop_copies: u32::from(self.physical.backdrop_copies) * u32::from(renders_pixels),
+        }
+    }
+}
+
+/// Stable render-group support counters derived from a logical plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderGroupSupportCounters {
+    /// Groups whose accepted plan has visible work for the supplied capture bounds.
+    pub rendered_groups: u32,
+    /// Groups with no accepted visible work and no planning rejection.
+    pub elided_groups: u32,
+    /// Groups with at least one typed planning rejection.
+    pub rejected_groups: u32,
+    /// Device pixels in the source capture region.
+    pub source_capture_pixels: u64,
+    /// Device-pixel footprint that backdrop-sampling effects may read.
+    pub backdrop_read_pixels: u64,
+    /// Logical passes required by accepted visible work.
+    pub logical_passes: u32,
+    /// Physical passes in the current backend summary for accepted visible work.
+    pub physical_passes: u32,
+    /// Intermediate textures in the current backend summary for accepted visible work.
+    pub intermediate_textures: u32,
+    /// Backdrop texture copies in the current backend summary for accepted visible work.
+    pub backdrop_copies: u32,
 }
 
 /// A typed reason why an authored render-group effect could not enter the exact plan.
@@ -1946,6 +2009,16 @@ impl PhysicalRenderGroupPlan {
             backdrop_copies: requirements.backdrop_copies,
         }
     }
+}
+
+fn bounds_pixel_area(bounds: Bounds<ScaledPixels>) -> u64 {
+    if bounds.is_empty() {
+        return 0;
+    }
+
+    let width = bounds.size.width.0.max(0.).ceil() as u64;
+    let height = bounds.size.height.0.max(0.).ceil() as u64;
+    width.saturating_mul(height)
 }
 
 const MAX_EXACT_GAUSSIAN_SIGMA: f32 = 8.;
@@ -2884,6 +2957,97 @@ mod tests {
         assert_eq!(plan.requirements().source_outset, ScaledPixels(12.));
         assert_eq!(plan.requirements().backdrop_outset, ScaledPixels(24.));
         assert_eq!(plan.physical_plan().backdrop_copies, 1);
+    }
+
+    #[test]
+    fn logical_visual_plan_reports_support_counters_for_visible_work() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![
+                CompositeEffect::source_blur(Pixels(2.)),
+                CompositeEffect::backdrop_blur(Pixels(4.)),
+            ],
+        );
+
+        let counters = plan.support_counters(scaled_bounds(10., 20., 100., 40.));
+
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 1,
+                elided_groups: 0,
+                rejected_groups: 0,
+                source_capture_pixels: 4_000,
+                backdrop_read_pixels: 7_936,
+                logical_passes: 3,
+                physical_passes: 3,
+                intermediate_textures: 2,
+                backdrop_copies: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_support_counters_separate_rejected_work() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::source_blur(Pixels(20.))],
+        );
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(plan.accepted_effects(), []);
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 0,
+                elided_groups: 0,
+                rejected_groups: 1,
+                source_capture_pixels: 0,
+                backdrop_read_pixels: 0,
+                logical_passes: 0,
+                physical_passes: 0,
+                intermediate_textures: 0,
+                backdrop_copies: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_support_counters_elide_identity_work() {
+        let plan = LogicalVisualPlan::from_effects(1., 1., Vec::new());
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 0,
+                elided_groups: 1,
+                rejected_groups: 0,
+                source_capture_pixels: 0,
+                backdrop_read_pixels: 0,
+                logical_passes: 0,
+                physical_passes: 0,
+                intermediate_textures: 0,
+                backdrop_copies: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_support_counters_count_boundary_opacity() {
+        let plan = LogicalVisualPlan::from_effects(1., 0.5, Vec::new());
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(counters.rendered_groups, 1);
+        assert_eq!(counters.elided_groups, 0);
+        assert_eq!(counters.source_capture_pixels, 4_000);
+        assert_eq!(counters.logical_passes, 2);
+        assert_eq!(counters.physical_passes, 2);
     }
 
     #[test]

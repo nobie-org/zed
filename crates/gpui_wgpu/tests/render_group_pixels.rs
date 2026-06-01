@@ -111,6 +111,11 @@ fn gray() -> Hsla {
     rgba(0x808080ff).into()
 }
 
+fn gray_byte(value: u8) -> Hsla {
+    let value = u32::from(value);
+    rgba((value << 24) | (value << 16) | (value << 8) | 0xff).into()
+}
+
 fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
     let mut scene = Scene::default();
     for primitive in primitives {
@@ -579,6 +584,47 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
         stable_center,
         [64, 64, 64, 255],
         "center should stay the unchanged backdrop when the edge band is outside the sample point"
+    );
+}
+
+#[test]
+fn render_group_backdrop_lens_reconstructs_subpixel_backdrop_samples() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    for x in 0..IMAGE_SIZE {
+        let color = if x % 2 == 0 {
+            gray_byte(0)
+        } else {
+            gray_byte(255)
+        };
+        grouped.insert_primitive(quad(x as u32, rect(x as f32, 0., 1., 32.), color));
+    }
+    grouped.insert_primitive(paint_group_with_effects(
+        IMAGE_SIZE as u32,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(2.5),
+            px(6.),
+            px(0.),
+            0.,
+            0.,
+            point(-1., 0.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let reconstructed = (10..14)
+        .map(|x| pixel(&image, x, 16)[0])
+        .collect::<Vec<_>>();
+
+    assert!(
+        reconstructed
+            .iter()
+            .any(|channel| (32..=223).contains(channel)),
+        "subpixel lens sampling should reconstruct the backdrop between texels instead of stepping between nearest-neighbor stripes: {reconstructed:?}"
     );
 }
 

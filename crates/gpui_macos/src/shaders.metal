@@ -1000,6 +1000,39 @@ float4 sample_backdrop_texture(texture2d<float> backdrop_texture,
   return backdrop_texture.sample(texture_sampler, coords);
 }
 
+float4 load_backdrop_texel_clamped(texture2d<float> backdrop_texture,
+                                   int2 texel) {
+  int2 max_texel = int2(
+      int(backdrop_texture.get_width()) - 1,
+      int(backdrop_texture.get_height()) - 1);
+  int2 clamped_texel = clamp(texel, int2(0), max_texel);
+  return backdrop_texture.read(uint2(clamped_texel));
+}
+
+float4 sample_backdrop_texture_linear(texture2d<float> backdrop_texture,
+                                      float2 coords) {
+  if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
+    return float4(0.0);
+  }
+
+  float2 dimensions = float2(
+      float(backdrop_texture.get_width()),
+      float(backdrop_texture.get_height()));
+  float2 texel = coords * dimensions - float2(0.5);
+  float2 texel_floor = floor(texel);
+  int2 base = int2(texel_floor);
+  float2 fraction = texel - texel_floor;
+
+  float4 top_left = load_backdrop_texel_clamped(backdrop_texture, base);
+  float4 top_right = load_backdrop_texel_clamped(backdrop_texture, base + int2(1, 0));
+  float4 bottom_left = load_backdrop_texel_clamped(backdrop_texture, base + int2(0, 1));
+  float4 bottom_right = load_backdrop_texel_clamped(backdrop_texture, base + int2(1, 1));
+
+  float4 top = mix(top_left, top_right, fraction.x);
+  float4 bottom = mix(bottom_left, bottom_right, fraction.x);
+  return mix(top, bottom, fraction.y);
+}
+
 float4 sample_group_source(texture2d<float> intermediate_texture,
                            sampler intermediate_texture_sampler,
                            float2 coords,
@@ -1079,6 +1112,38 @@ float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,
   return color / total;
 }
 
+float4 sample_backdrop_blurred_linear(texture2d<float> backdrop_texture,
+                                      float2 coords,
+                                      float2 pixel_size,
+                                      float sigma) {
+  if (sigma <= 0.0) {
+    return sample_backdrop_texture_linear(backdrop_texture, coords);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float4 color = float4(0.0);
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          color += sample_backdrop_texture_linear(
+              backdrop_texture,
+              coords + offset * pixel_size) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return float4(0.0);
+  }
+  return color / total;
+}
+
 float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
                               sampler texture_sampler,
                               float2 coords,
@@ -1094,38 +1159,37 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
   float material_sdf = group_material_sdf(point, input);
   float material_alpha = saturate(0.5 - material_sdf);
   float rim_width = max(input.backdrop_lens.y, 0.0001);
-  float edge_position = saturate(abs(material_sdf) / rim_width);
+  float edge_position = saturate(max(-material_sdf, 0.0) / rim_width);
   float bevel_t = smoothstep(0.0, 1.0, edge_position);
-  float side_normal = cos(bevel_t * 1.5707964) * material_alpha;
-  float curvature = sin(bevel_t * 3.1415927) * material_alpha;
-  float focus_ridge = group_lens_focus_ridge(edge_position, curvature);
-  if (side_normal + curvature + focus_ridge <= 0.0) {
-    return sample_backdrop_blurred(
-        backdrop_texture, texture_sampler, coords, pixel_size, sigma);
+  float outer_wall_position = (edge_position - 0.18) / 0.14;
+  float outer_wall = exp(-(outer_wall_position * outer_wall_position)) * material_alpha;
+  float bevel_body = sin(bevel_t * 3.1415927) * material_alpha;
+  float focus_ridge = group_lens_focus_ridge(edge_position, bevel_body);
+  if (outer_wall + bevel_body + focus_ridge <= 0.0) {
+    return sample_backdrop_blurred_linear(
+        backdrop_texture, coords, pixel_size, sigma);
   }
 
   float refraction_profile = saturate(
-      side_normal * 0.82 + curvature * 0.22 + focus_ridge * 0.24);
+      outer_wall * 0.34 + bevel_body * 0.58 + focus_ridge * 0.28);
   float chroma_profile = saturate(
-      side_normal * 0.68 + curvature * 0.16 + focus_ridge * 0.42);
+      outer_wall * 0.52 + bevel_body * 0.86 + focus_ridge * 0.72);
 
   float2 normal = group_material_normal(point, input);
   float2 refraction_offset = normal * input.backdrop_lens.x * refraction_profile * pixel_size;
   float2 center_coords = coords + refraction_offset;
-  float4 sample = sample_backdrop_blurred(
-      backdrop_texture, texture_sampler, center_coords, pixel_size, sigma);
+  float4 sample = sample_backdrop_blurred_linear(
+      backdrop_texture, center_coords, pixel_size, sigma);
 
   if (input.backdrop_lens.z > 0.0) {
     float2 chroma_offset = normal * input.backdrop_lens.z * chroma_profile * pixel_size;
-    float red = sample_backdrop_blurred(
+    float red = sample_backdrop_blurred_linear(
         backdrop_texture,
-        texture_sampler,
         center_coords + chroma_offset,
         pixel_size,
         sigma).r;
-    float blue = sample_backdrop_blurred(
+    float blue = sample_backdrop_blurred_linear(
         backdrop_texture,
-        texture_sampler,
         center_coords - chroma_offset,
         pixel_size,
         sigma).b;
@@ -1143,12 +1207,12 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
   float2 tangent = float2(-normal.y, normal.x);
   float guided_light = pow(abs(dot(tangent, light_direction)), 2.0);
   float highlight_profile =
-      side_normal * (0.22 + 0.58 * facing_light) +
-      curvature * 0.10 * facing_light +
+      outer_wall * (0.18 + 0.62 * facing_light) +
+      bevel_body * (0.10 + 0.18 * facing_light) +
       focus_ridge * (0.12 + 0.48 * guided_light);
   float shadow_profile =
-      side_normal * 0.28 * facing_shadow +
-      curvature * 0.10 * facing_shadow +
+      outer_wall * 0.24 * facing_shadow +
+      bevel_body * 0.12 * facing_shadow +
       focus_ridge * 0.22 * facing_shadow;
   float highlight = saturate(highlight_profile * input.backdrop_lens_lighting.x);
   float shadow = saturate(shadow_profile * input.backdrop_lens_lighting.y);

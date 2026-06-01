@@ -620,6 +620,14 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
     let focus_ridge = pixel(&image, 11, 16);
     let inner_falloff = pixel(&image, 12, 16);
     let stable_center = pixel(&image, 16, 16);
+    let bevel_samples = [
+        outer_edge[0],
+        outer_shoulder[0],
+        mid_bevel[0],
+        focus_ridge[0],
+        inner_falloff[0],
+        stable_center[0],
+    ];
 
     assert!(
         outer_edge[0] > stable_center[0],
@@ -640,6 +648,12 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
     assert!(
         inner_falloff[0] > stable_center[0],
         "rounded side should decay back to the stable pane after the focus ridge: inner_falloff {inner_falloff:?} center {stable_center:?}"
+    );
+    assert!(
+        bevel_samples
+            .windows(2)
+            .all(|samples| samples[0].abs_diff(samples[1]) <= 48),
+        "rounded side should ramp continuously instead of forming separate visual rails: {bevel_samples:?}"
     );
     assert_eq!(
         stable_center,

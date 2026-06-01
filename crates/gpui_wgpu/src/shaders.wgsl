@@ -1203,9 +1203,13 @@ fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {
     return gradient / gradient_length;
 }
 
-fn group_lens_focus_ridge(edge_position: f32, curvature: f32) -> f32 {
-    let ridge_position = (edge_position - 0.64) / 0.22;
-    return exp(-(ridge_position * ridge_position)) * curvature;
+fn group_lens_rounded_side(edge_position: f32, material_alpha: f32) -> vec3<f32> {
+    let bevel_t = smoothstep(0.0, 1.0, edge_position);
+    let wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha;
+    let body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha;
+    let ridge_position = (edge_position - 0.68) / 0.34;
+    let ridge = exp(-(ridge_position * ridge_position)) * body;
+    return vec3<f32>(wall, body, ridge);
 }
 
 fn sample_group_texture(coords: vec2<f32>) -> vec4<f32> {
@@ -1368,21 +1372,21 @@ fn sample_backdrop_lensed(
     let material_alpha = clamp(0.5 - material_sdf, 0.0, 1.0);
     let rim_width = max(sprite.backdrop_lens.y, 0.0001);
     let edge_position = clamp(max(-material_sdf, 0.0) / rim_width, 0.0, 1.0);
-    let bevel_t = smoothstep(0.0, 1.0, edge_position);
-    let side_normal = cos(bevel_t * 1.5707964) * material_alpha;
-    let curvature = sin(bevel_t * 3.1415927) * material_alpha;
-    let focus_ridge = group_lens_focus_ridge(edge_position, curvature);
-    if (side_normal + curvature + focus_ridge <= 0.0) {
+    let rounded_side = group_lens_rounded_side(edge_position, material_alpha);
+    let wall = rounded_side.x;
+    let body = rounded_side.y;
+    let focus_ridge = rounded_side.z;
+    if (wall + body + focus_ridge <= 0.0) {
         return sample_backdrop_blurred_linear(coords, pixel_size, sigma);
     }
 
     let refraction_profile = clamp(
-        side_normal * 0.82 + curvature * 0.22 + focus_ridge * 0.24,
+        wall * 0.72 + body * 0.42 + focus_ridge * 0.10,
         0.0,
         1.0,
     );
     let chroma_profile = clamp(
-        side_normal * 0.68 + curvature * 0.16 + focus_ridge * 0.42,
+        wall * 0.54 + body * 0.22 + focus_ridge * 0.22,
         0.0,
         1.0,
     );
@@ -1410,13 +1414,13 @@ fn sample_backdrop_lensed(
     let tangent = vec2<f32>(-normal.y, normal.x);
     let guided_light = pow(abs(dot(tangent, light_direction)), 2.0);
     let highlight_profile =
-        side_normal * (0.22 + 0.58 * facing_light) +
-        curvature * 0.10 * facing_light +
-        focus_ridge * (0.12 + 0.48 * guided_light);
+        wall * (0.18 + 0.46 * facing_light) +
+        body * (0.08 + 0.14 * facing_light) +
+        focus_ridge * (0.08 + 0.24 * guided_light);
     let shadow_profile =
-        side_normal * 0.28 * facing_shadow +
-        curvature * 0.10 * facing_shadow +
-        focus_ridge * 0.22 * facing_shadow;
+        wall * 0.24 * facing_shadow +
+        body * 0.12 * facing_shadow +
+        focus_ridge * 0.18 * facing_shadow;
     let highlight = clamp(highlight_profile * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
     let shadow = clamp(shadow_profile * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
     var straight_rgb = sample.rgb / sample.a;

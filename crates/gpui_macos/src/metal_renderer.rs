@@ -2429,3 +2429,190 @@ pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        BorderStyle, CompositeEffect, Edges, Hsla, LogicalVisualPlan, PaintGroup, px, rgba,
+        transparent_black,
+    };
+    use image::RgbaImage;
+    use std::sync::Arc;
+
+    const IMAGE_SIZE: i32 = 32;
+
+    fn sp(value: f32) -> ScaledPixels {
+        ScaledPixels(value)
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(point(sp(x), sp(y)), size(sp(width), sp(height)))
+    }
+
+    fn viewport() -> Bounds<ScaledPixels> {
+        rect(0., 0., IMAGE_SIZE as f32, IMAGE_SIZE as f32)
+    }
+
+    fn mask() -> ContentMask<ScaledPixels> {
+        ContentMask { bounds: viewport() }
+    }
+
+    fn quad(order: u32, bounds: Bounds<ScaledPixels>, background: impl Into<Background>) -> Quad {
+        Quad {
+            order,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: mask(),
+            background: background.into(),
+            border_color: transparent_black(),
+            corner_radii: Corners::all(sp(0.)),
+            border_widths: Edges::all(sp(0.)),
+        }
+    }
+
+    fn paint_group_with_effects(
+        order: u32,
+        capture_bounds: Bounds<ScaledPixels>,
+        effects: Vec<CompositeEffect>,
+        scene: Scene,
+    ) -> PaintGroup {
+        PaintGroup {
+            order,
+            bounds: capture_bounds,
+            capture_bounds,
+            content_mask: mask(),
+            scale_factor: 1.,
+            plan: LogicalVisualPlan::from_effects(1., 1., effects),
+            scene: Arc::new(scene),
+        }
+    }
+
+    fn black() -> Hsla {
+        rgba(0x000000ff).into()
+    }
+
+    fn render(scene: &Scene) -> RgbaImage {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let device = MetalRenderer::create_device();
+        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
+        renderer
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render metal scene")
+    }
+
+    fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        image.get_pixel(x, y).0
+    }
+
+    #[test]
+    fn render_group_backdrop_lens_metal_lights_continuous_bevel_profile() {
+        let group_scene = Scene::default();
+
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), rgba(0x404040ff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 16., 16.),
+            vec![CompositeEffect::backdrop_lens(
+                px(0.),
+                px(6.),
+                px(0.),
+                0.8,
+                0.,
+                point(0., -1.),
+            )],
+            group_scene,
+        ));
+        grouped.finish();
+
+        let image = render(&grouped);
+        let outer_edge = pixel(&image, 8, 16);
+        let outer_shoulder = pixel(&image, 9, 16);
+        let mid_bevel = pixel(&image, 10, 16);
+        let focus_ridge = pixel(&image, 11, 16);
+        let inner_falloff = pixel(&image, 12, 16);
+        let stable_center = pixel(&image, 16, 16);
+        let bevel_samples = [
+            outer_edge[0],
+            outer_shoulder[0],
+            mid_bevel[0],
+            focus_ridge[0],
+            inner_falloff[0],
+            stable_center[0],
+        ];
+
+        assert!(
+            outer_edge[0] > stable_center[0],
+            "outer edge should catch glancing light: outer_edge {outer_edge:?} center {stable_center:?}"
+        );
+        assert!(
+            outer_shoulder[0] > stable_center[0],
+            "rounded side should stay lit after the outer edge instead of collapsing into a dark band: outer_shoulder {outer_shoulder:?} center {stable_center:?}"
+        );
+        assert!(
+            mid_bevel[0] > stable_center[0],
+            "mid-bevel should stay optically active between the outer wall and inner focus ridge: mid_bevel {mid_bevel:?} center {stable_center:?}"
+        );
+        assert!(
+            focus_ridge[0] > mid_bevel[0],
+            "inner focus ridge should concentrate more light than the rounded bevel body for tangent-guided light: focus_ridge {focus_ridge:?} mid_bevel {mid_bevel:?}"
+        );
+        assert!(
+            inner_falloff[0] > stable_center[0],
+            "rounded side should decay back to the stable pane after the focus ridge: inner_falloff {inner_falloff:?} center {stable_center:?}"
+        );
+        assert!(
+            bevel_samples
+                .windows(2)
+                .all(|samples| samples[0].abs_diff(samples[1]) <= 48),
+            "rounded side should ramp continuously instead of forming separate visual rails: {bevel_samples:?}"
+        );
+        assert_eq!(
+            stable_center,
+            [64, 64, 64, 255],
+            "center should stay the unchanged backdrop when the edge band is outside the sample point"
+        );
+    }
+
+    #[test]
+    fn render_group_backdrop_lens_metal_reflects_backdrop_color_along_material_edge() {
+        let group_scene = Scene::default();
+
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(quad(1, rect(8., 11., 16., 3.), rgba(0x0000ffff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            2,
+            rect(8., 8., 16., 16.),
+            vec![CompositeEffect::backdrop_lens(
+                px(0.),
+                px(6.),
+                px(0.),
+                0.7,
+                0.,
+                point(0., -1.),
+            )],
+            group_scene,
+        ));
+        grouped.finish();
+
+        let image = render(&grouped);
+        let reflected_edge = pixel(&image, 9, 16);
+        let stable_center = pixel(&image, 16, 16);
+
+        assert!(
+            reflected_edge[2] > reflected_edge[0] + 16
+                && reflected_edge[2] > reflected_edge[1] + 16,
+            "edge reflection should carry backdrop color along the tangent instead of only whitening the bevel: {reflected_edge:?}"
+        );
+        assert_eq!(
+            stable_center,
+            [0, 0, 0, 255],
+            "center pane should not pick up the edge reflection sample"
+        );
+    }
+}

@@ -1974,6 +1974,305 @@ pub enum RenderGroupLimitUnit {
     GaussianSigma,
 }
 
+/// Render-group capability a tool can ask the GPUI planner to classify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum RenderGroupCapabilityProbe {
+    SourceColor,
+    ExactSourceBlur,
+    SourceDistortion,
+    SourceMask,
+    TextCaptureFidelity,
+    BackdropMaterial,
+    BackdropLens,
+    MaterialResource,
+    MaterialLighting,
+    AdaptiveBackdropPolicy,
+    ContentAlphaShadow,
+    GlowApproximation,
+    DerivedStroke,
+    DerivedReflection,
+    InnerEffect,
+    CompositeOpacity,
+    CompositeBlend,
+    DestinationMask,
+    TransformedGroup,
+    GeometryWarp,
+    RoundedGroupShape,
+    SpatialSampling,
+    TemporalMaterial,
+    TemporalInteraction,
+    TemporalTransition,
+    NamedMaterialPolicy,
+    ResourceBackedEffect,
+    MultiInputEffect,
+    DebugVisualizer,
+    BackendDiagnostics,
+}
+
+impl RenderGroupCapabilityProbe {
+    /// Returns the current planner-owned support report for this capability.
+    pub fn report(self) -> RenderGroupCapabilityReport {
+        use RenderGroupCapabilityRejectionReason as Reason;
+
+        match self {
+            Self::SourceColor
+            | Self::SourceMask
+            | Self::BackdropMaterial
+            | Self::BackdropLens
+            | Self::MaterialLighting
+            | Self::ContentAlphaShadow
+            | Self::CompositeOpacity
+            | Self::CompositeBlend
+            | Self::RoundedGroupShape => RenderGroupCapabilityReport::rendered(
+                self,
+                "current normalized render-group plan has a backend path",
+            ),
+            Self::ExactSourceBlur => RenderGroupCapabilityReport::partial(
+                self,
+                Reason::ExactKernelLimit,
+                "exact Gaussian blur is accepted only within the current kernel limit",
+                "use an explicitly approximate tier or lower the exact blur radius",
+            ),
+            Self::GlowApproximation => RenderGroupCapabilityReport::approximation(
+                self,
+                Reason::ApproximationOnly,
+                "storybook lowers glow pressure through an existing shadow primitive",
+                "graduate glow only when it has distinct provenance and fixtures",
+            ),
+            Self::DebugVisualizer => RenderGroupCapabilityReport::inspector_only(
+                self,
+                Reason::InspectorOnly,
+                "debug visualization is tooling metadata, not a group pixel effect",
+                "add a rendered overlay only with explicit debug-layer semantics",
+            ),
+            Self::BackendDiagnostics => RenderGroupCapabilityReport::inspector_only(
+                self,
+                Reason::BackendDiagnosticsMissing,
+                "support counters are planned; backend diagnostic counters are not wired yet",
+                "connect actual copied pixels, texture-pool behavior, shader variants, and timing",
+            ),
+            Self::SourceDistortion => RenderGroupCapabilityReport::unsupported(
+                self,
+                Reason::LogicalNodeMissing,
+                "no source-distortion logical node exists",
+                "add source-distortion nodes with coordinate-space and resampling laws",
+            ),
+            Self::TextCaptureFidelity => RenderGroupCapabilityReport::unsupported(
+                self,
+                Reason::FixtureMissing,
+                "active capture text behavior is not fixture-backed across backends",
+                "add text/cached-descendant fixtures before claiming support",
+            ),
+            Self::MaterialResource | Self::ResourceBackedEffect => {
+                RenderGroupCapabilityReport::unsupported(
+                    self,
+                    Reason::ResourceBindingMissing,
+                    "no effect resource identity, sampler policy, or cache key is in the plan",
+                    "add resource-backed logical nodes and backend bindings",
+                )
+            }
+            Self::AdaptiveBackdropPolicy | Self::NamedMaterialPolicy => {
+                RenderGroupCapabilityReport::unsupported(
+                    self,
+                    Reason::PolicyMissing,
+                    "policy-selected materials are not named planner inputs",
+                    "add named accessibility/theme material policies instead of silent fallback",
+                )
+            }
+            Self::DerivedStroke | Self::InnerEffect => RenderGroupCapabilityReport::unsupported(
+                self,
+                Reason::ProvenancePathMissing,
+                "no distinct derived-layer provenance path exists for this effect",
+                "add a provenance-specific derived node before rendering pixels",
+            ),
+            Self::DerivedReflection => RenderGroupCapabilityReport::unsupported(
+                self,
+                Reason::MultiInputPassMissing,
+                "derived reflection needs generated pixels and bounds beyond the current normalized slots",
+                "add an explicit derived reflection node with source/destination provenance",
+            ),
+            Self::DestinationMask => RenderGroupCapabilityReport::unsupported(
+                self,
+                Reason::DestinationReadMissing,
+                "destination masking is not represented in the current physical plan",
+                "add destination-read capability rows and backend rejection metadata",
+            ),
+            Self::TransformedGroup => RenderGroupCapabilityReport::unsupported(
+                self,
+                Reason::CoordinatePlanMissing,
+                "transformed group capture/effect/hit bounds are not a planner node",
+                "add transform-space requirements and backend fixtures",
+            ),
+            Self::GeometryWarp | Self::SpatialSampling | Self::MultiInputEffect => {
+                RenderGroupCapabilityReport::unsupported(
+                    self,
+                    Reason::PassGraphMissing,
+                    "the effect cannot be represented honestly by normalized singleton slots",
+                    "introduce an explicit pass graph when a concrete public effect requires it",
+                )
+            }
+            Self::TemporalMaterial | Self::TemporalInteraction | Self::TemporalTransition => {
+                RenderGroupCapabilityReport::unsupported(
+                    self,
+                    Reason::TemporalDependencyMissing,
+                    "time/input/lifecycle invalidation keys are not planner dependencies",
+                    "add deterministic dependency keys and invalidation policy",
+                )
+            }
+        }
+    }
+}
+
+/// Current support tier for a render-group capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum RenderGroupCapabilityStatus {
+    Rendered,
+    Partial,
+    Approximation,
+    InspectorOnly,
+    Unsupported,
+}
+
+impl RenderGroupCapabilityStatus {
+    /// Short label for inspector display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rendered => "rendered",
+            Self::Partial => "partial",
+            Self::Approximation => "approximation",
+            Self::InspectorOnly => "inspector only",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Typed reason a capability cannot currently claim rendered support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum RenderGroupCapabilityRejectionReason {
+    ExactKernelLimit,
+    ApproximationOnly,
+    InspectorOnly,
+    LogicalNodeMissing,
+    PassGraphMissing,
+    ResourceBindingMissing,
+    TemporalDependencyMissing,
+    PolicyMissing,
+    BackendDiagnosticsMissing,
+    FixtureMissing,
+    ProvenancePathMissing,
+    MultiInputPassMissing,
+    DestinationReadMissing,
+    CoordinatePlanMissing,
+}
+
+impl RenderGroupCapabilityRejectionReason {
+    /// Short label for inspector display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExactKernelLimit => "exact kernel limit",
+            Self::ApproximationOnly => "approximation only",
+            Self::InspectorOnly => "inspector only",
+            Self::LogicalNodeMissing => "missing logical node",
+            Self::PassGraphMissing => "needs pass graph",
+            Self::ResourceBindingMissing => "missing resource binding",
+            Self::TemporalDependencyMissing => "missing temporal dependency",
+            Self::PolicyMissing => "missing material policy",
+            Self::BackendDiagnosticsMissing => "missing backend diagnostics",
+            Self::FixtureMissing => "missing fixture",
+            Self::ProvenancePathMissing => "missing provenance path",
+            Self::MultiInputPassMissing => "needs multi-input pass",
+            Self::DestinationReadMissing => "needs destination read",
+            Self::CoordinatePlanMissing => "missing coordinate plan",
+        }
+    }
+}
+
+/// Planner-owned capability report for inspector and tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct RenderGroupCapabilityReport {
+    pub probe: RenderGroupCapabilityProbe,
+    pub status: RenderGroupCapabilityStatus,
+    pub rejection: Option<RenderGroupCapabilityRejectionReason>,
+    pub evidence: &'static str,
+    pub suggestion: &'static str,
+}
+
+impl RenderGroupCapabilityReport {
+    fn rendered(probe: RenderGroupCapabilityProbe, evidence: &'static str) -> Self {
+        Self {
+            probe,
+            status: RenderGroupCapabilityStatus::Rendered,
+            rejection: None,
+            evidence,
+            suggestion: "assert backend fixtures and limits for public support claims",
+        }
+    }
+
+    fn partial(
+        probe: RenderGroupCapabilityProbe,
+        rejection: RenderGroupCapabilityRejectionReason,
+        evidence: &'static str,
+        suggestion: &'static str,
+    ) -> Self {
+        Self {
+            probe,
+            status: RenderGroupCapabilityStatus::Partial,
+            rejection: Some(rejection),
+            evidence,
+            suggestion,
+        }
+    }
+
+    fn approximation(
+        probe: RenderGroupCapabilityProbe,
+        rejection: RenderGroupCapabilityRejectionReason,
+        evidence: &'static str,
+        suggestion: &'static str,
+    ) -> Self {
+        Self {
+            probe,
+            status: RenderGroupCapabilityStatus::Approximation,
+            rejection: Some(rejection),
+            evidence,
+            suggestion,
+        }
+    }
+
+    fn inspector_only(
+        probe: RenderGroupCapabilityProbe,
+        rejection: RenderGroupCapabilityRejectionReason,
+        evidence: &'static str,
+        suggestion: &'static str,
+    ) -> Self {
+        Self {
+            probe,
+            status: RenderGroupCapabilityStatus::InspectorOnly,
+            rejection: Some(rejection),
+            evidence,
+            suggestion,
+        }
+    }
+
+    fn unsupported(
+        probe: RenderGroupCapabilityProbe,
+        rejection: RenderGroupCapabilityRejectionReason,
+        evidence: &'static str,
+        suggestion: &'static str,
+    ) -> Self {
+        Self {
+            probe,
+            status: RenderGroupCapabilityStatus::Unsupported,
+            rejection: Some(rejection),
+            evidence,
+            suggestion,
+        }
+    }
+}
+
 /// Backend-independent requirements implied by a logical visual plan.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[allow(missing_docs)]
@@ -3362,6 +3661,45 @@ mod tests {
                 requested: ScaledPixels(72_f32.sqrt()),
                 unit: RenderGroupLimitUnit::GaussianSigma,
             }
+        );
+    }
+
+    #[test]
+    fn render_group_capability_reports_rendered_current_primitives() {
+        let report = RenderGroupCapabilityProbe::BackdropLens.report();
+
+        assert_eq!(report.status, RenderGroupCapabilityStatus::Rendered);
+        assert_eq!(report.rejection, None);
+        assert!(report.evidence.contains("backend path"));
+    }
+
+    #[test]
+    fn render_group_capability_reports_non_blur_capability_gaps() {
+        let destination_mask = RenderGroupCapabilityProbe::DestinationMask.report();
+        assert_eq!(
+            destination_mask.status,
+            RenderGroupCapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            destination_mask.rejection,
+            Some(RenderGroupCapabilityRejectionReason::DestinationReadMissing)
+        );
+
+        let temporal = RenderGroupCapabilityProbe::TemporalInteraction.report();
+        assert_eq!(temporal.status, RenderGroupCapabilityStatus::Unsupported);
+        assert_eq!(
+            temporal.rejection,
+            Some(RenderGroupCapabilityRejectionReason::TemporalDependencyMissing)
+        );
+
+        let diagnostics = RenderGroupCapabilityProbe::BackendDiagnostics.report();
+        assert_eq!(
+            diagnostics.status,
+            RenderGroupCapabilityStatus::InspectorOnly
+        );
+        assert_eq!(
+            diagnostics.rejection,
+            Some(RenderGroupCapabilityRejectionReason::BackendDiagnosticsMissing)
         );
     }
 

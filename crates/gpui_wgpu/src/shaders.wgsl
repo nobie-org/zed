@@ -1205,8 +1205,9 @@ fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {
 
 fn group_lens_rounded_side(edge_position: f32, material_alpha: f32) -> vec3<f32> {
     let bevel_t = smoothstep(0.0, 1.0, edge_position);
-    let wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha;
-    let body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha;
+    let center_gate = 1.0 - smoothstep(0.94, 1.0, edge_position);
+    let wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha * center_gate;
+    let body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha * center_gate;
     let ridge_position = (edge_position - 0.68) / 0.34;
     let ridge = exp(-(ridge_position * ridge_position)) * body;
     return vec3<f32>(wall, body, ridge);
@@ -1424,6 +1425,31 @@ fn sample_backdrop_lensed(
     let highlight = clamp(highlight_profile * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
     let shadow = clamp(shadow_profile * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
     var straight_rgb = sample.rgb / sample.a;
+    let reflection_profile = clamp(
+        (
+            wall * 0.30 +
+            body * 0.18 +
+            focus_ridge * (0.18 + 0.32 * guided_light)
+        ) * sprite.backdrop_lens_lighting.x,
+        0.0,
+        0.60,
+    );
+    if (reflection_profile > 0.0) {
+        let reflection_distance = max(sprite.backdrop_lens.x, rim_width * 0.55);
+        let reflection_envelope = clamp(wall * 0.70 + body * 0.42 + focus_ridge * 0.24, 0.0, 1.0);
+        let reflection_offset =
+            (tangent * reflection_distance * (0.45 + 0.35 * guided_light) -
+            normal * reflection_distance * 0.14) * reflection_envelope * pixel_size;
+        let reflection_sample =
+            sample_backdrop_blurred_linear(coords + reflection_offset, pixel_size, sigma);
+        if (reflection_sample.a > 0.0) {
+            straight_rgb = mix(
+                straight_rgb,
+                reflection_sample.rgb / reflection_sample.a,
+                reflection_profile,
+            );
+        }
+    }
     straight_rgb = mix(straight_rgb, vec3<f32>(1.0), highlight);
     straight_rgb *= 1.0 - shadow;
     return vec4<f32>(straight_rgb * sample.a, sample.a);

@@ -967,8 +967,9 @@ float2 group_material_normal(float2 point, GroupSpriteVertexOutput input) {
 
 float3 group_lens_rounded_side(float edge_position, float material_alpha) {
   float bevel_t = smoothstep(0.0, 1.0, edge_position);
-  float wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha;
-  float body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha;
+  float center_gate = 1.0 - smoothstep(0.94, 1.0, edge_position);
+  float wall = pow(max(1.0 - bevel_t, 0.0), 1.18) * material_alpha * center_gate;
+  float body = pow(max(sin(bevel_t * 3.1415927), 0.0), 0.56) * material_alpha * center_gate;
   float ridge_position = (edge_position - 0.68) / 0.34;
   float ridge = exp(-(ridge_position * ridge_position)) * body;
   return float3(wall, body, ridge);
@@ -1210,6 +1211,30 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
   float highlight = saturate(highlight_profile * input.backdrop_lens_lighting.x);
   float shadow = saturate(shadow_profile * input.backdrop_lens_lighting.y);
   float3 straight_rgb = sample.rgb / sample.a;
+  float reflection_profile = saturate(
+      (wall * 0.30 +
+       body * 0.18 +
+       focus_ridge * (0.18 + 0.32 * guided_light)) *
+      input.backdrop_lens_lighting.x);
+  reflection_profile = min(reflection_profile, 0.60);
+  if (reflection_profile > 0.0) {
+    float reflection_distance = max(input.backdrop_lens.x, rim_width * 0.55);
+    float reflection_envelope = saturate(wall * 0.70 + body * 0.42 + focus_ridge * 0.24);
+    float2 reflection_offset =
+        (tangent * reflection_distance * (0.45 + 0.35 * guided_light) -
+         normal * reflection_distance * 0.14) * reflection_envelope * pixel_size;
+    float4 reflection_sample = sample_backdrop_blurred_linear(
+        backdrop_texture,
+        coords + reflection_offset,
+        pixel_size,
+        sigma);
+    if (reflection_sample.a > 0.0) {
+      straight_rgb = mix(
+          straight_rgb,
+          reflection_sample.rgb / reflection_sample.a,
+          reflection_profile);
+    }
+  }
   straight_rgb = mix(straight_rgb, float3(1.0), highlight);
   straight_rgb *= 1.0 - shadow;
   return float4(straight_rgb * sample.a, sample.a);

@@ -663,6 +663,43 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
 }
 
 #[test]
+fn render_group_backdrop_lens_reflects_backdrop_color_along_material_edge() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(quad(1, rect(8., 11., 16., 3.), rgba(0x0000ffff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(0.),
+            px(6.),
+            px(0.),
+            0.7,
+            0.,
+            point(0., -1.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let reflected_edge = pixel(&image, 9, 16);
+    let stable_center = pixel(&image, 16, 16);
+
+    assert!(
+        reflected_edge[2] > reflected_edge[0] + 16 && reflected_edge[2] > reflected_edge[1] + 16,
+        "edge reflection should carry backdrop color along the tangent instead of only whitening the bevel: {reflected_edge:?}"
+    );
+    assert_eq!(
+        stable_center,
+        [0, 0, 0, 255],
+        "center pane should not pick up the edge reflection sample"
+    );
+}
+
+#[test]
 fn render_group_backdrop_lens_reconstructs_subpixel_backdrop_samples() {
     let group_scene = Scene::default();
 

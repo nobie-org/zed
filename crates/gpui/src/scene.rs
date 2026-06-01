@@ -878,6 +878,7 @@ pub enum CompositeEffect {
     SourceColorFilter(SourceColorFilter),
     SourceBlur(Pixels),
     SourceMask(Corners<Pixels>),
+    SourceMaskBeforeBlur(Corners<Pixels>),
     BackdropColorFilter(SourceColorFilter),
     BackdropBlur(Pixels),
     BackdropLens(CompositeBackdropLens<Pixels>),
@@ -885,6 +886,7 @@ pub enum CompositeEffect {
     MaterialShape(Corners<Pixels>),
     DropShadow(CompositeDropShadow<Pixels>),
     SurfaceShadow(CompositeSurfaceShadow<Pixels>),
+    ProcessedContentGlow(CompositeProcessedContentGlow),
     RoundedMask(Corners<Pixels>),
     BlendMode(CompositeBlendMode),
 }
@@ -996,6 +998,11 @@ impl CompositeEffect {
         Self::SourceMask(shape.corner_radii())
     }
 
+    /// Clips source/content before subsequent source blur samples are taken.
+    pub fn source_mask_before_blur(shape: GroupShape) -> Self {
+        Self::SourceMaskBeforeBlur(shape.corner_radii())
+    }
+
     /// Applies a Gaussian blur to the already-rendered backdrop under the group.
     pub fn backdrop_blur(radius: Pixels) -> Self {
         Self::BackdropBlur(Pixels(radius.0.max(0.)))
@@ -1055,6 +1062,17 @@ impl CompositeEffect {
         })
     }
 
+    /// Draws a tinted glow from processed content pixels.
+    pub fn processed_content_glow(
+        stages: impl IntoIterator<Item = DerivedStage>,
+        glow: Glow,
+    ) -> Self {
+        Self::ProcessedContentGlow(CompositeProcessedContentGlow {
+            stages: stages.into_iter().collect(),
+            color: glow.color,
+        })
+    }
+
     /// Masks the composited source image by a rounded rectangle matching the
     /// render group's layout bounds.
     pub fn rounded_mask(corner_radii: Corners<Pixels>) -> Self {
@@ -1073,6 +1091,7 @@ impl CompositeEffect {
             Self::SourceColorFilter(filter) => filter.is_identity(),
             Self::SourceBlur(radius) => radius.0 <= f32::EPSILON,
             Self::SourceMask(_) => false,
+            Self::SourceMaskBeforeBlur(_) => false,
             Self::BackdropColorFilter(filter) => filter.is_identity(),
             Self::BackdropBlur(radius) => radius.0 <= f32::EPSILON,
             Self::BackdropLens(lens) => lens.is_identity(),
@@ -1080,6 +1099,7 @@ impl CompositeEffect {
             Self::MaterialShape(_) => true,
             Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
             Self::SurfaceShadow(shadow) => shadow.color.a <= f32::EPSILON,
+            Self::ProcessedContentGlow(glow) => glow.color.a <= f32::EPSILON,
             Self::RoundedMask(_) => false,
             Self::BlendMode(mode) => *mode == CompositeBlendMode::Normal,
         }
@@ -1097,8 +1117,10 @@ impl CompositeEffect {
             | Self::SourceColorFilter(_)
             | Self::SourceBlur(_)
             | Self::SourceMask(_)
+            | Self::SourceMaskBeforeBlur(_)
             | Self::DropShadow(_)
             | Self::SurfaceShadow(_)
+            | Self::ProcessedContentGlow(_)
             | Self::MaterialShape(_)
             | Self::RoundedMask(_) => false,
         }
@@ -1121,6 +1143,23 @@ pub struct CompositeSurfaceShadow<P: Clone + Copy + Debug + Default + PartialEq>
     pub shape: Corners<P>,
     pub offset: Point<P>,
     pub blur_radius: P,
+    pub color: Hsla,
+}
+
+/// A glow derived from processed content pixels.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct CompositeProcessedContentGlow {
+    pub stages: Vec<DerivedStage>,
+    pub color: Hsla,
+}
+
+/// A validated processed-content glow in device pixels.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct CompositeProcessedContentGlowPlan {
+    pub luma_threshold: f32,
+    pub blur_radius: ScaledPixels,
     pub color: Hsla,
 }
 
@@ -1398,6 +1437,7 @@ pub struct ContentLayer {
     source_mask: Option<GroupShape>,
     source_blur: Pixels,
     color_filter: SourceColorFilter,
+    stages: Option<Vec<ContentStage>>,
 }
 
 impl Default for ContentLayer {
@@ -1406,11 +1446,42 @@ impl Default for ContentLayer {
             source_mask: None,
             source_blur: Pixels(0.),
             color_filter: SourceColorFilter::identity(),
+            stages: None,
         }
     }
 }
 
+/// An ordered content/source stage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ContentStage {
+    /// Clips content to the given group shape at this point in the content chain.
+    ClipTo(GroupShape),
+    /// Applies exact Gaussian blur at this point in the content chain.
+    ExactBlur(Pixels),
+}
+
+impl ContentStage {
+    /// Clips content to the given group shape at this point in the content chain.
+    pub fn clip_to(shape: GroupShape) -> Self {
+        Self::ClipTo(shape)
+    }
+
+    /// Applies exact Gaussian blur at this point in the content chain.
+    pub fn exact_blur(radius: Pixels) -> Self {
+        Self::ExactBlur(Pixels(radius.0.max(0.)))
+    }
+}
+
 impl ContentLayer {
+    /// Creates an ordered content layer where stage order is part of the visual meaning.
+    pub fn staged(stages: impl IntoIterator<Item = ContentStage>) -> Self {
+        Self {
+            stages: Some(stages.into_iter().collect()),
+            ..Self::default()
+        }
+    }
+
     /// Creates a content layer clipped to the given shape.
     pub fn clipped_to(shape: GroupShape) -> Self {
         Self {
@@ -1426,7 +1497,22 @@ impl ContentLayer {
 
     /// Applies a source/content blur.
     pub fn blur(mut self, radius: Pixels) -> Self {
-        self.source_blur = Pixels(radius.0.max(0.));
+        let radius = Pixels(radius.0.max(0.));
+        if let Some(stages) = &mut self.stages {
+            stages.push(ContentStage::ExactBlur(radius));
+        } else {
+            self.source_blur = radius;
+        }
+        self
+    }
+
+    /// Clips content to the given group shape.
+    pub fn clip_to(mut self, shape: GroupShape) -> Self {
+        if let Some(stages) = &mut self.stages {
+            stages.push(ContentStage::ClipTo(shape));
+        } else {
+            self.source_mask = Some(shape);
+        }
         self
     }
 
@@ -1463,7 +1549,27 @@ impl ContentLayer {
     }
 
     pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
-        if let Some(mask) = self.source_mask {
+        if let Some(stages) = &self.stages {
+            for (index, stage) in stages.iter().enumerate() {
+                match *stage {
+                    ContentStage::ClipTo(shape) => {
+                        let blur_after = stages[index + 1..]
+                            .iter()
+                            .any(|stage| matches!(stage, ContentStage::ExactBlur(radius) if radius.0 > f32::EPSILON));
+                        if blur_after {
+                            effects.push(CompositeEffect::source_mask_before_blur(shape));
+                        } else {
+                            effects.push(CompositeEffect::source_mask(shape));
+                        }
+                    }
+                    ContentStage::ExactBlur(radius) => {
+                        if radius.0 > f32::EPSILON {
+                            effects.push(CompositeEffect::source_blur(radius));
+                        }
+                    }
+                }
+            }
+        } else if let Some(mask) = self.source_mask {
             effects.push(CompositeEffect::source_mask(mask));
         }
         if self.source_blur.0 > f32::EPSILON {
@@ -1479,6 +1585,7 @@ impl ContentLayer {
 enum DerivedLayerSource {
     ContentAlpha,
     SurfaceShape(GroupShape),
+    ProcessedContent,
 }
 
 /// Extra layers derived from named render-group provenance.
@@ -1505,6 +1612,15 @@ impl DerivedLayer {
         }
     }
 
+    /// Creates a processed-content derived layer builder.
+    pub fn from_processed_content(
+        stages: impl IntoIterator<Item = DerivedStage>,
+    ) -> ProcessedContentDerivedLayer {
+        ProcessedContentDerivedLayer {
+            stages: stages.into_iter().collect(),
+        }
+    }
+
     /// Adds a shadow derived from this layer's named provenance.
     pub fn shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
         let effect = match self.source {
@@ -1514,6 +1630,9 @@ impl DerivedLayer {
             DerivedLayerSource::SurfaceShape(shape) => {
                 CompositeEffect::surface_shadow(shape, offset, blur_radius, color)
             }
+            DerivedLayerSource::ProcessedContent => {
+                panic!("processed-content derived layers support glow(), not shadow()")
+            }
         };
         self.effects.push(effect);
         self
@@ -1521,6 +1640,82 @@ impl DerivedLayer {
 
     pub(crate) fn push_effects(&self, effects: &mut Vec<CompositeEffect>) {
         effects.extend(self.effects.iter().cloned());
+    }
+}
+
+/// A builder for layers derived from processed content pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessedContentDerivedLayer {
+    stages: Vec<DerivedStage>,
+}
+
+impl ProcessedContentDerivedLayer {
+    /// Adds a tinted glow derived from processed content pixels.
+    pub fn glow(self, glow: Glow) -> DerivedLayer {
+        DerivedLayer {
+            source: DerivedLayerSource::ProcessedContent,
+            effects: vec![CompositeEffect::processed_content_glow(self.stages, glow)],
+        }
+    }
+}
+
+/// An ordered processed-content derived stage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum DerivedStage {
+    /// Extracts pixels whose unpremultiplied luma is at or above the threshold.
+    ThresholdLuma(LumaThreshold),
+    /// Applies exact Gaussian blur to the extracted processed-content pixels.
+    ExactBlur(Pixels),
+}
+
+impl DerivedStage {
+    /// Extracts pixels whose unpremultiplied luma is at or above the threshold.
+    pub fn threshold_luma(threshold: LumaThreshold) -> Self {
+        Self::ThresholdLuma(threshold)
+    }
+
+    /// Applies exact Gaussian blur to the extracted processed-content pixels.
+    pub fn exact_blur(radius: Pixels) -> Self {
+        Self::ExactBlur(Pixels(radius.0.max(0.)))
+    }
+}
+
+/// Luma threshold used by processed-content derived stages.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LumaThreshold {
+    value: f32,
+}
+
+impl LumaThreshold {
+    /// Creates a threshold that keeps pixels at or above `value`.
+    pub fn above(value: f32) -> Self {
+        Self {
+            value: value.clamp(0., 1.),
+        }
+    }
+
+    /// Returns the normalized threshold value.
+    pub fn value(self) -> f32 {
+        self.value
+    }
+}
+
+/// A tinted glow derived from processed content pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glow {
+    color: Hsla,
+}
+
+impl Glow {
+    /// Creates a glow with the given straight RGBA color.
+    pub fn tinted(color: Hsla) -> Self {
+        Self { color }
+    }
+
+    /// Returns the glow color.
+    pub fn color(self) -> Hsla {
+        self.color
     }
 }
 
@@ -1942,6 +2137,7 @@ pub enum RenderGroupRejectedEffect {
     BackdropBlur,
     DropShadow,
     SurfaceShadow,
+    ProcessedContentGlow,
 }
 
 impl RenderGroupRejectedEffect {
@@ -1952,6 +2148,7 @@ impl RenderGroupRejectedEffect {
             Self::BackdropBlur => "surface.frost",
             Self::DropShadow => "derived.content_alpha.shadow",
             Self::SurfaceShadow => "derived.surface_shape.shadow",
+            Self::ProcessedContentGlow => "derived.processed_content.glow",
         }
     }
 }
@@ -1964,6 +2161,9 @@ pub enum RenderGroupPlanningRejectionReason {
         limit: ScaledPixels,
         requested: ScaledPixels,
         unit: RenderGroupLimitUnit,
+    },
+    UnsupportedStageSequence {
+        expected: &'static str,
     },
 }
 
@@ -2034,11 +2234,9 @@ impl RenderGroupCapabilityProbe {
                 "exact Gaussian blur is accepted only within the current kernel limit",
                 "use an explicitly approximate tier or lower the exact blur radius",
             ),
-            Self::GlowApproximation => RenderGroupCapabilityReport::approximation(
+            Self::GlowApproximation => RenderGroupCapabilityReport::rendered(
                 self,
-                Reason::ApproximationOnly,
-                "storybook lowers glow pressure through an existing shadow primitive",
-                "graduate glow only when it has distinct provenance and fixtures",
+                "processed-content glow has distinct source-pixel provenance and a backend path",
             ),
             Self::DebugVisualizer => RenderGroupCapabilityReport::inspector_only(
                 self,
@@ -2227,6 +2425,7 @@ impl RenderGroupCapabilityReport {
         }
     }
 
+    #[allow(dead_code)]
     fn approximation(
         probe: RenderGroupCapabilityProbe,
         rejection: RenderGroupCapabilityRejectionReason,
@@ -2302,6 +2501,13 @@ impl RenderGroupRequirements {
                         .0
                         .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
                 ),
+                CompositeEffect::ProcessedContentGlow(glow) => {
+                    if let Some(glow) = lower_processed_content_glow(scale_factor, glow) {
+                        ScaledPixels(outset.0.max(gaussian_kernel_outset(glow.blur_radius).0))
+                    } else {
+                        outset
+                    }
+                }
                 _ => outset,
             });
         let backdrop_outset =
@@ -2322,8 +2528,9 @@ impl RenderGroupRequirements {
                     _ => outset,
                 });
         let reads_backdrop = normalized.reads_backdrop();
-        let has_derived =
-            !normalized.drop_shadows().is_empty() || !normalized.surface_shadows().is_empty();
+        let has_derived = !normalized.drop_shadows().is_empty()
+            || !normalized.surface_shadows().is_empty()
+            || !normalized.processed_content_glows().is_empty();
         let pass_count = 1
             + u8::from(reads_backdrop)
             + u8::from(has_derived)
@@ -2434,6 +2641,25 @@ fn reject_unsupported_exact_effects(
                     continue;
                 }
             }
+            CompositeEffect::ProcessedContentGlow(glow) => {
+                let Some(glow) = lower_processed_content_glow(scale_factor, glow) else {
+                    planning_rejections.push(RenderGroupPlanningRejection {
+                        effect: RenderGroupRejectedEffect::ProcessedContentGlow,
+                        reason: RenderGroupPlanningRejectionReason::UnsupportedStageSequence {
+                            expected: "threshold_luma(...) followed by exact_blur(...)",
+                        },
+                        suggestion: "use DerivedStage::threshold_luma(...) followed by DerivedStage::exact_blur(...)",
+                    });
+                    continue;
+                };
+                if glow.blur_radius.0 > MAX_EXACT_GAUSSIAN_SIGMA {
+                    planning_rejections.push(exact_blur_limit_rejection(
+                        RenderGroupRejectedEffect::ProcessedContentGlow,
+                        glow.blur_radius,
+                    ));
+                    continue;
+                }
+            }
             _ => {}
         }
         accepted_effects.push(effect.clone());
@@ -2459,6 +2685,25 @@ fn exact_blur_limit_rejection(
         },
         suggestion: "use an explicitly approximate blur tier or reduce the exact blur radius",
     }
+}
+
+fn lower_processed_content_glow(
+    scale_factor: f32,
+    glow: &CompositeProcessedContentGlow,
+) -> Option<CompositeProcessedContentGlowPlan> {
+    let [
+        DerivedStage::ThresholdLuma(threshold),
+        DerivedStage::ExactBlur(radius),
+    ] = glow.stages.as_slice()
+    else {
+        return None;
+    };
+
+    Some(CompositeProcessedContentGlowPlan {
+        luma_threshold: threshold.value(),
+        blur_radius: radius.scale(scale_factor),
+        color: glow.color,
+    })
 }
 
 /// An affine source-color transform applied to an already-composited render
@@ -2580,6 +2825,7 @@ pub struct CompositeEffectPlan {
     source_color_filter: SourceColorFilter,
     source_blur_radius: ScaledPixels,
     source_mask: Option<Corners<ScaledPixels>>,
+    source_mask_blur_order: SourceMaskBlurOrder,
     backdrop_color_filter: SourceColorFilter,
     backdrop_blur_radius: ScaledPixels,
     backdrop_lens: Option<CompositeBackdropLens<ScaledPixels>>,
@@ -2587,8 +2833,28 @@ pub struct CompositeEffectPlan {
     material_shape: Option<Corners<ScaledPixels>>,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
     surface_shadows: Vec<CompositeSurfaceShadow<ScaledPixels>>,
+    processed_content_glows: Vec<CompositeProcessedContentGlowPlan>,
     rounded_mask: Option<Corners<ScaledPixels>>,
     blend_mode: CompositeBlendMode,
+}
+
+/// How source/content masks compose with source blur.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum SourceMaskBlurOrder {
+    #[default]
+    AfterBlur,
+    BeforeBlur,
+}
+
+impl SourceMaskBlurOrder {
+    /// Returns the stable shader discriminant.
+    pub fn shader_code(self) -> u32 {
+        match self {
+            Self::AfterBlur => 0,
+            Self::BeforeBlur => 1,
+        }
+    }
 }
 
 fn composite_tint(below: Hsla, above: Hsla) -> Hsla {
@@ -2630,6 +2896,7 @@ impl CompositeEffectPlan {
             source_color_filter: SourceColorFilter::identity(),
             source_blur_radius: ScaledPixels(0.),
             source_mask: None,
+            source_mask_blur_order: SourceMaskBlurOrder::AfterBlur,
             backdrop_color_filter: SourceColorFilter::identity(),
             backdrop_blur_radius: ScaledPixels(0.),
             backdrop_lens: None,
@@ -2637,6 +2904,7 @@ impl CompositeEffectPlan {
             material_shape: None,
             drop_shadows: Vec::new(),
             surface_shadows: Vec::new(),
+            processed_content_glows: Vec::new(),
             rounded_mask: None,
             blend_mode: CompositeBlendMode::Normal,
         };
@@ -2656,6 +2924,11 @@ impl CompositeEffectPlan {
                 }
                 CompositeEffect::SourceMask(corner_radii) => {
                     plan.source_mask = Some(corner_radii.scale(scale_factor));
+                    plan.source_mask_blur_order = SourceMaskBlurOrder::AfterBlur;
+                }
+                CompositeEffect::SourceMaskBeforeBlur(corner_radii) => {
+                    plan.source_mask = Some(corner_radii.scale(scale_factor));
+                    plan.source_mask_blur_order = SourceMaskBlurOrder::BeforeBlur;
                 }
                 CompositeEffect::BackdropColorFilter(filter) => {
                     plan.backdrop_color_filter = plan.backdrop_color_filter.then(*filter);
@@ -2690,9 +2963,15 @@ impl CompositeEffectPlan {
                         color: shadow.color,
                     });
                 }
+                CompositeEffect::ProcessedContentGlow(glow) => {
+                    if let Some(glow) = lower_processed_content_glow(scale_factor, glow) {
+                        plan.processed_content_glows.push(glow);
+                    }
+                }
                 CompositeEffect::RoundedMask(corner_radii) => {
                     let corner_radii = corner_radii.scale(scale_factor);
                     plan.source_mask = Some(corner_radii);
+                    plan.source_mask_blur_order = SourceMaskBlurOrder::AfterBlur;
                     plan.material_shape = Some(corner_radii);
                     plan.rounded_mask = Some(corner_radii);
                 }
@@ -2724,6 +3003,11 @@ impl CompositeEffectPlan {
     /// Returns the optional source/content mask in device pixels.
     pub fn source_mask(&self) -> Option<Corners<ScaledPixels>> {
         self.source_mask
+    }
+
+    /// Returns whether source masking happens before or after source blur.
+    pub fn source_mask_blur_order(&self) -> SourceMaskBlurOrder {
+        self.source_mask_blur_order
     }
 
     /// Returns the normalized backdrop color filter.
@@ -2779,6 +3063,11 @@ impl CompositeEffectPlan {
         &self.surface_shadows
     }
 
+    /// Returns processed-content glows in declared order.
+    pub fn processed_content_glows(&self) -> &[CompositeProcessedContentGlowPlan] {
+        &self.processed_content_glows
+    }
+
     /// Returns the optional rounded group mask in device pixels.
     pub fn rounded_mask(&self) -> Option<Corners<ScaledPixels>> {
         self.rounded_mask
@@ -2810,6 +3099,12 @@ impl CompositeEffectPlan {
                     let shadow_outset = offset.x.0.abs().max(offset.y.0.abs()) + blur_outset;
                     outset = ScaledPixels(outset.0.max(shadow_outset));
                 }
+                CompositeEffect::ProcessedContentGlow(glow) => {
+                    if let Some(glow) = lower_processed_content_glow(scale_factor, glow) {
+                        outset =
+                            ScaledPixels(outset.0.max(gaussian_kernel_outset(glow.blur_radius).0));
+                    }
+                }
                 CompositeEffect::BackdropBlur(radius) => {
                     outset = ScaledPixels(
                         outset
@@ -2821,6 +3116,7 @@ impl CompositeEffectPlan {
                 CompositeEffect::Opacity(_)
                 | CompositeEffect::SourceColorFilter(_)
                 | CompositeEffect::SourceMask(_)
+                | CompositeEffect::SourceMaskBeforeBlur(_)
                 | CompositeEffect::BackdropColorFilter(_)
                 | CompositeEffect::BackdropTint(_)
                 | CompositeEffect::BlendMode(_)
@@ -3313,6 +3609,113 @@ mod tests {
         assert_eq!(plan.requirements().source_outset, ScaledPixels(12.));
         assert_eq!(plan.requirements().backdrop_outset, ScaledPixels(24.));
         assert_eq!(plan.physical_plan().backdrop_copies, 1);
+    }
+
+    #[test]
+    fn render_group_content_stages_preserve_mask_blur_order() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
+        let clip_then_blur = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            None,
+            ContentLayer::staged([
+                ContentStage::clip_to(shape),
+                ContentStage::exact_blur(Pixels(2.)),
+            ]),
+            [],
+            Composite::normal(),
+        ));
+        let blur_then_clip = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            None,
+            ContentLayer::staged([
+                ContentStage::exact_blur(Pixels(2.)),
+                ContentStage::clip_to(shape),
+            ]),
+            [],
+            Composite::normal(),
+        ));
+
+        let clip_then_blur = LogicalVisualPlan::from_input(1., 1., &clip_then_blur);
+        let blur_then_clip = LogicalVisualPlan::from_input(1., 1., &blur_then_clip);
+
+        assert_eq!(
+            clip_then_blur.accepted_effects(),
+            &[
+                CompositeEffect::source_mask_before_blur(shape),
+                CompositeEffect::source_blur(Pixels(2.)),
+            ]
+        );
+        assert_eq!(
+            clip_then_blur.normalized_effects().source_mask_blur_order(),
+            SourceMaskBlurOrder::BeforeBlur
+        );
+        assert_eq!(
+            blur_then_clip.accepted_effects(),
+            &[
+                CompositeEffect::source_blur(Pixels(2.)),
+                CompositeEffect::source_mask(shape),
+            ]
+        );
+        assert_eq!(
+            blur_then_clip.normalized_effects().source_mask_blur_order(),
+            SourceMaskBlurOrder::AfterBlur
+        );
+    }
+
+    #[test]
+    fn processed_content_glow_lowers_with_content_pixel_provenance() {
+        let input = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            None,
+            ContentLayer::default(),
+            [DerivedLayer::from_processed_content([
+                DerivedStage::threshold_luma(LumaThreshold::above(0.8)),
+                DerivedStage::exact_blur(Pixels(3.)),
+            ])
+            .glow(Glow::tinted(red()))],
+            Composite::normal(),
+        ));
+
+        let plan = LogicalVisualPlan::from_input(2., 1., &input);
+
+        assert_eq!(plan.planning_rejections(), []);
+        assert_eq!(plan.normalized_effects().processed_content_glows().len(), 1);
+        assert_eq!(
+            plan.normalized_effects().processed_content_glows()[0],
+            CompositeProcessedContentGlowPlan {
+                luma_threshold: 0.8,
+                blur_radius: ScaledPixels(6.),
+                color: red(),
+            }
+        );
+        assert_eq!(plan.requirements().output_outset, ScaledPixels(18.));
+    }
+
+    #[test]
+    fn processed_content_glow_rejects_unsupported_stage_order() {
+        let input = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            None,
+            ContentLayer::default(),
+            [DerivedLayer::from_processed_content([
+                DerivedStage::exact_blur(Pixels(3.)),
+                DerivedStage::threshold_luma(LumaThreshold::above(0.8)),
+            ])
+            .glow(Glow::tinted(red()))],
+            Composite::normal(),
+        ));
+
+        let plan = LogicalVisualPlan::from_input(1., 1., &input);
+
+        assert_eq!(plan.accepted_effects(), []);
+        assert_eq!(plan.normalized_effects().processed_content_glows(), []);
+        assert_eq!(plan.planning_rejections().len(), 1);
+        assert_eq!(
+            plan.planning_rejections()[0].effect.provenance(),
+            "derived.processed_content.glow"
+        );
+        assert_eq!(
+            plan.planning_rejections()[0].reason,
+            RenderGroupPlanningRejectionReason::UnsupportedStageSequence {
+                expected: "threshold_luma(...) followed by exact_blur(...)",
+            }
+        );
     }
 
     #[test]

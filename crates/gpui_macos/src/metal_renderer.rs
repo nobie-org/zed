@@ -1379,7 +1379,10 @@ impl MetalRenderer {
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
         let mut sprites = Vec::with_capacity(
-            effect_plan.drop_shadows().len() + effect_plan.surface_shadows().len() + 1,
+            effect_plan.drop_shadows().len()
+                + effect_plan.surface_shadows().len()
+                + effect_plan.processed_content_glows().len()
+                + 1,
         );
         let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
@@ -1400,6 +1403,9 @@ impl MetalRenderer {
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
                 shadow_blur_radius: shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                _pad1: [0; 2],
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii,
@@ -1429,11 +1435,46 @@ impl MetalRenderer {
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
                 shadow_blur_radius: shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                _pad1: [0; 2],
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii: shadow.shape,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for glow in effect_plan.processed_content_glows() {
+            let color = glow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 3,
+                source_blur_radius: effect_plan.source_blur_radius().0,
+                source_mask_enabled,
+                shadow_offset: [0., 0.],
+                shadow_blur_radius: glow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: glow.luma_threshold,
+                _pad1: [0; 2],
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii,
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1456,6 +1497,9 @@ impl MetalRenderer {
             shadow_offset: [0., 0.],
             shadow_blur_radius: 0.,
             backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
+            source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+            derived_luma_threshold: 0.,
+            _pad1: [0; 2],
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds,
             source_mask_corner_radii,
@@ -2406,6 +2450,9 @@ pub struct GroupSprite {
     pub shadow_offset: [f32; 2],
     pub shadow_blur_radius: f32,
     pub backdrop_blur_radius: f32,
+    pub source_mask_blur_order: u32,
+    pub derived_luma_threshold: f32,
+    pub _pad1: [u32; 2],
     pub shadow_color: [f32; 4],
     pub source_mask_bounds: Bounds<ScaledPixels>,
     pub source_mask_corner_radii: Corners<ScaledPixels>,

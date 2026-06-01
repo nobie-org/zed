@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use gpui::{
     Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect, ContentMask, Corners,
-    DevicePixels, Edges, GroupShape, Hsla, LogicalVisualPlan, PaintGroup, PlatformHeadlessRenderer,
-    Quad, ScaledPixels, Scene, point, px, rgba, size, transparent_black,
+    DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, LogicalVisualPlan, LumaThreshold,
+    PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene, point, px, rgba, size,
+    transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 use image::RgbaImage;
@@ -71,6 +72,24 @@ fn paint_group_with_effects(
     PaintGroup {
         order,
         bounds: capture_bounds,
+        capture_bounds,
+        content_mask: mask(),
+        scale_factor: 1.,
+        plan: LogicalVisualPlan::from_effects(1., 1., effects),
+        scene: Arc::new(scene),
+    }
+}
+
+fn paint_group_with_bounds(
+    order: u32,
+    bounds: Bounds<ScaledPixels>,
+    capture_bounds: Bounds<ScaledPixels>,
+    effects: Vec<CompositeEffect>,
+    scene: Scene,
+) -> PaintGroup {
+    PaintGroup {
+        order,
+        bounds,
         capture_bounds,
         content_mask: mask(),
         scale_factor: 1.,
@@ -462,6 +481,79 @@ fn render_group_rounded_mask_clips_blurred_source_body() {
     let image = render(&grouped);
     assert!(pixel(&image, 14, 14)[1] > 200);
     assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
+}
+
+#[test]
+fn render_group_staged_clip_then_blur_spreads_past_mask_edge() {
+    let shape = GroupShape::rounded_rect(Corners::all(px(8.)));
+
+    let mut blur_then_clip = Scene::default();
+    blur_then_clip.insert_primitive(quad(0, viewport(), black()));
+    blur_then_clip.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(8., 8., 16., 16.),
+        rect(4., 4., 24., 24.),
+        vec![
+            CompositeEffect::source_blur(px(4.)),
+            CompositeEffect::source_mask(shape),
+        ],
+        finished_scene([quad(0, rect(8., 8., 16., 16.), green())]),
+    ));
+    blur_then_clip.finish();
+
+    let mut clip_then_blur = Scene::default();
+    clip_then_blur.insert_primitive(quad(0, viewport(), black()));
+    clip_then_blur.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(8., 8., 16., 16.),
+        rect(4., 4., 24., 24.),
+        vec![
+            CompositeEffect::source_mask_before_blur(shape),
+            CompositeEffect::source_blur(px(4.)),
+        ],
+        finished_scene([quad(0, rect(8., 8., 16., 16.), green())]),
+    ));
+    clip_then_blur.finish();
+
+    let after_mask = pixel(&render(&blur_then_clip), 7, 12);
+    let before_mask = pixel(&render(&clip_then_blur), 7, 12);
+
+    assert_eq!(after_mask, [0, 0, 0, 255]);
+    assert!(
+        before_mask[1] > after_mask[1],
+        "clip-then-blur should spread green past the mask edge: before={before_mask:?} after={after_mask:?}"
+    );
+}
+
+#[test]
+fn render_group_processed_content_glow_follows_bright_pixels() {
+    let group_scene = finished_scene([quad(0, rect(13., 13., 4., 4.), white())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(12., 12., 8., 8.),
+        rect(6., 6., 20., 20.),
+        vec![CompositeEffect::processed_content_glow(
+            [
+                DerivedStage::threshold_luma(LumaThreshold::above(0.8)),
+                DerivedStage::exact_blur(px(3.)),
+            ],
+            Glow::tinted(red()),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let glow_sample = pixel(&image, 11, 15);
+    let far_sample = pixel(&image, 4, 4);
+
+    assert!(
+        glow_sample[0] > far_sample[0],
+        "processed-content glow should add red near bright content: glow={glow_sample:?} far={far_sample:?}"
+    );
 }
 
 #[test]

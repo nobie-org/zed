@@ -1746,6 +1746,7 @@ pub struct LogicalVisualPlan {
     accepted_effects: Vec<CompositeEffect>,
     planning_rejections: Vec<RenderGroupPlanningRejection>,
     normalized: CompositeEffectPlan,
+    dependencies: RenderGroupDependencies,
     requirements: RenderGroupRequirements,
     physical: PhysicalRenderGroupPlan,
 }
@@ -1766,6 +1767,8 @@ impl LogicalVisualPlan {
             reject_unsupported_exact_effects(scale_factor, &effects);
         let normalized =
             CompositeEffectPlan::from_effects(scale_factor, boundary_opacity, &accepted_effects);
+        let dependencies =
+            RenderGroupDependencies::from_effect_plan(&accepted_effects, &normalized);
         let requirements =
             RenderGroupRequirements::from_effect_plan(scale_factor, &accepted_effects, &normalized);
         let physical = PhysicalRenderGroupPlan::from_requirements(&requirements);
@@ -1774,6 +1777,7 @@ impl LogicalVisualPlan {
             accepted_effects,
             planning_rejections,
             normalized,
+            dependencies,
             requirements,
             physical,
         }
@@ -1804,6 +1808,11 @@ impl LogicalVisualPlan {
         self.requirements
     }
 
+    /// Returns backend-independent source/backdrop/shape dependencies.
+    pub fn dependencies(&self) -> RenderGroupDependencies {
+        self.dependencies
+    }
+
     /// Returns the current physical execution summary.
     pub fn physical_plan(&self) -> PhysicalRenderGroupPlan {
         self.physical
@@ -1815,11 +1824,8 @@ impl LogicalVisualPlan {
         capture_bounds: Bounds<ScaledPixels>,
     ) -> RenderGroupSupportCounters {
         let has_rejections = !self.planning_rejections.is_empty();
-        let has_accepted_visual_work = self
-            .accepted_effects
-            .iter()
-            .any(|effect| !effect.is_identity())
-            || (self.normalized.opacity() - 1.).abs() > f32::EPSILON;
+        let has_accepted_visual_work =
+            plan_has_visual_work(&self.accepted_effects, &self.normalized);
         let renders_pixels = has_accepted_visual_work
             && self.normalized.opacity() > f32::EPSILON
             && !capture_bounds.is_empty();
@@ -1845,6 +1851,52 @@ impl LogicalVisualPlan {
             intermediate_textures: u32::from(self.physical.intermediate_textures)
                 * u32::from(renders_pixels),
             backdrop_copies: u32::from(self.physical.backdrop_copies) * u32::from(renders_pixels),
+        }
+    }
+}
+
+/// Backend-independent source, destination, and shape dependencies implied by a plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderGroupDependencies {
+    /// The plan samples the captured source image.
+    pub source_pixels: bool,
+    /// The plan derives pixels from captured source alpha.
+    pub source_alpha: bool,
+    /// The plan applies an authored source/content mask.
+    pub source_mask: bool,
+    /// The plan samples already-painted parent target pixels.
+    pub backdrop_pixels: bool,
+    /// The plan needs destination pixels for boundary composition.
+    pub destination_pixels: bool,
+    /// The plan reads the material/surface shape.
+    pub material_shape: bool,
+    /// The plan derives a material normal from the material/surface shape.
+    pub material_normal: bool,
+}
+
+impl RenderGroupDependencies {
+    fn from_effect_plan(effects: &[CompositeEffect], normalized: &CompositeEffectPlan) -> Self {
+        let source_pixels = plan_has_visual_work(effects, normalized);
+        let source_alpha = !normalized.drop_shadows().is_empty();
+        let source_mask = normalized.source_mask().is_some();
+        let backdrop_pixels = normalized.has_backdrop_material();
+        let destination_pixels = normalized.blend_mode() != CompositeBlendMode::Normal;
+        let material_shape = (normalized.material_shape().is_some()
+            && normalized.has_backdrop_material())
+            || !normalized.surface_shadows().is_empty();
+        let material_normal = normalized
+            .backdrop_lens()
+            .is_some_and(|lens| !lens.is_identity());
+
+        Self {
+            source_pixels,
+            source_alpha,
+            source_mask,
+            backdrop_pixels,
+            destination_pixels,
+            material_shape,
+            material_normal,
         }
     }
 }
@@ -2019,6 +2071,11 @@ fn bounds_pixel_area(bounds: Bounds<ScaledPixels>) -> u64 {
     let width = bounds.size.width.0.max(0.).ceil() as u64;
     let height = bounds.size.height.0.max(0.).ceil() as u64;
     width.saturating_mul(height)
+}
+
+fn plan_has_visual_work(effects: &[CompositeEffect], normalized: &CompositeEffectPlan) -> bool {
+    effects.iter().any(|effect| !effect.is_identity())
+        || (normalized.opacity() - 1.).abs() > f32::EPSILON
 }
 
 const MAX_EXACT_GAUSSIAN_SIGMA: f32 = 8.;
@@ -2986,6 +3043,111 @@ mod tests {
                 backdrop_copies: 1,
             }
         );
+    }
+
+    #[test]
+    fn logical_visual_plan_reports_source_dependencies() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![
+                CompositeEffect::source_blur(Pixels(2.)),
+                CompositeEffect::source_mask(shape),
+                CompositeEffect::drop_shadow(point(Pixels(0.), Pixels(4.)), Pixels(3.), red()),
+            ],
+        );
+
+        assert_eq!(
+            plan.dependencies(),
+            RenderGroupDependencies {
+                source_pixels: true,
+                source_alpha: true,
+                source_mask: true,
+                backdrop_pixels: false,
+                destination_pixels: false,
+                material_shape: false,
+                material_normal: false,
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_reports_surface_and_destination_dependencies() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![
+                CompositeEffect::material_shape(shape),
+                CompositeEffect::backdrop_lens(
+                    Pixels(4.),
+                    Pixels(12.),
+                    Pixels(1.),
+                    0.4,
+                    0.2,
+                    point(-0.5, -1.),
+                ),
+                CompositeEffect::blend_mode(CompositeBlendMode::Multiply),
+            ],
+        );
+
+        assert_eq!(
+            plan.dependencies(),
+            RenderGroupDependencies {
+                source_pixels: true,
+                source_alpha: false,
+                source_mask: false,
+                backdrop_pixels: true,
+                destination_pixels: true,
+                material_shape: true,
+                material_normal: true,
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_reports_surface_shadow_shape_dependency() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::surface_shadow(
+                shape,
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(3.),
+                red(),
+            )],
+        );
+
+        assert_eq!(
+            plan.dependencies(),
+            RenderGroupDependencies {
+                source_pixels: true,
+                source_alpha: false,
+                source_mask: false,
+                backdrop_pixels: false,
+                destination_pixels: false,
+                material_shape: true,
+                material_normal: false,
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_dependency_metadata_elides_rejected_work() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::drop_shadow(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(20.),
+                red(),
+            )],
+        );
+
+        assert_eq!(plan.accepted_effects(), []);
+        assert_eq!(plan.dependencies(), RenderGroupDependencies::default());
     }
 
     #[test]

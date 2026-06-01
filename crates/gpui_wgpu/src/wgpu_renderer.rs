@@ -2209,7 +2209,9 @@ impl WgpuRenderer {
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
-        let mut sprites = Vec::with_capacity(effect_plan.drop_shadows().len() + 1);
+        let mut sprites = Vec::with_capacity(
+            effect_plan.drop_shadows().len() + effect_plan.surface_shadows().len() + 1,
+        );
         let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
             None => (0., Corners::all(ScaledPixels(0.))),
@@ -2234,6 +2236,35 @@ impl WgpuRenderer {
                 source_mask_corner_radii,
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                _pad0: [0; 2],
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for shadow in effect_plan.surface_shadows() {
+            let color = shadow.color.to_rgb();
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 2,
+                source_blur_radius: 0.,
+                source_mask_enabled: 0.,
+                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
+                shadow_blur_radius: shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds,
+                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
+                material_shape_bounds: group.bounds,
+                material_shape_corner_radii: shadow.shape,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,

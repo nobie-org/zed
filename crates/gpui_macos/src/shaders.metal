@@ -1260,6 +1260,35 @@ float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
   return alpha / total;
 }
 
+float sample_material_alpha_blurred(float2 point,
+                                    float sigma,
+                                    GroupSpriteVertexOutput input) {
+  if (sigma <= 0.0) {
+    return group_material_alpha(point, input);
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float alpha = 0.0;
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      for (int x = -24; x <= 24; x++) {
+        if (abs(x) <= radius) {
+          float2 offset = float2(float(x), float(y));
+          float weight = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+          alpha += group_material_alpha(point + offset, input) * weight;
+          total += weight;
+        }
+      }
+    }
+  }
+
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  return alpha / total;
+}
+
 float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput input) {
   if (sample.a <= 0.0) {
     return sample;
@@ -1356,6 +1385,14 @@ fragment float4 group_sprite_fragment(
         sample_coords,
         sample_point,
         input.texture_pixel_size,
+        input.shadow_blur_radius,
+        input) * input.shadow_color.a * input.opacity;
+    return float4(input.shadow_color.rgb * alpha, alpha);
+  }
+  if (input.effect_kind == 2) {
+    float2 sample_point = input.screen_position - input.shadow_offset;
+    float alpha = sample_material_alpha_blurred(
+        sample_point,
         input.shadow_blur_radius,
         input) * input.shadow_color.a * input.opacity;
     return float4(input.shadow_color.rgb * alpha, alpha);

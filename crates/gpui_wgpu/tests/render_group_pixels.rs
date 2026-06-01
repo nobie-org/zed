@@ -373,6 +373,57 @@ fn render_group_drop_shadow_uses_composited_source_alpha() {
 }
 
 #[test]
+fn render_group_surface_shadow_uses_material_shape_without_source_alpha() {
+    let mut source_alpha_shadow = Scene::default();
+    source_alpha_shadow.insert_primitive(quad(0, viewport(), black()));
+    source_alpha_shadow.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::drop_shadow(
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+        )],
+        Scene::default(),
+    ));
+    source_alpha_shadow.finish();
+
+    let mut surface_shadow = Scene::default();
+    surface_shadow.insert_primitive(quad(0, viewport(), black()));
+    surface_shadow.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::surface_shadow(
+            GroupShape::rectangle(),
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+        )],
+        Scene::default(),
+    ));
+    surface_shadow.finish();
+
+    let source_alpha_image = render(&source_alpha_shadow);
+    let surface_image = render(&surface_shadow);
+
+    assert_eq!(
+        pixel(&source_alpha_image, 19, 12),
+        [0, 0, 0, 255],
+        "content-alpha shadow must stay absent when the captured source is empty"
+    );
+    assert_eq!(
+        pixel(&surface_image, 12, 12),
+        [0, 0, 0, 255],
+        "offset surface shadow should not fill the original material body"
+    );
+    assert_eq!(
+        pixel(&surface_image, 19, 12),
+        [128, 128, 128, 255],
+        "surface shadow should be generated from the material shape even with no source alpha"
+    );
+}
+
+#[test]
 fn render_group_rounded_mask_clips_composited_source() {
     let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
 

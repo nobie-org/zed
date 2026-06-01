@@ -884,6 +884,7 @@ pub enum CompositeEffect {
     BackdropTint(Hsla),
     MaterialShape(Corners<Pixels>),
     DropShadow(CompositeDropShadow<Pixels>),
+    SurfaceShadow(CompositeSurfaceShadow<Pixels>),
     RoundedMask(Corners<Pixels>),
     BlendMode(CompositeBlendMode),
 }
@@ -1039,6 +1040,21 @@ impl CompositeEffect {
         })
     }
 
+    /// Draws a drop shadow from an explicit surface/material shape.
+    pub fn surface_shadow(
+        shape: GroupShape,
+        offset: Point<Pixels>,
+        blur_radius: Pixels,
+        color: Hsla,
+    ) -> Self {
+        Self::SurfaceShadow(CompositeSurfaceShadow {
+            shape: shape.corner_radii(),
+            offset,
+            blur_radius: Pixels(blur_radius.0.max(0.)),
+            color,
+        })
+    }
+
     /// Masks the composited source image by a rounded rectangle matching the
     /// render group's layout bounds.
     pub fn rounded_mask(corner_radii: Corners<Pixels>) -> Self {
@@ -1063,6 +1079,7 @@ impl CompositeEffect {
             Self::BackdropTint(color) => color.a <= f32::EPSILON,
             Self::MaterialShape(_) => true,
             Self::DropShadow(shadow) => shadow.color.a <= f32::EPSILON,
+            Self::SurfaceShadow(shadow) => shadow.color.a <= f32::EPSILON,
             Self::RoundedMask(_) => false,
             Self::BlendMode(mode) => *mode == CompositeBlendMode::Normal,
         }
@@ -1081,6 +1098,7 @@ impl CompositeEffect {
             | Self::SourceBlur(_)
             | Self::SourceMask(_)
             | Self::DropShadow(_)
+            | Self::SurfaceShadow(_)
             | Self::MaterialShape(_)
             | Self::RoundedMask(_) => false,
         }
@@ -1091,6 +1109,16 @@ impl CompositeEffect {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
 pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
+    pub offset: Point<P>,
+    pub blur_radius: P,
+    pub color: Hsla,
+}
+
+/// A drop shadow effect derived from an explicit surface/material shape.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct CompositeSurfaceShadow<P: Clone + Copy + Debug + Default + PartialEq> {
+    pub shape: Corners<P>,
     pub offset: Point<P>,
     pub blur_radius: P,
     pub color: Hsla,
@@ -1447,9 +1475,16 @@ impl ContentLayer {
     }
 }
 
-/// Extra layers derived from render-group content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DerivedLayerSource {
+    ContentAlpha,
+    SurfaceShape(GroupShape),
+}
+
+/// Extra layers derived from named render-group provenance.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DerivedLayer {
+    source: DerivedLayerSource,
     effects: Vec<CompositeEffect>,
 }
 
@@ -1457,14 +1492,30 @@ impl DerivedLayer {
     /// Creates an empty content-alpha derived layer builder.
     pub fn from_content_alpha() -> Self {
         Self {
+            source: DerivedLayerSource::ContentAlpha,
             effects: Vec::new(),
         }
     }
 
-    /// Adds a shadow derived from content/source alpha.
+    /// Creates an empty surface-shape derived layer builder.
+    pub fn from_surface_shape(shape: GroupShape) -> Self {
+        Self {
+            source: DerivedLayerSource::SurfaceShape(shape),
+            effects: Vec::new(),
+        }
+    }
+
+    /// Adds a shadow derived from this layer's named provenance.
     pub fn shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
-        self.effects
-            .push(CompositeEffect::drop_shadow(offset, blur_radius, color));
+        let effect = match self.source {
+            DerivedLayerSource::ContentAlpha => {
+                CompositeEffect::drop_shadow(offset, blur_radius, color)
+            }
+            DerivedLayerSource::SurfaceShape(shape) => {
+                CompositeEffect::surface_shadow(shape, offset, blur_radius, color)
+            }
+        };
+        self.effects.push(effect);
         self
     }
 
@@ -1775,6 +1826,7 @@ pub enum RenderGroupRejectedEffect {
     SourceBlur,
     BackdropBlur,
     DropShadow,
+    SurfaceShadow,
 }
 
 impl RenderGroupRejectedEffect {
@@ -1784,6 +1836,7 @@ impl RenderGroupRejectedEffect {
             Self::SourceBlur => "content.blur",
             Self::BackdropBlur => "surface.frost",
             Self::DropShadow => "derived.content_alpha.shadow",
+            Self::SurfaceShadow => "derived.surface_shape.shadow",
         }
     }
 }
@@ -1855,7 +1908,8 @@ impl RenderGroupRequirements {
                     _ => outset,
                 });
         let reads_backdrop = normalized.reads_backdrop();
-        let has_derived = !normalized.drop_shadows().is_empty();
+        let has_derived =
+            !normalized.drop_shadows().is_empty() || !normalized.surface_shadows().is_empty();
         let pass_count = 1
             + u8::from(reads_backdrop)
             + u8::from(has_derived)
@@ -1936,6 +1990,16 @@ fn reject_unsupported_exact_effects(
                 if requested.0 > MAX_EXACT_GAUSSIAN_SIGMA {
                     planning_rejections.push(exact_blur_limit_rejection(
                         RenderGroupRejectedEffect::DropShadow,
+                        requested,
+                    ));
+                    continue;
+                }
+            }
+            CompositeEffect::SurfaceShadow(shadow) => {
+                let requested = shadow.blur_radius.scale(scale_factor);
+                if requested.0 > MAX_EXACT_GAUSSIAN_SIGMA {
+                    planning_rejections.push(exact_blur_limit_rejection(
+                        RenderGroupRejectedEffect::SurfaceShadow,
                         requested,
                     ));
                     continue;
@@ -2093,6 +2157,7 @@ pub struct CompositeEffectPlan {
     backdrop_tint: Hsla,
     material_shape: Option<Corners<ScaledPixels>>,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
+    surface_shadows: Vec<CompositeSurfaceShadow<ScaledPixels>>,
     rounded_mask: Option<Corners<ScaledPixels>>,
     blend_mode: CompositeBlendMode,
 }
@@ -2142,6 +2207,7 @@ impl CompositeEffectPlan {
             backdrop_tint: transparent_black(),
             material_shape: None,
             drop_shadows: Vec::new(),
+            surface_shadows: Vec::new(),
             rounded_mask: None,
             blend_mode: CompositeBlendMode::Normal,
         };
@@ -2182,6 +2248,14 @@ impl CompositeEffectPlan {
                 }
                 CompositeEffect::DropShadow(shadow) => {
                     plan.drop_shadows.push(CompositeDropShadow {
+                        offset: shadow.offset.scale(scale_factor),
+                        blur_radius: shadow.blur_radius.scale(scale_factor),
+                        color: shadow.color,
+                    });
+                }
+                CompositeEffect::SurfaceShadow(shadow) => {
+                    plan.surface_shadows.push(CompositeSurfaceShadow {
+                        shape: shadow.shape.scale(scale_factor),
                         offset: shadow.offset.scale(scale_factor),
                         blur_radius: shadow.blur_radius.scale(scale_factor),
                         color: shadow.color,
@@ -2271,6 +2345,11 @@ impl CompositeEffectPlan {
         &self.drop_shadows
     }
 
+    /// Returns surface-shape drop shadows in declared order.
+    pub fn surface_shadows(&self) -> &[CompositeSurfaceShadow<ScaledPixels>] {
+        &self.surface_shadows
+    }
+
     /// Returns the optional rounded group mask in device pixels.
     pub fn rounded_mask(&self) -> Option<Corners<ScaledPixels>> {
         self.rounded_mask
@@ -2289,6 +2368,13 @@ impl CompositeEffectPlan {
                     );
                 }
                 CompositeEffect::DropShadow(shadow) => {
+                    let offset = shadow.offset.scale(scale_factor);
+                    let blur_outset =
+                        gaussian_kernel_outset(shadow.blur_radius.scale(scale_factor)).0;
+                    let shadow_outset = offset.x.0.abs().max(offset.y.0.abs()) + blur_outset;
+                    outset = ScaledPixels(outset.0.max(shadow_outset));
+                }
+                CompositeEffect::SurfaceShadow(shadow) => {
                     let offset = shadow.offset.scale(scale_factor);
                     let blur_outset =
                         gaussian_kernel_outset(shadow.blur_radius.scale(scale_factor)).0;
@@ -2637,12 +2723,19 @@ mod tests {
 
     #[test]
     fn composite_effect_plan_scales_source_effect_geometry() {
+        let shadow_shape = GroupShape::rounded_rect(Corners::all(Pixels(7.)));
         let plan = CompositeEffectPlan::from_effects(
             2.,
             1.,
             &[
                 CompositeEffect::source_blur(Pixels(3.)),
                 CompositeEffect::drop_shadow(point(Pixels(4.), Pixels(-2.)), Pixels(5.), red()),
+                CompositeEffect::surface_shadow(
+                    shadow_shape,
+                    point(Pixels(-3.), Pixels(6.)),
+                    Pixels(4.),
+                    red(),
+                ),
                 CompositeEffect::rounded_mask(Corners::all(Pixels(6.))),
             ],
         );
@@ -2653,6 +2746,15 @@ mod tests {
             point(ScaledPixels(8.), ScaledPixels(-4.))
         );
         assert_eq!(plan.drop_shadows()[0].blur_radius, ScaledPixels(10.));
+        assert_eq!(
+            plan.surface_shadows()[0].shape,
+            Corners::all(ScaledPixels(14.))
+        );
+        assert_eq!(
+            plan.surface_shadows()[0].offset,
+            point(ScaledPixels(-6.), ScaledPixels(12.))
+        );
+        assert_eq!(plan.surface_shadows()[0].blur_radius, ScaledPixels(8.));
         assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(12.))));
         assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(12.))));
         assert_eq!(plan.rounded_mask(), Some(Corners::all(ScaledPixels(12.))));
@@ -2682,6 +2784,48 @@ mod tests {
         assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(8.))));
         assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(18.))));
         assert_eq!(plan.rounded_mask(), None);
+    }
+
+    #[test]
+    fn derived_surface_shape_shadow_lowers_with_surface_provenance() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(10.)));
+        let input = RenderGroupInput::Semantic(SemanticRenderGroupSpec::from_layers(
+            None,
+            ContentLayer::default(),
+            [DerivedLayer::from_surface_shape(shape).shadow(
+                point(Pixels(2.), Pixels(3.)),
+                Pixels(4.),
+                red(),
+            )],
+            Composite::normal(),
+        ));
+
+        let plan = LogicalVisualPlan::from_input(2., 1., &input);
+
+        assert_eq!(
+            plan.accepted_effects(),
+            &[CompositeEffect::surface_shadow(
+                shape,
+                point(Pixels(2.), Pixels(3.)),
+                Pixels(4.),
+                red()
+            )]
+        );
+        assert_eq!(plan.normalized_effects().drop_shadows(), []);
+        assert_eq!(plan.normalized_effects().surface_shadows().len(), 1);
+        assert_eq!(
+            plan.normalized_effects().surface_shadows()[0].shape,
+            Corners::all(ScaledPixels(20.))
+        );
+        assert_eq!(
+            plan.normalized_effects().surface_shadows()[0].offset,
+            point(ScaledPixels(4.), ScaledPixels(6.))
+        );
+        assert_eq!(
+            plan.normalized_effects().surface_shadows()[0].blur_radius,
+            ScaledPixels(8.)
+        );
+        assert_eq!(plan.requirements().output_outset, ScaledPixels(30.));
     }
 
     #[test]
@@ -2793,10 +2937,23 @@ mod tests {
             ),
             ScaledPixels(29.)
         );
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(
+                1.,
+                &[CompositeEffect::surface_shadow(
+                    GroupShape::rectangle(),
+                    point(Pixels(-4.), Pixels(7.)),
+                    Pixels(20.),
+                    red(),
+                )],
+            ),
+            ScaledPixels(31.)
+        );
     }
 
     #[test]
     fn logical_visual_plan_rejects_exact_blur_beyond_kernel_limit() {
+        let shape = GroupShape::rectangle();
         let plan = LogicalVisualPlan::from_effects(
             1.,
             1.,
@@ -2804,6 +2961,12 @@ mod tests {
                 CompositeEffect::source_blur(Pixels(20.)),
                 CompositeEffect::backdrop_blur(Pixels(9.)),
                 CompositeEffect::drop_shadow(point(Pixels(0.), Pixels(4.)), Pixels(12.), red()),
+                CompositeEffect::surface_shadow(
+                    shape,
+                    point(Pixels(0.), Pixels(4.)),
+                    Pixels(10.),
+                    red(),
+                ),
                 CompositeEffect::opacity(0.5),
             ],
         );
@@ -2819,7 +2982,7 @@ mod tests {
         );
         assert_eq!(plan.requirements().source_outset, ScaledPixels(0.));
         assert_eq!(plan.requirements().backdrop_outset, ScaledPixels(0.));
-        assert_eq!(plan.planning_rejections().len(), 3);
+        assert_eq!(plan.planning_rejections().len(), 4);
         assert_eq!(
             plan.planning_rejections()[0].effect.provenance(),
             "content.blur"
@@ -2839,6 +3002,10 @@ mod tests {
         assert_eq!(
             plan.planning_rejections()[2].effect.provenance(),
             "derived.content_alpha.shadow"
+        );
+        assert_eq!(
+            plan.planning_rejections()[3].effect.provenance(),
+            "derived.surface_shape.shadow"
         );
     }
 

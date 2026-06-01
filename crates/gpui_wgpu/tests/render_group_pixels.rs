@@ -537,6 +537,47 @@ fn render_group_backdrop_lens_refracts_parent_target_near_material_edge() {
 }
 
 #[test]
+fn render_group_backdrop_lens_lights_inner_edge_band() {
+    let group_scene = Scene::default();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), rgba(0x404040ff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::backdrop_lens(
+            px(0.),
+            px(8.),
+            px(0.),
+            0.8,
+            0.,
+            point(0., -1.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    let outer_wall = pixel(&image, 8, 16);
+    let inner_caustic = pixel(&image, 13, 16);
+    let stable_center = pixel(&image, 16, 16);
+
+    assert!(
+        outer_wall[0] > stable_center[0],
+        "outer edge wall should catch light: outer_wall {outer_wall:?} center {stable_center:?}"
+    );
+    assert!(
+        inner_caustic[0] > outer_wall[0],
+        "inner caustic band should concentrate more light than the outer wall for tangent-guided light: inner_caustic {inner_caustic:?} outer_wall {outer_wall:?}"
+    );
+    assert_eq!(
+        stable_center,
+        [64, 64, 64, 255],
+        "center should stay the unchanged backdrop when the edge band is outside the sample point"
+    );
+}
+
+#[test]
 fn render_group_blend_mode_applies_at_group_boundary() {
     let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]);
 

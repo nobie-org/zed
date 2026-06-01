@@ -1212,6 +1212,10 @@ fn group_lens_rim(point: vec2<f32>, sprite: GroupSprite) -> f32 {
     return rim * group_material_alpha(point, sprite);
 }
 
+fn group_lens_band(edge_position: f32, center: f32, half_width: f32) -> f32 {
+    return 1.0 - smoothstep(0.0, half_width, abs(edge_position - center));
+}
+
 fn sample_group_texture(coords: vec2<f32>) -> vec4<f32> {
     if (coords.x < 0.0 || coords.y < 0.0 || coords.x > 1.0 || coords.y > 1.0) {
         return vec4<f32>(0.0);
@@ -1305,18 +1309,39 @@ fn sample_backdrop_lensed(
     sigma: f32,
     sprite: GroupSprite,
 ) -> vec4<f32> {
-    let rim = group_lens_rim(point, sprite);
+    if (sprite.backdrop_lens.w <= 0.0 || sprite.backdrop_lens.y <= 0.0) {
+        return sample_backdrop_blurred(coords, pixel_size, sigma);
+    }
+
+    let material_sdf = group_material_sdf(point, sprite);
+    let material_alpha = clamp(0.5 - material_sdf, 0.0, 1.0);
+    let rim_width = max(sprite.backdrop_lens.y, 0.0001);
+    let edge_position = clamp(abs(material_sdf) / rim_width, 0.0, 1.0);
+    let rim = (1.0 - smoothstep(0.0, 1.0, edge_position)) * material_alpha;
     if (rim <= 0.0) {
         return sample_backdrop_blurred(coords, pixel_size, sigma);
     }
 
+    let outer_wall = (1.0 - smoothstep(0.0, 0.16, edge_position)) * material_alpha;
+    let inner_caustic = group_lens_band(edge_position, 0.62, 0.14) * material_alpha;
+    let refraction_profile = clamp(
+        rim * 0.72 + outer_wall * 0.35 + inner_caustic * 0.58,
+        0.0,
+        1.0,
+    );
+    let chroma_profile = clamp(
+        rim * 0.60 + outer_wall * 0.25 + inner_caustic * 0.90,
+        0.0,
+        1.0,
+    );
+
     let normal = group_material_normal(point, sprite);
-    let refraction_offset = normal * sprite.backdrop_lens.x * rim * pixel_size;
+    let refraction_offset = normal * sprite.backdrop_lens.x * refraction_profile * pixel_size;
     let center_coords = coords + refraction_offset;
     var sample = sample_backdrop_blurred(center_coords, pixel_size, sigma);
 
     if (sprite.backdrop_lens.z > 0.0) {
-        let chroma_offset = normal * sprite.backdrop_lens.z * rim * pixel_size;
+        let chroma_offset = normal * sprite.backdrop_lens.z * chroma_profile * pixel_size;
         let red = sample_backdrop_blurred(center_coords + chroma_offset, pixel_size, sigma).r;
         let blue = sample_backdrop_blurred(center_coords - chroma_offset, pixel_size, sigma).b;
         sample = vec4<f32>(red, sample.g, blue, sample.a);
@@ -1330,8 +1355,17 @@ fn sample_backdrop_lensed(
     let light_direction = sprite.backdrop_lens_lighting.zw / light_length;
     let facing_light = max(dot(normal, light_direction), 0.0);
     let facing_shadow = max(dot(-normal, light_direction), 0.0);
-    let highlight = clamp(rim * facing_light * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
-    let shadow = clamp(rim * facing_shadow * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
+    let tangent = vec2<f32>(-normal.y, normal.x);
+    let guided_light = pow(abs(dot(tangent, light_direction)), 2.0);
+    let highlight_profile =
+        rim * facing_light * 0.35 +
+        outer_wall * (0.35 + 0.65 * facing_light) +
+        inner_caustic * (0.35 + 0.65 * guided_light);
+    let shadow_profile =
+        rim * facing_shadow * 0.45 +
+        inner_caustic * (0.35 + 0.65 * facing_shadow);
+    let highlight = clamp(highlight_profile * sprite.backdrop_lens_lighting.x, 0.0, 1.0);
+    let shadow = clamp(shadow_profile * sprite.backdrop_lens_lighting.y, 0.0, 1.0);
     var straight_rgb = sample.rgb / sample.a;
     straight_rgb = mix(straight_rgb, vec3<f32>(1.0), highlight);
     straight_rgb *= 1.0 - shadow;

@@ -2698,7 +2698,6 @@ impl RenderingParameters {
     /// so cross-platform byte-identity (macOS Metal vs Linux Vulkan/lavapipe)
     /// requires single-sampled path rasterization. Gamma/contrast use the same
     /// env-driven defaults as the windowed path.
-    #[cfg(any(test, feature = "test-support"))]
     fn headless() -> Self {
         Self::from_env(1)
     }

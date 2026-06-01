@@ -2189,7 +2189,7 @@ pub enum RenderGroupCapabilityProbe {
     MaterialLighting,
     AdaptiveBackdropPolicy,
     ContentAlphaShadow,
-    GlowApproximation,
+    ProcessedContentGlow,
     DerivedStroke,
     DerivedReflection,
     InnerEffect,
@@ -2234,7 +2234,7 @@ impl RenderGroupCapabilityProbe {
                 "exact Gaussian blur is accepted only within the current kernel limit",
                 "use an explicitly approximate tier or lower the exact blur radius",
             ),
-            Self::GlowApproximation => RenderGroupCapabilityReport::rendered(
+            Self::ProcessedContentGlow => RenderGroupCapabilityReport::rendered(
                 self,
                 "processed-content glow has distinct source-pixel provenance and a backend path",
             ),

@@ -965,16 +965,6 @@ float2 group_material_normal(float2 point, GroupSpriteVertexOutput input) {
   return gradient / gradient_length;
 }
 
-float group_lens_rim(float2 point, GroupSpriteVertexOutput input) {
-  if (input.backdrop_lens.w <= 0.0 || input.backdrop_lens.y <= 0.0) {
-    return 0.0;
-  }
-
-  float distance_to_edge = abs(group_material_sdf(point, input));
-  float rim = 1.0 - smoothstep(0.0, input.backdrop_lens.y, distance_to_edge);
-  return rim * group_material_alpha(point, input);
-}
-
 float group_lens_focus_ridge(float edge_position, float curvature) {
   float ridge_position = (edge_position - 0.64) / 0.22;
   return exp(-(ridge_position * ridge_position)) * curvature;
@@ -1161,19 +1151,18 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
   float rim_width = max(input.backdrop_lens.y, 0.0001);
   float edge_position = saturate(max(-material_sdf, 0.0) / rim_width);
   float bevel_t = smoothstep(0.0, 1.0, edge_position);
-  float outer_wall_position = (edge_position - 0.18) / 0.14;
-  float outer_wall = exp(-(outer_wall_position * outer_wall_position)) * material_alpha;
-  float bevel_body = sin(bevel_t * 3.1415927) * material_alpha;
-  float focus_ridge = group_lens_focus_ridge(edge_position, bevel_body);
-  if (outer_wall + bevel_body + focus_ridge <= 0.0) {
+  float side_normal = cos(bevel_t * 1.5707964) * material_alpha;
+  float curvature = sin(bevel_t * 3.1415927) * material_alpha;
+  float focus_ridge = group_lens_focus_ridge(edge_position, curvature);
+  if (side_normal + curvature + focus_ridge <= 0.0) {
     return sample_backdrop_blurred_linear(
         backdrop_texture, coords, pixel_size, sigma);
   }
 
   float refraction_profile = saturate(
-      outer_wall * 0.34 + bevel_body * 0.58 + focus_ridge * 0.28);
+      side_normal * 0.82 + curvature * 0.22 + focus_ridge * 0.24);
   float chroma_profile = saturate(
-      outer_wall * 0.52 + bevel_body * 0.86 + focus_ridge * 0.72);
+      side_normal * 0.68 + curvature * 0.16 + focus_ridge * 0.42);
 
   float2 normal = group_material_normal(point, input);
   float2 refraction_offset = normal * input.backdrop_lens.x * refraction_profile * pixel_size;
@@ -1207,12 +1196,12 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
   float2 tangent = float2(-normal.y, normal.x);
   float guided_light = pow(abs(dot(tangent, light_direction)), 2.0);
   float highlight_profile =
-      outer_wall * (0.18 + 0.62 * facing_light) +
-      bevel_body * (0.10 + 0.18 * facing_light) +
+      side_normal * (0.22 + 0.58 * facing_light) +
+      curvature * 0.10 * facing_light +
       focus_ridge * (0.12 + 0.48 * guided_light);
   float shadow_profile =
-      outer_wall * 0.24 * facing_shadow +
-      bevel_body * 0.12 * facing_shadow +
+      side_normal * 0.28 * facing_shadow +
+      curvature * 0.10 * facing_shadow +
       focus_ridge * 0.22 * facing_shadow;
   float highlight = saturate(highlight_profile * input.backdrop_lens_lighting.x);
   float shadow = saturate(shadow_profile * input.backdrop_lens_lighting.y);

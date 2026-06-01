@@ -614,14 +614,20 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
     grouped.finish();
 
     let image = render(&grouped);
-    let outer_wall = pixel(&image, 8, 16);
+    let outer_edge = pixel(&image, 8, 16);
+    let outer_shoulder = pixel(&image, 9, 16);
     let mid_bevel = pixel(&image, 10, 16);
     let focus_ridge = pixel(&image, 11, 16);
+    let inner_falloff = pixel(&image, 12, 16);
     let stable_center = pixel(&image, 16, 16);
 
     assert!(
-        outer_wall[0] > stable_center[0],
-        "outer edge wall should catch light: outer_wall {outer_wall:?} center {stable_center:?}"
+        outer_edge[0] > stable_center[0],
+        "outer edge should catch glancing light: outer_edge {outer_edge:?} center {stable_center:?}"
+    );
+    assert!(
+        outer_shoulder[0] > stable_center[0],
+        "rounded side should stay lit after the outer edge instead of collapsing into a dark band: outer_shoulder {outer_shoulder:?} center {stable_center:?}"
     );
     assert!(
         mid_bevel[0] > stable_center[0],
@@ -630,6 +636,10 @@ fn render_group_backdrop_lens_lights_continuous_bevel_profile() {
     assert!(
         focus_ridge[0] > mid_bevel[0],
         "inner focus ridge should concentrate more light than the rounded bevel body for tangent-guided light: focus_ridge {focus_ridge:?} mid_bevel {mid_bevel:?}"
+    );
+    assert!(
+        inner_falloff[0] > stable_center[0],
+        "rounded side should decay back to the stable pane after the focus ridge: inner_falloff {inner_falloff:?} center {stable_center:?}"
     );
     assert_eq!(
         stable_center,

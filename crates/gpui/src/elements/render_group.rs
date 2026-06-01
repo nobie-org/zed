@@ -1,7 +1,7 @@
 use crate::{
     AnyElement, App, Bounds, Composite, CompositeBlendMode, CompositeEffect, ContentLayer, Corners,
     DerivedLayer, Element, ElementId, GlassSurface, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Point, Window,
+    IntoElement, LayoutId, Pixels, Point, RenderGroupInput, Window,
 };
 use std::{mem, panic};
 
@@ -12,58 +12,27 @@ use std::{mem, panic};
 #[track_caller]
 pub fn render_group() -> RenderGroupBuilder {
     RenderGroupBuilder {
-        effects: Vec::new(),
-        effect_mode: RenderGroupEffectMode::None,
+        input: RenderGroupInput::default(),
         source: Some(panic::Location::caller()),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RenderGroupEffectMode {
-    None,
-    Semantic,
-    Raw,
-}
-
-impl RenderGroupEffectMode {
-    fn semantic(self) -> Self {
-        match self {
-            Self::None | Self::Semantic => Self::Semantic,
-            Self::Raw => panic!(
-                "raw render-group effects cannot be mixed with semantic surface/content/derived/composite layers"
-            ),
-        }
-    }
-
-    fn raw(self) -> Self {
-        match self {
-            Self::None | Self::Raw => Self::Raw,
-            Self::Semantic => panic!(
-                "semantic render-group layers cannot be mixed with raw CompositeEffect lists"
-            ),
-        }
     }
 }
 
 /// Builder for a render group before its child has been attached.
 pub struct RenderGroupBuilder {
-    effects: Vec<CompositeEffect>,
-    effect_mode: RenderGroupEffectMode,
+    input: RenderGroupInput,
     source: Option<&'static panic::Location<'static>>,
 }
 
 impl RenderGroupBuilder {
     /// Applies one composite effect to the group.
     pub fn effect(mut self, effect: CompositeEffect) -> Self {
-        self.effect_mode = self.effect_mode.raw();
-        self.effects.push(effect);
+        self.input.raw_mut().push(effect);
         self
     }
 
     /// Applies a sequence of composite effects to the group.
     pub fn effects(mut self, effects: impl IntoIterator<Item = CompositeEffect>) -> Self {
-        self.effect_mode = self.effect_mode.raw();
-        self.effects.extend(effects);
+        self.input.raw_mut().extend(effects);
         self
     }
 
@@ -72,36 +41,31 @@ impl RenderGroupBuilder {
         mut self,
         effects: impl IntoIterator<Item = CompositeEffect>,
     ) -> Self {
-        self.effect_mode = self.effect_mode.raw();
-        self.effects.extend(effects);
+        self.input.raw_mut().extend(effects);
         self
     }
 
     /// Applies a semantic surface layer to the group.
     pub fn surface(mut self, surface: GlassSurface) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        surface.push_effects(&mut self.effects);
+        self.input.semantic_mut().surface(surface);
         self
     }
 
     /// Applies semantic content/source effects to the group.
     pub fn content(mut self, content: ContentLayer) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        content.push_effects(&mut self.effects);
+        self.input.semantic_mut().content(content);
         self
     }
 
     /// Applies a semantic derived layer to the group.
     pub fn derived(mut self, derived: DerivedLayer) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        derived.push_effects(&mut self.effects);
+        self.input.semantic_mut().derived(derived);
         self
     }
 
     /// Applies final compositing options to the group.
     pub fn composite(mut self, composite: Composite) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        composite.push_effects(&mut self.effects);
+        self.input.semantic_mut().composite(composite);
         self
     }
 
@@ -226,8 +190,7 @@ impl RenderGroupBuilder {
     pub fn child(self, child: impl IntoElement) -> RenderGroup {
         RenderGroup {
             child: child.into_any_element(),
-            effects: self.effects,
-            effect_mode: self.effect_mode,
+            input: self.input,
             source: self.source,
         }
     }
@@ -236,23 +199,20 @@ impl RenderGroupBuilder {
 /// An element that composites one child as an isolated render group.
 pub struct RenderGroup {
     child: AnyElement,
-    effects: Vec<CompositeEffect>,
-    effect_mode: RenderGroupEffectMode,
+    input: RenderGroupInput,
     source: Option<&'static panic::Location<'static>>,
 }
 
 impl RenderGroup {
     /// Applies one composite effect to the group.
     pub fn effect(mut self, effect: CompositeEffect) -> Self {
-        self.effect_mode = self.effect_mode.raw();
-        self.effects.push(effect);
+        self.input.raw_mut().push(effect);
         self
     }
 
     /// Applies a sequence of composite effects to the group.
     pub fn effects(mut self, effects: impl IntoIterator<Item = CompositeEffect>) -> Self {
-        self.effect_mode = self.effect_mode.raw();
-        self.effects.extend(effects);
+        self.input.raw_mut().extend(effects);
         self
     }
 
@@ -261,36 +221,31 @@ impl RenderGroup {
         mut self,
         effects: impl IntoIterator<Item = CompositeEffect>,
     ) -> Self {
-        self.effect_mode = self.effect_mode.raw();
-        self.effects.extend(effects);
+        self.input.raw_mut().extend(effects);
         self
     }
 
     /// Applies a semantic surface layer to the group.
     pub fn surface(mut self, surface: GlassSurface) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        surface.push_effects(&mut self.effects);
+        self.input.semantic_mut().surface(surface);
         self
     }
 
     /// Applies semantic content/source effects to the group.
     pub fn content(mut self, content: ContentLayer) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        content.push_effects(&mut self.effects);
+        self.input.semantic_mut().content(content);
         self
     }
 
     /// Applies a semantic derived layer to the group.
     pub fn derived(mut self, derived: DerivedLayer) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        derived.push_effects(&mut self.effects);
+        self.input.semantic_mut().derived(derived);
         self
     }
 
     /// Applies final compositing options to the group.
     pub fn composite(mut self, composite: Composite) -> Self {
-        self.effect_mode = self.effect_mode.semantic();
-        composite.push_effects(&mut self.effects);
+        self.input.semantic_mut().composite(composite);
         self
     }
 
@@ -500,8 +455,8 @@ impl Element for RenderGroup {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let effects = self.effects.clone();
-        window.paint_group(bounds, effects, |window| {
+        let input = self.input.clone();
+        window.paint_group(bounds, input, |window| {
             self.child.paint(window, cx);
         });
     }

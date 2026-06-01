@@ -159,8 +159,7 @@ impl Scene {
     /// Returns whether any render group in this scene needs parent-target pixels.
     pub fn requires_backdrop_effects(&self) -> bool {
         self.groups.iter().any(|group| {
-            group.effects.iter().any(CompositeEffect::reads_backdrop)
-                || group.scene.requires_backdrop_effects()
+            group.plan.requirements().reads_backdrop || group.scene.requires_backdrop_effects()
         })
     }
 
@@ -861,8 +860,7 @@ pub struct PaintGroup {
     pub capture_bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub scale_factor: f32,
-    pub boundary_opacity: f32,
-    pub effects: Vec<CompositeEffect>,
+    pub plan: LogicalVisualPlan,
     pub scene: Arc<Scene>,
 }
 
@@ -1512,6 +1510,12 @@ pub struct Composite {
     blend_mode: CompositeBlendMode,
 }
 
+impl Default for Composite {
+    fn default() -> Self {
+        Self::normal()
+    }
+}
+
 impl Composite {
     /// Returns normal final compositing.
     pub fn normal() -> Self {
@@ -1539,6 +1543,271 @@ impl Composite {
         }
         if self.blend_mode != CompositeBlendMode::Normal {
             effects.push(CompositeEffect::blend_mode(self.blend_mode));
+        }
+    }
+}
+
+/// Structured semantic render-group input before renderer planning.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticRenderGroupSpec {
+    surface: Option<GlassSurface>,
+    content: ContentLayer,
+    derived_layers: Vec<DerivedLayer>,
+    composite: Composite,
+}
+
+impl Default for SemanticRenderGroupSpec {
+    fn default() -> Self {
+        Self {
+            surface: None,
+            content: ContentLayer::default(),
+            derived_layers: Vec::new(),
+            composite: Composite::normal(),
+        }
+    }
+}
+
+impl SemanticRenderGroupSpec {
+    pub(crate) fn surface(&mut self, surface: GlassSurface) {
+        self.surface = Some(surface);
+    }
+
+    pub(crate) fn content(&mut self, content: ContentLayer) {
+        self.content = content;
+    }
+
+    pub(crate) fn derived(&mut self, derived: DerivedLayer) {
+        self.derived_layers.push(derived);
+    }
+
+    pub(crate) fn composite(&mut self, composite: Composite) {
+        self.composite = composite;
+    }
+
+    fn effects(&self) -> Vec<CompositeEffect> {
+        let mut effects = Vec::new();
+        if let Some(surface) = &self.surface {
+            surface.push_effects(&mut effects);
+        }
+        self.content.push_effects(&mut effects);
+        for derived in &self.derived_layers {
+            derived.push_effects(&mut effects);
+        }
+        self.composite.push_effects(&mut effects);
+        effects
+    }
+
+    fn has_active_effect(&self) -> bool {
+        self.effects().iter().any(|effect| !effect.is_identity())
+    }
+}
+
+/// Render-group input after API mode validation and before logical planning.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RenderGroupInput {
+    /// No render-group effects have been authored yet.
+    None,
+    /// Semantic layer input: surface, content, derived layers, and boundary composite.
+    Semantic(SemanticRenderGroupSpec),
+    /// Raw GPUI primitive syntax with documented normalization rules.
+    Raw(Vec<CompositeEffect>),
+}
+
+impl Default for RenderGroupInput {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl RenderGroupInput {
+    pub(crate) fn semantic_mut(&mut self) -> &mut SemanticRenderGroupSpec {
+        match self {
+            Self::None => {
+                *self = Self::Semantic(SemanticRenderGroupSpec::default());
+                match self {
+                    Self::Semantic(spec) => spec,
+                    Self::None | Self::Raw(_) => unreachable!(),
+                }
+            }
+            Self::Semantic(spec) => spec,
+            Self::Raw(_) => panic!(
+                "raw render-group effects cannot be mixed with semantic surface/content/derived/composite layers"
+            ),
+        }
+    }
+
+    pub(crate) fn raw_mut(&mut self) -> &mut Vec<CompositeEffect> {
+        match self {
+            Self::None => {
+                *self = Self::Raw(Vec::new());
+                match self {
+                    Self::Raw(effects) => effects,
+                    Self::None | Self::Semantic(_) => unreachable!(),
+                }
+            }
+            Self::Raw(effects) => effects,
+            Self::Semantic(_) => panic!(
+                "semantic render-group layers cannot be mixed with raw CompositeEffect lists"
+            ),
+        }
+    }
+
+    pub(crate) fn effects(&self) -> Vec<CompositeEffect> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Semantic(spec) => spec.effects(),
+            Self::Raw(effects) => effects.clone(),
+        }
+    }
+
+    pub(crate) fn has_active_effect(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Semantic(spec) => spec.has_active_effect(),
+            Self::Raw(effects) => effects.iter().any(|effect| !effect.is_identity()),
+        }
+    }
+}
+
+/// Backend-independent visual meaning for a render group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalVisualPlan {
+    effects: Vec<CompositeEffect>,
+    normalized: CompositeEffectPlan,
+    requirements: RenderGroupRequirements,
+    physical: PhysicalRenderGroupPlan,
+}
+
+impl LogicalVisualPlan {
+    /// Lowers validated render-group input into a backend-independent plan.
+    pub fn from_input(scale_factor: f32, boundary_opacity: f32, input: &RenderGroupInput) -> Self {
+        Self::from_effects(scale_factor, boundary_opacity, input.effects())
+    }
+
+    /// Lowers raw normalized effect syntax into a backend-independent plan.
+    pub fn from_effects(
+        scale_factor: f32,
+        boundary_opacity: f32,
+        effects: Vec<CompositeEffect>,
+    ) -> Self {
+        let normalized =
+            CompositeEffectPlan::from_effects(scale_factor, boundary_opacity, &effects);
+        let requirements =
+            RenderGroupRequirements::from_effect_plan(scale_factor, &effects, &normalized);
+        let physical = PhysicalRenderGroupPlan::from_requirements(&requirements);
+        Self {
+            effects,
+            normalized,
+            requirements,
+            physical,
+        }
+    }
+
+    /// Returns the raw syntax that produced this plan.
+    pub fn effects(&self) -> &[CompositeEffect] {
+        &self.effects
+    }
+
+    /// Returns the normalized current physical slice consumed by backends.
+    pub fn normalized_effects(&self) -> &CompositeEffectPlan {
+        &self.normalized
+    }
+
+    /// Returns backend-independent requirements.
+    pub fn requirements(&self) -> RenderGroupRequirements {
+        self.requirements
+    }
+
+    /// Returns the current physical execution summary.
+    pub fn physical_plan(&self) -> PhysicalRenderGroupPlan {
+        self.physical
+    }
+}
+
+/// Backend-independent requirements implied by a logical visual plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[allow(missing_docs)]
+pub struct RenderGroupRequirements {
+    pub reads_backdrop: bool,
+    pub source_outset: ScaledPixels,
+    pub backdrop_outset: ScaledPixels,
+    pub output_outset: ScaledPixels,
+    pub requires_source_capture: bool,
+    pub pass_count: u8,
+    pub intermediate_textures: u8,
+    pub backdrop_copies: u8,
+}
+
+impl RenderGroupRequirements {
+    fn from_effect_plan(
+        scale_factor: f32,
+        effects: &[CompositeEffect],
+        normalized: &CompositeEffectPlan,
+    ) -> Self {
+        let output_outset = CompositeEffectPlan::visual_outset(scale_factor, effects);
+        let source_outset = effects
+            .iter()
+            .fold(ScaledPixels(0.), |outset, effect| match effect {
+                CompositeEffect::SourceBlur(radius) => ScaledPixels(
+                    outset
+                        .0
+                        .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
+                ),
+                _ => outset,
+            });
+        let backdrop_outset =
+            effects
+                .iter()
+                .fold(ScaledPixels(0.), |outset, effect| match effect {
+                    CompositeEffect::BackdropBlur(radius) => ScaledPixels(
+                        outset
+                            .0
+                            .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
+                    ),
+                    CompositeEffect::BackdropLens(lens) => ScaledPixels(
+                        outset
+                            .0
+                            .max(lens.refraction_radius().scale(scale_factor).0)
+                            .max(lens.chromatic_aberration().scale(scale_factor).0),
+                    ),
+                    _ => outset,
+                });
+        let reads_backdrop = normalized.reads_backdrop();
+        let has_derived = !normalized.drop_shadows().is_empty();
+        let pass_count = 1
+            + u8::from(reads_backdrop)
+            + u8::from(has_derived)
+            + u8::from(normalized.opacity() > 0.);
+        let intermediate_textures = 1 + u8::from(reads_backdrop);
+
+        Self {
+            reads_backdrop,
+            source_outset,
+            backdrop_outset,
+            output_outset,
+            requires_source_capture: true,
+            pass_count,
+            intermediate_textures,
+            backdrop_copies: u8::from(reads_backdrop),
+        }
+    }
+}
+
+/// Backend-specific execution summary for the current render-group renderer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct PhysicalRenderGroupPlan {
+    pub pass_count: u8,
+    pub intermediate_textures: u8,
+    pub backdrop_copies: u8,
+}
+
+impl PhysicalRenderGroupPlan {
+    fn from_requirements(requirements: &RenderGroupRequirements) -> Self {
+        Self {
+            pass_count: requirements.pass_count,
+            intermediate_textures: requirements.intermediate_textures,
+            backdrop_copies: requirements.backdrop_copies,
         }
     }
 }
@@ -2089,8 +2358,7 @@ mod tests {
             capture_bounds,
             content_mask,
             scale_factor: 1.,
-            boundary_opacity: 0.5,
-            effects: vec![CompositeEffect::opacity(0.5)],
+            plan: LogicalVisualPlan::from_effects(1., 0.5, vec![CompositeEffect::opacity(0.5)]),
             scene: Arc::new(Scene::default()),
         }
     }
@@ -2134,8 +2402,8 @@ mod tests {
         replayed.replay(0..scene.len(), &scene);
 
         assert_eq!(replayed.groups.len(), 1);
-        assert_eq!(replayed.groups[0].boundary_opacity, 0.5);
-        assert_eq!(replayed.groups[0].effects.len(), 1);
+        assert_eq!(replayed.groups[0].plan.normalized_effects().opacity(), 0.25);
+        assert_eq!(replayed.groups[0].plan.effects().len(), 1);
     }
 
     #[test]
@@ -2284,6 +2552,71 @@ mod tests {
                 CompositeEffect::material_shape(shape),
                 CompositeEffect::backdrop_blur(Pixels(4.))
             ]
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_lowers_semantic_input_once() {
+        let shape = GroupShape::rounded_rect(Corners::all(Pixels(8.)));
+        let mut input = RenderGroupInput::default();
+        input
+            .semantic_mut()
+            .surface(GlassSurface::for_shape(shape).frost(Pixels(4.)));
+        input
+            .semantic_mut()
+            .content(ContentLayer::clipped_to(shape).blur(Pixels(2.)));
+        input
+            .semantic_mut()
+            .composite(Composite::normal().opacity(0.5));
+
+        let plan = LogicalVisualPlan::from_input(2., 0.75, &input);
+
+        assert_eq!(plan.normalized_effects().opacity(), 0.375);
+        assert_eq!(
+            plan.normalized_effects().source_blur_radius(),
+            ScaledPixels(4.)
+        );
+        assert_eq!(
+            plan.normalized_effects().source_mask(),
+            Some(Corners::all(ScaledPixels(16.)))
+        );
+        assert_eq!(
+            plan.normalized_effects().material_shape(),
+            Some(Corners::all(ScaledPixels(16.)))
+        );
+        assert!(plan.requirements().reads_backdrop);
+        assert_eq!(plan.requirements().source_outset, ScaledPixels(12.));
+        assert_eq!(plan.requirements().backdrop_outset, ScaledPixels(24.));
+        assert_eq!(plan.physical_plan().backdrop_copies, 1);
+    }
+
+    #[test]
+    fn render_group_input_keeps_semantic_and_raw_modes_disjoint() {
+        let shape = GroupShape::rectangle();
+        let mut semantic_then_raw = RenderGroupInput::default();
+        semantic_then_raw
+            .semantic_mut()
+            .content(ContentLayer::default());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                semantic_then_raw
+                    .raw_mut()
+                    .push(CompositeEffect::opacity(0.5));
+            }))
+            .is_err()
+        );
+
+        let mut raw_then_semantic = RenderGroupInput::default();
+        raw_then_semantic
+            .raw_mut()
+            .push(CompositeEffect::opacity(0.5));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                raw_then_semantic
+                    .semantic_mut()
+                    .surface(GlassSurface::for_shape(shape));
+            }))
+            .is_err()
         );
     }
 

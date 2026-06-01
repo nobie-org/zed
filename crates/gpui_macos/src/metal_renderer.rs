@@ -1236,11 +1236,7 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
-            let effect_plan = CompositeEffectPlan::from_effects(
-                group.scale_factor,
-                group.boundary_opacity,
-                &group.effects,
-            );
+            let effect_plan = group.plan.normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }

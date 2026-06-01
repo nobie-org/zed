@@ -2078,11 +2078,7 @@ impl WgpuRenderer {
         retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
         for group in groups {
-            let effect_plan = CompositeEffectPlan::from_effects(
-                group.scale_factor,
-                group.boundary_opacity,
-                &group.effects,
-            );
+            let effect_plan = group.plan.normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }

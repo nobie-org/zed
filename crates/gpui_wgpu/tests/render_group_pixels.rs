@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use gpui::{
     Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect, ContentMask, Corners,
-    DevicePixels, Edges, Hsla, PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene,
-    point, px, rgba, size, transparent_black,
+    DevicePixels, Edges, Hsla, LogicalVisualPlan, PaintGroup, PlatformHeadlessRenderer, Quad,
+    ScaledPixels, Scene, point, px, rgba, size, transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 use image::RgbaImage;
@@ -74,8 +74,7 @@ fn paint_group_with_effects(
         capture_bounds,
         content_mask: mask(),
         scale_factor: 1.,
-        boundary_opacity: 1.,
-        effects,
+        plan: LogicalVisualPlan::from_effects(1., 1., effects),
         scene: Arc::new(scene),
     }
 }

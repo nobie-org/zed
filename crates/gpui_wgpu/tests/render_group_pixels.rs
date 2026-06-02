@@ -1,12 +1,14 @@
 #![cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use gpui::{
-    Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect, ContentMask, Corners,
-    DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, LogicalVisualPlan, LumaThreshold,
-    PaintGroup, PlatformHeadlessRenderer, Quad, ScaledPixels, Scene, point, px, rgba, size,
-    transparent_black,
+    AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
+    ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
+    LogicalVisualPlan, LumaThreshold, MonochromeSprite, PaintGroup, PlatformAtlas,
+    PlatformHeadlessRenderer, PolychromeSprite, Quad, RenderImageParams, RenderSvgParams,
+    ScaledPixels, Scene, TransformationMatrix, point, px, rgba, size, transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 use image::RgbaImage;
@@ -1010,4 +1012,280 @@ fn render_group_blend_mode_applies_at_group_boundary() {
     grouped.finish();
 
     assert_eq!(pixel(&render(&grouped), 12, 12), [64, 64, 128, 255]);
+}
+
+// --- Descendant capture: text (monochrome sprites) ---------------------------
+//
+// Render groups must capture and composite glyph sprites, not only quads. A glyph
+// paints as a `MonochromeSprite` that samples a coverage tile in the monochrome
+// atlas and multiplies it by `color`. These fixtures inject a synthetic
+// fully-covered tile (a stand-in glyph) so the captured pixels are deterministic,
+// then prove the group captures the sprite losslessly and composites group
+// effects over it. Without this, broad text-in-group UI is unproven.
+
+/// Render a scene that needs atlas-backed sprites: the build closure receives the
+/// renderer's sprite atlas so it can insert tiles before the scene is rendered.
+/// `render_scene_to_image` calls `atlas.before_frame()`, which flushes the staged
+/// tile uploads before the draw, so the injected pixels are on the GPU.
+fn render_with_atlas(build: impl FnOnce(&Arc<dyn PlatformAtlas>) -> Scene) -> RgbaImage {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    let atlas = renderer.sprite_atlas().clone();
+    let scene = build(&atlas);
+    renderer
+        .render_scene_to_image(
+            &scene,
+            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+        )
+        .expect("render scene")
+}
+
+/// Allocate and upload a `side`x`side` monochrome tile whose every texel has the
+/// given coverage, returning the tile a `MonochromeSprite` can sample. Uses an
+/// `AtlasKey::Svg` key (monochrome texture kind) as a synthetic stand-in glyph.
+fn monochrome_coverage_tile(
+    atlas: &Arc<dyn PlatformAtlas>,
+    key: &str,
+    side: i32,
+    coverage: u8,
+) -> AtlasTile {
+    let tile_size = size(DevicePixels(side), DevicePixels(side));
+    let params = RenderSvgParams {
+        path: key.to_string().into(),
+        size: tile_size,
+    };
+    atlas
+        .get_or_insert_with(&AtlasKey::Svg(params), &mut || {
+            Ok(Some((
+                tile_size,
+                Cow::Owned(vec![coverage; (side * side) as usize]),
+            )))
+        })
+        .expect("atlas insert succeeds")
+        .expect("atlas returns a tile")
+}
+
+fn monochrome_sprite(
+    order: u32,
+    bounds: Bounds<ScaledPixels>,
+    color: Hsla,
+    tile: AtlasTile,
+) -> MonochromeSprite {
+    MonochromeSprite {
+        order,
+        pad: 0,
+        bounds,
+        content_mask: mask(),
+        color,
+        tile,
+        transformation: TransformationMatrix::default(),
+    }
+}
+
+#[test]
+fn render_group_captures_monochrome_text_sprite_losslessly() {
+    // The same glyph sprite rendered inline vs inside an identity render group
+    // must produce identical pixels — proving the group captures monochrome
+    // (text) sprites, not only quads.
+    let inline = render_with_atlas(|atlas| {
+        let tile = monochrome_coverage_tile(atlas, "glyph", 8, 0xff);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(monochrome_sprite(1, rect(8., 8., 8., 8.), white(), tile));
+        scene.finish();
+        scene
+    });
+
+    let grouped = render_with_atlas(|atlas| {
+        let tile = monochrome_coverage_tile(atlas, "glyph", 8, 0xff);
+        let mut group_scene = Scene::default();
+        group_scene.insert_primitive(monochrome_sprite(0, rect(8., 8., 8., 8.), white(), tile));
+        group_scene.finish();
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group(1, rect(8., 8., 8., 8.), 1., group_scene));
+        scene.finish();
+        scene
+    });
+
+    assert_eq!(grouped.as_raw(), inline.as_raw());
+}
+
+#[test]
+fn render_group_opacity_composites_captured_monochrome_text_sprite() {
+    // A fully-covered white glyph at full opacity is white; captured inside an
+    // opacity(0.5) group it must composite to half-white over black — proving the
+    // group effect applies to the captured sprite coverage, not just to quads.
+    let image = render_with_atlas(|atlas| {
+        let tile = monochrome_coverage_tile(atlas, "glyph", 8, 0xff);
+        let mut group_scene = Scene::default();
+        group_scene.insert_primitive(monochrome_sprite(0, rect(8., 8., 8., 8.), white(), tile));
+        group_scene.finish();
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group(1, rect(8., 8., 8., 8.), 0.5, group_scene));
+        scene.finish();
+        scene
+    });
+
+    assert_eq!(pixel(&image, 1, 1), [0, 0, 0, 255]);
+    assert_eq!(pixel(&image, 12, 12), [128, 128, 128, 255]);
+}
+
+// --- Descendant capture: images (polychrome sprites) -------------------------
+//
+// Images paint as `PolychromeSprite`s sampling an RGBA tile in the polychrome
+// atlas. A white, fully-opaque tile keeps the expected pixels independent of
+// channel order and premultiplication, isolating capture/compositing of image
+// descendants from color-format details.
+
+/// Allocate and upload a `side`x`side` fully-opaque white polychrome tile (4
+/// bytes/texel) via an `AtlasKey::Image` key (polychrome texture kind).
+fn polychrome_white_tile(atlas: &Arc<dyn PlatformAtlas>, key: usize, side: i32) -> AtlasTile {
+    let tile_size = size(DevicePixels(side), DevicePixels(side));
+    let params = RenderImageParams {
+        image_id: ImageId(key),
+        frame_index: 0,
+    };
+    atlas
+        .get_or_insert_with(&AtlasKey::Image(params), &mut || {
+            Ok(Some((
+                tile_size,
+                Cow::Owned(vec![0xff; (side * side * 4) as usize]),
+            )))
+        })
+        .expect("atlas insert succeeds")
+        .expect("atlas returns a tile")
+}
+
+fn polychrome_sprite(
+    order: u32,
+    bounds: Bounds<ScaledPixels>,
+    tile: AtlasTile,
+) -> PolychromeSprite {
+    PolychromeSprite {
+        order,
+        pad: 0,
+        grayscale: false,
+        opacity: 1.,
+        bounds,
+        content_mask: mask(),
+        corner_radii: Corners::all(sp(0.)),
+        tile,
+    }
+}
+
+#[test]
+fn render_group_captures_polychrome_image_sprite_losslessly() {
+    // The same image sprite rendered inline vs inside an identity render group
+    // must produce identical pixels — proving the group captures polychrome
+    // (image) sprites, not only quads.
+    let inline = render_with_atlas(|atlas| {
+        let tile = polychrome_white_tile(atlas, 1, 8);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(polychrome_sprite(1, rect(8., 8., 8., 8.), tile));
+        scene.finish();
+        scene
+    });
+
+    let grouped = render_with_atlas(|atlas| {
+        let tile = polychrome_white_tile(atlas, 1, 8);
+        let mut group_scene = Scene::default();
+        group_scene.insert_primitive(polychrome_sprite(0, rect(8., 8., 8., 8.), tile));
+        group_scene.finish();
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group(1, rect(8., 8., 8., 8.), 1., group_scene));
+        scene.finish();
+        scene
+    });
+
+    assert_eq!(grouped.as_raw(), inline.as_raw());
+}
+
+#[test]
+fn render_group_opacity_composites_captured_polychrome_image_sprite() {
+    // A fully-opaque white image at full opacity is white; captured inside an
+    // opacity(0.5) group it must composite to half-white over black — proving the
+    // group effect applies to the captured image sprite, not just to quads.
+    let image = render_with_atlas(|atlas| {
+        let tile = polychrome_white_tile(atlas, 1, 8);
+        let mut group_scene = Scene::default();
+        group_scene.insert_primitive(polychrome_sprite(0, rect(8., 8., 8., 8.), tile));
+        group_scene.finish();
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group(1, rect(8., 8., 8., 8.), 0.5, group_scene));
+        scene.finish();
+        scene
+    });
+
+    assert_eq!(pixel(&image, 1, 1), [0, 0, 0, 255]);
+    assert_eq!(pixel(&image, 12, 12), [128, 128, 128, 255]);
+}
+
+// --- Descendant capture: cached descendants (replayed primitives) ------------
+//
+// A cached element (`AnyView::cached`) is reused by replaying its recorded
+// primitives into the CURRENT scene: `Scene::replay` walks the prior frame's
+// `paint_operations` and re-`insert_primitive`s them into `self`. During
+// `Window::paint_group`, the current scene *is* the group's scene (paint_group
+// `mem::take`s `next_frame.scene` for the group's children), so a cached child
+// replayed inside a group lands in the group scene and is captured. These
+// fixtures exercise that exact `replay` mechanism rather than re-deriving it.
+
+/// A previous-frame scene holding one recorded child primitive, plus the
+/// `0..len` range a cached reuse would replay (one `paint_operation` per
+/// non-empty `insert_primitive`).
+fn recorded_child(child: Quad) -> (Scene, std::ops::Range<usize>) {
+    let mut previous_frame = Scene::default();
+    previous_frame.insert_primitive(child);
+    (previous_frame, 0..1)
+}
+
+#[test]
+fn render_group_captures_cached_descendant_replay_losslessly() {
+    // A child replayed (as a cached reuse) inside an identity render group must
+    // match the same child painted inline — the group captures replayed cached
+    // primitives, not only freshly-inserted ones.
+    let (previous_frame, range) = recorded_child(quad(0, rect(8., 8., 8., 8.), white()));
+
+    let mut inline = Scene::default();
+    inline.insert_primitive(quad(0, viewport(), black()));
+    inline.insert_primitive(quad(1, rect(8., 8., 8., 8.), white()));
+    inline.finish();
+
+    let mut group_scene = Scene::default();
+    group_scene.replay(range, &previous_frame);
+    group_scene.finish();
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group(1, rect(8., 8., 8., 8.), 1., group_scene));
+    grouped.finish();
+
+    assert_eq!(render(&grouped).as_raw(), render(&inline).as_raw());
+}
+
+#[test]
+fn render_group_opacity_composites_cached_descendant_replay() {
+    // A full white child replayed (cached reuse) inside an opacity(0.5) group must
+    // composite to half-white over black — proving the group effect applies to the
+    // captured replayed primitive.
+    let (previous_frame, range) = recorded_child(quad(0, rect(8., 8., 8., 8.), white()));
+
+    let mut group_scene = Scene::default();
+    group_scene.replay(range, &previous_frame);
+    group_scene.finish();
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group(1, rect(8., 8., 8., 8.), 0.5, group_scene));
+    grouped.finish();
+
+    let image = render(&grouped);
+    assert_eq!(pixel(&image, 1, 1), [0, 0, 0, 255]);
+    assert_eq!(pixel(&image, 12, 12), [128, 128, 128, 255]);
 }

@@ -1464,6 +1464,19 @@ float3 blend_rgb(uint mode, float3 source, float3 backdrop) {
   if (mode == 6) {
     return min(source + backdrop, float3(1.0));
   }
+  if (mode == 7) {
+    return abs(source - backdrop);
+  }
+  if (mode == 8) {
+    return source + backdrop - 2.0 * source * backdrop;
+  }
+  if (mode == 9) {
+    return mix(
+      2.0 * source * backdrop,
+      1.0 - 2.0 * (1.0 - source) * (1.0 - backdrop),
+      step(float3(0.5), source)
+    );
+  }
   return source;
 }
 

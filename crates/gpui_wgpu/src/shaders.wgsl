@@ -1669,6 +1669,19 @@ fn blend_rgb(mode: u32, source: vec3<f32>, backdrop: vec3<f32>) -> vec3<f32> {
     if (mode == 6u) {
         return min(source + backdrop, vec3<f32>(1.0));
     }
+    if (mode == 7u) {
+        return abs(source - backdrop);
+    }
+    if (mode == 8u) {
+        return source + backdrop - 2.0 * source * backdrop;
+    }
+    if (mode == 9u) {
+        return mix(
+            2.0 * source * backdrop,
+            1.0 - 2.0 * (1.0 - source) * (1.0 - backdrop),
+            step(vec3<f32>(0.5), source),
+        );
+    }
     return source;
 }
 

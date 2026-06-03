@@ -2502,8 +2502,8 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeEffect, Edges, Hsla, LogicalVisualPlan, PaintGroup,
-        RenderGroupBackendCounters, px, rgba, transparent_black,
+        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, Hsla, LogicalVisualPlan,
+        PaintGroup, RenderGroupBackendCounters, px, rgba, transparent_black,
     };
     use image::RgbaImage;
     use std::sync::Arc;
@@ -2566,6 +2566,55 @@ mod tests {
 
     fn gray() -> Hsla {
         rgba(0x808080ff).into()
+    }
+
+    fn white() -> Hsla {
+        rgba(0xffffffff).into()
+    }
+
+    #[test]
+    fn render_group_difference_blend_mode_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), rgba(0x0000ffff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::blend_mode(CompositeBlendMode::Difference)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), white())]),
+        ));
+        grouped.finish();
+
+        assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 0, 255]);
+    }
+
+    #[test]
+    fn render_group_exclusion_blend_mode_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), rgba(0xffffffff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::blend_mode(CompositeBlendMode::Exclusion)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), white())]),
+        ));
+        grouped.finish();
+
+        assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn render_group_hard_light_blend_mode_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), rgba(0x808080ff)));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::blend_mode(CompositeBlendMode::HardLight)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), white())]),
+        ));
+        grouped.finish();
+
+        assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 255, 255]);
     }
 
     #[test]

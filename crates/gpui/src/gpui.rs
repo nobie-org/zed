@@ -41,6 +41,37 @@ pub mod profiler;
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
+/// Renderer-facing scene storage and batching protocol.
+///
+/// This module is public for the platform renderer crates. Application code
+/// should use GPUI's author-facing paint and render-group APIs instead of
+/// constructing these storage records directly.
+pub mod scene_protocol {
+    pub use crate::scene::{
+        CompositeEffectPlan, CompositeProcessedContentGlowPlan, DrawOrder, LogicalVisualPlan,
+        MonochromeSprite, PaintGroup, PaintSurface, Path, PathId, PathVertex,
+        PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
+        PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
+        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+        RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
+        TransformationMatrix, Underline,
+    };
+}
+/// Render-group planning and capability diagnostics for inspectors and tests.
+///
+/// Application code should prefer GPUI's semantic layer APIs instead of planning
+/// render groups directly.
+pub mod render_group_diagnostics {
+    pub use crate::scene::{
+        LogicalVisualPlan, PhysicalRenderGroupPlan, RenderGroupBackendCounters,
+        RenderGroupCapabilityProbe, RenderGroupCapabilityRejectionReason,
+        RenderGroupCapabilityReport, RenderGroupCapabilityStatus, RenderGroupDependencies,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
+        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+        RenderGroupSupportCounters, SemanticRenderGroupSpec,
+    };
+}
 mod shared_uri;
 mod style;
 mod styled;
@@ -107,7 +138,18 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
-pub use scene::*;
+#[cfg(target_os = "macos")]
+pub(crate) use scene::PaintSurface;
+pub use scene::{
+    BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
+    CompositeEffect, CompositeProcessedContentGlow, CompositeSurfaceShadow, ContentLayer,
+    ContentStage, DerivedLayer, DerivedStage, GlassLens, GlassSurface, Glow, GroupShape,
+    GroupShapeKind, LumaThreshold, Path, ProcessedContentDerivedLayer, SourceColorFilter,
+    SourceMaskBlurOrder, SourceToneOp, TransformationMatrix,
+};
+pub(crate) use scene::{
+    MonochromeSprite, PaintGroup, PolychromeSprite, Quad, Scene, Shadow, SubpixelSprite, Underline,
+};
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;

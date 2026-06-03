@@ -1,10 +1,12 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, CompositeEffectPlan, Corners, DevicePixels, GpuSpecs,
-    MonochromeSprite, PaintGroup, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    RenderGroupBackendCounters, ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline,
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point, ScaledPixels, Size,
     get_gamma_correction_ratios, point,
+    scene_protocol::{
+        CompositeEffectPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, PrimitiveBatch,
+        Quad, RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite, Underline,
+    },
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -1778,6 +1780,7 @@ impl WgpuRenderer {
 
                     did_draw
                 }
+                unknown => panic!("unsupported GPUI primitive batch: {unknown:?}"),
             };
             if !ok {
                 return false;
@@ -2689,7 +2692,8 @@ impl WgpuRenderer {
                 }],
             });
 
-        let msaa = Self::create_msaa_if_needed(&resources.device, format, width, height, sample_count);
+        let msaa =
+            Self::create_msaa_if_needed(&resources.device, format, width, height, sample_count);
         let (target_view, resolve_target) = match msaa.as_ref() {
             Some((_, msaa_view)) => (msaa_view, Some(mask_view)),
             None => (mask_view, None),

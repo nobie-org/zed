@@ -20,7 +20,7 @@ pub use div::*;
 pub use image_cache::*;
 pub use img::*;
 pub use list::*;
-pub use render_group::*;
+pub use render_group::{RenderGroup, RenderGroupBuilder, RenderGroupExt, render_group};
 pub use surface::*;
 pub use svg::*;
 pub use text::*;

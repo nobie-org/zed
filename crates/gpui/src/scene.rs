@@ -308,6 +308,7 @@ pub(crate) enum PaintOperation {
 
 #[derive(Clone)]
 #[expect(missing_docs)]
+#[non_exhaustive]
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
@@ -586,6 +587,7 @@ impl<'a> Iterator for BatchIterator<'a> {
     allow(dead_code)
 )]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
@@ -1998,6 +2000,7 @@ impl SemanticRenderGroupSpec {
 
 /// Render-group input after API mode validation and before logical planning.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum RenderGroupInput {
     /// No render-group effects have been authored yet.
     None,
@@ -2283,6 +2286,7 @@ pub struct RenderGroupPlanningRejection {
 /// Render-group effect provenance for typed planning rejection metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum RenderGroupRejectedEffect {
     SourceBlur,
     BackdropBlur,
@@ -2307,6 +2311,7 @@ impl RenderGroupRejectedEffect {
 /// Machine-readable planning rejection details.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum RenderGroupPlanningRejectionReason {
     LimitExceeded {
         limit: ScaledPixels,
@@ -2321,6 +2326,7 @@ pub enum RenderGroupPlanningRejectionReason {
 /// Unit for a render-group planning limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum RenderGroupLimitUnit {
     GaussianSigma,
 }
@@ -2328,6 +2334,7 @@ pub enum RenderGroupLimitUnit {
 /// Render-group capability a tool can ask the GPUI planner to classify.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum RenderGroupCapabilityProbe {
     SourceColor,
     ExactSourceBlur,
@@ -2482,6 +2489,7 @@ impl RenderGroupCapabilityProbe {
 /// Current support tier for a render-group capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum RenderGroupCapabilityStatus {
     Rendered,
     Partial,
@@ -2506,6 +2514,7 @@ impl RenderGroupCapabilityStatus {
 /// Typed reason a capability cannot currently claim rendered support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum RenderGroupCapabilityRejectionReason {
     ExactKernelLimit,
     ApproximationOnly,

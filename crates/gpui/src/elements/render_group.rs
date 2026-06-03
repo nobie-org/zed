@@ -1,7 +1,7 @@
 use crate::{
     AnyElement, App, Bounds, Composite, CompositeBlendMode, CompositeEffect, ContentLayer, Corners,
     DerivedLayer, Element, ElementId, GlassSurface, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Point, RenderGroupInput, Window,
+    IntoElement, LayoutId, Pixels, Point, Window, scene::RenderGroupInput,
 };
 use std::{mem, panic};
 

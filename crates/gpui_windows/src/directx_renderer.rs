@@ -21,6 +21,10 @@ use windows::{
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
+use gpui::scene_protocol::{
+    MonochromeSprite, PaintSurface, Path, PolychromeSprite, PrimitiveBatch, Quad, Scene, Shadow,
+    SubpixelSprite, Underline,
+};
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
@@ -339,6 +343,7 @@ impl DirectXRenderer {
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
                 PrimitiveBatch::Groups(_) => Err(anyhow!("render groups are not implemented for DirectX")),
+                unknown => Err(anyhow!("unsupported GPUI primitive batch: {unknown:?}")),
             }
             .context(format!(
                 "scene too large:\

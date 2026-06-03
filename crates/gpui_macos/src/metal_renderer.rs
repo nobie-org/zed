@@ -7,9 +7,12 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, Corners, DevicePixels,
-    MonochromeSprite, PaintGroup, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
-    Quad, RenderGroupBackendCounters, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, Point, ScaledPixels,
+    Size, Surface, point,
+    scene_protocol::{
+        CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, Path, PolychromeSprite,
+        PrimitiveBatch, Quad, RenderGroupBackendCounters, Scene, Shadow, Underline,
+    },
     size,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -1145,6 +1148,7 @@ impl MetalRenderer {
                     did_draw
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                unknown => panic!("unsupported GPUI primitive batch: {unknown:?}"),
             };
             if !ok {
                 command_encoder.end_encoding();
@@ -2693,8 +2697,9 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla,
-        LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters, px, rgba, transparent_black,
+        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, px, rgba,
+        scene_protocol::{LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters},
+        transparent_black,
     };
     use image::RgbaImage;
     use std::sync::Arc;
@@ -2960,7 +2965,8 @@ mod tests {
             "horizontal blur should smear green into +x neighbor: {smeared_x:?}"
         );
         assert_eq!(
-            cross_axis_y, [0, 0, 0, 255],
+            cross_axis_y,
+            [0, 0, 0, 255],
             "horizontal blur must not smear vertically: {cross_axis_y:?}"
         );
     }
@@ -2994,7 +3000,8 @@ mod tests {
             "vertical blur should smear green into +y neighbor: {smeared_y:?}"
         );
         assert_eq!(
-            cross_axis_x, [0, 0, 0, 255],
+            cross_axis_x,
+            [0, 0, 0, 255],
             "vertical blur must not smear horizontally: {cross_axis_x:?}"
         );
     }

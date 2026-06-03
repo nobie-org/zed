@@ -74,7 +74,9 @@ struct GroupSprite {
     backdrop_blur_radius: f32,
     source_mask_blur_order: u32,
     derived_luma_threshold: f32,
-    _pad1: [u32; 2],
+    // 0 = analytic SDF source mask, 1 = sampled arbitrary-path coverage mask.
+    source_mask_mode: u32,
+    _pad1: u32,
     shadow_color: [f32; 4],
     source_mask_bounds: Bounds<ScaledPixels>,
     source_mask_corner_radii: Corners<ScaledPixels>,
@@ -866,6 +868,10 @@ impl WgpuRenderer {
                     count: None,
                 },
                 unfiltered_texture_entry(3),
+                // Binding 4: rasterized arbitrary-path source-mask coverage. Bound
+                // for every group (a real texture per the backdrop precedent); the
+                // shader only samples it when `source_mask_mode == 1`.
+                unfiltered_texture_entry(4),
             ],
         });
 
@@ -1994,6 +2000,7 @@ impl WgpuRenderer {
         instance_count: u32,
         group_view: &wgpu::TextureView,
         backdrop_view: &wgpu::TextureView,
+        source_mask_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
         pipeline: &wgpu::RenderPipeline,
         instance_offset: &mut u64,
@@ -2027,6 +2034,10 @@ impl WgpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(backdrop_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(source_mask_view),
                     },
                 ],
             });
@@ -2172,6 +2183,27 @@ impl WgpuRenderer {
                 &group_view
             };
 
+            // Arbitrary-path source mask pre-pass: rasterize the group's path into
+            // a coverage mask in the same screen/device space as all group
+            // geometry, parallel to the backdrop copy. For groups without a path
+            // mask, bind `&group_view` (a real allocated texture, per the backdrop
+            // precedent above); the `source_mask_mode` flag gates the sample so the
+            // bound-but-unread texture is harmless.
+            let source_mask_view_storage;
+            let source_mask_view = if let Some(path) = effect_plan.source_mask_path() {
+                let (mask_texture, mask_view) = self.create_group_intermediate();
+                if !self.rasterize_source_mask_path(encoder, &mask_view, path, instance_offset) {
+                    return false;
+                }
+                // The mask is a path-rasterization intermediate, which the planner
+                // excludes from per-group counts, so it is NOT counted here.
+                retained_textures.push(mask_texture);
+                source_mask_view_storage = mask_view;
+                &source_mask_view_storage
+            } else {
+                &group_view
+            };
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("group_composite_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2192,6 +2224,7 @@ impl WgpuRenderer {
                 effect_plan,
                 &group_view,
                 backdrop_view,
+                source_mask_view,
                 instance_offset,
                 &mut pass,
             ) {
@@ -2233,6 +2266,7 @@ impl WgpuRenderer {
         effect_plan: CompositeEffectPlan,
         group_view: &wgpu::TextureView,
         backdrop_view: &wgpu::TextureView,
+        source_mask_view: &wgpu::TextureView,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
@@ -2251,8 +2285,16 @@ impl WgpuRenderer {
                 + effect_plan.processed_content_glows().len()
                 + 1,
         );
+        // A path source mask supersedes the analytic SDF: enable masking and
+        // select sampled mode so the shader reads the rasterized coverage texture.
+        let source_mask_mode: u32 = if effect_plan.source_mask_path().is_some() {
+            1
+        } else {
+            0
+        };
         let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
+            None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
         let material_shape_corner_radii = effect_plan
@@ -2277,7 +2319,8 @@ impl WgpuRenderer {
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
-                _pad1: [0; 2],
+                source_mask_mode,
+                _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii,
@@ -2317,7 +2360,8 @@ impl WgpuRenderer {
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
-                _pad1: [0; 2],
+                source_mask_mode: 0,
+                _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
@@ -2352,7 +2396,8 @@ impl WgpuRenderer {
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: glow.luma_threshold,
-                _pad1: [0; 2],
+                source_mask_mode,
+                _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii,
@@ -2385,7 +2430,8 @@ impl WgpuRenderer {
             backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
             source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
             derived_luma_threshold: 0.,
-            _pad1: [0; 2],
+            source_mask_mode,
+            _pad1: 0,
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds,
             source_mask_corner_radii,
@@ -2420,6 +2466,7 @@ impl WgpuRenderer {
             sprites.len() as u32,
             group_view,
             backdrop_view,
+            source_mask_view,
             &self.resources().group_sampler,
             &self.resources().pipelines.groups,
             instance_offset,
@@ -2566,6 +2613,91 @@ impl WgpuRenderer {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("path_rasterization_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+
+            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
+            pass.set_bind_group(1, &data_bind_group, &[]);
+            pass.draw(0..vertices.len() as u32, 0..1);
+        }
+
+        true
+    }
+
+    /// Rasterizes a render group's arbitrary source-mask path into `mask_view`
+    /// using the shared `path_rasterization` pipeline (and the same MSAA sample
+    /// count) so its anti-aliased coverage matches the analytic source-mask SDF.
+    ///
+    /// The path is rasterized in screen/device space with no group-local remap;
+    /// its forced-opaque-white fill makes the cleared-transparent target's alpha
+    /// channel hold pure coverage (`mask.a == coverage`).
+    fn rasterize_source_mask_path(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        mask_view: &wgpu::TextureView,
+        path: &Path<ScaledPixels>,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let bounds = path.clipped_bounds();
+        let vertices: Vec<PathRasterizationVertex> = path
+            .vertices
+            .iter()
+            .map(|v| PathRasterizationVertex {
+                xy_position: v.xy_position,
+                st_position: v.st_position,
+                color: path.color,
+                bounds,
+            })
+            .collect();
+
+        if vertices.is_empty() {
+            return true;
+        }
+
+        let vertex_data = unsafe { Self::instance_bytes(&vertices) };
+        let Some((vertex_offset, vertex_size)) =
+            self.write_to_instance_buffer(instance_offset, vertex_data)
+        else {
+            return false;
+        };
+
+        let sample_count = self.rendering_params.path_sample_count;
+        let format = self.surface_config.format;
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+
+        let resources = self.resources();
+        let data_bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("source_mask_path_rasterization_bind_group"),
+                layout: &resources.bind_group_layouts.instances,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.instance_binding(vertex_offset, vertex_size),
+                }],
+            });
+
+        let msaa = Self::create_msaa_if_needed(&resources.device, format, width, height, sample_count);
+        let (target_view, resolve_target) = match msaa.as_ref() {
+            Some((_, msaa_view)) => (msaa_view, Some(mask_view)),
+            None => (mask_view, None),
+        };
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("source_mask_path_rasterization_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target_view,
                     resolve_target,

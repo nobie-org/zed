@@ -1291,6 +1291,31 @@ impl MetalRenderer {
                 &group_texture
             };
 
+            // Arbitrary-path source mask pre-pass: rasterize the group's path into
+            // a coverage mask in the same screen/device space as all group
+            // geometry, parallel to the backdrop copy. For groups without a path
+            // mask, bind `&group_texture` (a real allocated texture); the
+            // `source_mask_mode` flag gates the sample so the bound-but-unread
+            // texture is harmless. The mask is a path-rasterization intermediate,
+            // which the planner excludes from per-group counts, so it is NOT
+            // counted here.
+            let source_mask_texture;
+            let source_mask_texture_ref = if let Some(path) = effect_plan.source_mask_path() {
+                let Some(texture) = self.rasterize_source_mask_path(
+                    path,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_buffer,
+                ) else {
+                    return false;
+                };
+                source_mask_texture = texture;
+                &source_mask_texture
+            } else {
+                &group_texture
+            };
+
             let command_encoder = new_command_encoder_for_texture(
                 command_buffer,
                 target_texture,
@@ -1304,6 +1329,7 @@ impl MetalRenderer {
                 effect_plan,
                 &group_texture,
                 backdrop_texture_ref,
+                source_mask_texture_ref,
                 instance_buffer,
                 instance_offset,
                 viewport_size,
@@ -1370,6 +1396,7 @@ impl MetalRenderer {
         effect_plan: CompositeEffectPlan,
         group_texture: &metal::TextureRef,
         backdrop_texture: &metal::TextureRef,
+        source_mask_texture: &metal::TextureRef,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1393,6 +1420,10 @@ impl MetalRenderer {
             SpriteInputIndex::BackdropTexture as u64,
             Some(backdrop_texture),
         );
+        command_encoder.set_fragment_texture(
+            SpriteInputIndex::SourceMaskTexture as u64,
+            Some(source_mask_texture),
+        );
 
         let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
         let (source_tone_op, source_tone_param) = effect_plan
@@ -1409,8 +1440,16 @@ impl MetalRenderer {
                 + effect_plan.processed_content_glows().len()
                 + 1,
         );
+        // A path source mask supersedes the analytic SDF: enable masking and
+        // select sampled mode so the shader reads the rasterized coverage texture.
+        let source_mask_mode: u32 = if effect_plan.source_mask_path().is_some() {
+            1
+        } else {
+            0
+        };
         let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
             Some(corner_radii) => (1., corner_radii),
+            None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
         let material_shape_corner_radii = effect_plan
@@ -1435,7 +1474,8 @@ impl MetalRenderer {
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
-                _pad1: [0; 2],
+                source_mask_mode,
+                _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii,
@@ -1475,7 +1515,8 @@ impl MetalRenderer {
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
-                _pad1: [0; 2],
+                source_mask_mode: 0,
+                _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
@@ -1510,7 +1551,8 @@ impl MetalRenderer {
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: glow.luma_threshold,
-                _pad1: [0; 2],
+                source_mask_mode,
+                _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds,
                 source_mask_corner_radii,
@@ -1543,7 +1585,8 @@ impl MetalRenderer {
             backdrop_blur_radius: effect_plan.backdrop_blur_radius().0,
             source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
             derived_luma_threshold: 0.,
-            _pad1: [0; 2],
+            source_mask_mode,
+            _pad1: 0,
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds,
             source_mask_corner_radii,
@@ -1738,6 +1781,122 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
         true
+    }
+
+    /// Rasterizes a render group's arbitrary source-mask path into a fresh
+    /// coverage-mask texture using the shared path rasterization pipeline (and
+    /// the same MSAA sample count) so its anti-aliased coverage matches the
+    /// analytic source-mask SDF.
+    ///
+    /// The path is rasterized in screen/device space with no group-local remap;
+    /// its forced-opaque-white fill makes the cleared-transparent target's alpha
+    /// channel hold pure coverage (`mask.a == coverage`).
+    fn rasterize_source_mask_path(
+        &self,
+        path: &Path<ScaledPixels>,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Option<metal::Texture> {
+        let mask_texture = self.new_group_intermediate_texture(viewport_size)?;
+
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+
+        // Allocate a per-group MSAA target matching the shared path pipeline's
+        // sample count so anti-aliased edges match the analytic oracle.
+        let msaa_texture = if self.path_sample_count > 1 {
+            let storage_mode = if self.is_apple_gpu {
+                metal::MTLStorageMode::Memoryless
+            } else {
+                metal::MTLStorageMode::Private
+            };
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(viewport_size.width.0 as u64);
+            descriptor.set_height(viewport_size.height.0 as u64);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+            descriptor.set_storage_mode(storage_mode);
+            descriptor.set_sample_count(self.path_sample_count as _);
+            descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+            Some(self.device.new_texture(&descriptor))
+        } else {
+            None
+        };
+
+        if let Some(msaa_texture) = &msaa_texture {
+            color_attachment.set_texture(Some(msaa_texture));
+            color_attachment.set_resolve_texture(Some(&mask_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
+        } else {
+            color_attachment.set_texture(Some(&mask_texture));
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        }
+
+        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+
+        align_offset(instance_offset);
+        let bounds = path.bounds.intersect(&path.content_mask.bounds);
+        let vertices: Vec<PathRasterizationVertex> = path
+            .vertices
+            .iter()
+            .map(|v| PathRasterizationVertex {
+                xy_position: v.xy_position,
+                st_position: v.st_position,
+                color: path.color,
+                bounds,
+            })
+            .collect();
+        if vertices.is_empty() {
+            command_encoder.end_encoding();
+            return Some(mask_texture);
+        }
+        let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
+        let next_offset = *instance_offset + vertices_bytes_len;
+        if next_offset > instance_buffer.size {
+            command_encoder.end_encoding();
+            return None;
+        }
+        command_encoder.set_vertex_buffer(
+            PathRasterizationInputIndex::Vertices as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            PathRasterizationInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_buffer(
+            PathRasterizationInputIndex::Vertices as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                vertices.as_ptr() as *const u8,
+                buffer_contents,
+                vertices_bytes_len,
+            );
+        }
+        command_encoder.draw_primitives(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            vertices.len() as u64,
+        );
+        *instance_offset = next_offset;
+
+        command_encoder.end_encoding();
+        Some(mask_texture)
     }
 
     fn draw_shadows(
@@ -2462,6 +2621,7 @@ enum SpriteInputIndex {
     AtlasTextureSize = 3,
     AtlasTexture = 4,
     BackdropTexture = 5,
+    SourceMaskTexture = 6,
 }
 
 #[repr(C)]
@@ -2499,7 +2659,9 @@ pub struct GroupSprite {
     pub backdrop_blur_radius: f32,
     pub source_mask_blur_order: u32,
     pub derived_luma_threshold: f32,
-    pub _pad1: [u32; 2],
+    // 0 = analytic SDF source mask, 1 = sampled arbitrary-path coverage mask.
+    pub source_mask_mode: u32,
+    pub _pad1: u32,
     pub shadow_color: [f32; 4],
     pub source_mask_bounds: Bounds<ScaledPixels>,
     pub source_mask_corner_radii: Corners<ScaledPixels>,
@@ -2870,6 +3032,39 @@ mod tests {
     }
 
     #[test]
+    fn backend_counters_exclude_source_mask_path_intermediate_metal() {
+        // Parity with the wgpu law: the path source-mask intermediate is a
+        // path-rasterization target, not a group-composite/backdrop-copy target,
+        // so the planner does not predict it and the renderer does not count it.
+        // A path-mask group (no backdrop) stays at intermediate_textures == 1;
+        // this locks the intentional exclusion against drift.
+        let group_bounds = rect(4., 4., 20., 20.);
+        let group = paint_group_with_effects(
+            1,
+            group_bounds,
+            vec![CompositeEffect::source_mask_path(Arc::new(rectangle_path(
+                group_bounds,
+            )))],
+            finished_scene([quad(0, group_bounds, green())]),
+        );
+        let predicted = predicted_counters(&group);
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 1,
+                backdrop_copies: 0,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(group);
+        scene.finish();
+
+        assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
     fn backend_counters_match_planner_for_backdrop_blur_group_metal() {
         let group = paint_group_with_effects(
             1,
@@ -3145,5 +3340,87 @@ mod tests {
         // away to background black but the squircle (n=4) keeps as opaque source.
         assert_eq!(pixel(&rounded, 6, 5), [0, 0, 0, 255]);
         assert_eq!(pixel(&superellipse, 6, 5), [0, 255, 0, 255]);
+    }
+
+    /// Builds a filled-rectangle `Path` (two solid triangles) in logical pixels,
+    /// matching `GroupShape::rectangle()` over the same bounds. The plan forces
+    /// the fill to opaque white so coverage lands in the mask's alpha channel.
+    fn rectangle_path(bounds: Bounds<ScaledPixels>) -> Path<gpui::Pixels> {
+        let x0 = px(bounds.origin.x.0);
+        let y0 = px(bounds.origin.y.0);
+        let x1 = px(bounds.origin.x.0 + bounds.size.width.0);
+        let y1 = px(bounds.origin.y.0 + bounds.size.height.0);
+
+        let top_left = point(x0, y0);
+        let top_right = point(x1, y0);
+        let bottom_right = point(x1, y1);
+        let bottom_left = point(x0, y1);
+
+        // st = (0, 1) at every vertex => solid coverage across each triangle.
+        let solid = (point(0., 1.), point(0., 1.), point(0., 1.));
+
+        let mut path = Path::new(top_left);
+        path.content_mask = ContentMask {
+            bounds: Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(IMAGE_SIZE as f32), px(IMAGE_SIZE as f32)),
+            ),
+        };
+        path.push_triangle((top_left, top_right, bottom_right), solid);
+        path.push_triangle((top_left, bottom_right, bottom_left), solid);
+        path
+    }
+
+    /// ORACLE (metal): an arbitrary-path source mask tracing a rectangle must
+    /// produce the SAME coverage as the analytic `GroupShape::rectangle()` source
+    /// mask. AfterBlur, no source blur => the mask multiplies once at integer
+    /// pixel centers where the rasterized path coverage and analytic SDF agree.
+    #[test]
+    fn render_group_source_mask_path_matches_analytic_rectangle_mask_metal() {
+        let group_bounds = rect(4., 4., 20., 20.);
+
+        let analytic = {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(0, viewport(), black()));
+            scene.insert_primitive(paint_group_with_effects(
+                1,
+                group_bounds,
+                vec![CompositeEffect::source_mask(GroupShape::rectangle())],
+                finished_scene([quad(0, group_bounds, green())]),
+            ));
+            scene.finish();
+            render(&scene)
+        };
+
+        let path_mask = {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(0, viewport(), black()));
+            scene.insert_primitive(paint_group_with_effects(
+                1,
+                group_bounds,
+                vec![CompositeEffect::source_mask_path(Arc::new(rectangle_path(
+                    group_bounds,
+                )))],
+                finished_scene([quad(0, group_bounds, green())]),
+            ));
+            scene.finish();
+            render(&scene)
+        };
+
+        // Interior lit green (coverage 1); exterior clipped to black (coverage 0).
+        assert_eq!(pixel(&analytic, 14, 14), [0, 255, 0, 255]);
+        assert_eq!(pixel(&path_mask, 14, 14), [0, 255, 0, 255]);
+        assert_eq!(pixel(&analytic, 1, 1), [0, 0, 0, 255]);
+        assert_eq!(pixel(&path_mask, 1, 1), [0, 0, 0, 255]);
+        assert_eq!(pixel(&analytic, 2, 14), [0, 0, 0, 255]);
+        assert_eq!(pixel(&path_mask, 2, 14), [0, 0, 0, 255]);
+
+        for (x, y) in [(14u32, 14u32), (6, 6), (20, 20), (1, 1), (2, 14), (30, 30)] {
+            assert_eq!(
+                pixel(&path_mask, x, y),
+                pixel(&analytic, x, y),
+                "path mask != analytic mask at ({x}, {y})"
+            );
+        }
     }
 }

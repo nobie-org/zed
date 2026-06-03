@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
-    LogicalVisualPlan, LumaThreshold, MonochromeSprite, PaintGroup, PlatformAtlas,
+    LogicalVisualPlan, LumaThreshold, MonochromeSprite, PaintGroup, Path, Pixels, PlatformAtlas,
     PlatformHeadlessRenderer, PolychromeSprite, Quad, RenderGroupBackendCounters,
     RenderImageParams, RenderSvgParams, ScaledPixels, Scene, TransformationMatrix, point, px, rgba,
     size, transparent_black,
@@ -264,6 +264,41 @@ fn backend_counters_match_planner_for_backdrop_blur_group() {
         RenderGroupBackendCounters {
             intermediate_textures: 2,
             backdrop_copies: 1,
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(group);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
+}
+
+#[test]
+fn backend_counters_exclude_source_mask_path_intermediate() {
+    // A path source mask rasterizes the path into its own intermediate texture,
+    // but that is a path-rasterization intermediate, NOT a group-composite/
+    // backdrop-copy target — the category `RenderGroupBackendCounters` models.
+    // The planner does not predict it and neither renderer counts it, so a
+    // path-mask group (no backdrop) stays at intermediate_textures == 1. This
+    // test locks that intentional exclusion so neither side drifts into counting
+    // it (which would silently break measured == predicted).
+    let group_bounds = rect(4., 4., 20., 20.);
+    let group = paint_group_with_effects(
+        1,
+        group_bounds,
+        vec![CompositeEffect::source_mask_path(Arc::new(rectangle_path(
+            group_bounds,
+        )))],
+        finished_scene([quad(0, group_bounds, green())]),
+    );
+    let predicted = predicted_counters(&group);
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            intermediate_textures: 1,
+            backdrop_copies: 0,
         }
     );
 
@@ -1839,4 +1874,93 @@ fn render_group_superellipse_surface_shadow_uses_shape_kind() {
     assert_ne!(rounded.as_raw(), squircle.as_raw());
     // n=2 shares the circular-corner SDF, so its shadow matches the rounded one.
     assert_eq!(rounded.as_raw(), n2.as_raw());
+}
+
+/// Builds a filled-rectangle `Path` (two solid triangles) in logical pixels,
+/// matching `GroupShape::rectangle()` over the same bounds. The fill color is
+/// irrelevant (the plan forces it to opaque white so coverage lands in alpha),
+/// but the content mask must cover the rectangle or the rasterizer clips it.
+fn rectangle_path(bounds: Bounds<ScaledPixels>) -> Path<Pixels> {
+    let x0 = px(bounds.origin.x.0);
+    let y0 = px(bounds.origin.y.0);
+    let x1 = px(bounds.origin.x.0 + bounds.size.width.0);
+    let y1 = px(bounds.origin.y.0 + bounds.size.height.0);
+
+    let top_left = point(x0, y0);
+    let top_right = point(x1, y0);
+    let bottom_right = point(x1, y1);
+    let bottom_left = point(x0, y1);
+
+    // st = (0, 1) at every vertex makes the path-rasterization fragment emit
+    // solid coverage (`f = 0 - 1 < 0` => alpha = 1) across each triangle.
+    let solid = (point(0., 1.), point(0., 1.), point(0., 1.));
+
+    let mut path = Path::new(top_left);
+    path.content_mask = ContentMask {
+        bounds: Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(IMAGE_SIZE as f32), px(IMAGE_SIZE as f32)),
+        ),
+    };
+    path.push_triangle((top_left, top_right, bottom_right), solid);
+    path.push_triangle((top_left, bottom_right, bottom_left), solid);
+    path
+}
+
+/// ORACLE: an arbitrary-path source mask tracing a rectangle must produce the
+/// SAME source-mask coverage as the analytic `GroupShape::rectangle()` source
+/// mask. Restricted to AfterBlur with no source blur so the mask multiplies once
+/// at integer pixel centers, where the rasterized path coverage and the analytic
+/// SDF coverage agree exactly.
+#[test]
+fn render_group_source_mask_path_matches_analytic_rectangle_mask() {
+    let group_bounds = rect(4., 4., 20., 20.);
+
+    let analytic = {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_effects(
+            1,
+            group_bounds,
+            vec![CompositeEffect::source_mask(GroupShape::rectangle())],
+            finished_scene([quad(0, group_bounds, green())]),
+        ));
+        scene.finish();
+        render(&scene)
+    };
+
+    let path_mask = {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_effects(
+            1,
+            group_bounds,
+            vec![CompositeEffect::source_mask_path(Arc::new(rectangle_path(
+                group_bounds,
+            )))],
+            finished_scene([quad(0, group_bounds, green())]),
+        ));
+        scene.finish();
+        render(&scene)
+    };
+
+    // Interior is lit green (mask coverage 1); exterior is clipped to the black
+    // backdrop (mask coverage 0). Probed pixels, then hard-coded.
+    assert_eq!(pixel(&analytic, 14, 14), [0, 255, 0, 255]);
+    assert_eq!(pixel(&path_mask, 14, 14), [0, 255, 0, 255]);
+    assert_eq!(pixel(&analytic, 1, 1), [0, 0, 0, 255]);
+    assert_eq!(pixel(&path_mask, 1, 1), [0, 0, 0, 255]);
+    // A pixel just outside the masked rectangle stays clipped under both masks.
+    assert_eq!(pixel(&analytic, 2, 14), [0, 0, 0, 255]);
+    assert_eq!(pixel(&path_mask, 2, 14), [0, 0, 0, 255]);
+
+    // The path mask must equal the analytic mask at every interior/exterior
+    // sample point the source-mask consumer reads.
+    for (x, y) in [(14u32, 14u32), (6, 6), (20, 20), (1, 1), (2, 14), (30, 30)] {
+        assert_eq!(
+            pixel(&path_mask, x, y),
+            pixel(&analytic, x, y),
+            "path mask != analytic mask at ({x}, {y})"
+        );
+    }
 }

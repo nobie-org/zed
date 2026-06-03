@@ -308,6 +308,7 @@ pub(crate) enum PaintOperation {
 
 #[derive(Clone)]
 #[expect(missing_docs)]
+#[non_exhaustive]
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
@@ -586,6 +587,7 @@ impl<'a> Iterator for BatchIterator<'a> {
     allow(dead_code)
 )]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),

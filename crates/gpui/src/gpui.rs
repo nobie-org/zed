@@ -119,6 +119,8 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
+#[cfg(target_os = "macos")]
+pub(crate) use scene::PaintSurface;
 pub use scene::{
     BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
     CompositeEffect, CompositeProcessedContentGlow, CompositeProcessedContentGlowPlan,
@@ -133,8 +135,7 @@ pub use scene::{
     SourceToneOp, TransformationMatrix,
 };
 pub(crate) use scene::{
-    MonochromeSprite, PaintGroup, PaintSurface, PolychromeSprite, Quad, Scene, Shadow,
-    SubpixelSprite, Underline,
+    MonochromeSprite, PaintGroup, PolychromeSprite, Quad, Scene, Shadow, SubpixelSprite, Underline,
 };
 pub use shared_uri::*;
 use std::{any::Any, future::Future};

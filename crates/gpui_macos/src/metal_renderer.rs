@@ -1148,6 +1148,7 @@ impl MetalRenderer {
                     did_draw
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                unknown => panic!("unsupported GPUI primitive batch: {unknown:?}"),
             };
             if !ok {
                 command_encoder.end_encoding();

@@ -1780,6 +1780,7 @@ impl WgpuRenderer {
 
                     did_draw
                 }
+                unknown => panic!("unsupported GPUI primitive batch: {unknown:?}"),
             };
             if !ok {
                 return false;

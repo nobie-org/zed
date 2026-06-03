@@ -1419,6 +1419,8 @@ impl MetalRenderer {
         let (smk, sme) = effect_plan.source_mask_shape().shader_params();
         let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
         let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let db = effect_plan.source_directional_blur();
+        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -1440,6 +1442,7 @@ impl MetalRenderer {
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
                 group_shape_params,
+                source_directional_blur,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1479,6 +1482,7 @@ impl MetalRenderer {
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii: shadow.shape,
                 group_shape_params: shadow_group_shape_params,
+                source_directional_blur,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1513,6 +1517,7 @@ impl MetalRenderer {
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
                 group_shape_params,
+                source_directional_blur,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1545,6 +1550,7 @@ impl MetalRenderer {
             material_shape_bounds: group.bounds,
             material_shape_corner_radii,
             group_shape_params,
+            source_directional_blur,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {
@@ -2500,6 +2506,7 @@ pub struct GroupSprite {
     pub material_shape_bounds: Bounds<ScaledPixels>,
     pub material_shape_corner_radii: Corners<ScaledPixels>,
     pub group_shape_params: [f32; 4],
+    pub source_directional_blur: [f32; 4],
     pub color_matrix: [[f32; 4]; 4],
     pub color_offset: [f32; 4],
     pub backdrop_active: f32,
@@ -2584,6 +2591,10 @@ mod tests {
 
     fn red() -> Hsla {
         rgba(0xff0000ff).into()
+    }
+
+    fn green() -> Hsla {
+        rgba(0x00ff00ff).into()
     }
 
     fn gray() -> Hsla {
@@ -2716,6 +2727,71 @@ mod tests {
 
         // Neutral gray is a fixed point of hue rotation.
         assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn render_group_directional_blur_smears_along_x_only_metal() {
+        // A small bright green square inside a group with a horizontal directional
+        // (motion) blur. The streak must smear the source along +x but leave the
+        // cross-axis (+y) untouched.
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(6., 6., 20., 20.),
+            vec![CompositeEffect::directional_blur(0.0, px(8.))],
+            finished_scene([quad(0, rect(14., 14., 4., 4.), green())]),
+        ));
+        grouped.finish();
+
+        let image = render(&grouped);
+        // +x of the square edge (square spans x in [14,18)): smeared green.
+        let smeared_x = pixel(&image, 20, 16);
+        // +y of the square edge: NOT smeared vertically -> stays black.
+        let cross_axis_y = pixel(&image, 16, 20);
+
+        assert!(
+            smeared_x[1] > 0,
+            "horizontal blur should smear green into +x neighbor: {smeared_x:?}"
+        );
+        assert_eq!(
+            cross_axis_y, [0, 0, 0, 255],
+            "horizontal blur must not smear vertically: {cross_axis_y:?}"
+        );
+    }
+
+    #[test]
+    fn render_group_directional_blur_smears_along_y_only_metal() {
+        // Same source, but a vertical directional blur (angle = 90 degrees). The
+        // streak must now smear along +y and leave +x untouched, proving the angle
+        // parameter rotates the streak.
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(6., 6., 20., 20.),
+            vec![CompositeEffect::directional_blur(
+                std::f32::consts::FRAC_PI_2,
+                px(8.),
+            )],
+            finished_scene([quad(0, rect(14., 14., 4., 4.), green())]),
+        ));
+        grouped.finish();
+
+        let image = render(&grouped);
+        // +y of the square edge: smeared green.
+        let smeared_y = pixel(&image, 16, 20);
+        // +x of the square edge: NOT smeared horizontally -> stays black.
+        let cross_axis_x = pixel(&image, 20, 16);
+
+        assert!(
+            smeared_y[1] > 0,
+            "vertical blur should smear green into +y neighbor: {smeared_y:?}"
+        );
+        assert_eq!(
+            cross_axis_x, [0, 0, 0, 255],
+            "vertical blur must not smear horizontally: {cross_axis_x:?}"
+        );
     }
 
     fn render(scene: &Scene) -> RgbaImage {

@@ -1139,6 +1139,7 @@ struct GroupSprite {
     material_shape_bounds: Bounds,
     material_shape_corner_radii: Corners,
     group_shape_params: vec4<f32>,
+    source_directional_blur: vec4<f32>,
     color_matrix: array<vec4<f32>, 4>,
     color_offset: vec4<f32>,
     backdrop_active: f32,
@@ -1291,6 +1292,40 @@ fn sample_group_source_blurred(
     sigma: f32,
     sprite: GroupSprite,
 ) -> vec4<f32> {
+    // Directional (motion) blur replaces the isotropic source blur for source
+    // sampling: a non-zero blur vector takes a 1D Gaussian streak along it and
+    // returns immediately, skipping the isotropic path.
+    let dblur = sprite.source_directional_blur.xy;
+    let dlen = length(dblur);
+    if (dlen > 0.0) {
+        let dir = dblur / dlen;
+        let dradius = min(i32(ceil(dlen)), 24);
+        let dsigma = max(dlen / 3.0, 1.0);
+        var dcolor = vec4<f32>(0.0);
+        var dtotal = 0.0;
+        for (var i = -24; i <= 24; i = i + 1) {
+            if (abs(i) <= dradius) {
+                let t = f32(i);
+                let off = dir * t;
+                let w = exp(-(t * t) / (2.0 * dsigma * dsigma));
+                if (sprite.source_mask_blur_order == 1u) {
+                    dcolor += sample_group_source(coords + off * pixel_size, point + off, sprite) * w;
+                } else {
+                    dcolor += sample_group_texture(coords + off * pixel_size) * w;
+                }
+                dtotal += w;
+            }
+        }
+        if (dtotal <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        let dblurred = dcolor / dtotal;
+        if (sprite.source_mask_blur_order == 1u) {
+            return dblurred;
+        }
+        return dblurred * group_source_mask_alpha(point, sprite);
+    }
+
     if (sigma <= 0.0) {
         return sample_group_source(coords, point, sprite);
     }

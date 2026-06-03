@@ -81,6 +81,7 @@ struct GroupSprite {
     material_shape_bounds: Bounds<ScaledPixels>,
     material_shape_corner_radii: Corners<ScaledPixels>,
     group_shape_params: [f32; 4],
+    source_directional_blur: [f32; 4],
     color_matrix: [[f32; 4]; 4],
     color_offset: [f32; 4],
     backdrop_active: f32,
@@ -2260,6 +2261,8 @@ impl WgpuRenderer {
         let (smk, sme) = effect_plan.source_mask_shape().shader_params();
         let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
         let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let db = effect_plan.source_directional_blur();
+        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -2281,6 +2284,7 @@ impl WgpuRenderer {
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
                 group_shape_params,
+                source_directional_blur,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2320,6 +2324,7 @@ impl WgpuRenderer {
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii: shadow.shape,
                 group_shape_params: shadow_group_shape_params,
+                source_directional_blur,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2354,6 +2359,7 @@ impl WgpuRenderer {
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
                 group_shape_params,
+                source_directional_blur,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2386,6 +2392,7 @@ impl WgpuRenderer {
             material_shape_bounds: group.bounds,
             material_shape_corner_radii,
             group_shape_params,
+            source_directional_blur,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {

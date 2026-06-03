@@ -709,6 +709,75 @@ fn render_group_source_blur_samples_composited_source() {
 }
 
 #[test]
+fn render_group_directional_blur_smears_along_x_only() {
+    // A small bright green square inside a group with a horizontal directional
+    // (motion) blur. The streak must smear the source along +x but leave the
+    // cross-axis (+y) untouched.
+    let group_scene = finished_scene([quad(0, rect(14., 14., 4., 4.), green())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(6., 6., 20., 20.),
+        vec![CompositeEffect::directional_blur(0.0, px(8.))],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    // +x of the square edge (square spans x in [14,18)): smeared green.
+    let smeared_x = pixel(&image, 20, 16);
+    // +y of the square edge: NOT smeared vertically -> stays black.
+    let cross_axis_y = pixel(&image, 16, 20);
+
+    assert!(
+        smeared_x[1] > 0,
+        "horizontal blur should smear green into +x neighbor: {smeared_x:?}"
+    );
+    assert_eq!(
+        cross_axis_y, [0, 0, 0, 255],
+        "horizontal blur must not smear vertically: {cross_axis_y:?}"
+    );
+}
+
+#[test]
+fn render_group_directional_blur_smears_along_y_only() {
+    // Same source, but a vertical directional blur (angle = 90 degrees). The
+    // streak must now smear along +y and leave +x untouched, proving the angle
+    // parameter rotates the streak.
+    let group_scene = finished_scene([quad(0, rect(14., 14., 4., 4.), green())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(6., 6., 20., 20.),
+        vec![CompositeEffect::directional_blur(
+            std::f32::consts::FRAC_PI_2,
+            px(8.),
+        )],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let image = render(&grouped);
+    // +y of the square edge: smeared green.
+    let smeared_y = pixel(&image, 16, 20);
+    // +x of the square edge: NOT smeared horizontally -> stays black.
+    let cross_axis_x = pixel(&image, 20, 16);
+
+    assert!(
+        smeared_y[1] > 0,
+        "vertical blur should smear green into +y neighbor: {smeared_y:?}"
+    );
+    assert_eq!(
+        cross_axis_x, [0, 0, 0, 255],
+        "vertical blur must not smear horizontally: {cross_axis_x:?}"
+    );
+}
+
+#[test]
 fn render_group_drop_shadow_uses_composited_source_alpha() {
     let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
 

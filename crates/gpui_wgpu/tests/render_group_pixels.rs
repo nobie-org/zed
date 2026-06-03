@@ -6,11 +6,11 @@ use std::sync::Arc;
 use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
-    LogicalVisualPlan, LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer,
-    RenderImageParams, RenderSvgParams, ScaledPixels, point, px, rgba,
+    LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer, RenderImageParams,
+    RenderSvgParams, ScaledPixels, point, px, rgba,
     scene_protocol::{
-        MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad, RenderGroupBackendCounters,
-        Scene, TransformationMatrix,
+        LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
+        RenderGroupBackendCounters, Scene, TransformationMatrix,
     },
     size, transparent_black,
 };

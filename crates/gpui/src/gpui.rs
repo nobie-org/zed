@@ -48,9 +48,28 @@ mod scene;
 /// constructing these storage records directly.
 pub mod scene_protocol {
     pub use crate::scene::{
-        CompositeEffectPlan, DrawOrder, MonochromeSprite, PaintGroup, PaintSurface, Path, PathId,
-        PathVertex, PathVertex_ScaledPixels, PolychromeSprite, Primitive, PrimitiveBatch, Quad,
-        RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite, TransformationMatrix, Underline,
+        CompositeEffectPlan, CompositeProcessedContentGlowPlan, DrawOrder, LogicalVisualPlan,
+        MonochromeSprite, PaintGroup, PaintSurface, Path, PathId, PathVertex,
+        PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
+        PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
+        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+        RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
+        TransformationMatrix, Underline,
+    };
+}
+/// Render-group planning and capability diagnostics for inspectors and tests.
+///
+/// Application code should prefer GPUI's semantic layer APIs instead of planning
+/// render groups directly.
+pub mod render_group_diagnostics {
+    pub use crate::scene::{
+        LogicalVisualPlan, PhysicalRenderGroupPlan, RenderGroupBackendCounters,
+        RenderGroupCapabilityProbe, RenderGroupCapabilityRejectionReason,
+        RenderGroupCapabilityReport, RenderGroupCapabilityStatus, RenderGroupDependencies,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
+        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+        RenderGroupSupportCounters, SemanticRenderGroupSpec,
     };
 }
 mod shared_uri;
@@ -123,16 +142,10 @@ pub use refineable::*;
 pub(crate) use scene::PaintSurface;
 pub use scene::{
     BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
-    CompositeEffect, CompositeProcessedContentGlow, CompositeProcessedContentGlowPlan,
-    CompositeSurfaceShadow, ContentLayer, ContentStage, DerivedLayer, DerivedStage, DrawOrder,
-    GlassLens, GlassSurface, Glow, GroupShape, GroupShapeKind, LogicalVisualPlan, LumaThreshold,
-    Path, PathId, PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan,
-    ProcessedContentDerivedLayer, RenderGroupBackendCounters, RenderGroupCapabilityProbe,
-    RenderGroupCapabilityRejectionReason, RenderGroupCapabilityReport, RenderGroupCapabilityStatus,
-    RenderGroupDependencies, RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
-    RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
-    RenderGroupSupportCounters, SemanticRenderGroupSpec, SourceColorFilter, SourceMaskBlurOrder,
-    SourceToneOp, TransformationMatrix,
+    CompositeEffect, CompositeProcessedContentGlow, CompositeSurfaceShadow, ContentLayer,
+    ContentStage, DerivedLayer, DerivedStage, GlassLens, GlassSurface, Glow, GroupShape,
+    GroupShapeKind, LumaThreshold, Path, ProcessedContentDerivedLayer, SourceColorFilter,
+    SourceMaskBlurOrder, SourceToneOp, TransformationMatrix,
 };
 pub(crate) use scene::{
     MonochromeSprite, PaintGroup, PolychromeSprite, Quad, Scene, Shadow, SubpixelSprite, Underline,

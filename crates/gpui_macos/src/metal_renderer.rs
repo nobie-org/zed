@@ -2697,9 +2697,8 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla,
-        LogicalVisualPlan, px, rgba,
-        scene_protocol::{PaintGroup, RenderGroupBackendCounters},
+        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, px, rgba,
+        scene_protocol::{LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters},
         transparent_black,
     };
     use image::RgbaImage;

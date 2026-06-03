@@ -1395,6 +1395,10 @@ impl MetalRenderer {
         );
 
         let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
+        let (source_tone_op, source_tone_param) = effect_plan
+            .source_color_filter()
+            .tone()
+            .shader_code_and_param();
         let (backdrop_color_matrix, backdrop_color_offset) =
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
@@ -1436,7 +1440,8 @@ impl MetalRenderer {
                 color_offset,
                 backdrop_active: 0.,
                 blend_mode: 0,
-                _pad0: [0; 2],
+                source_tone_op: 0,
+                source_tone_param: 0.,
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
@@ -1468,7 +1473,8 @@ impl MetalRenderer {
                 color_offset,
                 backdrop_active: 0.,
                 blend_mode: 0,
-                _pad0: [0; 2],
+                source_tone_op: 0,
+                source_tone_param: 0.,
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
@@ -1500,7 +1506,8 @@ impl MetalRenderer {
                 color_offset,
                 backdrop_active: 0.,
                 blend_mode: 0,
-                _pad0: [0; 2],
+                source_tone_op: 0,
+                source_tone_param: 0.,
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
@@ -1534,7 +1541,8 @@ impl MetalRenderer {
                 0.
             },
             blend_mode: effect_plan.blend_mode().shader_code(),
-            _pad0: [0; 2],
+            source_tone_op,
+            source_tone_param,
             backdrop_tint: [
                 backdrop_tint.r,
                 backdrop_tint.g,
@@ -2483,7 +2491,8 @@ pub struct GroupSprite {
     pub color_offset: [f32; 4],
     pub backdrop_active: f32,
     pub blend_mode: u32,
-    pub _pad0: [u32; 2],
+    pub source_tone_op: u32,
+    pub source_tone_param: f32,
     pub backdrop_tint: [f32; 4],
     pub backdrop_color_matrix: [[f32; 4]; 4],
     pub backdrop_color_offset: [f32; 4],
@@ -2615,6 +2624,54 @@ mod tests {
         grouped.finish();
 
         assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn render_group_posterize_quantizes_source_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::posterize(3.)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]),
+        ));
+        grouped.finish();
+
+        // 3 bands: gray(0.502) → floor(1.506)=1 → 1/2 = 0.5.
+        assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn render_group_threshold_splits_source_by_luma_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::threshold(0.5)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), red())]),
+        ));
+        grouped.finish();
+
+        // red luma 0.2126 < 0.5 → black.
+        assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn render_group_solarize_inverts_above_threshold_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::solarize(0.5)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), white())]),
+        ));
+        grouped.finish();
+
+        // white ≥ 0.5 → inverted to black.
+        assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
     }
 
     #[test]

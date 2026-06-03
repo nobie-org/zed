@@ -968,6 +968,21 @@ impl CompositeEffect {
         Self::SourceColorFilter(SourceColorFilter::sepia())
     }
 
+    /// Posterizes source color to `levels` (>= 2) bands.
+    pub fn posterize(levels: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::posterize(levels))
+    }
+
+    /// Thresholds source color to black/white by luma at `threshold` (0..1).
+    pub fn threshold(threshold: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::threshold(threshold))
+    }
+
+    /// Solarizes source color, inverting channels at or above `threshold` (0..1).
+    pub fn solarize(threshold: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::solarize(threshold))
+    }
+
     /// Multiplies backdrop color channels by `factor`.
     pub fn backdrop_brightness(factor: f32) -> Self {
         Self::BackdropColorFilter(SourceColorFilter::brightness(factor))
@@ -2749,11 +2764,42 @@ fn lower_processed_content_glow(
 /// The transform operates on unpremultiplied linear RGB and preserves alpha.
 /// This keeps coverage separate from source color effects and lets opacity
 /// remain a distinct group effect.
+/// A non-linear tone operation applied to source color after the affine matrix.
+///
+/// Tone ops cannot be folded into the color matrix, so they ride alongside it on
+/// [`SourceColorFilter`] and are applied in the shader after the matrix, on
+/// straight (unpremultiplied) RGB, before the final clamp.
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub enum SourceToneOp {
+    /// No tone operation.
+    #[default]
+    None,
+    /// Quantize each channel to `levels` (clamped to >= 2) bands.
+    Posterize(f32),
+    /// Map to black/white by whether luma reaches the threshold (0..1).
+    Threshold(f32),
+    /// Invert channels at or above the threshold (0..1).
+    Solarize(f32),
+}
+
+impl SourceToneOp {
+    /// Returns the stable shader discriminant and parameter for this tone op.
+    pub fn shader_code_and_param(self) -> (u32, f32) {
+        match self {
+            Self::None => (0, 0.),
+            Self::Posterize(levels) => (1, levels.max(2.)),
+            Self::Threshold(threshold) => (2, threshold),
+            Self::Solarize(threshold) => (3, threshold),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
 pub struct SourceColorFilter {
     matrix: [[f32; 3]; 3],
     offset: [f32; 3],
+    tone: SourceToneOp,
 }
 
 impl SourceColorFilter {
@@ -2762,6 +2808,7 @@ impl SourceColorFilter {
         Self {
             matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
             offset: [0., 0., 0.],
+            tone: SourceToneOp::None,
         }
     }
 
@@ -2771,6 +2818,7 @@ impl SourceColorFilter {
         Self {
             matrix: [[factor, 0., 0.], [0., factor, 0.], [0., 0., factor]],
             offset: [0., 0., 0.],
+            tone: SourceToneOp::None,
         }
     }
 
@@ -2781,6 +2829,7 @@ impl SourceColorFilter {
         Self {
             matrix: [[factor, 0., 0.], [0., factor, 0.], [0., 0., factor]],
             offset: [offset, offset, offset],
+            tone: SourceToneOp::None,
         }
     }
 
@@ -2798,6 +2847,7 @@ impl SourceColorFilter {
         Self {
             matrix,
             offset: [0., 0., 0.],
+            tone: SourceToneOp::None,
         }
     }
 
@@ -2813,12 +2863,37 @@ impl SourceColorFilter {
         Self {
             matrix: [[scale, 0., 0.], [0., scale, 0.], [0., 0., scale]],
             offset: [amount, amount, amount],
+            tone: SourceToneOp::None,
         }
     }
 
     /// Returns an affine source-color matrix over unpremultiplied RGB.
     pub fn color_matrix(matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
-        Self { matrix, offset }
+        Self {
+            matrix,
+            offset,
+            tone: SourceToneOp::None,
+        }
+    }
+
+    /// Returns a tone-only filter that posterizes source color to `levels` bands.
+    pub fn posterize(levels: f32) -> Self {
+        Self::identity().with_tone(SourceToneOp::Posterize(levels))
+    }
+
+    /// Returns a tone-only filter that thresholds source luma at `threshold` (0..1).
+    pub fn threshold(threshold: f32) -> Self {
+        Self::identity().with_tone(SourceToneOp::Threshold(threshold))
+    }
+
+    /// Returns a tone-only filter that solarizes source color at `threshold` (0..1).
+    pub fn solarize(threshold: f32) -> Self {
+        Self::identity().with_tone(SourceToneOp::Solarize(threshold))
+    }
+
+    fn with_tone(mut self, tone: SourceToneOp) -> Self {
+        self.tone = tone;
+        self
     }
 
     /// Returns a filter that rotates source hue by `degrees` around the gray
@@ -2845,6 +2920,7 @@ impl SourceColorFilter {
         Self {
             matrix,
             offset: [0., 0., 0.],
+            tone: SourceToneOp::None,
         }
     }
 
@@ -2857,6 +2933,7 @@ impl SourceColorFilter {
                 [0.272, 0.534, 0.131],
             ],
             offset: [0., 0., 0.],
+            tone: SourceToneOp::None,
         }
     }
 
@@ -2879,7 +2956,19 @@ impl SourceColorFilter {
                     .sum::<f32>();
         }
 
-        Self { matrix, offset }
+        // Tone ops are non-linear and don't fold into the matrix; the most
+        // recently set one wins.
+        let tone = if next.tone != SourceToneOp::None {
+            next.tone
+        } else {
+            self.tone
+        };
+
+        Self {
+            matrix,
+            offset,
+            tone,
+        }
     }
 
     /// Returns whether this filter leaves source colors unchanged.
@@ -2890,6 +2979,11 @@ impl SourceColorFilter {
     /// Returns the affine matrix and offset for renderer consumption.
     pub fn components(&self) -> ([[f32; 3]; 3], [f32; 3]) {
         (self.matrix, self.offset)
+    }
+
+    /// Returns the non-linear tone operation applied after the matrix.
+    pub fn tone(&self) -> SourceToneOp {
+        self.tone
     }
 }
 

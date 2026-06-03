@@ -4,8 +4,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, CompositeEffectPlan, Corners, DevicePixels, GpuSpecs,
     MonochromeSprite, PaintGroup, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     RenderGroupBackendCounters, ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline,
-    get_gamma_correction_ratios,
-    point,
+    get_gamma_correction_ratios, point,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -85,7 +84,8 @@ struct GroupSprite {
     color_offset: [f32; 4],
     backdrop_active: f32,
     blend_mode: u32,
-    _pad0: [u32; 2],
+    source_tone_op: u32,
+    source_tone_param: f32,
     backdrop_tint: [f32; 4],
     backdrop_color_matrix: [[f32; 4]; 4],
     backdrop_color_offset: [f32; 4],
@@ -2235,6 +2235,10 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
+        let (source_tone_op, source_tone_param) = effect_plan
+            .source_color_filter()
+            .tone()
+            .shader_code_and_param();
         let (backdrop_color_matrix, backdrop_color_offset) =
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
@@ -2276,7 +2280,8 @@ impl WgpuRenderer {
                 color_offset,
                 backdrop_active: 0.,
                 blend_mode: 0,
-                _pad0: [0; 2],
+                source_tone_op: 0,
+                source_tone_param: 0.,
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
@@ -2308,7 +2313,8 @@ impl WgpuRenderer {
                 color_offset,
                 backdrop_active: 0.,
                 blend_mode: 0,
-                _pad0: [0; 2],
+                source_tone_op: 0,
+                source_tone_param: 0.,
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
@@ -2340,7 +2346,8 @@ impl WgpuRenderer {
                 color_offset,
                 backdrop_active: 0.,
                 blend_mode: 0,
-                _pad0: [0; 2],
+                source_tone_op: 0,
+                source_tone_param: 0.,
                 backdrop_tint: [0., 0., 0., 0.],
                 backdrop_color_matrix,
                 backdrop_color_offset,
@@ -2374,7 +2381,8 @@ impl WgpuRenderer {
                 0.
             },
             blend_mode: effect_plan.blend_mode().shader_code(),
-            _pad0: [0; 2],
+            source_tone_op,
+            source_tone_param,
             backdrop_tint: [
                 backdrop_tint.r,
                 backdrop_tint.g,

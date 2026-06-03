@@ -859,6 +859,8 @@ struct GroupSpriteVertexOutput {
   float4 color_offset;
   float backdrop_active;
   uint blend_mode [[flat]];
+  uint source_tone_op [[flat]];
+  float source_tone_param;
   float4 backdrop_tint;
   float4 backdrop_color_matrix_0;
   float4 backdrop_color_matrix_1;
@@ -909,6 +911,8 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     float4(sprite.color_offset[0], sprite.color_offset[1], sprite.color_offset[2], sprite.color_offset[3]),
     sprite.backdrop_active,
     sprite.blend_mode,
+    sprite.source_tone_op,
+    sprite.source_tone_param,
     float4(sprite.backdrop_tint[0], sprite.backdrop_tint[1], sprite.backdrop_tint[2], sprite.backdrop_tint[3]),
     float4(sprite.backdrop_color_matrix[0][0], sprite.backdrop_color_matrix[0][1], sprite.backdrop_color_matrix[0][2], sprite.backdrop_color_matrix[0][3]),
     float4(sprite.backdrop_color_matrix[1][0], sprite.backdrop_color_matrix[1][1], sprite.backdrop_color_matrix[1][2], sprite.backdrop_color_matrix[1][3]),
@@ -1324,17 +1328,36 @@ float sample_material_alpha_blurred(float2 point,
   return alpha / total;
 }
 
+float3 apply_source_tone(float3 rgb, uint op, float param) {
+  if (op == 1) {
+    // Posterize to `param` bands; the trailing clamp pulls the c==1 overshoot to 1.
+    return floor(rgb * param) / max(param - 1.0, 1.0);
+  }
+  if (op == 2) {
+    // Threshold to black/white by luma.
+    float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    return float3(step(param, luma));
+  }
+  if (op == 3) {
+    // Solarize: invert channels at or above the threshold.
+    return mix(rgb, float3(1.0) - rgb, step(float3(param), rgb));
+  }
+  return rgb;
+}
+
 float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput input) {
   if (sample.a <= 0.0) {
     return sample;
   }
 
   float4 rgba = float4(sample.rgb / sample.a, sample.a);
-  float3 rgb = saturate(float3(
+  float3 rgb = float3(
     dot(input.color_matrix_0, rgba) + input.color_offset.x,
     dot(input.color_matrix_1, rgba) + input.color_offset.y,
     dot(input.color_matrix_2, rgba) + input.color_offset.z
-  ));
+  );
+  rgb = apply_source_tone(rgb, input.source_tone_op, input.source_tone_param);
+  rgb = saturate(rgb);
 
   return float4(rgb * sample.a, sample.a);
 }

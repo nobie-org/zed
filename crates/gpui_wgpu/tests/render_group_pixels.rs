@@ -559,6 +559,86 @@ fn render_group_sepia_warm_biases_source_gray() {
     assert_eq!([r, g, b, a], [173, 154, 120, 255]);
 }
 
+fn tone_group(effect: CompositeEffect, source: impl Into<Background>) -> Scene {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), source)]);
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![effect],
+        group_scene,
+    ));
+    grouped.finish();
+    grouped
+}
+
+#[test]
+fn render_group_posterize_quantizes_source() {
+    // 3 bands: gray(0.502) → floor(1.506)=1 → 1/2 = 0.5.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(CompositeEffect::posterize(3.), gray())),
+            12,
+            12
+        ),
+        [128, 128, 128, 255]
+    );
+    // 2 bands, white: floor(2.0)=2 → 2/1=2.0, clamped to 1.0.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(CompositeEffect::posterize(2.), white())),
+            12,
+            12
+        ),
+        [255, 255, 255, 255]
+    );
+}
+
+#[test]
+fn render_group_threshold_splits_source_by_luma() {
+    // gray luma 0.502 ≥ 0.5 → white.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(CompositeEffect::threshold(0.5), gray())),
+            12,
+            12
+        ),
+        [255, 255, 255, 255]
+    );
+    // red luma 0.2126 < 0.5 → black.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(CompositeEffect::threshold(0.5), red())),
+            12,
+            12
+        ),
+        [0, 0, 0, 255]
+    );
+}
+
+#[test]
+fn render_group_solarize_inverts_above_threshold() {
+    // white: all channels ≥ 0.5 → inverted to black.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(CompositeEffect::solarize(0.5), white())),
+            12,
+            12
+        ),
+        [0, 0, 0, 255]
+    );
+    // gray(0.502) ≥ 0.5 → 1 - 0.502 = 0.498 → 127.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(CompositeEffect::solarize(0.5), gray())),
+            12,
+            12
+        ),
+        [127, 127, 127, 255]
+    );
+}
+
 #[test]
 fn render_group_source_color_filters_are_ordered() {
     let first_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);

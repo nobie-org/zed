@@ -1138,6 +1138,7 @@ struct GroupSprite {
     source_mask_corner_radii: Corners,
     material_shape_bounds: Bounds,
     material_shape_corner_radii: Corners,
+    group_shape_params: vec4<f32>,
     color_matrix: array<vec4<f32>, 4>,
     color_offset: vec4<f32>,
     backdrop_active: f32,
@@ -1178,12 +1179,30 @@ fn vs_group(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) inst
     return out;
 }
 
+fn lp_norm(v: vec2<f32>, n: f32) -> f32 {
+    if (n == 2.0) { return length(v); }
+    let a = abs(v);
+    return pow(pow(a.x, n) + pow(a.y, n), 1.0 / n);
+}
+
+fn group_shape_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners, exponent: f32) -> f32 {
+    let half_size = bounds.size / 2.0;
+    let center = bounds.origin + half_size;
+    let center_to_point = point - center;
+    let corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    let ccp = (abs(center_to_point) - half_size) + corner_radius;
+    if (corner_radius == 0.0) { return max(ccp.x, ccp.y); }
+    let d_inset = lp_norm(max(vec2<f32>(0.0), ccp), exponent) + min(0.0, max(ccp.x, ccp.y));
+    return d_inset - corner_radius;
+}
+
 fn group_source_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
     if (sprite.source_mask_enabled <= 0.0) {
         return 1.0;
     }
 
-    return clamp(0.5 - quad_sdf(point, sprite.source_mask_bounds, sprite.source_mask_corner_radii), 0.0, 1.0);
+    let exponent = select(2.0, sprite.group_shape_params.y, sprite.group_shape_params.x == 1.0);
+    return clamp(0.5 - group_shape_sdf(point, sprite.source_mask_bounds, sprite.source_mask_corner_radii, exponent), 0.0, 1.0);
 }
 
 fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
@@ -1191,7 +1210,8 @@ fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
 }
 
 fn group_material_sdf(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    return quad_sdf(point, sprite.material_shape_bounds, sprite.material_shape_corner_radii);
+    let exponent = select(2.0, sprite.group_shape_params.w, sprite.group_shape_params.z == 1.0);
+    return group_shape_sdf(point, sprite.material_shape_bounds, sprite.material_shape_corner_radii, exponent);
 }
 
 fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {

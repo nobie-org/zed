@@ -877,13 +877,13 @@ pub enum CompositeEffect {
     Opacity(f32),
     SourceColorFilter(SourceColorFilter),
     SourceBlur(Pixels),
-    SourceMask(Corners<Pixels>),
-    SourceMaskBeforeBlur(Corners<Pixels>),
+    SourceMask(GroupShape),
+    SourceMaskBeforeBlur(GroupShape),
     BackdropColorFilter(SourceColorFilter),
     BackdropBlur(Pixels),
     BackdropLens(CompositeBackdropLens<Pixels>),
     BackdropTint(Hsla),
-    MaterialShape(Corners<Pixels>),
+    MaterialShape(GroupShape),
     DropShadow(CompositeDropShadow<Pixels>),
     SurfaceShadow(CompositeSurfaceShadow<Pixels>),
     ProcessedContentGlow(CompositeProcessedContentGlow),
@@ -891,34 +891,87 @@ pub enum CompositeEffect {
     BlendMode(CompositeBlendMode),
 }
 
+/// The corner SDF family a render-group shape uses.
+///
+/// `RoundedRect` is the circular-arc corner used everywhere today. `Superellipse`
+/// generalizes the corner to an Lp-norm (squircle) with the given exponent; the
+/// exponent is the shader's `n` and a value of `2.0` is bit-identical to
+/// `RoundedRect`.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum GroupShapeKind {
+    /// Circular-arc corners (the historical rounded rectangle).
+    #[default]
+    RoundedRect,
+    /// Lp-norm (squircle) corners with the given exponent.
+    Superellipse(f32),
+}
+
+impl GroupShapeKind {
+    /// Returns the renderer-facing `(kind, exponent)` shader parameters.
+    ///
+    /// `RoundedRect` maps to `(0, 0.)`; `Superellipse(n)` maps to `(1, n)`.
+    pub fn shader_params(self) -> (u32, f32) {
+        match self {
+            Self::RoundedRect => (0, 0.),
+            Self::Superellipse(exponent) => (1, exponent),
+        }
+    }
+}
+
 /// A render-group shape in group layout coordinates.
 ///
-/// V1 supports rounded rectangles matching the group's layout bounds. The type
+/// V1 supports rounded rectangles matching the group's layout bounds, plus an
+/// additive superellipse (squircle) corner variant that is visual-only. The type
 /// is intentionally distinct from child border styling: a recipe may choose to
 /// use the same radii for child style, content clipping, and surface material,
 /// but raw render groups do not infer that coupling from children.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GroupShape {
-    corner_radii: Corners<Pixels>,
+pub enum GroupShape {
+    /// A rounded rectangle with circular-arc corners.
+    RoundedRect(Corners<Pixels>),
+    /// A superellipse (squircle) with Lp-norm corners.
+    Superellipse {
+        /// Corner radii in group layout coordinates.
+        corner_radii: Corners<Pixels>,
+        /// The Lp-norm exponent (`n`), clamped to at least `2.0`.
+        exponent: f32,
+    },
 }
 
 impl GroupShape {
     /// Returns a rectangular group shape.
     pub fn rectangle() -> Self {
-        Self {
-            corner_radii: Corners::all(Pixels(0.)),
-        }
+        Self::RoundedRect(Corners::all(Pixels(0.)))
     }
 
     /// Returns a rounded-rectangle group shape.
     pub fn rounded_rect(corner_radii: Corners<Pixels>) -> Self {
-        Self {
+        Self::RoundedRect(corner_radii.map(|radius| Pixels(radius.0.max(0.))))
+    }
+
+    /// Returns a superellipse (squircle) group shape.
+    ///
+    /// Radii are clamped to be non-negative and the exponent is clamped to at
+    /// least `2.0` (below which the shape would pinch inside the rounded rect).
+    pub fn superellipse(corner_radii: Corners<Pixels>, exponent: f32) -> Self {
+        Self::Superellipse {
             corner_radii: corner_radii.map(|radius| Pixels(radius.0.max(0.))),
+            exponent: exponent.max(2.0),
         }
     }
 
-    fn corner_radii(&self) -> Corners<Pixels> {
-        self.corner_radii
+    pub(crate) fn corner_radii(&self) -> Corners<Pixels> {
+        match self {
+            Self::RoundedRect(corner_radii) => *corner_radii,
+            Self::Superellipse { corner_radii, .. } => *corner_radii,
+        }
+    }
+
+    pub(crate) fn shape_kind(&self) -> GroupShapeKind {
+        match self {
+            Self::RoundedRect(_) => GroupShapeKind::RoundedRect,
+            Self::Superellipse { exponent, .. } => GroupShapeKind::Superellipse(*exponent),
+        }
     }
 }
 
@@ -1020,12 +1073,12 @@ impl CompositeEffect {
 
     /// Clips the composited source/content image by a group shape.
     pub fn source_mask(shape: GroupShape) -> Self {
-        Self::SourceMask(shape.corner_radii())
+        Self::SourceMask(shape)
     }
 
     /// Clips source/content before subsequent source blur samples are taken.
     pub fn source_mask_before_blur(shape: GroupShape) -> Self {
-        Self::SourceMaskBeforeBlur(shape.corner_radii())
+        Self::SourceMaskBeforeBlur(shape)
     }
 
     /// Applies a Gaussian blur to the already-rendered backdrop under the group.
@@ -1060,7 +1113,7 @@ impl CompositeEffect {
 
     /// Defines the material domain used by backdrop materials and lens normals.
     pub fn material_shape(shape: GroupShape) -> Self {
-        Self::MaterialShape(shape.corner_radii())
+        Self::MaterialShape(shape)
     }
 
     /// Draws a drop shadow from the composited source image's alpha channel.
@@ -1081,6 +1134,7 @@ impl CompositeEffect {
     ) -> Self {
         Self::SurfaceShadow(CompositeSurfaceShadow {
             shape: shape.corner_radii(),
+            shape_kind: shape.shape_kind(),
             offset,
             blur_radius: Pixels(blur_radius.0.max(0.)),
             color,
@@ -1166,6 +1220,7 @@ pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
 #[allow(missing_docs)]
 pub struct CompositeSurfaceShadow<P: Clone + Copy + Debug + Default + PartialEq> {
     pub shape: Corners<P>,
+    pub shape_kind: GroupShapeKind,
     pub offset: Point<P>,
     pub blur_radius: P,
     pub color: Hsla,
@@ -2251,6 +2306,7 @@ pub enum RenderGroupCapabilityProbe {
     TransformedGroup,
     GeometryWarp,
     RoundedGroupShape,
+    SuperellipseGroupShape,
     SpatialSampling,
     TemporalMaterial,
     TemporalInteraction,
@@ -2276,7 +2332,8 @@ impl RenderGroupCapabilityProbe {
             | Self::ContentAlphaShadow
             | Self::CompositeOpacity
             | Self::CompositeBlend
-            | Self::RoundedGroupShape => RenderGroupCapabilityReport::rendered(
+            | Self::RoundedGroupShape
+            | Self::SuperellipseGroupShape => RenderGroupCapabilityReport::rendered(
                 self,
                 "current normalized render-group plan has a backend path",
             ),
@@ -2995,12 +3052,14 @@ pub struct CompositeEffectPlan {
     source_color_filter: SourceColorFilter,
     source_blur_radius: ScaledPixels,
     source_mask: Option<Corners<ScaledPixels>>,
+    source_mask_shape: GroupShapeKind,
     source_mask_blur_order: SourceMaskBlurOrder,
     backdrop_color_filter: SourceColorFilter,
     backdrop_blur_radius: ScaledPixels,
     backdrop_lens: Option<CompositeBackdropLens<ScaledPixels>>,
     backdrop_tint: Hsla,
     material_shape: Option<Corners<ScaledPixels>>,
+    material_shape_shape: GroupShapeKind,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
     surface_shadows: Vec<CompositeSurfaceShadow<ScaledPixels>>,
     processed_content_glows: Vec<CompositeProcessedContentGlowPlan>,
@@ -3066,12 +3125,14 @@ impl CompositeEffectPlan {
             source_color_filter: SourceColorFilter::identity(),
             source_blur_radius: ScaledPixels(0.),
             source_mask: None,
+            source_mask_shape: GroupShapeKind::RoundedRect,
             source_mask_blur_order: SourceMaskBlurOrder::AfterBlur,
             backdrop_color_filter: SourceColorFilter::identity(),
             backdrop_blur_radius: ScaledPixels(0.),
             backdrop_lens: None,
             backdrop_tint: transparent_black(),
             material_shape: None,
+            material_shape_shape: GroupShapeKind::RoundedRect,
             drop_shadows: Vec::new(),
             surface_shadows: Vec::new(),
             processed_content_glows: Vec::new(),
@@ -3092,12 +3153,14 @@ impl CompositeEffectPlan {
                     plan.source_blur_radius =
                         ScaledPixels((plan.source_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt());
                 }
-                CompositeEffect::SourceMask(corner_radii) => {
-                    plan.source_mask = Some(corner_radii.scale(scale_factor));
+                CompositeEffect::SourceMask(shape) => {
+                    plan.source_mask = Some(shape.corner_radii().scale(scale_factor));
+                    plan.source_mask_shape = shape.shape_kind();
                     plan.source_mask_blur_order = SourceMaskBlurOrder::AfterBlur;
                 }
-                CompositeEffect::SourceMaskBeforeBlur(corner_radii) => {
-                    plan.source_mask = Some(corner_radii.scale(scale_factor));
+                CompositeEffect::SourceMaskBeforeBlur(shape) => {
+                    plan.source_mask = Some(shape.corner_radii().scale(scale_factor));
+                    plan.source_mask_shape = shape.shape_kind();
                     plan.source_mask_blur_order = SourceMaskBlurOrder::BeforeBlur;
                 }
                 CompositeEffect::BackdropColorFilter(filter) => {
@@ -3115,8 +3178,9 @@ impl CompositeEffectPlan {
                 CompositeEffect::BackdropTint(color) => {
                     plan.backdrop_tint = composite_tint(plan.backdrop_tint, *color);
                 }
-                CompositeEffect::MaterialShape(corner_radii) => {
-                    plan.material_shape = Some(corner_radii.scale(scale_factor));
+                CompositeEffect::MaterialShape(shape) => {
+                    plan.material_shape = Some(shape.corner_radii().scale(scale_factor));
+                    plan.material_shape_shape = shape.shape_kind();
                 }
                 CompositeEffect::DropShadow(shadow) => {
                     plan.drop_shadows.push(CompositeDropShadow {
@@ -3128,6 +3192,7 @@ impl CompositeEffectPlan {
                 CompositeEffect::SurfaceShadow(shadow) => {
                     plan.surface_shadows.push(CompositeSurfaceShadow {
                         shape: shadow.shape.scale(scale_factor),
+                        shape_kind: shadow.shape_kind,
                         offset: shadow.offset.scale(scale_factor),
                         blur_radius: shadow.blur_radius.scale(scale_factor),
                         color: shadow.color,
@@ -3141,8 +3206,10 @@ impl CompositeEffectPlan {
                 CompositeEffect::RoundedMask(corner_radii) => {
                     let corner_radii = corner_radii.scale(scale_factor);
                     plan.source_mask = Some(corner_radii);
+                    plan.source_mask_shape = GroupShapeKind::RoundedRect;
                     plan.source_mask_blur_order = SourceMaskBlurOrder::AfterBlur;
                     plan.material_shape = Some(corner_radii);
+                    plan.material_shape_shape = GroupShapeKind::RoundedRect;
                     plan.rounded_mask = Some(corner_radii);
                 }
                 CompositeEffect::BlendMode(mode) => {
@@ -3175,6 +3242,11 @@ impl CompositeEffectPlan {
         self.source_mask
     }
 
+    /// Returns the corner-SDF family of the source/content mask.
+    pub fn source_mask_shape(&self) -> GroupShapeKind {
+        self.source_mask_shape
+    }
+
     /// Returns whether source masking happens before or after source blur.
     pub fn source_mask_blur_order(&self) -> SourceMaskBlurOrder {
         self.source_mask_blur_order
@@ -3203,6 +3275,11 @@ impl CompositeEffectPlan {
     /// Returns the optional material shape in device pixels.
     pub fn material_shape(&self) -> Option<Corners<ScaledPixels>> {
         self.material_shape
+    }
+
+    /// Returns the corner-SDF family of the material shape.
+    pub fn material_shape_shape(&self) -> GroupShapeKind {
+        self.material_shape_shape
     }
 
     /// Returns whether the plan needs a backdrop material layer.

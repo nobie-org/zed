@@ -1416,6 +1416,9 @@ impl MetalRenderer {
         let material_shape_corner_radii = effect_plan
             .material_shape()
             .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
+        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
+        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -1436,6 +1439,7 @@ impl MetalRenderer {
                 source_mask_corner_radii,
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
+                group_shape_params,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1452,6 +1456,11 @@ impl MetalRenderer {
 
         for shadow in effect_plan.surface_shadows() {
             let color = shadow.color.to_rgb();
+            // The surface-shadow SDF reads the material slot; drive it from the
+            // shadow's own shape so a superellipse shadow gets squircle corners.
+            let (shadow_shape_kind, shadow_shape_exponent) = shadow.shape_kind.shader_params();
+            let shadow_group_shape_params =
+                [0., 0., shadow_shape_kind as f32, shadow_shape_exponent];
             sprites.push(GroupSprite {
                 bounds: group.capture_bounds,
                 opacity: effect_plan.opacity(),
@@ -1469,6 +1478,7 @@ impl MetalRenderer {
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii: shadow.shape,
+                group_shape_params: shadow_group_shape_params,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1502,6 +1512,7 @@ impl MetalRenderer {
                 source_mask_corner_radii,
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
+                group_shape_params,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -1533,6 +1544,7 @@ impl MetalRenderer {
             source_mask_corner_radii,
             material_shape_bounds: group.bounds,
             material_shape_corner_radii,
+            group_shape_params,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {
@@ -2487,6 +2499,7 @@ pub struct GroupSprite {
     pub source_mask_corner_radii: Corners<ScaledPixels>,
     pub material_shape_bounds: Bounds<ScaledPixels>,
     pub material_shape_corner_radii: Corners<ScaledPixels>,
+    pub group_shape_params: [f32; 4],
     pub color_matrix: [[f32; 4]; 4],
     pub color_offset: [f32; 4],
     pub backdrop_active: f32,
@@ -2511,8 +2524,8 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, Hsla, LogicalVisualPlan,
-        PaintGroup, RenderGroupBackendCounters, px, rgba, transparent_black,
+        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla,
+        LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters, px, rgba, transparent_black,
     };
     use image::RgbaImage;
     use std::sync::Arc;
@@ -3014,5 +3027,47 @@ mod tests {
             [0, 0, 0, 255],
             "center pane should not pick up the edge reflection sample"
         );
+    }
+
+    fn superellipse_clip_scene(shape: GroupShape) -> Scene {
+        let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), rgba(0x00ff00ff))]);
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(4., 4., 20., 20.),
+            vec![CompositeEffect::source_mask(shape)],
+            group_scene,
+        ));
+        grouped.finish();
+        grouped
+    }
+
+    /// A superellipse with exponent 2.0 must render byte-identical to a rounded
+    /// rectangle with the same radii: this guards the shared corner-SDF refactor.
+    #[test]
+    fn render_group_superellipse_n2_matches_rounded_rect_metal() {
+        let radii = Corners::all(px(8.));
+        let rounded = render(&superellipse_clip_scene(GroupShape::rounded_rect(radii)));
+        let superellipse = render(&superellipse_clip_scene(GroupShape::superellipse(
+            radii, 2.0,
+        )));
+        assert_eq!(rounded.as_raw(), superellipse.as_raw());
+    }
+
+    /// A fuller superellipse corner (exponent 4) keeps a near-corner pixel that
+    /// the circular rounded-rect corner (exponent 2) clips to background.
+    #[test]
+    fn render_group_superellipse_keeps_fuller_corner_metal() {
+        let radii = Corners::all(px(8.));
+        let rounded = render(&superellipse_clip_scene(GroupShape::rounded_rect(radii)));
+        let superellipse = render(&superellipse_clip_scene(GroupShape::superellipse(
+            radii, 4.0,
+        )));
+
+        // Pixel (6, 5) sits in the corner crescent that the circular corner clips
+        // away to background black but the squircle (n=4) keeps as opaque source.
+        assert_eq!(pixel(&rounded, 6, 5), [0, 0, 0, 255]);
+        assert_eq!(pixel(&superellipse, 6, 5), [0, 255, 0, 255]);
     }
 }

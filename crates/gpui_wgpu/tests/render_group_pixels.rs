@@ -1682,3 +1682,92 @@ fn render_group_opacity_composites_cached_descendant_replay() {
     assert_eq!(pixel(&image, 1, 1), [0, 0, 0, 255]);
     assert_eq!(pixel(&image, 12, 12), [128, 128, 128, 255]);
 }
+
+/// A superellipse with exponent 2.0 must render byte-identical to a rounded
+/// rectangle with the same radii: this guards the shared corner-SDF refactor
+/// against any drift away from the historical `length()` corner.
+#[test]
+fn render_group_superellipse_n2_matches_rounded_rect() {
+    let radii = Corners::all(px(8.));
+
+    let render_with = |shape: GroupShape| {
+        let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(4., 4., 20., 20.),
+            vec![CompositeEffect::source_mask(shape)],
+            group_scene,
+        ));
+        grouped.finish();
+        render(&grouped)
+    };
+
+    let rounded = render_with(GroupShape::rounded_rect(radii));
+    let superellipse = render_with(GroupShape::superellipse(radii, 2.0));
+
+    assert_eq!(rounded.as_raw(), superellipse.as_raw());
+}
+
+/// A fuller superellipse corner (exponent 4) keeps a near-corner pixel that the
+/// circular rounded-rect corner (exponent 2) clips to background.
+#[test]
+fn render_group_superellipse_keeps_fuller_corner() {
+    let radii = Corners::all(px(8.));
+
+    let render_with = |shape: GroupShape| {
+        let group_scene = finished_scene([quad(0, rect(4., 4., 20., 20.), green())]);
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(4., 4., 20., 20.),
+            vec![CompositeEffect::source_mask(shape)],
+            group_scene,
+        ));
+        grouped.finish();
+        render(&grouped)
+    };
+
+    let rounded = render_with(GroupShape::rounded_rect(radii));
+    let superellipse = render_with(GroupShape::superellipse(radii, 4.0));
+
+    // Pixel (6, 5) sits in the corner crescent that the circular corner clips
+    // away to background black but the squircle (n=4) keeps as opaque source.
+    assert_eq!(pixel(&rounded, 6, 5), [0, 0, 0, 255]);
+    assert_eq!(pixel(&superellipse, 6, 5), [0, 255, 0, 255]);
+}
+
+#[test]
+fn render_group_superellipse_surface_shadow_uses_shape_kind() {
+    let radii = Corners::all(px(10.));
+    let shadow_scene = |shape: GroupShape| {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_effects(
+            1,
+            rect(6., 6., 18., 18.),
+            vec![CompositeEffect::surface_shadow(
+                shape,
+                point(px(2.), px(2.)),
+                px(0.),
+                white(),
+            )],
+            Scene::default(),
+        ));
+        scene.finish();
+        render(&scene)
+    };
+
+    let rounded = shadow_scene(GroupShape::rounded_rect(radii));
+    let squircle = shadow_scene(GroupShape::superellipse(radii, 8.0));
+    let n2 = shadow_scene(GroupShape::superellipse(radii, 2.0));
+
+    // The squircle's fuller corner changes the surface-shadow silhouette. If the
+    // shadow sprite didn't carry the shadow's own shape_kind, this would render
+    // identical to the rounded shadow.
+    assert_ne!(rounded.as_raw(), squircle.as_raw());
+    // n=2 shares the circular-corner SDF, so its shadow matches the rounded one.
+    assert_eq!(rounded.as_raw(), n2.as_raw());
+}

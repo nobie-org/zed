@@ -7,8 +7,9 @@ use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
     LogicalVisualPlan, LumaThreshold, MonochromeSprite, PaintGroup, PlatformAtlas,
-    PlatformHeadlessRenderer, PolychromeSprite, Quad, RenderImageParams, RenderSvgParams,
-    ScaledPixels, Scene, TransformationMatrix, point, px, rgba, size, transparent_black,
+    PlatformHeadlessRenderer, PolychromeSprite, Quad, RenderGroupBackendCounters,
+    RenderImageParams, RenderSvgParams, ScaledPixels, Scene, TransformationMatrix, point, px, rgba,
+    size, transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
 use image::RgbaImage;
@@ -156,6 +157,29 @@ fn render(scene: &Scene) -> RgbaImage {
         .expect("render scene")
 }
 
+/// Render `scene` headlessly and return the backend's measured render-group counters.
+fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    renderer
+        .render_scene_to_image(
+            scene,
+            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+        )
+        .expect("render scene");
+    renderer
+        .render_group_backend_counters()
+        .expect("counters recorded after a successful render")
+}
+
+/// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
+fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
+    let counters = group.plan.support_counters(group.capture_bounds);
+    RenderGroupBackendCounters {
+        intermediate_textures: counters.intermediate_textures,
+        backdrop_copies: counters.backdrop_copies,
+    }
+}
+
 fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
     image.get_pixel(x, y).0
 }
@@ -189,6 +213,164 @@ fn identity_render_group_matches_inline_rendering() {
     let grouped_image = render(&grouped);
 
     assert_eq!(grouped_image.as_raw(), inline_image.as_raw());
+}
+
+// --- M2b: measured backend render-group counters match the planner ---
+//
+// The backend allocates one group intermediate per rendered group, plus a backdrop
+// copy target and one blit when the group reads the backdrop. These tests prove the
+// measured counts equal the planner's predicted RenderGroupSupportCounters for
+// groups both sides agree are rendered. The law is asserted only on `renders_pixels`
+// groups (or fully elided opacity<=0 groups): the backend draws degenerate groups
+// the planner elides (identity opacity, opacity in (0, EPSILON], empty bounds), so
+// those are intentionally out of scope here.
+
+#[test]
+fn backend_counters_match_planner_for_opacity_group() {
+    let group = paint_group(
+        1,
+        rect(4., 4., 16., 16.),
+        0.5,
+        finished_scene([quad(0, rect(4., 4., 16., 16.), red_half())]),
+    );
+    let predicted = predicted_counters(&group);
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            intermediate_textures: 1,
+            backdrop_copies: 0,
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(group);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
+}
+
+#[test]
+fn backend_counters_match_planner_for_backdrop_blur_group() {
+    let group = paint_group_with_effects(
+        1,
+        rect(4., 4., 16., 16.),
+        vec![CompositeEffect::backdrop_blur(px(4.))],
+        finished_scene([quad(0, rect(6., 6., 8., 8.), red_half())]),
+    );
+    let predicted = predicted_counters(&group);
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            intermediate_textures: 2,
+            backdrop_copies: 1,
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(group);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
+}
+
+#[test]
+fn backend_counters_sum_across_sibling_groups() {
+    let opacity_group = paint_group(
+        1,
+        rect(2., 2., 10., 10.),
+        0.5,
+        finished_scene([quad(0, rect(2., 2., 10., 10.), red_half())]),
+    );
+    let backdrop_group = paint_group_with_effects(
+        2,
+        rect(14., 14., 12., 12.),
+        vec![CompositeEffect::backdrop_blur(px(4.))],
+        finished_scene([quad(0, rect(16., 16., 6., 6.), blue_half())]),
+    );
+    let predicted = RenderGroupBackendCounters {
+        intermediate_textures: predicted_counters(&opacity_group).intermediate_textures
+            + predicted_counters(&backdrop_group).intermediate_textures,
+        backdrop_copies: predicted_counters(&opacity_group).backdrop_copies
+            + predicted_counters(&backdrop_group).backdrop_copies,
+    };
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            intermediate_textures: 3,
+            backdrop_copies: 1,
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(opacity_group);
+    scene.insert_primitive(backdrop_group);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
+}
+
+#[test]
+fn backend_counters_zero_for_elided_opacity_zero_group() {
+    let group = paint_group(
+        1,
+        rect(4., 4., 16., 16.),
+        0.0,
+        finished_scene([quad(0, rect(4., 4., 16., 16.), red_half())]),
+    );
+    let predicted = predicted_counters(&group);
+    assert_eq!(predicted, RenderGroupBackendCounters::default());
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(group);
+    scene.finish();
+
+    assert_eq!(
+        backend_counters(&scene),
+        RenderGroupBackendCounters::default()
+    );
+}
+
+#[test]
+fn backend_counters_match_planner_for_nested_groups() {
+    let inner = paint_group_with_effects(
+        0,
+        rect(6., 6., 12., 12.),
+        vec![CompositeEffect::backdrop_blur(px(4.))],
+        finished_scene([quad(0, rect(8., 8., 6., 6.), blue_half())]),
+    );
+    let inner_predicted = predicted_counters(&inner);
+
+    let mut inner_scene = Scene::default();
+    inner_scene.insert_primitive(quad(0, rect(4., 4., 20., 20.), white()));
+    inner_scene.insert_primitive(inner);
+    inner_scene.finish();
+
+    let outer = paint_group(1, rect(4., 4., 20., 20.), 0.5, inner_scene);
+    let outer_predicted = predicted_counters(&outer);
+
+    let predicted = RenderGroupBackendCounters {
+        intermediate_textures: outer_predicted.intermediate_textures
+            + inner_predicted.intermediate_textures,
+        backdrop_copies: outer_predicted.backdrop_copies + inner_predicted.backdrop_copies,
+    };
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            intermediate_textures: 3,
+            backdrop_copies: 1,
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(outer);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
 }
 
 #[test]

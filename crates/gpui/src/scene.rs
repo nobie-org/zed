@@ -2120,6 +2120,27 @@ pub struct RenderGroupSupportCounters {
     pub backdrop_copies: u32,
 }
 
+/// Measured render-group resource counts a backend actually produced while
+/// rendering a scene, for comparison against the planner's predicted
+/// [`RenderGroupSupportCounters`].
+///
+/// Counts only **group** intermediates (each group's render target plus any
+/// backdrop-copy target) and backdrop blits, summed over every rendered group
+/// including nested ones. Root-overflow and path-rasterization intermediates are
+/// excluded because the planner does not count them in its per-group totals.
+///
+/// The exact-match law (`measured == predicted`) holds for groups the backend and
+/// planner agree are rendered; it does not for degenerate groups the backend draws
+/// but the planner elides (identity opacity, opacity in `(0, EPSILON]`, or empty
+/// capture bounds). See `gpui_wgpu/tests/render_group_pixels.rs`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderGroupBackendCounters {
+    /// Group intermediate textures allocated (group target + backdrop-copy target).
+    pub intermediate_textures: u32,
+    /// Backdrop texture copies performed.
+    pub backdrop_copies: u32,
+}
+
 /// A typed reason why an authored render-group effect could not enter the exact plan.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]

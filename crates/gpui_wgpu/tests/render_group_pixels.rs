@@ -675,6 +675,52 @@ fn render_group_solarize_inverts_above_threshold() {
 }
 
 #[test]
+fn render_group_duotone_black_white_is_grayscale() {
+    // duotone(black, white) is the affine luma map out = luma — i.e. grayscale.
+    // gray(0.502) has luma 0.502, so every channel stays 128.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(
+                CompositeEffect::duotone(rgba(0x000000ff), rgba(0xffffffff)),
+                gray(),
+            )),
+            12,
+            12
+        ),
+        [128, 128, 128, 255]
+    );
+}
+
+#[test]
+fn render_group_duotone_maps_luma_to_color_gradient() {
+    // duotone(blue, yellow): luma 1 -> light (yellow), luma 0 -> dark (blue).
+    // White source (luma 1) lands on the light endpoint.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(
+                CompositeEffect::duotone(rgba(0x0000ffff), rgba(0xffff00ff)),
+                white(),
+            )),
+            12,
+            12
+        ),
+        [255, 255, 0, 255]
+    );
+    // Black source (luma 0) lands on the dark endpoint.
+    assert_eq!(
+        pixel(
+            &render(&tone_group(
+                CompositeEffect::duotone(rgba(0x0000ffff), rgba(0xffff00ff)),
+                black(),
+            )),
+            12,
+            12
+        ),
+        [0, 0, 255, 255]
+    );
+}
+
+#[test]
 fn render_group_source_color_filters_are_ordered() {
     let first_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
     let second_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);

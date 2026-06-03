@@ -1029,6 +1029,12 @@ impl CompositeEffect {
         Self::SourceColorFilter(SourceColorFilter::sepia())
     }
 
+    /// Maps source luma to a gradient between `dark` (black-luma) and `light`
+    /// (white-luma) — a duotone. Folds into the source-color matrix; no resource.
+    pub fn duotone(dark: Rgba, light: Rgba) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::duotone(dark, light))
+    }
+
     /// Posterizes source color to `levels` (>= 2) bands.
     pub fn posterize(levels: f32) -> Self {
         Self::SourceColorFilter(SourceColorFilter::posterize(levels))
@@ -3037,6 +3043,29 @@ impl SourceColorFilter {
                 [0.272, 0.534, 0.131],
             ],
             offset: [0., 0., 0.],
+            tone: SourceToneOp::None,
+        }
+    }
+
+    /// Returns a duotone filter that maps source luma to a gradient between two
+    /// colors: black-luma → `dark`, white-luma → `light`. Because the mapping is
+    /// affine in luma (`out = dark + luma * (light - dark)` with the same luma
+    /// basis as `saturate`/`hue_rotate`), it folds exactly into the source-color
+    /// matrix + offset — no resource texture or shader change required.
+    pub fn duotone(dark: Rgba, light: Rgba) -> Self {
+        let luma = [0.2126, 0.7152, 0.0722];
+        let dark = [dark.r, dark.g, dark.b];
+        let light = [light.r, light.g, light.b];
+        let mut matrix = [[0.; 3]; 3];
+        for row in 0..3 {
+            let span = light[row] - dark[row];
+            for column in 0..3 {
+                matrix[row][column] = span * luma[column];
+            }
+        }
+        Self {
+            matrix,
+            offset: dark,
             tone: SourceToneOp::None,
         }
     }

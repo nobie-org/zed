@@ -853,6 +853,7 @@ struct GroupSpriteVertexOutput {
   float4 source_mask_corner_radii;
   float4 material_shape_bounds;
   float4 material_shape_corner_radii;
+  float4 group_shape_params;
   float4 color_matrix_0;
   float4 color_matrix_1;
   float4 color_matrix_2;
@@ -905,6 +906,7 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     float4(sprite.source_mask_corner_radii.top_left, sprite.source_mask_corner_radii.top_right, sprite.source_mask_corner_radii.bottom_right, sprite.source_mask_corner_radii.bottom_left),
     float4(sprite.material_shape_bounds.origin.x, sprite.material_shape_bounds.origin.y, sprite.material_shape_bounds.size.width, sprite.material_shape_bounds.size.height),
     float4(sprite.material_shape_corner_radii.top_left, sprite.material_shape_corner_radii.top_right, sprite.material_shape_corner_radii.bottom_right, sprite.material_shape_corner_radii.bottom_left),
+    float4(sprite.group_shape_params[0], sprite.group_shape_params[1], sprite.group_shape_params[2], sprite.group_shape_params[3]),
     float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
     float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
     float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
@@ -923,7 +925,15 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
   };
 }
 
-float group_rounded_shape_sdf(float2 point, float4 bounds, float4 corner_radii) {
+float lp_norm(float2 v, float n) {
+  if (n == 2.0) {
+    return length(v);
+  }
+  float2 a = fabs(v);
+  return pow(pow(a.x, n) + pow(a.y, n), 1.0 / n);
+}
+
+float group_shape_sdf(float2 point, float4 bounds, float4 corner_radii, float exponent) {
   float2 half_size = bounds.zw / 2.0;
   float2 center = bounds.xy + half_size;
   float2 center_to_point = point - center;
@@ -939,9 +949,12 @@ float group_rounded_shape_sdf(float2 point, float4 bounds, float4 corner_radii) 
       corner_radius = corner_radii.z;
     }
   }
-  float2 corner_to_point = abs(center_to_point) - half_size;
-  float2 corner_center_to_point = corner_to_point + corner_radius;
-  return quad_sdf_impl(corner_center_to_point, corner_radius);
+  float2 ccp = (fabs(center_to_point) - half_size) + corner_radius;
+  if (corner_radius == 0.0) {
+    return max(ccp.x, ccp.y);
+  }
+  float d_inset = lp_norm(max(float2(0.0), ccp), exponent) + min(0.0, max(ccp.x, ccp.y));
+  return d_inset - corner_radius;
 }
 
 float group_source_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
@@ -949,11 +962,13 @@ float group_source_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
     return 1.0;
   }
 
-  return saturate(0.5 - group_rounded_shape_sdf(point, input.source_mask_bounds, input.source_mask_corner_radii));
+  float exponent = input.group_shape_params.x == 1.0 ? input.group_shape_params.y : 2.0;
+  return saturate(0.5 - group_shape_sdf(point, input.source_mask_bounds, input.source_mask_corner_radii, exponent));
 }
 
 float group_material_sdf(float2 point, GroupSpriteVertexOutput input) {
-  return group_rounded_shape_sdf(point, input.material_shape_bounds, input.material_shape_corner_radii);
+  float exponent = input.group_shape_params.z == 1.0 ? input.group_shape_params.w : 2.0;
+  return group_shape_sdf(point, input.material_shape_bounds, input.material_shape_corner_radii, exponent);
 }
 
 float group_material_alpha(float2 point, GroupSpriteVertexOutput input) {

@@ -80,6 +80,7 @@ struct GroupSprite {
     source_mask_corner_radii: Corners<ScaledPixels>,
     material_shape_bounds: Bounds<ScaledPixels>,
     material_shape_corner_radii: Corners<ScaledPixels>,
+    group_shape_params: [f32; 4],
     color_matrix: [[f32; 4]; 4],
     color_offset: [f32; 4],
     backdrop_active: f32,
@@ -2256,6 +2257,9 @@ impl WgpuRenderer {
         let material_shape_corner_radii = effect_plan
             .material_shape()
             .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
+        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
+        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
 
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
@@ -2276,6 +2280,7 @@ impl WgpuRenderer {
                 source_mask_corner_radii,
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
+                group_shape_params,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2292,6 +2297,11 @@ impl WgpuRenderer {
 
         for shadow in effect_plan.surface_shadows() {
             let color = shadow.color.to_rgb();
+            // The surface-shadow SDF reads the material slot; drive it from the
+            // shadow's own shape so a superellipse shadow gets squircle corners.
+            let (shadow_shape_kind, shadow_shape_exponent) = shadow.shape_kind.shader_params();
+            let shadow_group_shape_params =
+                [0., 0., shadow_shape_kind as f32, shadow_shape_exponent];
             sprites.push(GroupSprite {
                 bounds: group.capture_bounds,
                 opacity: effect_plan.opacity(),
@@ -2309,6 +2319,7 @@ impl WgpuRenderer {
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii: shadow.shape,
+                group_shape_params: shadow_group_shape_params,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2342,6 +2353,7 @@ impl WgpuRenderer {
                 source_mask_corner_radii,
                 material_shape_bounds: group.bounds,
                 material_shape_corner_radii,
+                group_shape_params,
                 color_matrix,
                 color_offset,
                 backdrop_active: 0.,
@@ -2373,6 +2385,7 @@ impl WgpuRenderer {
             source_mask_corner_radii,
             material_shape_bounds: group.bounds,
             material_shape_corner_radii,
+            group_shape_params,
             color_matrix,
             color_offset,
             backdrop_active: if effect_plan.has_backdrop_material() {

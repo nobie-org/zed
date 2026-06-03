@@ -3,7 +3,8 @@ use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, CompositeEffectPlan, Corners, DevicePixels, GpuSpecs,
     MonochromeSprite, PaintGroup, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    RenderGroupBackendCounters, ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline,
+    get_gamma_correction_ratios,
     point,
 };
 use log::warn;
@@ -195,6 +196,8 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Measured render-group resource counts from the most recent scene encode.
+    last_render_group_counters: Option<RenderGroupBackendCounters>,
 }
 
 impl WgpuRenderer {
@@ -582,6 +585,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured,
             needs_redraw: false,
+            last_render_group_counters: None,
         })
     }
 
@@ -1493,6 +1497,14 @@ impl WgpuRenderer {
         encoded
     }
 
+    /// Returns the measured render-group resource counts from the most recent
+    /// scene encode (group intermediate textures + backdrop copies), or `None` if
+    /// no scene has been rendered. Validated against the planner's predicted
+    /// [`RenderGroupSupportCounters`] in `tests/render_group_pixels.rs`.
+    pub fn render_group_backend_counters(&self) -> Option<RenderGroupBackendCounters> {
+        self.last_render_group_counters
+    }
+
     /// Encode `scene` into `target_view` and submit it (does **not** present).
     /// Shared by the windowed `draw` path (target = surface texture; caller
     /// presents) and the headless `render_scene_to_image` path (target =
@@ -1555,6 +1567,9 @@ impl WgpuRenderer {
 
         loop {
             let mut instance_offset: u64 = 0;
+            // Fresh per retry iteration: an instance-buffer overflow re-runs the
+            // full encode, so a per-function accumulator would double-count.
+            let mut group_counters = RenderGroupBackendCounters::default();
 
             let mut encoder =
                 self.resources()
@@ -1576,6 +1591,7 @@ impl WgpuRenderer {
                     &mut instance_offset,
                     true,
                     &mut retained_textures,
+                    &mut group_counters,
                 );
                 let drew_root = encoded_root
                     && self.draw_texture_to_view(
@@ -1597,6 +1613,7 @@ impl WgpuRenderer {
                     &mut instance_offset,
                     true,
                     &mut retained_textures,
+                    &mut group_counters,
                 )
             };
 
@@ -1607,6 +1624,8 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
+                    // Render did not complete; don't report stale counters as measured.
+                    self.last_render_group_counters = None;
                     return true;
                 }
                 self.grow_instance_buffer();
@@ -1617,6 +1636,7 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             drop(retained_textures);
+            self.last_render_group_counters = Some(group_counters);
             return true;
         }
     }
@@ -1631,6 +1651,7 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         clear: bool,
         retained_textures: &mut Vec<wgpu::Texture>,
+        group_counters: &mut RenderGroupBackendCounters,
     ) -> bool {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene_pass"),
@@ -1729,6 +1750,7 @@ impl WgpuRenderer {
                         encoder,
                         instance_offset,
                         retained_textures,
+                        group_counters,
                     );
 
                     pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2079,6 +2101,7 @@ impl WgpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
         retained_textures: &mut Vec<wgpu::Texture>,
+        group_counters: &mut RenderGroupBackendCounters,
     ) -> bool {
         for group in groups {
             let effect_plan = group.plan.normalized_effects().clone();
@@ -2087,6 +2110,7 @@ impl WgpuRenderer {
             }
 
             let (group_texture, group_view) = self.create_group_intermediate();
+            group_counters.intermediate_textures += 1;
 
             if !self.encode_scene_batches_to_view(
                 group.scene.as_ref(),
@@ -2097,6 +2121,7 @@ impl WgpuRenderer {
                 instance_offset,
                 true,
                 retained_textures,
+                group_counters,
             ) {
                 return false;
             }
@@ -2117,6 +2142,8 @@ impl WgpuRenderer {
                 }
 
                 let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+                group_counters.intermediate_textures += 1;
+                group_counters.backdrop_copies += 1;
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: target_texture,
@@ -2915,6 +2942,11 @@ impl WgpuHeadlessRenderer {
             },
         )?;
         Ok(Self { renderer })
+    }
+
+    /// Measured render-group resource counts from the most recent rendered scene.
+    pub fn render_group_backend_counters(&self) -> Option<RenderGroupBackendCounters> {
+        self.renderer.render_group_backend_counters()
     }
 }
 

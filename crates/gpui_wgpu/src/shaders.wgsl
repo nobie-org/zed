@@ -96,6 +96,9 @@ struct GammaParams {
 @group(1) @binding(1) var t_sprite: texture_2d<f32>;
 @group(1) @binding(2) var s_sprite: sampler;
 @group(1) @binding(3) var t_backdrop: texture_2d<f32>;
+// Rasterized arbitrary-path source mask; only sampled by `fs_group` when
+// `source_mask_mode == 1` (premultiplied white fill so `.a` is pure coverage).
+@group(1) @binding(4) var t_source_mask: texture_2d<f32>;
 
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
@@ -1132,7 +1135,8 @@ struct GroupSprite {
     backdrop_blur_radius: f32,
     source_mask_blur_order: u32,
     derived_luma_threshold: f32,
-    pad1: vec2<u32>,
+    source_mask_mode: u32,
+    pad1: u32,
     shadow_color: vec4<f32>,
     source_mask_bounds: Bounds,
     source_mask_corner_radii: Corners,
@@ -1200,6 +1204,15 @@ fn group_shape_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners, expo
 fn group_source_mask_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
     if (sprite.source_mask_enabled <= 0.0) {
         return 1.0;
+    }
+
+    if (sprite.source_mask_mode == 1u) {
+        // Sampled arbitrary-path coverage: the mask was rasterized in the same
+        // screen/device space as all group geometry, so its UV is the same
+        // screen-space UV `t_sprite`/`t_backdrop` use. The premultiplied
+        // forced-white path fill means `.a` is the clean scalar coverage.
+        let uv = point / globals.viewport_size;
+        return clamp(textureSample(t_source_mask, s_sprite, uv).a, 0.0, 1.0);
     }
 
     let exponent = select(2.0, sprite.group_shape_params.y, sprite.group_shape_params.x == 1.0);

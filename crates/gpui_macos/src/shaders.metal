@@ -870,6 +870,9 @@ struct GroupSpriteVertexOutput {
   float4 backdrop_color_offset;
   float4 backdrop_lens;
   float4 backdrop_lens_lighting;
+  // 0 = analytic SDF source mask, 1 = sampled arbitrary-path coverage mask.
+  // Added at END to avoid disturbing the positional initializer ordinals above.
+  uint source_mask_mode [[flat]];
 };
 
 vertex GroupSpriteVertexOutput group_sprite_vertex(
@@ -923,7 +926,8 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     float4(sprite.backdrop_color_matrix[2][0], sprite.backdrop_color_matrix[2][1], sprite.backdrop_color_matrix[2][2], sprite.backdrop_color_matrix[2][3]),
     float4(sprite.backdrop_color_offset[0], sprite.backdrop_color_offset[1], sprite.backdrop_color_offset[2], sprite.backdrop_color_offset[3]),
     float4(sprite.backdrop_lens[0], sprite.backdrop_lens[1], sprite.backdrop_lens[2], sprite.backdrop_lens[3]),
-    float4(sprite.backdrop_lens_lighting[0], sprite.backdrop_lens_lighting[1], sprite.backdrop_lens_lighting[2], sprite.backdrop_lens_lighting[3])
+    float4(sprite.backdrop_lens_lighting[0], sprite.backdrop_lens_lighting[1], sprite.backdrop_lens_lighting[2], sprite.backdrop_lens_lighting[3]),
+    sprite.source_mask_mode
   };
 }
 
@@ -959,9 +963,27 @@ float group_shape_sdf(float2 point, float4 bounds, float4 corner_radii, float ex
   return d_inset - corner_radius;
 }
 
-float group_source_mask_alpha(float2 point, GroupSpriteVertexOutput input) {
+float group_source_mask_alpha(texture2d<float> source_mask_texture,
+                              float2 point,
+                              GroupSpriteVertexOutput input) {
   if (input.source_mask_enabled <= 0.0) {
     return 1.0;
+  }
+
+  if (input.source_mask_mode == 1) {
+    // Sampled arbitrary-path coverage: the mask was rasterized in the same
+    // screen/device space as all group geometry, so its UV is the same
+    // screen-space UV the intermediate/backdrop textures use. The premultiplied
+    // forced-white path fill means `.a` is the clean scalar coverage.
+    // Nearest, to match the wgpu group sampler: the mask is a full-viewport
+    // texture sampled at integer fragment centers, so nearest reads the exact
+    // texel (anti-aliasing is already baked into the mask by the MSAA path
+    // rasterization). A linear sampler on both backends would only be needed if
+    // the mask were ever sampled at fractional UVs.
+    constexpr sampler source_mask_sampler(mag_filter::nearest, min_filter::nearest);
+    // texture_pixel_size = 1 / viewport, so uv = point / viewport = point * texture_pixel_size.
+    float2 uv = point * input.texture_pixel_size;
+    return saturate(source_mask_texture.sample(source_mask_sampler, uv).a);
   }
 
   float exponent = input.group_shape_params.x == 1.0 ? input.group_shape_params.y : 2.0;
@@ -1055,15 +1077,17 @@ float4 sample_backdrop_texture_linear(texture2d<float> backdrop_texture,
 
 float4 sample_group_source(texture2d<float> intermediate_texture,
                            sampler intermediate_texture_sampler,
+                           texture2d<float> source_mask_texture,
                            float2 coords,
                            float2 point,
                            GroupSpriteVertexOutput input) {
   return sample_group_texture(intermediate_texture, intermediate_texture_sampler, coords) *
-         group_source_mask_alpha(point, input);
+         group_source_mask_alpha(source_mask_texture, point, input);
 }
 
 float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
                                    sampler intermediate_texture_sampler,
+                                   texture2d<float> source_mask_texture,
                                    float2 coords,
                                    float2 point,
                                    float2 pixel_size,
@@ -1089,6 +1113,7 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
           dcolor += sample_group_source(
               intermediate_texture,
               intermediate_texture_sampler,
+              source_mask_texture,
               coords + off * pixel_size,
               point + off,
               input) * w;
@@ -1108,11 +1133,11 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
     if (input.source_mask_blur_order == 1) {
       return dblurred;
     }
-    return dblurred * group_source_mask_alpha(point, input);
+    return dblurred * group_source_mask_alpha(source_mask_texture, point, input);
   }
 
   if (sigma <= 0.0) {
-    return sample_group_source(intermediate_texture, intermediate_texture_sampler, coords, point, input);
+    return sample_group_source(intermediate_texture, intermediate_texture_sampler, source_mask_texture, coords, point, input);
   }
 
   int radius = min(int(ceil(3.0 * sigma)), 24);
@@ -1128,6 +1153,7 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
             color += sample_group_source(
                 intermediate_texture,
                 intermediate_texture_sampler,
+                source_mask_texture,
                 coords + offset * pixel_size,
                 point + offset,
                 input) * weight;
@@ -1150,7 +1176,7 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
   if (input.source_mask_blur_order == 1) {
     return blurred;
   }
-  return blurred * group_source_mask_alpha(point, input);
+  return blurred * group_source_mask_alpha(source_mask_texture, point, input);
 }
 
 float4 sample_backdrop_blurred(texture2d<float> backdrop_texture,
@@ -1322,13 +1348,14 @@ float4 sample_backdrop_lensed(texture2d<float> backdrop_texture,
 
 float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
                                  sampler intermediate_texture_sampler,
+                                 texture2d<float> source_mask_texture,
                                  float2 coords,
                                  float2 point,
                                  float2 pixel_size,
                                  float sigma,
                                  GroupSpriteVertexOutput input) {
   if (sigma <= 0.0) {
-    return sample_group_source(intermediate_texture, intermediate_texture_sampler, coords, point, input).a;
+    return sample_group_source(intermediate_texture, intermediate_texture_sampler, source_mask_texture, coords, point, input).a;
   }
 
   int radius = min(int(ceil(3.0 * sigma)), 24);
@@ -1343,6 +1370,7 @@ float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
           alpha += sample_group_source(
               intermediate_texture,
               intermediate_texture_sampler,
+              source_mask_texture,
               coords + offset * pixel_size,
               point + offset,
               input).a * weight;
@@ -1423,6 +1451,7 @@ float4 apply_group_source_color_filter(float4 sample, GroupSpriteVertexOutput in
 
 float4 sample_processed_content(texture2d<float> intermediate_texture,
                                 sampler intermediate_texture_sampler,
+                                texture2d<float> source_mask_texture,
                                 float2 coords,
                                 float2 point,
                                 float2 pixel_size,
@@ -1430,6 +1459,7 @@ float4 sample_processed_content(texture2d<float> intermediate_texture,
   float4 sample = sample_group_source_blurred(
       intermediate_texture,
       intermediate_texture_sampler,
+      source_mask_texture,
       coords,
       point,
       pixel_size,
@@ -1440,6 +1470,7 @@ float4 sample_processed_content(texture2d<float> intermediate_texture,
 
 float4 sample_processed_content_glow(texture2d<float> intermediate_texture,
                                      sampler intermediate_texture_sampler,
+                                     texture2d<float> source_mask_texture,
                                      float2 coords,
                                      float2 point,
                                      float2 pixel_size,
@@ -1449,6 +1480,7 @@ float4 sample_processed_content_glow(texture2d<float> intermediate_texture,
     float4 sample = sample_processed_content(
         intermediate_texture,
         intermediate_texture_sampler,
+        source_mask_texture,
         coords,
         point,
         pixel_size,
@@ -1472,6 +1504,7 @@ float4 sample_processed_content_glow(texture2d<float> intermediate_texture,
           float4 sample = sample_processed_content(
               intermediate_texture,
               intermediate_texture_sampler,
+              source_mask_texture,
               coords + offset * pixel_size,
               point + offset,
               pixel_size,
@@ -1575,7 +1608,8 @@ float4 apply_group_blend_mode(float4 sample, float4 backdrop, uint mode) {
 fragment float4 group_sprite_fragment(
   GroupSpriteVertexOutput input [[stage_in]],
   texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]],
-  texture2d<float> backdrop_texture [[texture(SpriteInputIndex_BackdropTexture)]]
+  texture2d<float> backdrop_texture [[texture(SpriteInputIndex_BackdropTexture)]],
+  texture2d<float> source_mask_texture [[texture(SpriteInputIndex_SourceMaskTexture)]]
 ) {
   constexpr sampler intermediate_texture_sampler(mag_filter::nearest, min_filter::nearest);
   if (input.effect_kind == 1) {
@@ -1584,6 +1618,7 @@ fragment float4 group_sprite_fragment(
     float alpha = sample_group_alpha_blurred(
         intermediate_texture,
         intermediate_texture_sampler,
+        source_mask_texture,
         sample_coords,
         sample_point,
         input.texture_pixel_size,
@@ -1603,6 +1638,7 @@ fragment float4 group_sprite_fragment(
     return sample_processed_content_glow(
         intermediate_texture,
         intermediate_texture_sampler,
+        source_mask_texture,
         input.texture_coords,
         input.screen_position,
         input.texture_pixel_size,
@@ -1612,6 +1648,7 @@ fragment float4 group_sprite_fragment(
   float4 sample = sample_group_source_blurred(
       intermediate_texture,
       intermediate_texture_sampler,
+      source_mask_texture,
       input.texture_coords,
       input.screen_position,
       input.texture_pixel_size,

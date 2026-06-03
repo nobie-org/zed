@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point, px, transparent_black,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point, px, solid_background,
+    transparent_black,
 };
 use std::{
     fmt::Debug,
@@ -880,6 +881,12 @@ pub enum CompositeEffect {
     SourceDirectionalBlur(Point<Pixels>),
     SourceMask(GroupShape),
     SourceMaskBeforeBlur(GroupShape),
+    /// Clips the composited source/content image by an arbitrary filled path,
+    /// rasterized as a coverage mask in the same screen/device space as the
+    /// group. Unlike [`SourceMask`], this is not restricted to the analytic
+    /// rounded-rect/superellipse family. When both are present on a group, the
+    /// path mask wins for the source mask.
+    SourceMaskPath(Arc<Path<Pixels>>),
     BackdropColorFilter(SourceColorFilter),
     BackdropBlur(Pixels),
     BackdropLens(CompositeBackdropLens<Pixels>),
@@ -1095,6 +1102,16 @@ impl CompositeEffect {
         Self::SourceMaskBeforeBlur(shape)
     }
 
+    /// Clips the composited source/content image by an arbitrary filled path.
+    ///
+    /// The path is rasterized into a coverage mask in the group's screen/device
+    /// space; its alpha selects the source. This is the first multi-pass group
+    /// effect and only feeds the source-mask consumer (not material shape or
+    /// surface shadow).
+    pub fn source_mask_path(path: Arc<Path<Pixels>>) -> Self {
+        Self::SourceMaskPath(path)
+    }
+
     /// Applies a Gaussian blur to the already-rendered backdrop under the group.
     pub fn backdrop_blur(radius: Pixels) -> Self {
         Self::BackdropBlur(Pixels(radius.0.max(0.)))
@@ -1188,6 +1205,7 @@ impl CompositeEffect {
             }
             Self::SourceMask(_) => false,
             Self::SourceMaskBeforeBlur(_) => false,
+            Self::SourceMaskPath(_) => false,
             Self::BackdropColorFilter(filter) => filter.is_identity(),
             Self::BackdropBlur(radius) => radius.0 <= f32::EPSILON,
             Self::BackdropLens(lens) => lens.is_identity(),
@@ -1215,6 +1233,7 @@ impl CompositeEffect {
             | Self::SourceDirectionalBlur(_)
             | Self::SourceMask(_)
             | Self::SourceMaskBeforeBlur(_)
+            | Self::SourceMaskPath(_)
             | Self::DropShadow(_)
             | Self::SurfaceShadow(_)
             | Self::ProcessedContentGlow(_)
@@ -2178,7 +2197,8 @@ impl RenderGroupDependencies {
     fn from_effect_plan(effects: &[CompositeEffect], normalized: &CompositeEffectPlan) -> Self {
         let source_pixels = plan_has_visual_work(effects, normalized);
         let source_alpha = !normalized.drop_shadows().is_empty();
-        let source_mask = normalized.source_mask().is_some();
+        let source_mask =
+            normalized.source_mask().is_some() || normalized.source_mask_path().is_some();
         let backdrop_pixels = normalized.has_backdrop_material();
         let destination_pixels = normalized.blend_mode() != CompositeBlendMode::Normal;
         let material_shape = (normalized.material_shape().is_some()
@@ -2308,6 +2328,7 @@ pub enum RenderGroupCapabilityProbe {
     DirectionalBlur,
     SourceDistortion,
     SourceMask,
+    PathSourceMask,
     TextCaptureFidelity,
     BackdropMaterial,
     BackdropLens,
@@ -2345,6 +2366,7 @@ impl RenderGroupCapabilityProbe {
         match self {
             Self::SourceColor
             | Self::SourceMask
+            | Self::PathSourceMask
             | Self::BackdropMaterial
             | Self::BackdropLens
             | Self::MaterialLighting
@@ -3080,6 +3102,7 @@ pub struct CompositeEffectPlan {
     source_mask: Option<Corners<ScaledPixels>>,
     source_mask_shape: GroupShapeKind,
     source_mask_blur_order: SourceMaskBlurOrder,
+    source_mask_path: Option<Arc<Path<ScaledPixels>>>,
     backdrop_color_filter: SourceColorFilter,
     backdrop_blur_radius: ScaledPixels,
     backdrop_lens: Option<CompositeBackdropLens<ScaledPixels>>,
@@ -3164,6 +3187,7 @@ impl CompositeEffectPlan {
             source_mask: None,
             source_mask_shape: GroupShapeKind::RoundedRect,
             source_mask_blur_order: SourceMaskBlurOrder::AfterBlur,
+            source_mask_path: None,
             backdrop_color_filter: SourceColorFilter::identity(),
             backdrop_blur_radius: ScaledPixels(0.),
             backdrop_lens: None,
@@ -3204,6 +3228,18 @@ impl CompositeEffectPlan {
                     plan.source_mask = Some(shape.corner_radii().scale(scale_factor));
                     plan.source_mask_shape = shape.shape_kind();
                     plan.source_mask_blur_order = SourceMaskBlurOrder::BeforeBlur;
+                }
+                CompositeEffect::SourceMaskPath(path) => {
+                    // Scale the mesh into device space (the same space all group
+                    // geometry lives in) and force the fill to opaque white so the
+                    // rasterized coverage lands cleanly in the mask's alpha
+                    // channel (`mask.a == coverage`). The path mask wins over any
+                    // analytic source mask: the renderer selects sampled mode when
+                    // `source_mask_path` is set.
+                    let mut scaled = path.scale(scale_factor);
+                    scaled.color = solid_background(Hsla::white());
+                    plan.source_mask_path = Some(Arc::new(scaled));
+                    plan.source_mask_blur_order = SourceMaskBlurOrder::AfterBlur;
                 }
                 CompositeEffect::BackdropColorFilter(filter) => {
                     plan.backdrop_color_filter = plan.backdrop_color_filter.then(*filter);
@@ -3299,6 +3335,15 @@ impl CompositeEffectPlan {
     /// Returns whether source masking happens before or after source blur.
     pub fn source_mask_blur_order(&self) -> SourceMaskBlurOrder {
         self.source_mask_blur_order
+    }
+
+    /// Returns the optional arbitrary-path source mask in device pixels.
+    ///
+    /// When present, the renderer rasterizes this path into a coverage mask and
+    /// selects sampled source-mask mode; the path mask supersedes any analytic
+    /// [`source_mask`](Self::source_mask) for source clipping.
+    pub fn source_mask_path(&self) -> Option<&Arc<Path<ScaledPixels>>> {
+        self.source_mask_path.as_ref()
     }
 
     /// Returns the normalized backdrop color filter.
@@ -3420,6 +3465,7 @@ impl CompositeEffectPlan {
                 | CompositeEffect::SourceColorFilter(_)
                 | CompositeEffect::SourceMask(_)
                 | CompositeEffect::SourceMaskBeforeBlur(_)
+                | CompositeEffect::SourceMaskPath(_)
                 | CompositeEffect::BackdropColorFilter(_)
                 | CompositeEffect::BackdropTint(_)
                 | CompositeEffect::BlendMode(_)
@@ -3436,7 +3482,7 @@ impl CompositeEffectPlan {
 pub struct PathId(pub usize);
 
 /// A line made up of a series of vertices and control points.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[expect(missing_docs)]
 pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub id: PathId,
@@ -3580,7 +3626,7 @@ impl From<Path<ScaledPixels>> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {

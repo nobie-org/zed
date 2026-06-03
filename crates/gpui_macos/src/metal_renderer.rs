@@ -2560,6 +2560,45 @@ mod tests {
         rgba(0x000000ff).into()
     }
 
+    fn red() -> Hsla {
+        rgba(0xff0000ff).into()
+    }
+
+    fn gray() -> Hsla {
+        rgba(0x808080ff).into()
+    }
+
+    #[test]
+    fn render_group_sepia_tones_source_red_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::sepia()],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), red())]),
+        ));
+        grouped.finish();
+
+        assert_eq!(pixel(&render(&grouped), 12, 12), [100, 89, 69, 255]);
+    }
+
+    #[test]
+    fn render_group_hue_rotate_keeps_gray_fixed_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::hue_rotate(120.)],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]),
+        ));
+        grouped.finish();
+
+        // Neutral gray is a fixed point of hue rotation.
+        assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+    }
+
     fn render(scene: &Scene) -> RgbaImage {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
         let device = MetalRenderer::create_device();

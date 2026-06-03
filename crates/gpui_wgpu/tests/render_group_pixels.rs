@@ -6,9 +6,12 @@ use std::sync::Arc;
 use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
-    LogicalVisualPlan, LumaThreshold, MonochromeSprite, PaintGroup, Path, Pixels, PlatformAtlas,
-    PlatformHeadlessRenderer, PolychromeSprite, Quad, RenderGroupBackendCounters,
-    RenderImageParams, RenderSvgParams, ScaledPixels, Scene, TransformationMatrix, point, px, rgba,
+    LogicalVisualPlan, LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer,
+    RenderImageParams, RenderSvgParams, ScaledPixels, point, px, rgba,
+    scene_protocol::{
+        MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad, RenderGroupBackendCounters,
+        Scene, TransformationMatrix,
+    },
     size, transparent_black,
 };
 use gpui_wgpu::WgpuHeadlessRenderer;
@@ -817,7 +820,8 @@ fn render_group_directional_blur_smears_along_x_only() {
         "horizontal blur should smear green into +x neighbor: {smeared_x:?}"
     );
     assert_eq!(
-        cross_axis_y, [0, 0, 0, 255],
+        cross_axis_y,
+        [0, 0, 0, 255],
         "horizontal blur must not smear vertically: {cross_axis_y:?}"
     );
 }
@@ -853,7 +857,8 @@ fn render_group_directional_blur_smears_along_y_only() {
         "vertical blur should smear green into +y neighbor: {smeared_y:?}"
     );
     assert_eq!(
-        cross_axis_x, [0, 0, 0, 255],
+        cross_axis_x,
+        [0, 0, 0, 255],
         "vertical blur must not smear horizontally: {cross_axis_x:?}"
     );
 }

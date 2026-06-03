@@ -30,6 +30,7 @@ use windows::{
 
 use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
+use gpui::scene_protocol::Scene;
 use gpui::*;
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);

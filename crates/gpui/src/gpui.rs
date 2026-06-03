@@ -41,6 +41,18 @@ pub mod profiler;
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
+/// Renderer-facing scene storage and batching protocol.
+///
+/// This module is public for the platform renderer crates. Application code
+/// should use GPUI's author-facing paint and render-group APIs instead of
+/// constructing these storage records directly.
+pub mod scene_protocol {
+    pub use crate::scene::{
+        CompositeEffectPlan, DrawOrder, MonochromeSprite, PaintGroup, PaintSurface, Path, PathId,
+        PathVertex, PathVertex_ScaledPixels, PolychromeSprite, Primitive, PrimitiveBatch, Quad,
+        RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite, TransformationMatrix, Underline,
+    };
+}
 mod shared_uri;
 mod style;
 mod styled;
@@ -107,7 +119,23 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
-pub use scene::*;
+pub use scene::{
+    BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
+    CompositeEffect, CompositeProcessedContentGlow, CompositeProcessedContentGlowPlan,
+    CompositeSurfaceShadow, ContentLayer, ContentStage, DerivedLayer, DerivedStage, DrawOrder,
+    GlassLens, GlassSurface, Glow, GroupShape, GroupShapeKind, LogicalVisualPlan, LumaThreshold,
+    Path, PathId, PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan,
+    ProcessedContentDerivedLayer, RenderGroupBackendCounters, RenderGroupCapabilityProbe,
+    RenderGroupCapabilityRejectionReason, RenderGroupCapabilityReport, RenderGroupCapabilityStatus,
+    RenderGroupDependencies, RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
+    RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+    RenderGroupSupportCounters, SemanticRenderGroupSpec, SourceColorFilter, SourceMaskBlurOrder,
+    SourceToneOp, TransformationMatrix,
+};
+pub(crate) use scene::{
+    MonochromeSprite, PaintGroup, PaintSurface, PolychromeSprite, Quad, Scene, Shadow,
+    SubpixelSprite, Underline,
+};
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;

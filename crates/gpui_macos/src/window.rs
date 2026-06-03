@@ -31,7 +31,7 @@ use gpui::{
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformInputSimulator, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
-    WindowParams, nobie_platform_trace, point, px, size,
+    WindowParams, nobie_platform_trace, point, px, scene_protocol::Scene, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1666,12 +1666,12 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
-    fn draw(&self, scene: &gpui::Scene) {
+    fn draw(&self, scene: &Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
     }
 
-    fn capture_scene(&self, scene: &gpui::Scene) -> gpui::Result<gpui::SceneCapture> {
+    fn capture_scene(&self, scene: &Scene) -> gpui::Result<gpui::SceneCapture> {
         #[cfg(any(test, feature = "test-support"))]
         {
             let mut this = self.0.lock();
@@ -1775,7 +1775,7 @@ impl PlatformWindow for MacWindow {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
+    fn render_to_image(&self, scene: &Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
     }

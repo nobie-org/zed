@@ -2268,8 +2268,8 @@ impl RenderGroupCapabilityProbe {
             Self::BackendDiagnostics => RenderGroupCapabilityReport::inspector_only(
                 self,
                 Reason::BackendDiagnosticsMissing,
-                "support counters are planned; backend diagnostic counters are not wired yet",
-                "connect actual copied pixels, texture-pool behavior, shader variants, and timing",
+                "intermediate-texture and backdrop-copy counts are measured by the wgpu and metal backends and validated against the planner; copied pixels, texture-pool behavior, shader variants, and timing are not wired",
+                "connect the remaining backend diagnostic counters (copied pixels, texture-pool behavior, shader variants, timing)",
             ),
             Self::SourceDistortion => RenderGroupCapabilityReport::unsupported(
                 self,

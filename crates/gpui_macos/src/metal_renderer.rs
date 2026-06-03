@@ -9,7 +9,8 @@ use cocoa::{
 use gpui::{
     AtlasTextureId, Background, Bounds, CompositeEffectPlan, ContentMask, Corners, DevicePixels,
     MonochromeSprite, PaintGroup, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
-    Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
+    Quad, RenderGroupBackendCounters, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point,
+    size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use gpui::{SceneCapture, SceneCaptureBackend};
@@ -141,6 +142,8 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    /// Measured render-group resource counts from the most recent scene render.
+    last_render_group_counters: Option<RenderGroupBackendCounters>,
 }
 
 #[repr(C)]
@@ -360,6 +363,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            last_render_group_counters: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -919,6 +923,7 @@ impl MetalRenderer {
             let alpha = if self.opaque { 1. } else { 0. };
             let mut instance_offset = 0;
 
+            self.last_render_group_counters = Some(RenderGroupBackendCounters::default());
             let ok = self.encode_primitives_to_texture(
                 scene,
                 instance_buffer,
@@ -976,6 +981,7 @@ impl MetalRenderer {
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
 
+        self.last_render_group_counters = Some(RenderGroupBackendCounters::default());
         let ok = self.encode_primitives_to_texture(
             scene,
             instance_buffer,
@@ -1226,6 +1232,14 @@ impl MetalRenderer {
         true
     }
 
+    /// Measured render-group resource counts from the most recent scene render
+    /// (group intermediate textures + backdrop copies), or `None` if no scene has
+    /// rendered. Validated against the planner's `RenderGroupSupportCounters` in
+    /// the metal render-group tests.
+    pub fn render_group_backend_counters(&self) -> Option<RenderGroupBackendCounters> {
+        self.last_render_group_counters
+    }
+
     fn draw_groups(
         &mut self,
         groups: &[PaintGroup],
@@ -1244,6 +1258,9 @@ impl MetalRenderer {
             let Some(group_texture) = self.new_group_intermediate_texture(viewport_size) else {
                 return false;
             };
+            if let Some(counters) = self.last_render_group_counters.as_mut() {
+                counters.intermediate_textures += 1;
+            }
 
             if !self.encode_primitives_to_texture(
                 group.scene.as_ref(),
@@ -1265,6 +1282,10 @@ impl MetalRenderer {
                     return false;
                 };
                 backdrop_texture = texture;
+                if let Some(counters) = self.last_render_group_counters.as_mut() {
+                    counters.intermediate_textures += 1;
+                    counters.backdrop_copies += 1;
+                }
                 &backdrop_texture
             } else {
                 &group_texture
@@ -2481,8 +2502,8 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeEffect, Edges, Hsla, LogicalVisualPlan, PaintGroup, px, rgba,
-        transparent_black,
+        BorderStyle, CompositeEffect, Edges, Hsla, LogicalVisualPlan, PaintGroup,
+        RenderGroupBackendCounters, px, rgba, transparent_black,
     };
     use image::RgbaImage;
     use std::sync::Arc;
@@ -2551,8 +2572,195 @@ mod tests {
             .expect("render metal scene")
     }
 
+    fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
+        let mut scene = Scene::default();
+        for primitive in primitives {
+            scene.insert_primitive(primitive);
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Render `scene` headlessly and return the metal backend's measured counters.
+    fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let device = MetalRenderer::create_device();
+        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
+        renderer
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render metal scene");
+        renderer
+            .render_group_backend_counters()
+            .expect("counters recorded after a successful render")
+    }
+
+    /// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
+    fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
+        let counters = group.plan.support_counters(group.capture_bounds);
+        RenderGroupBackendCounters {
+            intermediate_textures: counters.intermediate_textures,
+            backdrop_copies: counters.backdrop_copies,
+        }
+    }
+
     fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
         image.get_pixel(x, y).0
+    }
+
+    #[test]
+    fn backend_counters_match_planner_for_opacity_group_metal() {
+        let group = paint_group_with_effects(
+            1,
+            rect(4., 4., 16., 16.),
+            vec![CompositeEffect::opacity(0.5)],
+            finished_scene([quad(0, rect(4., 4., 16., 16.), black())]),
+        );
+        let predicted = predicted_counters(&group);
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 1,
+                backdrop_copies: 0,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(group);
+        scene.finish();
+
+        assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn backend_counters_match_planner_for_backdrop_blur_group_metal() {
+        let group = paint_group_with_effects(
+            1,
+            rect(4., 4., 16., 16.),
+            vec![CompositeEffect::backdrop_blur(px(4.))],
+            finished_scene([quad(0, rect(6., 6., 8., 8.), black())]),
+        );
+        let predicted = predicted_counters(&group);
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 2,
+                backdrop_copies: 1,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(group);
+        scene.finish();
+
+        assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn backend_counters_sum_across_sibling_groups_metal() {
+        let opacity_group = paint_group_with_effects(
+            1,
+            rect(2., 2., 10., 10.),
+            vec![CompositeEffect::opacity(0.5)],
+            finished_scene([quad(0, rect(2., 2., 10., 10.), black())]),
+        );
+        let backdrop_group = paint_group_with_effects(
+            2,
+            rect(14., 14., 12., 12.),
+            vec![CompositeEffect::backdrop_blur(px(4.))],
+            finished_scene([quad(0, rect(16., 16., 6., 6.), black())]),
+        );
+        let predicted = RenderGroupBackendCounters {
+            intermediate_textures: predicted_counters(&opacity_group).intermediate_textures
+                + predicted_counters(&backdrop_group).intermediate_textures,
+            backdrop_copies: predicted_counters(&opacity_group).backdrop_copies
+                + predicted_counters(&backdrop_group).backdrop_copies,
+        };
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 3,
+                backdrop_copies: 1,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(opacity_group);
+        scene.insert_primitive(backdrop_group);
+        scene.finish();
+
+        assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn backend_counters_zero_for_elided_opacity_zero_group_metal() {
+        let group = paint_group_with_effects(
+            1,
+            rect(4., 4., 16., 16.),
+            vec![CompositeEffect::opacity(0.0)],
+            finished_scene([quad(0, rect(4., 4., 16., 16.), black())]),
+        );
+        let predicted = predicted_counters(&group);
+        assert_eq!(predicted, RenderGroupBackendCounters::default());
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(group);
+        scene.finish();
+
+        assert_eq!(
+            backend_counters(&scene),
+            RenderGroupBackendCounters::default()
+        );
+    }
+
+    #[test]
+    fn backend_counters_match_planner_for_nested_groups_metal() {
+        let inner = paint_group_with_effects(
+            0,
+            rect(6., 6., 12., 12.),
+            vec![CompositeEffect::backdrop_blur(px(4.))],
+            finished_scene([quad(0, rect(8., 8., 6., 6.), black())]),
+        );
+        let inner_predicted = predicted_counters(&inner);
+
+        let mut inner_scene = Scene::default();
+        inner_scene.insert_primitive(quad(0, rect(4., 4., 20., 20.), black()));
+        inner_scene.insert_primitive(inner);
+        inner_scene.finish();
+
+        let outer = paint_group_with_effects(
+            1,
+            rect(4., 4., 20., 20.),
+            vec![CompositeEffect::opacity(0.5)],
+            inner_scene,
+        );
+        let outer_predicted = predicted_counters(&outer);
+
+        let predicted = RenderGroupBackendCounters {
+            intermediate_textures: outer_predicted.intermediate_textures
+                + inner_predicted.intermediate_textures,
+            backdrop_copies: outer_predicted.backdrop_copies + inner_predicted.backdrop_copies,
+        };
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 3,
+                backdrop_copies: 1,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(outer);
+        scene.finish();
+
+        assert_eq!(backend_counters(&scene), predicted);
     }
 
     #[test]

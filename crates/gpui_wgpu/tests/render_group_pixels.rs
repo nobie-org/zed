@@ -484,6 +484,78 @@ fn render_group_source_color_filter_preserves_source_alpha() {
 }
 
 #[test]
+fn render_group_hue_rotate_zero_is_identity() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::hue_rotate(0.)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    assert_eq!(pixel(&render(&grouped), 12, 12), [255, 0, 0, 255]);
+}
+
+#[test]
+fn render_group_hue_rotate_keeps_gray_fixed() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::hue_rotate(120.)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    // Neutral gray lies on the hue-rotation axis, so it is a fixed point.
+    assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+}
+
+#[test]
+fn render_group_sepia_tones_source_red() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::sepia()],
+        group_scene,
+    ));
+    grouped.finish();
+
+    assert_eq!(pixel(&render(&grouped), 12, 12), [100, 89, 69, 255]);
+}
+
+#[test]
+fn render_group_sepia_warm_biases_source_gray() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::sepia()],
+        group_scene,
+    ));
+    grouped.finish();
+
+    let [r, g, b, a] = pixel(&render(&grouped), 12, 12);
+    // Sepia warms neutral gray into a R > G > B ramp, preserving opacity.
+    assert!(r > g && g > b, "expected warm sepia ramp, got {:?}", [r, g, b, a]);
+    assert_eq!([r, g, b, a], [173, 154, 120, 255]);
+}
+
+#[test]
 fn render_group_source_color_filters_are_ordered() {
     let first_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);
     let second_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), red())]);

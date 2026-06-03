@@ -958,6 +958,16 @@ impl CompositeEffect {
         Self::SourceColorFilter(SourceColorFilter::color_matrix(matrix, offset))
     }
 
+    /// Rotates source hue by `degrees` around the gray axis.
+    pub fn hue_rotate(degrees: f32) -> Self {
+        Self::SourceColorFilter(SourceColorFilter::hue_rotate(degrees))
+    }
+
+    /// Applies a sepia tone to source color.
+    pub fn sepia() -> Self {
+        Self::SourceColorFilter(SourceColorFilter::sepia())
+    }
+
     /// Multiplies backdrop color channels by `factor`.
     pub fn backdrop_brightness(factor: f32) -> Self {
         Self::BackdropColorFilter(SourceColorFilter::brightness(factor))
@@ -2803,6 +2813,45 @@ impl SourceColorFilter {
     /// Returns an affine source-color matrix over unpremultiplied RGB.
     pub fn color_matrix(matrix: [[f32; 3]; 3], offset: [f32; 3]) -> Self {
         Self { matrix, offset }
+    }
+
+    /// Returns a filter that rotates source hue by `degrees` around the gray
+    /// axis. Uses the same luma basis as `saturate`/`grayscale`, so neutral gray
+    /// is a fixed point and 0 / 360 degrees are the identity.
+    pub fn hue_rotate(degrees: f32) -> Self {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let luma = [0.2126, 0.7152, 0.0722];
+        // SVG `feColorMatrix type="hueRotate"` sin-generator keyed to `luma`;
+        // every row sums to 0, which keeps neutral gray unchanged.
+        let sin_gen = [
+            [-luma[0], -luma[1], 1. - luma[2]],
+            [0.143, 0.140, -0.283],
+            [-(1. - luma[0]), luma[1], luma[2]],
+        ];
+        let mut matrix = [[0.; 3]; 3];
+        for row in 0..3 {
+            for column in 0..3 {
+                let base = luma[column];
+                let identity = if row == column { 1. } else { 0. };
+                matrix[row][column] = base + cos * (identity - base) + sin * sin_gen[row][column];
+            }
+        }
+        Self {
+            matrix,
+            offset: [0., 0., 0.],
+        }
+    }
+
+    /// Returns a filter that applies a sepia tone to source color.
+    pub fn sepia() -> Self {
+        Self {
+            matrix: [
+                [0.393, 0.769, 0.189],
+                [0.349, 0.686, 0.168],
+                [0.272, 0.534, 0.131],
+            ],
+            offset: [0., 0., 0.],
+        }
     }
 
     /// Returns the filter produced by applying `self` and then `next`.

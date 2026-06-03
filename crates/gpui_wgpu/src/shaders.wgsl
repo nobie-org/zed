@@ -1142,7 +1142,8 @@ struct GroupSprite {
     color_offset: vec4<f32>,
     backdrop_active: f32,
     blend_mode: u32,
-    pad0: vec2<u32>,
+    source_tone_op: u32,
+    source_tone_param: f32,
     backdrop_tint: vec4<f32>,
     backdrop_color_matrix: array<vec4<f32>, 4>,
     backdrop_color_offset: vec4<f32>,
@@ -1536,17 +1537,36 @@ fn sample_material_alpha_blurred(point: vec2<f32>, sigma: f32, sprite: GroupSpri
     return alpha / total;
 }
 
+fn apply_source_tone(rgb: vec3<f32>, op: u32, param: f32) -> vec3<f32> {
+    if (op == 1u) {
+        // Posterize to `param` bands; the trailing clamp pulls the c==1 overshoot to 1.
+        return floor(rgb * param) / max(param - 1.0, 1.0);
+    }
+    if (op == 2u) {
+        // Threshold to black/white by luma.
+        let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        return vec3<f32>(step(param, luma));
+    }
+    if (op == 3u) {
+        // Solarize: invert channels at or above the threshold.
+        return mix(rgb, vec3<f32>(1.0) - rgb, step(vec3<f32>(param), rgb));
+    }
+    return rgb;
+}
+
 fn apply_group_source_color_filter(sample: vec4<f32>, sprite: GroupSprite) -> vec4<f32> {
     if (sample.a <= 0.0) {
         return sample;
     }
 
     let rgba = vec4<f32>(sample.rgb / sample.a, sample.a);
-    let rgb = clamp(vec3<f32>(
+    var rgb = vec3<f32>(
         dot(sprite.color_matrix[0], rgba) + sprite.color_offset.x,
         dot(sprite.color_matrix[1], rgba) + sprite.color_offset.y,
         dot(sprite.color_matrix[2], rgba) + sprite.color_offset.z,
-    ), vec3<f32>(0.0), vec3<f32>(1.0));
+    );
+    rgb = apply_source_tone(rgb, sprite.source_tone_op, sprite.source_tone_param);
+    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
 
     return vec4<f32>(rgb * sample.a, sample.a);
 }

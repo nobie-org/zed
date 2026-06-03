@@ -2876,6 +2876,49 @@ mod tests {
     }
 
     #[test]
+    fn render_group_duotone_black_white_is_grayscale_metal() {
+        let mut grouped = Scene::default();
+        grouped.insert_primitive(quad(0, viewport(), black()));
+        grouped.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::duotone(rgba(0x000000ff), rgba(0xffffffff))],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), gray())]),
+        ));
+        grouped.finish();
+
+        // duotone(black, white) == grayscale; gray(0.502) luma stays 128.
+        assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn render_group_duotone_maps_luma_to_color_gradient_metal() {
+        // duotone(blue, yellow): white source (luma 1) -> yellow endpoint.
+        let mut light = Scene::default();
+        light.insert_primitive(quad(0, viewport(), black()));
+        light.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::duotone(rgba(0x0000ffff), rgba(0xffff00ff))],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), white())]),
+        ));
+        light.finish();
+        assert_eq!(pixel(&render(&light), 12, 12), [255, 255, 0, 255]);
+
+        // Black source (luma 0) -> blue endpoint.
+        let mut dark = Scene::default();
+        dark.insert_primitive(quad(0, viewport(), black()));
+        dark.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 8., 8.),
+            vec![CompositeEffect::duotone(rgba(0x0000ffff), rgba(0xffff00ff))],
+            finished_scene([quad(0, rect(8., 8., 8., 8.), black())]),
+        ));
+        dark.finish();
+        assert_eq!(pixel(&render(&dark), 12, 12), [0, 0, 255, 255]);
+    }
+
+    #[test]
     fn render_group_hue_rotate_keeps_gray_fixed_metal() {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));

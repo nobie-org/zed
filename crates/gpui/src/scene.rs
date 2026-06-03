@@ -1742,6 +1742,9 @@ pub enum CompositeBlendMode {
     Darken,
     Lighten,
     PlusLighter,
+    Difference,
+    Exclusion,
+    HardLight,
 }
 
 impl CompositeBlendMode {
@@ -1755,6 +1758,9 @@ impl CompositeBlendMode {
             Self::Darken => 4,
             Self::Lighten => 5,
             Self::PlusLighter => 6,
+            Self::Difference => 7,
+            Self::Exclusion => 8,
+            Self::HardLight => 9,
         }
     }
 }

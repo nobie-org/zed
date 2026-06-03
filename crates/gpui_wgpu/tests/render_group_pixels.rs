@@ -551,7 +551,11 @@ fn render_group_sepia_warm_biases_source_gray() {
 
     let [r, g, b, a] = pixel(&render(&grouped), 12, 12);
     // Sepia warms neutral gray into a R > G > B ramp, preserving opacity.
-    assert!(r > g && g > b, "expected warm sepia ramp, got {:?}", [r, g, b, a]);
+    assert!(
+        r > g && g > b,
+        "expected warm sepia ramp, got {:?}",
+        [r, g, b, a]
+    );
     assert_eq!([r, g, b, a], [173, 154, 120, 255]);
 }
 
@@ -1266,6 +1270,61 @@ fn render_group_blend_mode_applies_at_group_boundary() {
     grouped.finish();
 
     assert_eq!(pixel(&render(&grouped), 12, 12), [64, 64, 128, 255]);
+}
+
+#[test]
+fn render_group_difference_blend_mode_applies_at_group_boundary() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), white())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), rgba(0x0000ffff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::blend_mode(CompositeBlendMode::Difference)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    // |white - blue| = yellow.
+    assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 0, 255]);
+}
+
+#[test]
+fn render_group_exclusion_blend_mode_applies_at_group_boundary() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), white())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), rgba(0xffffffff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::blend_mode(CompositeBlendMode::Exclusion)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    // white exclusion white = black (s + b - 2sb = 0).
+    assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
+}
+
+#[test]
+fn render_group_hard_light_blend_mode_applies_at_group_boundary() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), white())]);
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), rgba(0x808080ff)));
+    grouped.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 8., 8.),
+        vec![CompositeEffect::blend_mode(CompositeBlendMode::HardLight)],
+        group_scene,
+    ));
+    grouped.finish();
+
+    // Hard-light with a white source takes the screen branch to full white
+    // (vs Multiply, which would leave the gray backdrop).
+    assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 255, 255]);
 }
 
 // --- Descendant capture: text (monochrome sprites) ---------------------------

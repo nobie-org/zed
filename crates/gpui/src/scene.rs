@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point, transparent_black,
+    Point, Radians, Rgba, ScaledPixels, Size, bounds_tree::BoundsTree, point, px, transparent_black,
 };
 use std::{
     fmt::Debug,
@@ -877,6 +877,7 @@ pub enum CompositeEffect {
     Opacity(f32),
     SourceColorFilter(SourceColorFilter),
     SourceBlur(Pixels),
+    SourceDirectionalBlur(Point<Pixels>),
     SourceMask(GroupShape),
     SourceMaskBeforeBlur(GroupShape),
     BackdropColorFilter(SourceColorFilter),
@@ -1071,6 +1072,19 @@ impl CompositeEffect {
         Self::SourceBlur(Pixels(radius.0.max(0.)))
     }
 
+    /// Applies a single-pass directional (motion) blur to the composited source
+    /// image along one vector.
+    ///
+    /// `angle` is in radians (`0` points along `+x`) and `length` is the blur
+    /// half-extent in pixels. The stored vector is `direction * length`, a
+    /// shader-friendly precomputed streak. When directional blur is active it
+    /// replaces the isotropic [`source_blur`](Self::source_blur) for source
+    /// sampling: if both are set on a group, directional blur wins.
+    pub fn directional_blur(angle: f32, length: Pixels) -> Self {
+        let l = length.0.max(0.);
+        Self::SourceDirectionalBlur(point(px(l * angle.cos()), px(l * angle.sin())))
+    }
+
     /// Clips the composited source/content image by a group shape.
     pub fn source_mask(shape: GroupShape) -> Self {
         Self::SourceMask(shape)
@@ -1169,6 +1183,9 @@ impl CompositeEffect {
             Self::Opacity(alpha) => (*alpha - 1.).abs() <= f32::EPSILON,
             Self::SourceColorFilter(filter) => filter.is_identity(),
             Self::SourceBlur(radius) => radius.0 <= f32::EPSILON,
+            Self::SourceDirectionalBlur(v) => {
+                v.x.0.abs() <= f32::EPSILON && v.y.0.abs() <= f32::EPSILON
+            }
             Self::SourceMask(_) => false,
             Self::SourceMaskBeforeBlur(_) => false,
             Self::BackdropColorFilter(filter) => filter.is_identity(),
@@ -1195,6 +1212,7 @@ impl CompositeEffect {
             Self::Opacity(_)
             | Self::SourceColorFilter(_)
             | Self::SourceBlur(_)
+            | Self::SourceDirectionalBlur(_)
             | Self::SourceMask(_)
             | Self::SourceMaskBeforeBlur(_)
             | Self::DropShadow(_)
@@ -2287,6 +2305,7 @@ pub enum RenderGroupLimitUnit {
 pub enum RenderGroupCapabilityProbe {
     SourceColor,
     ExactSourceBlur,
+    DirectionalBlur,
     SourceDistortion,
     SourceMask,
     TextCaptureFidelity,
@@ -2333,6 +2352,7 @@ impl RenderGroupCapabilityProbe {
             | Self::CompositeOpacity
             | Self::CompositeBlend
             | Self::RoundedGroupShape
+            | Self::DirectionalBlur
             | Self::SuperellipseGroupShape => RenderGroupCapabilityReport::rendered(
                 self,
                 "current normalized render-group plan has a backend path",
@@ -2609,6 +2629,11 @@ impl RenderGroupRequirements {
                     outset
                         .0
                         .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
+                ),
+                CompositeEffect::SourceDirectionalBlur(v) => ScaledPixels(
+                    outset
+                        .0
+                        .max(directional_kernel_outset(v.scale(scale_factor)).0),
                 ),
                 CompositeEffect::ProcessedContentGlow(glow) => {
                     if let Some(glow) = lower_processed_content_glow(scale_factor, glow) {
@@ -3051,6 +3076,7 @@ pub struct CompositeEffectPlan {
     opacity: f32,
     source_color_filter: SourceColorFilter,
     source_blur_radius: ScaledPixels,
+    source_directional_blur: Point<ScaledPixels>,
     source_mask: Option<Corners<ScaledPixels>>,
     source_mask_shape: GroupShapeKind,
     source_mask_blur_order: SourceMaskBlurOrder,
@@ -3113,6 +3139,16 @@ fn gaussian_kernel_outset(sigma: ScaledPixels) -> ScaledPixels {
     ScaledPixels((sigma.0 * 3.).min(24.))
 }
 
+/// Symmetric capture outset for a directional (motion) blur, in device pixels.
+///
+/// The directional shader caps its streak at `min(ceil(length), 24)` taps, so
+/// the capture region must dilate by at most 24 device pixels — matching
+/// [`gaussian_kernel_outset`]'s cap so the dilated intermediate is never larger
+/// than the kernel can reach.
+fn directional_kernel_outset(scaled: Point<ScaledPixels>) -> ScaledPixels {
+    ScaledPixels(scaled.x.0.abs().max(scaled.y.0.abs()).min(24.))
+}
+
 impl CompositeEffectPlan {
     /// Normalizes an ordered render-group effect list for renderer consumption.
     pub fn from_effects(
@@ -3124,6 +3160,7 @@ impl CompositeEffectPlan {
             opacity: boundary_opacity,
             source_color_filter: SourceColorFilter::identity(),
             source_blur_radius: ScaledPixels(0.),
+            source_directional_blur: point(ScaledPixels(0.), ScaledPixels(0.)),
             source_mask: None,
             source_mask_shape: GroupShapeKind::RoundedRect,
             source_mask_blur_order: SourceMaskBlurOrder::AfterBlur,
@@ -3152,6 +3189,11 @@ impl CompositeEffectPlan {
                     let radius = radius.scale(scale_factor);
                     plan.source_blur_radius =
                         ScaledPixels((plan.source_blur_radius.0.powi(2) + radius.0.powi(2)).sqrt());
+                }
+                CompositeEffect::SourceDirectionalBlur(v) => {
+                    // Directional blur does not compose with the isotropic source
+                    // blur; the last-declared directional vector wins.
+                    plan.source_directional_blur = v.scale(scale_factor);
                 }
                 CompositeEffect::SourceMask(shape) => {
                     plan.source_mask = Some(shape.corner_radii().scale(scale_factor));
@@ -3235,6 +3277,13 @@ impl CompositeEffectPlan {
     /// Returns the normalized Gaussian source blur radius in device pixels.
     pub fn source_blur_radius(&self) -> ScaledPixels {
         self.source_blur_radius
+    }
+
+    /// Returns the normalized directional (motion) blur half-extent vector in
+    /// device pixels. A zero vector means directional blur is inactive; when it
+    /// is active it replaces the isotropic source blur for source sampling.
+    pub fn source_directional_blur(&self) -> Point<ScaledPixels> {
+        self.source_directional_blur
     }
 
     /// Returns the optional source/content mask in device pixels.
@@ -3330,6 +3379,13 @@ impl CompositeEffectPlan {
                         outset
                             .0
                             .max(gaussian_kernel_outset(radius.scale(scale_factor)).0),
+                    );
+                }
+                CompositeEffect::SourceDirectionalBlur(v) => {
+                    outset = ScaledPixels(
+                        outset
+                            .0
+                            .max(directional_kernel_outset(v.scale(scale_factor)).0),
                     );
                 }
                 CompositeEffect::DropShadow(shadow) => {
@@ -4223,6 +4279,23 @@ mod tests {
                 )],
             ),
             ScaledPixels(31.)
+        );
+        // Directional blur dilates by its axis-aligned reach when under the cap,
+        // and saturates at the same 24px cap as the shader's tap limit so an
+        // over-long streak never over-allocates the captured intermediate.
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(
+                1.,
+                &[CompositeEffect::directional_blur(0., Pixels(10.))],
+            ),
+            ScaledPixels(10.)
+        );
+        assert_eq!(
+            CompositeEffectPlan::visual_outset(
+                1.,
+                &[CompositeEffect::directional_blur(0., Pixels(100.))],
+            ),
+            ScaledPixels(24.)
         );
     }
 

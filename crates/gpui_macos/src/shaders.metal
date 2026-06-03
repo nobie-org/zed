@@ -854,6 +854,7 @@ struct GroupSpriteVertexOutput {
   float4 material_shape_bounds;
   float4 material_shape_corner_radii;
   float4 group_shape_params;
+  float4 source_directional_blur;
   float4 color_matrix_0;
   float4 color_matrix_1;
   float4 color_matrix_2;
@@ -907,6 +908,7 @@ vertex GroupSpriteVertexOutput group_sprite_vertex(
     float4(sprite.material_shape_bounds.origin.x, sprite.material_shape_bounds.origin.y, sprite.material_shape_bounds.size.width, sprite.material_shape_bounds.size.height),
     float4(sprite.material_shape_corner_radii.top_left, sprite.material_shape_corner_radii.top_right, sprite.material_shape_corner_radii.bottom_right, sprite.material_shape_corner_radii.bottom_left),
     float4(sprite.group_shape_params[0], sprite.group_shape_params[1], sprite.group_shape_params[2], sprite.group_shape_params[3]),
+    float4(sprite.source_directional_blur[0], sprite.source_directional_blur[1], sprite.source_directional_blur[2], sprite.source_directional_blur[3]),
     float4(sprite.color_matrix[0][0], sprite.color_matrix[0][1], sprite.color_matrix[0][2], sprite.color_matrix[0][3]),
     float4(sprite.color_matrix[1][0], sprite.color_matrix[1][1], sprite.color_matrix[1][2], sprite.color_matrix[1][3]),
     float4(sprite.color_matrix[2][0], sprite.color_matrix[2][1], sprite.color_matrix[2][2], sprite.color_matrix[2][3]),
@@ -1067,6 +1069,48 @@ float4 sample_group_source_blurred(texture2d<float> intermediate_texture,
                                    float2 pixel_size,
                                    float sigma,
                                    GroupSpriteVertexOutput input) {
+  // Directional (motion) blur replaces the isotropic source blur for source
+  // sampling: a non-zero blur vector takes a 1D Gaussian streak along it and
+  // returns immediately, skipping the isotropic path.
+  float2 dblur = input.source_directional_blur.xy;
+  float dlen = length(dblur);
+  if (dlen > 0.0) {
+    float2 dir = dblur / dlen;
+    int dradius = min(int(ceil(dlen)), 24);
+    float dsigma = max(dlen / 3.0, 1.0);
+    float4 dcolor = float4(0.0);
+    float dtotal = 0.0;
+    for (int i = -24; i <= 24; i++) {
+      if (abs(i) <= dradius) {
+        float t = float(i);
+        float2 off = dir * t;
+        float w = exp(-(t * t) / (2.0 * dsigma * dsigma));
+        if (input.source_mask_blur_order == 1) {
+          dcolor += sample_group_source(
+              intermediate_texture,
+              intermediate_texture_sampler,
+              coords + off * pixel_size,
+              point + off,
+              input) * w;
+        } else {
+          dcolor += sample_group_texture(
+              intermediate_texture,
+              intermediate_texture_sampler,
+              coords + off * pixel_size) * w;
+        }
+        dtotal += w;
+      }
+    }
+    if (dtotal <= 0.0) {
+      return float4(0.0);
+    }
+    float4 dblurred = dcolor / dtotal;
+    if (input.source_mask_blur_order == 1) {
+      return dblurred;
+    }
+    return dblurred * group_source_mask_alpha(point, input);
+  }
+
   if (sigma <= 0.0) {
     return sample_group_source(intermediate_texture, intermediate_texture_sampler, coords, point, input);
   }

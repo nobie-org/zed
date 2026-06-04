@@ -858,13 +858,66 @@ impl From<PaintSurface> for Primitive {
 #[derive(Clone)]
 #[allow(missing_docs)]
 pub struct PaintGroup {
-    pub order: DrawOrder,
-    pub bounds: Bounds<ScaledPixels>,
-    pub capture_bounds: Bounds<ScaledPixels>,
-    pub content_mask: ContentMask<ScaledPixels>,
-    pub scale_factor: f32,
-    pub plan: LogicalVisualPlan,
-    pub scene: Arc<Scene>,
+    order: DrawOrder,
+    bounds: Bounds<ScaledPixels>,
+    capture_bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    plan: LogicalVisualPlan,
+    scene: Arc<Scene>,
+}
+
+impl PaintGroup {
+    pub(crate) fn new(
+        order: DrawOrder,
+        bounds: Bounds<ScaledPixels>,
+        capture_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        plan: LogicalVisualPlan,
+        scene: Scene,
+    ) -> Self {
+        Self {
+            order,
+            bounds,
+            capture_bounds,
+            content_mask,
+            plan,
+            scene: Arc::new(scene),
+        }
+    }
+
+    #[cfg(any(test, feature = "backend-test-support"))]
+    #[doc(hidden)]
+    /// Builds a paint group for renderer backend tests outside the `gpui` crate.
+    pub fn new_for_backend_test(
+        order: DrawOrder,
+        bounds: Bounds<ScaledPixels>,
+        capture_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        plan: LogicalVisualPlan,
+        scene: Scene,
+    ) -> Self {
+        Self::new(order, bounds, capture_bounds, content_mask, plan, scene)
+    }
+
+    /// Returns the semantic group bounds used for masks and material shapes.
+    pub fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds
+    }
+
+    /// Returns the screen-space bounds captured into the group intermediate.
+    pub fn capture_bounds(&self) -> Bounds<ScaledPixels> {
+        self.capture_bounds
+    }
+
+    /// Returns the logical effect plan for this group.
+    pub fn plan(&self) -> &LogicalVisualPlan {
+        &self.plan
+    }
+
+    /// Returns the captured child scene rendered into the group intermediate.
+    pub fn scene(&self) -> &Scene {
+        self.scene.as_ref()
+    }
 }
 
 impl From<PaintGroup> for Primitive {
@@ -3706,15 +3759,14 @@ mod tests {
         capture_bounds: Bounds<ScaledPixels>,
         content_mask: ContentMask<ScaledPixels>,
     ) -> PaintGroup {
-        PaintGroup {
-            order: 0,
+        PaintGroup::new(
+            0,
             bounds,
             capture_bounds,
             content_mask,
-            scale_factor: 1.,
-            plan: LogicalVisualPlan::from_effects(1., 0.5, vec![CompositeEffect::opacity(0.5)]),
-            scene: Arc::new(Scene::default()),
-        }
+            LogicalVisualPlan::from_effects(1., 0.5, vec![CompositeEffect::opacity(0.5)]),
+            Scene::default(),
+        )
     }
 
     fn apply_filter(filter: SourceColorFilter, rgb: [f32; 3]) -> [f32; 3] {

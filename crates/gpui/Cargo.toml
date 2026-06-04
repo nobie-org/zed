@@ -24,6 +24,9 @@ test-support = [
     "http_client/test-support",
     "proptest",
 ]
+# Internal renderer-crate tests need to synthesize scene-protocol groups without
+# making that construction authority part of ordinary GPUI test support.
+backend-test-support = []
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 wayland = [

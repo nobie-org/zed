@@ -71,4 +71,4 @@ gpui.workspace = true
 # propagate to its dependencies, but dev-dependencies do, so this is the
 # correct way to enable the feature exactly when needed.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support", "backend-test-support"] }

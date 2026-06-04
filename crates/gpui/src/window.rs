@@ -3534,15 +3534,14 @@ impl Window {
             .intersect(&content_mask.bounds);
 
         if !capture_bounds.is_empty() {
-            self.next_frame.scene.insert_primitive(PaintGroup {
-                order: 0,
+            self.next_frame.scene.insert_primitive(PaintGroup::new(
+                0,
                 bounds,
                 capture_bounds,
                 content_mask,
-                scale_factor: self.scale_factor(),
                 plan,
-                scene: Arc::new(group_scene),
-            });
+                group_scene,
+            ));
         }
 
         result

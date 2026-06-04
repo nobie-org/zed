@@ -1254,7 +1254,7 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
-            let effect_plan = group.plan.normalized_effects().clone();
+            let effect_plan = group.plan().normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -1267,7 +1267,7 @@ impl MetalRenderer {
             }
 
             if !self.encode_primitives_to_texture(
-                group.scene.as_ref(),
+                group.scene(),
                 instance_buffer,
                 instance_offset,
                 &group_texture,
@@ -1468,7 +1468,7 @@ impl MetalRenderer {
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
             sprites.push(GroupSprite {
-                bounds: group.capture_bounds,
+                bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind: 1,
                 source_blur_radius: 0.,
@@ -1481,9 +1481,9 @@ impl MetalRenderer {
                 source_mask_mode,
                 _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds,
+                source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds,
+                material_shape_bounds: group.bounds(),
                 material_shape_corner_radii,
                 group_shape_params,
                 source_directional_blur,
@@ -1509,7 +1509,7 @@ impl MetalRenderer {
             let shadow_group_shape_params =
                 [0., 0., shadow_shape_kind as f32, shadow_shape_exponent];
             sprites.push(GroupSprite {
-                bounds: group.capture_bounds,
+                bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind: 2,
                 source_blur_radius: 0.,
@@ -1522,9 +1522,9 @@ impl MetalRenderer {
                 source_mask_mode: 0,
                 _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds,
+                source_mask_bounds: group.bounds(),
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_bounds: group.bounds,
+                material_shape_bounds: group.bounds(),
                 material_shape_corner_radii: shadow.shape,
                 group_shape_params: shadow_group_shape_params,
                 source_directional_blur,
@@ -1545,7 +1545,7 @@ impl MetalRenderer {
         for glow in effect_plan.processed_content_glows() {
             let color = glow.color.to_rgb();
             sprites.push(GroupSprite {
-                bounds: group.capture_bounds,
+                bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind: 3,
                 source_blur_radius: effect_plan.source_blur_radius().0,
@@ -1558,9 +1558,9 @@ impl MetalRenderer {
                 source_mask_mode,
                 _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds,
+                source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds,
+                material_shape_bounds: group.bounds(),
                 material_shape_corner_radii,
                 group_shape_params,
                 source_directional_blur,
@@ -1579,7 +1579,7 @@ impl MetalRenderer {
         }
 
         sprites.push(GroupSprite {
-            bounds: group.capture_bounds,
+            bounds: group.capture_bounds(),
             opacity: effect_plan.opacity(),
             effect_kind: 0,
             source_blur_radius: effect_plan.source_blur_radius().0,
@@ -1592,9 +1592,9 @@ impl MetalRenderer {
             source_mask_mode,
             _pad1: 0,
             shadow_color: [0., 0., 0., 0.],
-            source_mask_bounds: group.bounds,
+            source_mask_bounds: group.bounds(),
             source_mask_corner_radii,
-            material_shape_bounds: group.bounds,
+            material_shape_bounds: group.bounds(),
             material_shape_corner_radii,
             group_shape_params,
             source_directional_blur,
@@ -2741,15 +2741,14 @@ mod tests {
         effects: Vec<CompositeEffect>,
         scene: Scene,
     ) -> PaintGroup {
-        PaintGroup {
+        PaintGroup::new_for_backend_test(
             order,
-            bounds: capture_bounds,
             capture_bounds,
-            content_mask: mask(),
-            scale_factor: 1.,
-            plan: LogicalVisualPlan::from_effects(1., 1., effects),
-            scene: Arc::new(scene),
-        }
+            capture_bounds,
+            mask(),
+            LogicalVisualPlan::from_effects(1., 1., effects),
+            scene,
+        )
     }
 
     fn black() -> Hsla {
@@ -3045,7 +3044,7 @@ mod tests {
 
     /// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
     fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
-        let counters = group.plan.support_counters(group.capture_bounds);
+        let counters = group.plan().support_counters(group.capture_bounds());
         RenderGroupBackendCounters {
             intermediate_textures: counters.intermediate_textures,
             backdrop_copies: counters.backdrop_copies,

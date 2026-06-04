@@ -75,15 +75,14 @@ fn paint_group_with_effects(
     effects: Vec<CompositeEffect>,
     scene: Scene,
 ) -> PaintGroup {
-    PaintGroup {
+    PaintGroup::new_for_backend_test(
         order,
-        bounds: capture_bounds,
         capture_bounds,
-        content_mask: mask(),
-        scale_factor: 1.,
-        plan: LogicalVisualPlan::from_effects(1., 1., effects),
-        scene: Arc::new(scene),
-    }
+        capture_bounds,
+        mask(),
+        LogicalVisualPlan::from_effects(1., 1., effects),
+        scene,
+    )
 }
 
 fn paint_group_with_bounds(
@@ -93,15 +92,14 @@ fn paint_group_with_bounds(
     effects: Vec<CompositeEffect>,
     scene: Scene,
 ) -> PaintGroup {
-    PaintGroup {
+    PaintGroup::new_for_backend_test(
         order,
         bounds,
         capture_bounds,
-        content_mask: mask(),
-        scale_factor: 1.,
-        plan: LogicalVisualPlan::from_effects(1., 1., effects),
-        scene: Arc::new(scene),
-    }
+        mask(),
+        LogicalVisualPlan::from_effects(1., 1., effects),
+        scene,
+    )
 }
 
 fn black() -> Hsla {
@@ -176,7 +174,7 @@ fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
 
 /// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
 fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
-    let counters = group.plan.support_counters(group.capture_bounds);
+    let counters = group.plan().support_counters(group.capture_bounds());
     RenderGroupBackendCounters {
         intermediate_textures: counters.intermediate_textures,
         backdrop_copies: counters.backdrop_copies,

@@ -2120,7 +2120,7 @@ impl WgpuRenderer {
         group_counters: &mut RenderGroupBackendCounters,
     ) -> bool {
         for group in groups {
-            let effect_plan = group.plan.normalized_effects().clone();
+            let effect_plan = group.plan().normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }
@@ -2129,7 +2129,7 @@ impl WgpuRenderer {
             group_counters.intermediate_textures += 1;
 
             if !self.encode_scene_batches_to_view(
-                group.scene.as_ref(),
+                group.scene(),
                 Some(&group_texture),
                 true,
                 &group_view,
@@ -2312,7 +2312,7 @@ impl WgpuRenderer {
         for shadow in effect_plan.drop_shadows() {
             let color = shadow.color.to_rgb();
             sprites.push(GroupSprite {
-                bounds: group.capture_bounds,
+                bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind: 1,
                 source_blur_radius: 0.,
@@ -2325,9 +2325,9 @@ impl WgpuRenderer {
                 source_mask_mode,
                 _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds,
+                source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds,
+                material_shape_bounds: group.bounds(),
                 material_shape_corner_radii,
                 group_shape_params,
                 source_directional_blur,
@@ -2353,7 +2353,7 @@ impl WgpuRenderer {
             let shadow_group_shape_params =
                 [0., 0., shadow_shape_kind as f32, shadow_shape_exponent];
             sprites.push(GroupSprite {
-                bounds: group.capture_bounds,
+                bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind: 2,
                 source_blur_radius: 0.,
@@ -2366,9 +2366,9 @@ impl WgpuRenderer {
                 source_mask_mode: 0,
                 _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds,
+                source_mask_bounds: group.bounds(),
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_bounds: group.bounds,
+                material_shape_bounds: group.bounds(),
                 material_shape_corner_radii: shadow.shape,
                 group_shape_params: shadow_group_shape_params,
                 source_directional_blur,
@@ -2389,7 +2389,7 @@ impl WgpuRenderer {
         for glow in effect_plan.processed_content_glows() {
             let color = glow.color.to_rgb();
             sprites.push(GroupSprite {
-                bounds: group.capture_bounds,
+                bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind: 3,
                 source_blur_radius: effect_plan.source_blur_radius().0,
@@ -2402,9 +2402,9 @@ impl WgpuRenderer {
                 source_mask_mode,
                 _pad1: 0,
                 shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds,
+                source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds,
+                material_shape_bounds: group.bounds(),
                 material_shape_corner_radii,
                 group_shape_params,
                 source_directional_blur,
@@ -2423,7 +2423,7 @@ impl WgpuRenderer {
         }
 
         sprites.push(GroupSprite {
-            bounds: group.capture_bounds,
+            bounds: group.capture_bounds(),
             opacity: effect_plan.opacity(),
             effect_kind: 0,
             source_blur_radius: effect_plan.source_blur_radius().0,
@@ -2436,9 +2436,9 @@ impl WgpuRenderer {
             source_mask_mode,
             _pad1: 0,
             shadow_color: [0., 0., 0., 0.],
-            source_mask_bounds: group.bounds,
+            source_mask_bounds: group.bounds(),
             source_mask_corner_radii,
-            material_shape_bounds: group.bounds,
+            material_shape_bounds: group.bounds(),
             material_shape_corner_radii,
             group_shape_params,
             source_directional_blur,

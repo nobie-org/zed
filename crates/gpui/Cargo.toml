@@ -27,6 +27,10 @@ test-support = [
 # Internal renderer-crate tests need to synthesize scene-protocol groups without
 # making that construction authority part of ordinary GPUI test support.
 backend-test-support = []
+# Nobie-local platform presentation tracing is an opt-in diagnostics surface.
+# Without this feature, the public trace hooks compile as no-op stubs and GPUI
+# does not read trace env vars, wall-clock time, or global trace counters.
+nobie-platform-trace = []
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 wayland = [

@@ -461,20 +461,35 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        let metal_draw_id = nobie_platform_trace::next_metal_draw_id();
-        let draw_id = nobie_platform_trace::current_draw_id();
-        let present_id = nobie_platform_trace::current_present_id();
-        nobie_platform_trace::trace(
-            "metal_draw_start",
-            format_args!(
-                "metal_draw_id={} draw_id={} present_id={} scene_ops={} surfaces={}",
-                metal_draw_id,
-                draw_id,
-                present_id,
-                scene.len(),
-                scene.surfaces.len()
-            ),
-        );
+        let trace_enabled = nobie_platform_trace::enabled();
+        let metal_draw_id = if trace_enabled {
+            nobie_platform_trace::next_metal_draw_id()
+        } else {
+            0
+        };
+        let draw_id = if trace_enabled {
+            nobie_platform_trace::current_draw_id()
+        } else {
+            0
+        };
+        let present_id = if trace_enabled {
+            nobie_platform_trace::current_present_id()
+        } else {
+            0
+        };
+        if trace_enabled {
+            nobie_platform_trace::trace(
+                "metal_draw_start",
+                format_args!(
+                    "metal_draw_id={} draw_id={} present_id={} scene_ops={} surfaces={}",
+                    metal_draw_id,
+                    draw_id,
+                    present_id,
+                    scene.len(),
+                    scene.surfaces.len()
+                ),
+            );
+        }
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -490,33 +505,37 @@ impl MetalRenderer {
             (viewport_size.height.ceil() as i32).into(),
         );
         let drawable = if let Some(drawable) = layer.next_drawable() {
-            nobie_platform_trace::trace(
-                "metal_next_drawable",
-                format_args!(
-                    "metal_draw_id={} draw_id={} present_id={} drawable_id={}",
-                    metal_draw_id,
-                    draw_id,
-                    present_id,
-                    drawable.drawable_id()
-                ),
-            );
+            if trace_enabled {
+                nobie_platform_trace::trace(
+                    "metal_next_drawable",
+                    format_args!(
+                        "metal_draw_id={} draw_id={} present_id={} drawable_id={}",
+                        metal_draw_id,
+                        draw_id,
+                        present_id,
+                        drawable.drawable_id()
+                    ),
+                );
+            }
             drawable
         } else {
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            nobie_platform_trace::trace(
-                "metal_next_drawable_failed",
-                format_args!(
-                    "metal_draw_id={} draw_id={} present_id={} viewport_width={} viewport_height={}",
-                    metal_draw_id,
-                    draw_id,
-                    present_id,
-                    viewport_size.width.0,
-                    viewport_size.height.0
-                ),
-            );
+            if trace_enabled {
+                nobie_platform_trace::trace(
+                    "metal_next_drawable_failed",
+                    format_args!(
+                        "metal_draw_id={} draw_id={} present_id={} viewport_width={} viewport_height={}",
+                        metal_draw_id,
+                        draw_id,
+                        present_id,
+                        viewport_size.width.0,
+                        viewport_size.height.0
+                    ),
+                );
+            }
             return;
         };
 
@@ -536,25 +555,28 @@ impl MetalRenderer {
                     let completed_metal_draw_id = metal_draw_id;
                     let completed_draw_id = draw_id;
                     let completed_present_id = present_id;
+                    let completed_trace_enabled = trace_enabled;
                     let block = ConcreteBlock::new(move |_| {
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
                         }
-                        nobie_platform_trace::trace(
-                            "metal_command_buffer_completed",
-                            format_args!(
-                                "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
-                                completed_metal_draw_id,
-                                completed_draw_id,
-                                completed_present_id,
-                                ca_current_media_time()
-                            ),
-                        );
+                        if completed_trace_enabled {
+                            nobie_platform_trace::trace(
+                                "metal_command_buffer_completed",
+                                format_args!(
+                                    "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
+                                    completed_metal_draw_id,
+                                    completed_draw_id,
+                                    completed_present_id,
+                                    ca_current_media_time()
+                                ),
+                            );
+                        }
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
-                    if nobie_platform_trace::enabled() {
+                    if trace_enabled {
                         let presented_metal_draw_id = metal_draw_id;
                         let presented_draw_id = draw_id;
                         let presented_present_id = present_id;
@@ -581,67 +603,77 @@ impl MetalRenderer {
                     }
 
                     if self.presents_with_transaction {
-                        nobie_platform_trace::trace(
-                            "metal_command_buffer_commit",
-                            format_args!(
-                                "metal_draw_id={} draw_id={} present_id={} present_mode=transaction drawable_id={} ca_time={:.9}",
-                                metal_draw_id,
-                                draw_id,
-                                present_id,
-                                drawable.drawable_id(),
-                                ca_current_media_time()
-                            ),
-                        );
+                        if trace_enabled {
+                            nobie_platform_trace::trace(
+                                "metal_command_buffer_commit",
+                                format_args!(
+                                    "metal_draw_id={} draw_id={} present_id={} present_mode=transaction drawable_id={} ca_time={:.9}",
+                                    metal_draw_id,
+                                    draw_id,
+                                    present_id,
+                                    drawable.drawable_id(),
+                                    ca_current_media_time()
+                                ),
+                            );
+                        }
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
-                        nobie_platform_trace::trace(
-                            "metal_drawable_present_schedule",
-                            format_args!(
-                                "metal_draw_id={} draw_id={} present_id={} present_mode=transaction drawable_id={} ca_time={:.9}",
-                                metal_draw_id,
-                                draw_id,
-                                present_id,
-                                drawable.drawable_id(),
-                                ca_current_media_time()
-                            ),
-                        );
+                        if trace_enabled {
+                            nobie_platform_trace::trace(
+                                "metal_drawable_present_schedule",
+                                format_args!(
+                                    "metal_draw_id={} draw_id={} present_id={} present_mode=transaction drawable_id={} ca_time={:.9}",
+                                    metal_draw_id,
+                                    draw_id,
+                                    present_id,
+                                    drawable.drawable_id(),
+                                    ca_current_media_time()
+                                ),
+                            );
+                        }
                         drawable.present();
                     } else {
-                        nobie_platform_trace::trace(
-                            "metal_drawable_present_schedule",
-                            format_args!(
-                                "metal_draw_id={} draw_id={} present_id={} present_mode=command_buffer drawable_id={} ca_time={:.9}",
-                                metal_draw_id,
-                                draw_id,
-                                present_id,
-                                drawable.drawable_id(),
-                                ca_current_media_time()
-                            ),
-                        );
+                        if trace_enabled {
+                            nobie_platform_trace::trace(
+                                "metal_drawable_present_schedule",
+                                format_args!(
+                                    "metal_draw_id={} draw_id={} present_id={} present_mode=command_buffer drawable_id={} ca_time={:.9}",
+                                    metal_draw_id,
+                                    draw_id,
+                                    present_id,
+                                    drawable.drawable_id(),
+                                    ca_current_media_time()
+                                ),
+                            );
+                        }
                         command_buffer.present_drawable(drawable);
-                        nobie_platform_trace::trace(
-                            "metal_command_buffer_commit",
-                            format_args!(
-                                "metal_draw_id={} draw_id={} present_id={} present_mode=command_buffer drawable_id={} ca_time={:.9}",
-                                metal_draw_id,
-                                draw_id,
-                                present_id,
-                                drawable.drawable_id(),
-                                ca_current_media_time()
-                            ),
-                        );
+                        if trace_enabled {
+                            nobie_platform_trace::trace(
+                                "metal_command_buffer_commit",
+                                format_args!(
+                                    "metal_draw_id={} draw_id={} present_id={} present_mode=command_buffer drawable_id={} ca_time={:.9}",
+                                    metal_draw_id,
+                                    draw_id,
+                                    present_id,
+                                    drawable.drawable_id(),
+                                    ca_current_media_time()
+                                ),
+                            );
+                        }
                         command_buffer.commit();
                     }
-                    nobie_platform_trace::trace(
-                        "metal_draw_finish",
-                        format_args!(
-                            "metal_draw_id={} draw_id={} present_id={} drawable_id={}",
-                            metal_draw_id,
-                            draw_id,
-                            present_id,
-                            drawable.drawable_id()
-                        ),
-                    );
+                    if trace_enabled {
+                        nobie_platform_trace::trace(
+                            "metal_draw_finish",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} drawable_id={}",
+                                metal_draw_id,
+                                draw_id,
+                                present_id,
+                                drawable.drawable_id()
+                            ),
+                        );
+                    }
                     return;
                 }
                 Err(err) => {
@@ -649,13 +681,15 @@ impl MetalRenderer {
                         "failed to render: {}. retrying with larger instance buffer size",
                         err
                     );
-                    nobie_platform_trace::trace(
-                        "metal_draw_retry",
-                        format_args!(
-                            "metal_draw_id={} draw_id={} present_id={} error={:?}",
-                            metal_draw_id, draw_id, present_id, err
-                        ),
-                    );
+                    if trace_enabled {
+                        nobie_platform_trace::trace(
+                            "metal_draw_retry",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} error={:?}",
+                                metal_draw_id, draw_id, present_id, err
+                            ),
+                        );
+                    }
                     let mut instance_buffer_pool = self.instance_buffer_pool.lock();
                     let buffer_size = instance_buffer_pool.buffer_size;
                     if buffer_size >= 256 * 1024 * 1024 {

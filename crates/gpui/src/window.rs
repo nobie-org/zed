@@ -568,6 +568,22 @@ pub struct DismissEvent;
 
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
+struct NobieRequestFrameIdScope;
+
+impl NobieRequestFrameIdScope {
+    fn enter() -> Self {
+        let request_frame_id = crate::nobie_platform_trace::next_request_frame_id();
+        crate::nobie_platform_trace::set_current_request_frame_id(request_frame_id);
+        Self
+    }
+}
+
+impl Drop for NobieRequestFrameIdScope {
+    fn drop(&mut self) {
+        crate::nobie_platform_trace::clear_current_request_frame_id();
+    }
+}
+
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
@@ -1449,6 +1465,7 @@ impl Window {
                 if !next_frame_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
+                            let _request_frame_id_scope = NobieRequestFrameIdScope::enter();
                             for callback in next_frame_callbacks {
                                 callback(window, cx);
                             }

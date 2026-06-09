@@ -136,14 +136,15 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         window: &mut Window,
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
+        let now = cx.background_executor().now();
         window.with_element_state(global_id.unwrap(), |state, window| {
             let mut state = state.unwrap_or_else(|| AnimationState {
-                start: Instant::now(),
+                start: now,
                 animation_ix: 0,
             });
             let animation_ix = state.animation_ix;
 
-            let mut delta = state.start.elapsed().as_secs_f32()
+            let mut delta = (now - state.start).as_secs_f32()
                 / self.animations[animation_ix].duration.as_secs_f32();
 
             let mut done = false;
@@ -152,7 +153,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                     if animation_ix >= self.animations.len() - 1 {
                         done = true;
                     } else {
-                        state.start = Instant::now();
+                        state.start = now;
                         state.animation_ix += 1;
                     }
                     delta = 1.0;
@@ -201,6 +202,68 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         cx: &mut App,
     ) {
         element.paint(window, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AppContext as _, Div, InteractiveElement as _, ParentElement as _, Render, Styled as _,
+        TestAppContext, Window, div, point, px, size,
+    };
+
+    struct AnimatedWidthView;
+
+    impl Render for AnimatedWidthView {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl IntoElement {
+            div().child(
+                div()
+                    .debug_selector(|| "animated-width".into())
+                    .h(px(10.))
+                    .with_animation(
+                        "animated-width-clock-test",
+                        Animation::new(Duration::from_millis(100)),
+                        |this: Div, delta| this.w(px(10. + 90. * delta)),
+                    ),
+            )
+        }
+    }
+
+    #[crate::test]
+    fn with_animation_uses_test_scheduler_clock(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let view = cx.new(|_| AnimatedWidthView);
+
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(20.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(
+            cx.debug_bounds("animated-width").unwrap().size.width,
+            px(10.)
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(20.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(
+            cx.debug_bounds("animated-width").unwrap().size.width,
+            px(55.)
+        );
+
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(20.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(
+            cx.debug_bounds("animated-width").unwrap().size.width,
+            px(100.)
+        );
     }
 }
 

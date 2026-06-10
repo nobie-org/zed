@@ -37,6 +37,7 @@ use gpui::{
 use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
+use core_foundation::runloop::CFRunLoop;
 use core_foundation_sys::base::CFEqual;
 use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanRef};
 use core_graphics::display::{CGDirectDisplayID, CGPoint, CGRect};
@@ -2143,7 +2144,68 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     }
 }
 
-extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+fn platform_input_kind(event: &PlatformInput) -> &'static str {
+    match event {
+        PlatformInput::KeyDown(_) => "key_down",
+        PlatformInput::KeyUp(_) => "key_up",
+        PlatformInput::ModifiersChanged(_) => "modifiers_changed",
+        PlatformInput::MouseDown(_) => "mouse_down",
+        PlatformInput::MouseUp(_) => "mouse_up",
+        PlatformInput::MouseMove(MouseMoveEvent {
+            pressed_button: Some(_),
+            ..
+        }) => "mouse_dragged",
+        PlatformInput::MouseMove(_) => "mouse_moved",
+        PlatformInput::MousePressure(_) => "mouse_pressure",
+        PlatformInput::MouseExited(_) => "mouse_exited",
+        PlatformInput::ScrollWheel(_) => "scroll_wheel",
+        PlatformInput::Pinch(_) => "pinch",
+        PlatformInput::FileDrop(_) => "file_drop",
+    }
+}
+
+fn trace_native_input_boundary(
+    event_name: &'static str,
+    selector: Sel,
+    native_event: id,
+    event_kind: &'static str,
+) {
+    if !nobie_platform_trace::enabled() {
+        return;
+    }
+
+    let run_loop_mode = CFRunLoop::get_current()
+        .current_mode()
+        .unwrap_or_else(|| "none".to_string());
+    let request_frame_id = nobie_platform_trace::current_request_frame_id();
+    let display_link_signal_id = nobie_platform_trace::current_display_link_signal_id();
+    let latest_display_link_signal_id = nobie_platform_trace::latest_display_link_signal_id();
+    let coalesced_count = nobie_platform_trace::current_display_link_coalesced_count();
+    let mouse_coalescing_enabled = unsafe { NSEvent::isMouseCoalescingEnabled(nil) == YES };
+    let native_event_type = unsafe { native_event.eventType() as u64 };
+    let native_event_number = unsafe { native_event.eventNumber() };
+    let native_event_timestamp = unsafe { native_event.timestamp() };
+
+    nobie_platform_trace::trace(
+        event_name,
+        format_args!(
+            "source=native_appkit selector={} kind={} native_event_type={} native_event_number={} native_event_timestamp={:.6} run_loop_mode={} mouse_coalescing_enabled={} request_frame_id={} display_link_signal_id={} latest_display_link_signal_id={} display_link_coalesced_count={}",
+            selector.name(),
+            event_kind,
+            native_event_type,
+            native_event_number,
+            native_event_timestamp,
+            run_loop_mode,
+            mouse_coalescing_enabled,
+            request_frame_id,
+            display_link_signal_id,
+            latest_display_link_signal_id,
+            coalesced_count,
+        ),
+    );
+}
+
+extern "C" fn handle_view_event(this: &Object, selector: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
@@ -2151,6 +2213,14 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        let event_kind = platform_input_kind(&event);
+        trace_native_input_boundary(
+            "native_input_boundary_start",
+            selector,
+            native_event,
+            event_kind,
+        );
+
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
@@ -2284,6 +2354,12 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             drop(lock);
             callback(event);
             window_state.lock().event_callback = Some(callback);
+            trace_native_input_boundary(
+                "native_input_boundary_finish",
+                selector,
+                native_event,
+                event_kind,
+            );
         }
     }
 }

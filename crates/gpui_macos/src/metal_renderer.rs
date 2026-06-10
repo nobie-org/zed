@@ -71,7 +71,12 @@ pub(crate) struct InstanceBufferPool {
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            // 16MiB absorbs dense first frames: a spreadsheet grid can show
+            // tens of thousands of glyph sprites at ~100 bytes each, which
+            // overflows a small initial buffer and forces a growth retry (an
+            // extra full encode pass) before anything reaches the screen.
+            // The pool still doubles on demand up to the 256MiB cap.
+            buffer_size: 16 * 1024 * 1024,
             buffers: Vec::new(),
         }
     }
@@ -677,8 +682,12 @@ impl MetalRenderer {
                     return;
                 }
                 Err(err) => {
-                    log::error!(
-                        "failed to render: {}. retrying with larger instance buffer size",
+                    // Designed growth path, not a failure: the frame is
+                    // re-encoded after the pool doubles, so report it at the
+                    // same level as the matching "increased instance buffer
+                    // size" message. Pool exhaustion below stays an error.
+                    log::info!(
+                        "scene exceeded instance buffer: {}. retrying with larger instance buffer size",
                         err
                     );
                     if trace_enabled {
@@ -787,8 +796,12 @@ impl MetalRenderer {
                     });
                 }
                 Err(err) => {
-                    log::error!(
-                        "failed to render: {}. retrying with larger instance buffer size",
+                    // Designed growth path, not a failure: the frame is
+                    // re-encoded after the pool doubles, so report it at the
+                    // same level as the matching "increased instance buffer
+                    // size" message. Pool exhaustion below stays an error.
+                    log::info!(
+                        "scene exceeded instance buffer: {}. retrying with larger instance buffer size",
                         err
                     );
                     let mut instance_buffer_pool = self.instance_buffer_pool.lock();
@@ -925,8 +938,12 @@ impl MetalRenderer {
                     });
                 }
                 Err(err) => {
-                    log::error!(
-                        "failed to render: {}. retrying with larger instance buffer size",
+                    // Designed growth path, not a failure: the frame is
+                    // re-encoded after the pool doubles, so report it at the
+                    // same level as the matching "increased instance buffer
+                    // size" message. Pool exhaustion below stays an error.
+                    log::info!(
+                        "scene exceeded instance buffer: {}. retrying with larger instance buffer size",
                         err
                     );
                     let mut instance_buffer_pool = self.instance_buffer_pool.lock();

@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use core_foundation::{base::TCFType, string::CFString};
 use core_foundation_sys::{
     base::{CFRelease, CFTypeRef},
     runloop::{
@@ -53,6 +54,12 @@ impl FrameRequestSource {
         }
         unsafe {
             CFRunLoopAddSource(frame_requests.main_run_loop, source, kCFRunLoopCommonModes);
+            let event_tracking_mode = CFString::from_static_string("NSEventTrackingRunLoopMode");
+            CFRunLoopAddSource(
+                frame_requests.main_run_loop,
+                source,
+                event_tracking_mode.as_concrete_TypeRef(),
+            );
         }
         frame_requests.source = source;
         Ok(frame_requests)

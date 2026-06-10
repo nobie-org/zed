@@ -1,18 +1,87 @@
-use anyhow::Result;
-use core_graphics::display::CGDirectDisplayID;
-use dispatch2::{
-    _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
+use anyhow::{Result, anyhow};
+use core_foundation_sys::{
+    base::{CFRelease, CFTypeRef},
+    runloop::{
+        CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopRef, CFRunLoopSourceContext,
+        CFRunLoopSourceCreate, CFRunLoopSourceInvalidate, CFRunLoopSourceRef,
+        CFRunLoopSourceSignal, CFRunLoopWakeUp, kCFRunLoopCommonModes,
+    },
 };
+use core_graphics::display::CGDirectDisplayID;
 use gpui::nobie_platform_trace;
-use std::ffi::c_void;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{ffi::c_void, ptr};
 use util::ResultExt;
 
 use crate::quartzcore_time::ca_current_media_time;
 
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
-    frame_requests: DispatchRetained<DispatchSource>,
+    _frame_requests: Box<FrameRequestSource>,
+}
+
+struct FrameRequestSource {
+    data: *mut c_void,
+    callback: extern "C" fn(*mut c_void),
+    main_run_loop: CFRunLoopRef,
+    source: CFRunLoopSourceRef,
+}
+
+impl FrameRequestSource {
+    fn new(data: *mut c_void, callback: extern "C" fn(*mut c_void)) -> Result<Box<Self>> {
+        let mut frame_requests = Box::new(Self {
+            data,
+            callback,
+            main_run_loop: unsafe { CFRunLoopGetMain() },
+            source: ptr::null_mut(),
+        });
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: &mut *frame_requests as *mut FrameRequestSource as *mut c_void,
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: frame_request_source_perform,
+        };
+        let source = unsafe { CFRunLoopSourceCreate(ptr::null(), 0, &mut context) };
+        if source.is_null() {
+            return Err(anyhow!("failed to create display link run-loop source"));
+        }
+        unsafe {
+            CFRunLoopAddSource(frame_requests.main_run_loop, source, kCFRunLoopCommonModes);
+        }
+        frame_requests.source = source;
+        Ok(frame_requests)
+    }
+
+    fn signal(&self) {
+        unsafe {
+            CFRunLoopSourceSignal(self.source);
+            CFRunLoopWakeUp(self.main_run_loop);
+        }
+    }
+}
+
+impl Drop for FrameRequestSource {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.source.is_null() {
+                CFRunLoopSourceInvalidate(self.source);
+                CFRelease(self.source as CFTypeRef);
+            }
+        }
+    }
+}
+
+extern "C" fn frame_request_source_perform(info: *const c_void) {
+    unsafe {
+        let frame_requests = &*(info as *const FrameRequestSource);
+        (frame_requests.callback)(frame_requests.data);
+    }
 }
 
 impl DisplayLink {
@@ -67,32 +136,24 @@ impl DisplayLink {
                 );
             }
             unsafe {
-                let frame_requests = &*(frame_requests as *const DispatchSource);
-                frame_requests.merge_data(1);
+                let frame_requests = &*(frame_requests as *const FrameRequestSource);
+                frame_requests.signal();
                 0
             }
         }
 
         unsafe {
-            let frame_requests = DispatchSource::new(
-                &raw const _dispatch_source_type_data_add as *mut _,
-                0,
-                0,
-                Some(DispatchQueue::main()),
-            );
-            frame_requests.set_context(data);
-            frame_requests.set_event_handler_f(callback);
-            frame_requests.resume();
+            let frame_requests = FrameRequestSource::new(data, callback)?;
 
             let display_link = sys::DisplayLink::new(
                 display_id,
                 display_link_callback,
-                &*frame_requests as *const DispatchSource as *mut c_void,
+                &*frame_requests as *const FrameRequestSource as *mut c_void,
             )?;
 
             Ok(Self {
                 display_link: Some(display_link),
-                frame_requests,
+                _frame_requests: frame_requests,
             })
         }
     }
@@ -123,7 +184,6 @@ impl Drop for DisplayLink {
         //
         // We might also want to upgrade to CADisplayLink, but that requires dropping old macOS support.
         std::mem::forget(self.display_link.take());
-        self.frame_requests.cancel();
     }
 }
 

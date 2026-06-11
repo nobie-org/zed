@@ -3525,6 +3525,12 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         let bounds = self.cover_bounds(bounds);
         let plan = LogicalVisualPlan::from_input(self.scale_factor(), boundary_opacity, &input);
+        // A planning-rejected effect silently does not paint; surface it
+        // (deduplicated, warn level) so authored visuals cannot vanish
+        // without a trace (NOBS-5648).
+        if !plan.planning_rejections().is_empty() {
+            crate::scene::log_planning_rejections_once(plan.planning_rejections());
+        }
         let effect_outset = plan.requirements().output_outset;
         let capture_bounds = group_scene
             .visual_bounds()

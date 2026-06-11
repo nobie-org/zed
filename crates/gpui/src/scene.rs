@@ -1800,6 +1800,13 @@ impl DerivedLayer {
     }
 
     /// Adds a shadow derived from this layer's named provenance.
+    ///
+    /// `blur_radius` is consumed as the Gaussian sigma (the backend kernel
+    /// weights by `exp(-d^2 / 2*sigma^2)` and samples `3*sigma` taps), and is
+    /// capped after display scaling at `MAX_EXACT_GAUSSIAN_SIGMA` scaled
+    /// pixels — a shadow over the cap is planning-rejected (it does not
+    /// paint) and warn-logged once. Larger product shadows should use the
+    /// element `BoxShadow` primitive instead.
     pub fn shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
         let effect = match self.source {
             DerivedLayerSource::ContentAlpha => {
@@ -2346,6 +2353,54 @@ pub enum RenderGroupRejectedEffect {
     DropShadow,
     SurfaceShadow,
     ProcessedContentGlow,
+}
+
+impl RenderGroupPlanningRejection {
+    /// Stable one-line author-facing description for logs and diagnostics.
+    pub fn describe(&self) -> String {
+        let provenance = self.effect.provenance();
+        let reason = match &self.reason {
+            RenderGroupPlanningRejectionReason::LimitExceeded {
+                limit,
+                requested,
+                unit,
+            } => {
+                let unit = match unit {
+                    RenderGroupLimitUnit::GaussianSigma => "gaussian sigma (scaled px)",
+                };
+                format!(
+                    "requested {} exceeds the exact-effect limit {} [{unit}]",
+                    requested.0, limit.0
+                )
+            }
+            RenderGroupPlanningRejectionReason::UnsupportedStageSequence { expected } => {
+                format!("unsupported stage sequence (expected {expected})")
+            }
+        };
+        format!("{provenance}: {reason}; {}", self.suggestion)
+    }
+}
+
+/// Warn-logs each distinct planning rejection once per process.
+///
+/// A planning-rejected effect does not paint at all, so silence here means an
+/// authored visual (a derived shadow, a frost, a glow) vanishes with no
+/// signal — the NOBS-5648 failure mode. Deduplicated by the rejection's
+/// describe() line so per-frame replanning cannot spam the log.
+pub(crate) fn log_planning_rejections_once(rejections: &[RenderGroupPlanningRejection]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    for rejection in rejections {
+        let line = rejection.describe();
+        let mut seen = SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.insert(line.clone()) {
+            log::warn!("render group dropped an authored effect: {line}");
+        }
+    }
 }
 
 impl RenderGroupRejectedEffect {
@@ -3741,6 +3796,45 @@ impl PathVertex<Pixels> {
 mod tests {
     use super::*;
     use crate::{red, size};
+
+    #[test]
+    fn planning_rejection_describe_names_provenance_limit_and_suggestion() {
+        let rejection = RenderGroupPlanningRejection {
+            effect: RenderGroupRejectedEffect::DropShadow,
+            reason: RenderGroupPlanningRejectionReason::LimitExceeded {
+                limit: ScaledPixels(8.),
+                requested: ScaledPixels(12.),
+                unit: RenderGroupLimitUnit::GaussianSigma,
+            },
+            suggestion: "use an explicitly approximate blur tier or reduce the exact blur radius",
+        };
+        assert_eq!(
+            rejection.describe(),
+            concat!(
+                "derived.content_alpha.shadow: requested 12 exceeds the exact-effect limit 8 ",
+                "[gaussian sigma (scaled px)]; use an explicitly approximate blur tier or ",
+                "reduce the exact blur radius"
+            ),
+        );
+    }
+
+    #[test]
+    fn rejected_drop_shadow_over_sigma_cap_is_absent_from_plan_but_described() {
+        let effects = vec![CompositeEffect::drop_shadow(
+            point(crate::px(0.), crate::px(4.)),
+            crate::px(6.),
+            crate::hsla(0., 0., 0., 0.1),
+        )];
+        // Retina: 6px blur scales to sigma 12 > MAX_EXACT_GAUSSIAN_SIGMA.
+        let plan = LogicalVisualPlan::from_effects(2.0, 1.0, effects);
+        assert_eq!(plan.normalized_effects().drop_shadows().len(), 0);
+        assert_eq!(plan.planning_rejections().len(), 1);
+        assert!(
+            plan.planning_rejections()[0]
+                .describe()
+                .contains("derived.content_alpha.shadow")
+        );
+    }
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels(value)

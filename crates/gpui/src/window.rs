@@ -1031,7 +1031,7 @@ pub struct Window {
     input_boundary_present_epoch: Rc<Cell<Option<u64>>>,
     draw_will_present: Cell<bool>,
     nobie_trace_last_draw_id: Cell<u64>,
-    last_request_frame_timestamp: Rc<Cell<Instant>>,
+    last_present_timestamp: Rc<Cell<Instant>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1058,7 +1058,6 @@ pub struct Window {
 struct InputBoundaryPresentation {
     eligible: bool,
     present_epoch_at_start: u64,
-    request_frame_at_start: Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1358,7 +1357,7 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
-        let last_request_frame_timestamp = Rc::new(Cell::new(Instant::now()));
+        let last_present_timestamp = Rc::new(Cell::new(Instant::now()));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1391,9 +1390,7 @@ impl Window {
             let input_boundary_present_epoch = input_boundary_present_epoch.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
-            let last_request_frame_timestamp = last_request_frame_timestamp.clone();
             move |request_frame_options| {
-                last_request_frame_timestamp.set(Instant::now());
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1721,7 +1718,7 @@ impl Window {
             input_boundary_present_epoch,
             draw_will_present: Cell::new(false),
             nobie_trace_last_draw_id: Cell::new(0),
-            last_request_frame_timestamp,
+            last_present_timestamp,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -2896,6 +2893,7 @@ impl Window {
         self.present_epoch
             .set(self.present_epoch.get().saturating_add(1));
         self.needs_present.set(false);
+        self.last_present_timestamp.set(Instant::now());
         crate::nobie_platform_trace::trace(
             "window_present_finish",
             format_args!(
@@ -2919,7 +2917,6 @@ impl Window {
                     | PlatformInput::ScrollWheel(_)
             ),
             present_epoch_at_start: self.present_epoch.get(),
-            request_frame_at_start: self.last_request_frame_timestamp.get(),
         }
     }
 
@@ -2949,21 +2946,13 @@ impl Window {
             return;
         }
 
-        if self.last_request_frame_timestamp.get() != input_boundary.request_frame_at_start {
-            crate::nobie_platform_trace::trace(
-                "input_boundary_present_skip",
-                format_args!("reason=request_frame_ran"),
-            );
-            return;
-        }
-
-        let request_frame_age = self.last_request_frame_timestamp.get().elapsed();
-        if request_frame_age < INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET {
+        let last_present_age = self.last_present_timestamp.get().elapsed();
+        if Self::input_boundary_present_is_fresh(last_present_age) {
             crate::nobie_platform_trace::trace(
                 "input_boundary_present_skip",
                 format_args!(
-                    "reason=request_frame_fresh request_frame_age_us={} budget_us={}",
-                    request_frame_age.as_micros(),
+                    "reason=frame_progress_fresh last_present_age_us={} budget_us={}",
+                    last_present_age.as_micros(),
                     INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET.as_micros()
                 ),
             );
@@ -2974,8 +2963,8 @@ impl Window {
             crate::nobie_platform_trace::trace(
                 "input_boundary_present_draw_present",
                 format_args!(
-                    "request_frame_age_us={} present_epoch={}",
-                    request_frame_age.as_micros(),
+                    "last_present_age_us={} present_epoch={}",
+                    last_present_age.as_micros(),
                     self.present_epoch.get()
                 ),
             );
@@ -2991,8 +2980,8 @@ impl Window {
             crate::nobie_platform_trace::trace(
                 "input_boundary_present_present_only",
                 format_args!(
-                    "request_frame_age_us={} present_epoch={}",
-                    request_frame_age.as_micros(),
+                    "last_present_age_us={} present_epoch={}",
+                    last_present_age.as_micros(),
                     self.present_epoch.get()
                 ),
             );
@@ -3006,6 +2995,10 @@ impl Window {
                 format_args!("reason=clean"),
             );
         }
+    }
+
+    fn input_boundary_present_is_fresh(last_present_age: Duration) -> bool {
+        last_present_age < INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET
     }
 
     /// Returns a snapshot of the current input-latency histograms.
@@ -6472,5 +6465,33 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_boundary_present_freshness_uses_strict_starvation_budget() {
+        assert!(Window::input_boundary_present_is_fresh(
+            INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET - Duration::from_nanos(1),
+        ));
+        assert!(!Window::input_boundary_present_is_fresh(
+            INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET,
+        ));
+    }
+
+    #[test]
+    fn input_boundary_freshness_source_uses_present_not_request_frame_callback() {
+        let source = include_str!("window.rs");
+
+        assert!(source.contains("last_present_timestamp: Rc<Cell<Instant>>"));
+        assert!(source.contains("self.last_present_timestamp.set(Instant::now());"));
+        assert!(
+            source.contains("let last_present_age = self.last_present_timestamp.get().elapsed();")
+        );
+        assert!(!source.contains(&["last", "request", "frame", "timestamp"].join("_")));
+        assert!(!source.contains(&["request", "frame", "at", "start"].join("_")));
     }
 }

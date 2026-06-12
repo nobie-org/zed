@@ -1575,6 +1575,7 @@ impl Window {
         platform_window.on_input({
             let mut cx = cx.to_async();
             Box::new(move |event| {
+                let _input_boundary_trace = crate::nobie_platform_trace::begin_input_boundary();
                 let Some((dispatch_result, input_boundary)) = handle
                     .update(&mut cx, |_, window, cx| {
                         let input_boundary = window.input_boundary_presentation(&event);
@@ -4749,6 +4750,7 @@ impl Window {
         event: PlatformInput,
         cx: &mut App,
     ) -> DispatchEventResult {
+        let _input_boundary_trace = crate::nobie_platform_trace::begin_input_boundary();
         let request_frame_id = crate::nobie_platform_trace::current_request_frame_id();
         let display_link_signal_id = crate::nobie_platform_trace::current_display_link_signal_id();
         crate::nobie_platform_trace::trace(

@@ -6,6 +6,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const TRACE_ENV: &str = "NOBIE_GPUI_TRACE_PLATFORM_PRESENT";
 
 thread_local! {
+    static CURRENT_INPUT_BOUNDARY_ID: Cell<u64> = const { Cell::new(0) };
+    static LAST_INPUT_BOUNDARY_ID: Cell<u64> = const { Cell::new(0) };
     static CURRENT_DRAW_ID: Cell<u64> = const { Cell::new(0) };
     static CURRENT_PRESENT_ID: Cell<u64> = const { Cell::new(0) };
     static CURRENT_DRAW_REASON: Cell<&'static str> = const { Cell::new("unspecified") };
@@ -53,6 +55,61 @@ fn next_id(counter: &AtomicU64) -> u64 {
         return 0;
     }
     counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+}
+
+fn next_always_id(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+}
+
+#[must_use]
+pub struct InputBoundaryTraceGuard {
+    id: u64,
+    previous_id: u64,
+}
+
+impl InputBoundaryTraceGuard {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for InputBoundaryTraceGuard {
+    fn drop(&mut self) {
+        set_current_input_boundary_id(self.previous_id);
+    }
+}
+
+pub fn begin_input_boundary() -> InputBoundaryTraceGuard {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = next_always_id(&NEXT);
+    let previous_id = current_input_boundary_id();
+    set_current_input_boundary_id(id);
+    set_last_input_boundary_id(id);
+    InputBoundaryTraceGuard { id, previous_id }
+}
+
+pub fn set_current_input_boundary_id(input_boundary_id: u64) {
+    CURRENT_INPUT_BOUNDARY_ID.with(|current| current.set(input_boundary_id));
+}
+
+pub fn clear_current_input_boundary_id() {
+    set_current_input_boundary_id(0);
+}
+
+pub fn current_input_boundary_id() -> u64 {
+    CURRENT_INPUT_BOUNDARY_ID.with(Cell::get)
+}
+
+pub fn set_last_input_boundary_id(input_boundary_id: u64) {
+    LAST_INPUT_BOUNDARY_ID.with(|last| last.set(input_boundary_id));
+}
+
+pub fn clear_last_input_boundary_id() {
+    set_last_input_boundary_id(0);
+}
+
+pub fn last_input_boundary_id() -> u64 {
+    LAST_INPUT_BOUNDARY_ID.with(Cell::get)
 }
 
 pub fn next_draw_id() -> u64 {
@@ -247,8 +304,15 @@ pub fn trace(event: &'static str, detail: std::fmt::Arguments<'_>) {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0);
+    let input_boundary_id = current_input_boundary_id();
 
-    eprintln!(
-        "nobie-gpui platform_present seq={seq} t_us={now_us} dt_us={dt_us} event={event} wall_us={wall_us} {detail}"
-    );
+    if input_boundary_id == 0 {
+        eprintln!(
+            "nobie-gpui platform_present seq={seq} t_us={now_us} dt_us={dt_us} event={event} wall_us={wall_us} {detail}"
+        );
+    } else {
+        eprintln!(
+            "nobie-gpui platform_present seq={seq} t_us={now_us} dt_us={dt_us} event={event} wall_us={wall_us} input_boundary_id={input_boundary_id} {detail}"
+        );
+    }
 }

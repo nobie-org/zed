@@ -2,6 +2,35 @@ pub fn enabled() -> bool {
     false
 }
 
+#[must_use]
+pub struct InputBoundaryTraceGuard;
+
+impl InputBoundaryTraceGuard {
+    pub fn id(&self) -> u64 {
+        0
+    }
+}
+
+pub fn begin_input_boundary() -> InputBoundaryTraceGuard {
+    InputBoundaryTraceGuard
+}
+
+pub fn set_current_input_boundary_id(_input_boundary_id: u64) {}
+
+pub fn clear_current_input_boundary_id() {}
+
+pub fn current_input_boundary_id() -> u64 {
+    0
+}
+
+pub fn set_last_input_boundary_id(_input_boundary_id: u64) {}
+
+pub fn clear_last_input_boundary_id() {}
+
+pub fn last_input_boundary_id() -> u64 {
+    0
+}
+
 pub fn next_draw_id() -> u64 {
     0
 }

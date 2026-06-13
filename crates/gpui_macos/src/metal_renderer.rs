@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentAlphaShadowMode, ContentMask, Corners, DevicePixels,
-    Point, ScaledPixels, Size, Surface, point,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, Point,
+    RenderGroupShadowMode, ScaledPixels, Size, Surface, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, Path, PolychromeSprite,
         PrimitiveBatch, Quad, RenderGroupBackendCounters, Scene, Shadow, Underline,
@@ -1641,10 +1641,11 @@ impl MetalRenderer {
                 physical_passes = support_counters.physical_passes,
                 intermediate_textures = support_counters.intermediate_textures,
                 backdrop_copies = support_counters.backdrop_copies,
-                content_alpha_separable = support_counters.shadow_modes.content_alpha_separable,
-                content_alpha_exact = support_counters.shadow_modes.content_alpha_exact,
-                content_alpha_downsampled = support_counters.shadow_modes.content_alpha_downsampled,
-                surface_geometry_shadows = support_counters.shadow_modes.surface_geometry,
+                shadow_source_content_alpha = support_counters.shadow_sources.content_alpha,
+                shadow_source_surface_geometry = support_counters.shadow_sources.surface_geometry,
+                shadow_mode_separable = support_counters.shadow_modes.separable,
+                shadow_mode_exact = support_counters.shadow_modes.exact,
+                shadow_mode_downsampled = support_counters.shadow_modes.downsampled,
                 content_alpha_max_kernel_radius =
                     support_counters.content_alpha_shadow_max_kernel_radius,
                 content_alpha_sample_estimate =
@@ -1754,14 +1755,13 @@ impl MetalRenderer {
             };
 
             if let Some(counters) = self.last_render_group_counters.as_mut() {
-                counters.shadow_modes.content_alpha_separable +=
-                    support_counters.shadow_modes.content_alpha_separable;
-                counters.shadow_modes.content_alpha_exact +=
-                    support_counters.shadow_modes.content_alpha_exact;
-                counters.shadow_modes.content_alpha_downsampled +=
-                    support_counters.shadow_modes.content_alpha_downsampled;
-                counters.shadow_modes.surface_geometry +=
-                    support_counters.shadow_modes.surface_geometry;
+                counters.shadow_sources.content_alpha +=
+                    support_counters.shadow_sources.content_alpha;
+                counters.shadow_sources.surface_geometry +=
+                    support_counters.shadow_sources.surface_geometry;
+                counters.shadow_modes.separable += support_counters.shadow_modes.separable;
+                counters.shadow_modes.exact += support_counters.shadow_modes.exact;
+                counters.shadow_modes.downsampled += support_counters.shadow_modes.downsampled;
                 counters.content_alpha_shadow_max_kernel_radius = counters
                     .content_alpha_shadow_max_kernel_radius
                     .max(support_counters.content_alpha_shadow_max_kernel_radius);
@@ -1771,13 +1771,13 @@ impl MetalRenderer {
 
             let mut separable_shadow_textures = HashMap::new();
             for shadow in effect_plan.drop_shadows() {
-                if shadow.mode != ContentAlphaShadowMode::Separable
-                    || shadow.blur_radius.0 <= f32::EPSILON
+                if shadow.shadow.mode != RenderGroupShadowMode::Separable
+                    || shadow.shadow.blur_radius.0 <= f32::EPSILON
                 {
                     continue;
                 }
 
-                let key = shadow.blur_radius.0.to_bits();
+                let key = shadow.shadow.blur_radius.0.to_bits();
                 if separable_shadow_textures.contains_key(&key) {
                     continue;
                 }
@@ -1793,14 +1793,15 @@ impl MetalRenderer {
                 {
                     let _span = tracing::trace_span!(
                         "gpui_macos::render_group_content_alpha_horizontal_blur",
-                        blur_radius = shadow.blur_radius.0,
-                        kernel_radius = ((shadow.blur_radius.0 * 3.).ceil().max(0.) as u64).min(24),
+                        blur_radius = shadow.shadow.blur_radius.0,
+                        kernel_radius =
+                            ((shadow.shadow.blur_radius.0 * 3.).ceil().max(0.) as u64).min(24),
                     )
                     .entered();
                     if !self.draw_group_alpha_horizontal_blur_to_texture(
                         group,
                         &effect_plan,
-                        shadow.blur_radius,
+                        shadow.shadow.blur_radius,
                         &group_texture,
                         source_mask_texture_ref,
                         &texture,
@@ -2046,29 +2047,29 @@ impl MetalRenderer {
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
         for shadow in effect_plan.drop_shadows() {
-            let (effect_kind, source_texture) = match shadow.mode {
-                ContentAlphaShadowMode::Separable if shadow.blur_radius.0 > f32::EPSILON => {
+            let (effect_kind, source_texture) = match shadow.shadow.mode {
+                RenderGroupShadowMode::Separable if shadow.shadow.blur_radius.0 > f32::EPSILON => {
                     let Some(texture) =
-                        separable_shadow_textures.get(&shadow.blur_radius.0.to_bits())
+                        separable_shadow_textures.get(&shadow.shadow.blur_radius.0.to_bits())
                     else {
                         return false;
                     };
                     (4, texture.as_ref())
                 }
-                ContentAlphaShadowMode::Separable | ContentAlphaShadowMode::Exact => {
+                RenderGroupShadowMode::Separable | RenderGroupShadowMode::Exact => {
                     (1, group_texture)
                 }
-                ContentAlphaShadowMode::Downsampled | _ => return false,
+                RenderGroupShadowMode::Downsampled | _ => return false,
             };
-            let color = shadow.color.to_rgb();
+            let color = shadow.shadow.color.to_rgb();
             let sprite = GroupSprite {
                 bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind,
                 source_blur_radius: 0.,
                 source_mask_enabled,
-                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
-                shadow_blur_radius: shadow.blur_radius.0,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
@@ -2115,7 +2116,10 @@ impl MetalRenderer {
         );
 
         for shadow in effect_plan.surface_shadows() {
-            let color = shadow.color.to_rgb();
+            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
+                return false;
+            }
+            let color = shadow.shadow.color.to_rgb();
             // The surface-shadow SDF reads the material slot; drive it from the
             // shadow's own shape so a superellipse shadow gets squircle corners.
             let (shadow_shape_kind, shadow_shape_exponent) = shadow.shape_kind.shader_params();
@@ -2127,8 +2131,8 @@ impl MetalRenderer {
                 effect_kind: 2,
                 source_blur_radius: 0.,
                 source_mask_enabled: 0.,
-                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
-                shadow_blur_radius: shadow.blur_radius.0,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
@@ -3390,7 +3394,7 @@ mod tests {
         BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, px, rgba,
         scene_protocol::{
             LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters,
-            RenderGroupShadowModeCounters,
+            RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
         },
         transparent_black,
     };
@@ -3741,6 +3745,7 @@ mod tests {
         RenderGroupBackendCounters {
             intermediate_textures: counters.intermediate_textures,
             backdrop_copies: counters.backdrop_copies,
+            shadow_sources: counters.shadow_sources,
             shadow_modes: counters.shadow_modes,
             content_alpha_shadow_max_kernel_radius: counters.content_alpha_shadow_max_kernel_radius,
             content_alpha_shadow_sample_count_estimate: counters
@@ -3864,13 +3869,16 @@ mod tests {
             finished_scene([quad(0, rect(20., 10., 40., 12.), white())]),
         );
         let predicted = predicted_counters(&group);
+        let mut shadow_sources = RenderGroupShadowSourceCounters::default();
+        shadow_sources.content_alpha = 1;
         let mut shadow_modes = RenderGroupShadowModeCounters::default();
-        shadow_modes.content_alpha_separable = 1;
+        shadow_modes.separable = 1;
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
                 intermediate_textures: 2,
                 backdrop_copies: 0,
+                shadow_sources,
                 shadow_modes,
                 content_alpha_shadow_max_kernel_radius: 9,
                 content_alpha_shadow_sample_count_estimate: 152_000,

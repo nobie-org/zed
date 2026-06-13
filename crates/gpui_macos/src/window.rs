@@ -561,15 +561,26 @@ impl MacWindowState {
     }
 
     fn start_display_link(&mut self) {
+        let had_display_link = self.display_link.is_some();
         self.stop_display_link();
-        unsafe {
-            if !self
-                .native_window
+        let occlusion_visible = unsafe {
+            self.native_window
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-            {
-                return;
-            }
+        };
+        nobie_platform_trace::trace(
+            "display_link_start_decision",
+            format_args!(
+                "occlusion_visible={} had_display_link={}",
+                occlusion_visible, had_display_link
+            ),
+        );
+        if !occlusion_visible {
+            nobie_platform_trace::trace(
+                "display_link_start_skipped",
+                format_args!("reason=occluded"),
+            );
+            return;
         }
         let display_id = unsafe { display_id_for_screen(self.native_window.screen()) };
         if let Some(mut display_link) =
@@ -577,11 +588,20 @@ impl MacWindowState {
         {
             display_link.start().log_err();
             self.display_link = Some(display_link);
+            nobie_platform_trace::trace(
+                "display_link_started",
+                format_args!("display_id={}", display_id),
+            );
         }
     }
 
     fn stop_display_link(&mut self) {
+        let had_display_link = self.display_link.is_some();
         self.display_link = None;
+        nobie_platform_trace::trace(
+            "display_link_stopped",
+            format_args!("had_display_link={}", had_display_link),
+        );
     }
 
     fn is_maximized(&self) -> bool {
@@ -2292,11 +2312,15 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = &mut *window_state.lock();
     unsafe {
-        if lock
+        let occlusion_visible = lock
             .native_window
             .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        {
+            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible);
+        nobie_platform_trace::trace(
+            "window_occlusion_state_changed",
+            format_args!("visible={}", occlusion_visible),
+        );
+        if occlusion_visible {
             lock.move_traffic_light();
             lock.start_display_link();
         } else {
@@ -2540,6 +2564,18 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        nobie_platform_trace::trace(
+            "display_layer_request_frame",
+            format_args!(
+                "had_display_link={} occlusion_visible={}",
+                lock.display_link.is_some(),
+                unsafe {
+                    lock.native_window
+                        .occlusionState()
+                        .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+                }
+            ),
+        );
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
@@ -2556,6 +2592,15 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    nobie_platform_trace::trace(
+        "display_link_step_enter",
+        format_args!(
+            "has_callback={} had_display_link={} latest_signal_id={}",
+            lock.request_frame_callback.is_some(),
+            lock.display_link.is_some(),
+            nobie_platform_trace::latest_display_link_signal_id()
+        ),
+    );
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         // Snapshot the latest CV-thread observation BEFORE invoking the

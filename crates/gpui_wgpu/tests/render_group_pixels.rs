@@ -1129,6 +1129,136 @@ fn render_group_backdrop_tint_is_visible_behind_translucent_source() {
     assert_eq!(pixel(&render(&grouped), 12, 12), [64, 64, 192, 255]);
 }
 
+fn backdrop_filter_scene(effect: CompositeEffect, backdrop: Hsla, source: Option<Hsla>) -> Scene {
+    backdrop_filter_scene_with_effects(vec![effect], backdrop, source)
+}
+
+fn backdrop_filter_scene_with_effects(
+    effects: Vec<CompositeEffect>,
+    backdrop: Hsla,
+    source: Option<Hsla>,
+) -> Scene {
+    let mut group_scene = Scene::default();
+    if let Some(source) = source {
+        group_scene.insert_primitive(quad(0, rect(8., 8., 8., 8.), source));
+    }
+    group_scene.finish();
+
+    let mut grouped = Scene::default();
+    grouped.insert_primitive(quad(0, viewport(), black()));
+    grouped.insert_primitive(quad(1, rect(8., 8., 8., 8.), backdrop));
+    grouped.insert_primitive(paint_group_with_effects(
+        2,
+        rect(8., 8., 8., 8.),
+        effects,
+        group_scene,
+    ));
+    grouped.finish();
+    grouped
+}
+
+#[test]
+fn render_group_backdrop_color_filters_transform_parent_target() {
+    let cases = [
+        (
+            "brightness",
+            CompositeEffect::backdrop_brightness(0.5),
+            white(),
+            [128, 128, 128, 255],
+        ),
+        (
+            "contrast",
+            CompositeEffect::backdrop_contrast(0.),
+            red(),
+            [128, 128, 128, 255],
+        ),
+        (
+            "saturate",
+            CompositeEffect::backdrop_saturate(0.),
+            red(),
+            [54, 54, 54, 255],
+        ),
+        (
+            "grayscale",
+            CompositeEffect::backdrop_grayscale(1.),
+            red(),
+            [54, 54, 54, 255],
+        ),
+        (
+            "invert",
+            CompositeEffect::backdrop_invert(1.),
+            red(),
+            [0, 255, 255, 255],
+        ),
+        (
+            "color_matrix",
+            CompositeEffect::backdrop_color_matrix(
+                [[0., 0., 0.], [1., 0., 0.], [0., 0., 0.]],
+                [0., 0., 0.],
+            ),
+            red(),
+            [0, 255, 0, 255],
+        ),
+    ];
+
+    for (name, effect, backdrop, expected) in cases {
+        let image = render(&backdrop_filter_scene(effect, backdrop, None));
+        assert_eq!(
+            pixel(&image, 12, 12),
+            expected,
+            "{name} should filter the parent backdrop under the group"
+        );
+        assert_eq!(
+            pixel(&image, 4, 4),
+            [0, 0, 0, 255],
+            "{name} should stay clipped to the group material bounds"
+        );
+    }
+}
+
+#[test]
+fn render_group_backdrop_color_filter_is_visible_behind_translucent_source() {
+    let image = render(&backdrop_filter_scene(
+        CompositeEffect::backdrop_invert(1.),
+        red(),
+        Some(blue_half()),
+    ));
+
+    assert_eq!(
+        pixel(&image, 12, 12),
+        [0, 127, 255, 255],
+        "blue half-alpha source should composite over the filtered cyan backdrop"
+    );
+}
+
+#[test]
+fn render_group_backdrop_color_filters_are_ordered() {
+    let brightness_then_invert = render(&backdrop_filter_scene_with_effects(
+        vec![
+            CompositeEffect::backdrop_brightness(0.5),
+            CompositeEffect::backdrop_invert(1.),
+        ],
+        red(),
+        None,
+    ));
+    let invert_then_brightness = render(&backdrop_filter_scene_with_effects(
+        vec![
+            CompositeEffect::backdrop_invert(1.),
+            CompositeEffect::backdrop_brightness(0.5),
+        ],
+        red(),
+        None,
+    ));
+
+    assert_eq!(pixel(&brightness_then_invert, 12, 12), [128, 255, 255, 255]);
+    assert_eq!(pixel(&invert_then_brightness, 12, 12), [0, 128, 128, 255]);
+    assert_ne!(
+        pixel(&brightness_then_invert, 12, 12),
+        pixel(&invert_then_brightness, 12, 12),
+        "backdrop filters should compose in input order"
+    );
+}
+
 #[test]
 fn render_group_backdrop_blur_samples_parent_target_at_group_order() {
     let group_scene = Scene::default();

@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::quartzcore_time::ca_current_media_time;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -85,6 +85,176 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
+}
+
+const GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL: u64 = 4;
+
+#[cfg(test)]
+const GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS: u64 = 32;
+
+#[cfg(test)]
+const GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES: u64 = 3
+    * GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS
+    * GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS
+    * GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL;
+
+#[cfg(not(test))]
+const GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GroupIntermediateTextureKey {
+    width: u64,
+    height: u64,
+    pixel_format: metal::MTLPixelFormat,
+    storage_mode: metal::MTLStorageMode,
+    usage: metal::MTLTextureUsage,
+}
+
+impl GroupIntermediateTextureKey {
+    fn viewport_bgra_render_target(viewport_size: Size<DevicePixels>) -> Option<Self> {
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            return None;
+        }
+
+        Some(Self {
+            width: viewport_size.width.0 as u64,
+            height: viewport_size.height.0 as u64,
+            pixel_format: metal::MTLPixelFormat::BGRA8Unorm,
+            storage_mode: metal::MTLStorageMode::Private,
+            usage: metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+        })
+    }
+
+    fn new_texture(&self, device: &metal::Device) -> metal::Texture {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(self.width);
+        texture_descriptor.set_height(self.height);
+        texture_descriptor.set_pixel_format(self.pixel_format);
+        texture_descriptor.set_storage_mode(self.storage_mode);
+        texture_descriptor.set_usage(self.usage);
+        device.new_texture(&texture_descriptor)
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.width
+            .saturating_mul(self.height)
+            .saturating_mul(GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL)
+    }
+}
+
+struct GroupIntermediateTexture {
+    key: GroupIntermediateTextureKey,
+    texture: metal::Texture,
+}
+
+struct AvailableGroupIntermediateTexture {
+    texture: metal::Texture,
+    release_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GroupIntermediateTexturePoolStats {
+    allocations: u64,
+    reuses: u64,
+    available_textures: usize,
+    available_bytes: u64,
+}
+
+#[derive(Default)]
+struct GroupIntermediateTexturePool {
+    textures: HashMap<GroupIntermediateTextureKey, Vec<AvailableGroupIntermediateTexture>>,
+    allocations: u64,
+    reuses: u64,
+    available_bytes: u64,
+    next_release_sequence: u64,
+}
+
+impl GroupIntermediateTexturePool {
+    fn acquire(
+        &mut self,
+        device: &metal::Device,
+        key: GroupIntermediateTextureKey,
+    ) -> metal::Texture {
+        if let Some(texture) = self
+            .textures
+            .get_mut(&key)
+            .and_then(|textures| textures.pop())
+        {
+            self.reuses += 1;
+            self.available_bytes = self.available_bytes.saturating_sub(key.byte_len());
+            texture.texture
+        } else {
+            self.allocations += 1;
+            key.new_texture(device)
+        }
+    }
+
+    fn release_many(&mut self, textures: Vec<GroupIntermediateTexture>) {
+        for texture in textures {
+            let byte_len = texture.key.byte_len();
+            if byte_len > GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES {
+                continue;
+            }
+
+            let release_sequence = self.next_release_sequence;
+            self.next_release_sequence = self.next_release_sequence.wrapping_add(1);
+            self.available_bytes = self.available_bytes.saturating_add(byte_len);
+            self.textures
+                .entry(texture.key)
+                .or_default()
+                .push(AvailableGroupIntermediateTexture {
+                    texture: texture.texture,
+                    release_sequence,
+                });
+        }
+
+        self.trim_to_budget();
+    }
+
+    fn trim_to_budget(&mut self) {
+        while self.available_bytes > GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES {
+            let Some((oldest_key, oldest_index)) = self
+                .textures
+                .iter()
+                .filter_map(|(key, textures)| {
+                    textures
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, texture)| texture.release_sequence)
+                        .map(|(index, texture)| (*key, index, texture.release_sequence))
+                })
+                .min_by_key(|(_, _, release_sequence)| *release_sequence)
+                .map(|(key, index, _)| (key, index))
+            else {
+                self.available_bytes = 0;
+                break;
+            };
+
+            let mut remove_key = false;
+            if let Some(textures) = self.textures.get_mut(&oldest_key) {
+                let removed = textures.swap_remove(oldest_index);
+                drop(removed);
+                self.available_bytes = self.available_bytes.saturating_sub(oldest_key.byte_len());
+                remove_key = textures.is_empty();
+            }
+            if remove_key {
+                self.textures.remove(&oldest_key);
+            }
+        }
+    }
+
+    fn stats(&self) -> GroupIntermediateTexturePoolStats {
+        GroupIntermediateTexturePoolStats {
+            allocations: self.allocations,
+            reuses: self.reuses,
+            available_textures: self
+                .textures
+                .values()
+                .map(std::vec::Vec::len)
+                .sum::<usize>(),
+            available_bytes: self.available_bytes,
+        }
+    }
 }
 
 impl InstanceBufferPool {
@@ -145,6 +315,9 @@ pub(crate) struct MetalRenderer {
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+    #[allow(clippy::arc_with_non_send_sync)]
+    group_intermediate_texture_pool: Arc<Mutex<GroupIntermediateTexturePool>>,
+    group_intermediate_textures_in_flight: Vec<GroupIntermediateTexture>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
@@ -369,6 +542,10 @@ impl MetalRenderer {
             bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
+            group_intermediate_texture_pool: Arc::new(Mutex::new(
+                GroupIntermediateTexturePool::default(),
+            )),
+            group_intermediate_textures_in_flight: Vec::new(),
             sprite_atlas,
             core_video_texture_cache,
             last_render_group_counters: None,
@@ -380,6 +557,59 @@ impl MetalRenderer {
 
     pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
         self.layer.as_ref().map(|l| l.as_ref())
+    }
+
+    fn add_completed_resource_release_handler(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        instance_buffer: InstanceBuffer,
+        trace_ids: Option<(u64, u64, u64)>,
+    ) {
+        let instance_buffer_pool = self.instance_buffer_pool.clone();
+        let group_intermediate_texture_pool = self.group_intermediate_texture_pool.clone();
+        let group_intermediate_textures = Cell::new(Some(mem::take(
+            &mut self.group_intermediate_textures_in_flight,
+        )));
+        let instance_buffer = Cell::new(Some(instance_buffer));
+        let block = ConcreteBlock::new(move |_| {
+            if let Some(instance_buffer) = instance_buffer.take() {
+                instance_buffer_pool.lock().release(instance_buffer);
+            }
+            if let Some(group_intermediate_textures) = group_intermediate_textures.take() {
+                group_intermediate_texture_pool
+                    .lock()
+                    .release_many(group_intermediate_textures);
+            }
+            if let Some((metal_draw_id, draw_id, present_id)) = trace_ids {
+                nobie_platform_trace::trace(
+                    "metal_command_buffer_completed",
+                    format_args!(
+                        "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
+                        metal_draw_id,
+                        draw_id,
+                        present_id,
+                        ca_current_media_time()
+                    ),
+                );
+            }
+        });
+        let block = block.copy();
+        command_buffer.add_completed_handler(&block);
+    }
+
+    fn release_group_intermediate_textures_now(&mut self) {
+        let group_intermediate_textures =
+            mem::take(&mut self.group_intermediate_textures_in_flight);
+        if !group_intermediate_textures.is_empty() {
+            self.group_intermediate_texture_pool
+                .lock()
+                .release_many(group_intermediate_textures);
+        }
+    }
+
+    #[cfg(test)]
+    fn group_intermediate_texture_pool_stats(&self) -> GroupIntermediateTexturePoolStats {
+        self.group_intermediate_texture_pool.lock().stats()
     }
 
     pub fn layer_ptr(&self) -> *mut CAMetalLayer {
@@ -555,31 +785,11 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let completed_metal_draw_id = metal_draw_id;
-                    let completed_draw_id = draw_id;
-                    let completed_present_id = present_id;
-                    let completed_trace_enabled = trace_enabled;
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                        if completed_trace_enabled {
-                            nobie_platform_trace::trace(
-                                "metal_command_buffer_completed",
-                                format_args!(
-                                    "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
-                                    completed_metal_draw_id,
-                                    completed_draw_id,
-                                    completed_present_id,
-                                    ca_current_media_time()
-                                ),
-                            );
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
+                    self.add_completed_resource_release_handler(
+                        &command_buffer,
+                        instance_buffer,
+                        trace_enabled.then_some((metal_draw_id, draw_id, present_id)),
+                    );
 
                     if trace_enabled {
                         let presented_metal_draw_id = metal_draw_id;
@@ -682,6 +892,7 @@ impl MetalRenderer {
                     return;
                 }
                 Err(err) => {
+                    self.release_group_intermediate_textures_now();
                     // Designed growth path, not a failure: the frame is
                     // re-encoded after the pool doubles, so report it at the
                     // same level as the matching "increased instance buffer
@@ -747,15 +958,11 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
+                    self.add_completed_resource_release_handler(
+                        &command_buffer,
+                        instance_buffer,
+                        None,
+                    );
 
                     // Commit and wait for completion without presenting
                     command_buffer.commit();
@@ -796,6 +1003,7 @@ impl MetalRenderer {
                     });
                 }
                 Err(err) => {
+                    self.release_group_intermediate_textures_now();
                     // Designed growth path, not a failure: the frame is
                     // re-encoded after the pool doubles, so report it at the
                     // same level as the matching "increased instance buffer
@@ -880,15 +1088,11 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
+                    self.add_completed_resource_release_handler(
+                        &command_buffer,
+                        instance_buffer,
+                        None,
+                    );
 
                     // On discrete GPUs (non-unified memory), Managed textures
                     // require an explicit blit synchronize before the CPU can
@@ -938,6 +1142,7 @@ impl MetalRenderer {
                     });
                 }
                 Err(err) => {
+                    self.release_group_intermediate_textures_now();
                     // Designed growth path, not a failure: the frame is
                     // re-encoded after the pool doubles, so report it at the
                     // same level as the matching "increased instance buffer
@@ -969,7 +1174,7 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         if scene.requires_backdrop_effects() {
-            let Some(root_texture) = self.new_group_intermediate_texture(viewport_size) else {
+            let Some(root_texture) = self.acquire_group_intermediate_texture(viewport_size) else {
                 anyhow::bail!("invalid viewport for backdrop render group: {viewport_size:?}");
             };
             let command_queue = self.command_queue.clone();
@@ -1310,7 +1515,7 @@ impl MetalRenderer {
                 continue;
             }
 
-            let Some(group_texture) = self.new_group_intermediate_texture(viewport_size) else {
+            let Some(group_texture) = self.acquire_group_intermediate_texture(viewport_size) else {
                 return false;
             };
             if let Some(counters) = self.last_render_group_counters.as_mut() {
@@ -1401,12 +1606,12 @@ impl MetalRenderer {
     }
 
     fn copy_backdrop_texture(
-        &self,
+        &mut self,
         target_texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
     ) -> Option<metal::Texture> {
-        let texture = self.new_group_intermediate_texture(viewport_size)?;
+        let texture = self.acquire_group_intermediate_texture(viewport_size)?;
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target_texture,
@@ -1427,22 +1632,21 @@ impl MetalRenderer {
         Some(texture)
     }
 
-    fn new_group_intermediate_texture(
-        &self,
+    fn acquire_group_intermediate_texture(
+        &mut self,
         viewport_size: Size<DevicePixels>,
     ) -> Option<metal::Texture> {
-        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
-            return None;
-        }
-
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(viewport_size.width.0 as u64);
-        texture_descriptor.set_height(viewport_size.height.0 as u64);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        texture_descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        Some(self.device.new_texture(&texture_descriptor))
+        let key = GroupIntermediateTextureKey::viewport_bgra_render_target(viewport_size)?;
+        let texture = self
+            .group_intermediate_texture_pool
+            .lock()
+            .acquire(&self.device, key);
+        self.group_intermediate_textures_in_flight
+            .push(GroupIntermediateTexture {
+                key,
+                texture: texture.clone(),
+            });
+        Some(texture)
     }
 
     fn draw_group_from_texture(
@@ -1847,14 +2051,14 @@ impl MetalRenderer {
     /// its forced-opaque-white fill makes the cleared-transparent target's alpha
     /// channel hold pure coverage (`mask.a == coverage`).
     fn rasterize_source_mask_path(
-        &self,
+        &mut self,
         path: &Path<ScaledPixels>,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
     ) -> Option<metal::Texture> {
-        let mask_texture = self.new_group_intermediate_texture(viewport_size)?;
+        let mask_texture = self.acquire_group_intermediate_texture(viewport_size)?;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -2755,7 +2959,7 @@ mod tests {
     use image::RgbaImage;
     use std::sync::Arc;
 
-    const IMAGE_SIZE: i32 = 32;
+    const IMAGE_SIZE: i32 = GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS as i32;
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels(value)
@@ -3102,6 +3306,19 @@ mod tests {
         }
     }
 
+    fn render_with_renderer(renderer: &mut MetalRenderer, scene: &Scene) {
+        renderer
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render metal scene");
+    }
+
+    fn group_intermediate_texture_bytes(count: u64) -> u64 {
+        count * IMAGE_SIZE as u64 * IMAGE_SIZE as u64 * GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL
+    }
+
     fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
         image.get_pixel(x, y).0
     }
@@ -3224,6 +3441,120 @@ mod tests {
         scene.finish();
 
         assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn group_intermediate_texture_pool_reuses_sibling_group_targets_metal() {
+        let left_group = paint_group_with_effects(
+            1,
+            rect(2., 2., 10., 10.),
+            vec![CompositeEffect::opacity(0.5)],
+            finished_scene([quad(0, rect(2., 2., 10., 10.), red())]),
+        );
+        let right_group = paint_group_with_effects(
+            2,
+            rect(16., 16., 10., 10.),
+            vec![CompositeEffect::opacity(0.5)],
+            finished_scene([quad(0, rect(16., 16., 10., 10.), green())]),
+        );
+        let predicted = RenderGroupBackendCounters {
+            intermediate_textures: predicted_counters(&left_group).intermediate_textures
+                + predicted_counters(&right_group).intermediate_textures,
+            backdrop_copies: 0,
+        };
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 2,
+                backdrop_copies: 0,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(left_group);
+        scene.insert_primitive(right_group);
+        scene.finish();
+
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let device = MetalRenderer::create_device();
+        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
+
+        render_with_renderer(&mut renderer, &scene);
+        assert_eq!(renderer.render_group_backend_counters(), Some(predicted));
+        assert_eq!(
+            renderer.group_intermediate_texture_pool_stats(),
+            GroupIntermediateTexturePoolStats {
+                allocations: 2,
+                reuses: 0,
+                available_textures: 2,
+                available_bytes: group_intermediate_texture_bytes(2),
+            }
+        );
+
+        render_with_renderer(&mut renderer, &scene);
+        assert_eq!(renderer.render_group_backend_counters(), Some(predicted));
+        assert_eq!(
+            renderer.group_intermediate_texture_pool_stats(),
+            GroupIntermediateTexturePoolStats {
+                allocations: 2,
+                reuses: 2,
+                available_textures: 2,
+                available_bytes: group_intermediate_texture_bytes(2),
+            }
+        );
+    }
+
+    #[test]
+    fn group_intermediate_texture_pool_trims_available_textures_to_budget_metal() {
+        let groups = (0..4)
+            .map(|ix| {
+                let origin = 2. + ix as f32 * 6.;
+                paint_group_with_effects(
+                    ix,
+                    rect(origin, origin, 4., 4.),
+                    vec![CompositeEffect::opacity(0.5)],
+                    finished_scene([quad(0, rect(origin, origin, 4., 4.), red())]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let predicted = RenderGroupBackendCounters {
+            intermediate_textures: groups
+                .iter()
+                .map(|group| predicted_counters(group).intermediate_textures)
+                .sum(),
+            backdrop_copies: 0,
+        };
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                intermediate_textures: 4,
+                backdrop_copies: 0,
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        for group in groups {
+            scene.insert_primitive(group);
+        }
+        scene.finish();
+
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let device = MetalRenderer::create_device();
+        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
+
+        render_with_renderer(&mut renderer, &scene);
+        assert_eq!(renderer.render_group_backend_counters(), Some(predicted));
+        assert_eq!(
+            renderer.group_intermediate_texture_pool_stats(),
+            GroupIntermediateTexturePoolStats {
+                allocations: 4,
+                reuses: 0,
+                available_textures: 3,
+                available_bytes: group_intermediate_texture_bytes(3),
+            }
+        );
     }
 
     #[test]

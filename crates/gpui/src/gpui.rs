@@ -48,14 +48,15 @@ mod scene;
 /// constructing these storage records directly.
 pub mod scene_protocol {
     pub use crate::scene::{
-        CompositeEffectPlan, CompositeProcessedContentGlowPlan, ContentAlphaShadowMode, DrawOrder,
-        LogicalVisualPlan, MonochromeSprite, PaintGroup, PaintMetalTexture, Path, PathId,
-        PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
+        CompositeEffectPlan, CompositeProcessedContentGlowPlan, DrawOrder, LogicalVisualPlan,
+        MonochromeSprite, PaintGroup, PaintMetalTexture, Path, PathId, PathVertex,
+        PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
         PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
         RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
         RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
-        RenderGroupShadowModeCounters, RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec,
-        Shadow, SubpixelSprite, TransformationMatrix, Underline,
+        RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
+        RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
+        TransformationMatrix, Underline,
     };
 }
 /// Render-group planning and capability diagnostics for inspectors and tests.
@@ -64,12 +65,12 @@ pub mod scene_protocol {
 /// render groups directly.
 pub mod render_group_diagnostics {
     pub use crate::scene::{
-        ContentAlphaShadowMode, LogicalVisualPlan, PhysicalRenderGroupPlan,
-        RenderGroupBackendCounters, RenderGroupCapabilityProbe,
-        RenderGroupCapabilityRejectionReason, RenderGroupCapabilityReport,
-        RenderGroupCapabilityStatus, RenderGroupDependencies, RenderGroupInput,
-        RenderGroupLimitUnit, RenderGroupPlanningRejection, RenderGroupPlanningRejectionReason,
-        RenderGroupRejectedEffect, RenderGroupRequirements, RenderGroupShadowModeCounters,
+        LogicalVisualPlan, PhysicalRenderGroupPlan, RenderGroupBackendCounters,
+        RenderGroupCapabilityProbe, RenderGroupCapabilityRejectionReason,
+        RenderGroupCapabilityReport, RenderGroupCapabilityStatus, RenderGroupDependencies,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
+        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+        RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
         RenderGroupSupportCounters, SemanticRenderGroupSpec,
     };
 }
@@ -143,9 +144,10 @@ pub use refineable::*;
 pub(crate) use scene::PaintMetalTexture;
 pub use scene::{
     BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
-    CompositeEffect, CompositeProcessedContentGlow, CompositeSurfaceShadow, ContentAlphaShadowMode,
+    CompositeEffect, CompositeProcessedContentGlow, CompositeShadow, CompositeSurfaceShadow,
     ContentLayer, ContentStage, DerivedLayer, DerivedStage, GlassLens, GlassSurface, Glow,
     GroupShape, GroupShapeKind, LumaThreshold, Path, ProcessedContentDerivedLayer,
+    RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
     SourceColorFilter, SourceMaskBlurOrder, SourceToneOp, TransformationMatrix,
 };
 pub(crate) use scene::{

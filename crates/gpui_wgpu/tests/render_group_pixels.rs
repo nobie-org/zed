@@ -10,7 +10,8 @@ use gpui::{
     RenderSvgParams, ScaledPixels, point, px, rgba,
     scene_protocol::{
         LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
-        RenderGroupBackendCounters, RenderGroupShadowModeCounters, Scene, TransformationMatrix,
+        RenderGroupBackendCounters, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
+        Scene, TransformationMatrix,
     },
     size, transparent_black,
 };
@@ -178,6 +179,7 @@ fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
     RenderGroupBackendCounters {
         intermediate_textures: counters.intermediate_textures,
         backdrop_copies: counters.backdrop_copies,
+        shadow_sources: counters.shadow_sources,
         shadow_modes: counters.shadow_modes,
         content_alpha_shadow_max_kernel_radius: counters.content_alpha_shadow_max_kernel_radius,
         content_alpha_shadow_sample_count_estimate: counters
@@ -295,13 +297,16 @@ fn backend_counters_match_planner_for_separable_content_alpha_shadow() {
         finished_scene([quad(0, rect(20., 10., 40., 12.), white())]),
     );
     let predicted = predicted_counters(&group);
+    let mut shadow_sources = RenderGroupShadowSourceCounters::default();
+    shadow_sources.content_alpha = 1;
     let mut shadow_modes = RenderGroupShadowModeCounters::default();
-    shadow_modes.content_alpha_separable = 1;
+    shadow_modes.separable = 1;
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
             intermediate_textures: 2,
             backdrop_copies: 0,
+            shadow_sources,
             shadow_modes,
             content_alpha_shadow_max_kernel_radius: 9,
             content_alpha_shadow_sample_count_estimate: 152_000,

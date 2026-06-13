@@ -42,6 +42,92 @@ use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct RenderTargetFrame {
+    pub origin: Point<ScaledPixels>,
+    pub size: Size<DevicePixels>,
+}
+
+impl RenderTargetFrame {
+    fn root(size: Size<DevicePixels>) -> Self {
+        Self {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size,
+        }
+    }
+
+    fn from_bounds(bounds: Bounds<ScaledPixels>) -> Option<Self> {
+        let left = bounds.origin.x.0.floor();
+        let top = bounds.origin.y.0.floor();
+        let right = (bounds.origin.x.0 + bounds.size.width.0).ceil();
+        let bottom = (bounds.origin.y.0 + bounds.size.height.0).ceil();
+        let width = (right - left) as i32;
+        let height = (bottom - top) as i32;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+
+        Some(Self {
+            origin: point(ScaledPixels(left), ScaledPixels(top)),
+            size: size(DevicePixels(width), DevicePixels(height)),
+        })
+    }
+
+    fn bounds(self) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            self.origin,
+            size(
+                ScaledPixels(self.size.width.0 as f32),
+                ScaledPixels(self.size.height.0 as f32),
+            ),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct TextureFrame {
+    pub origin: Point<ScaledPixels>,
+    pub size: Size<DevicePixels>,
+}
+
+impl From<RenderTargetFrame> for TextureFrame {
+    fn from(frame: RenderTargetFrame) -> Self {
+        Self {
+            origin: frame.origin,
+            size: frame.size,
+        }
+    }
+}
+
+impl TextureFrame {
+    fn rounded_out_for_bounds_in_target(
+        bounds: Bounds<ScaledPixels>,
+        target_frame: RenderTargetFrame,
+    ) -> Option<Self> {
+        let bounds = bounds.intersect(&target_frame.bounds());
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let left = bounds.origin.x.0.floor();
+        let top = bounds.origin.y.0.floor();
+        let right = (bounds.origin.x.0 + bounds.size.width.0).ceil();
+        let bottom = (bounds.origin.y.0 + bounds.size.height.0).ceil();
+        let width = (right - left) as i32;
+        let height = (bottom - top) as i32;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+
+        Some(Self {
+            origin: point(ScaledPixels(left), ScaledPixels(top)),
+            size: size(DevicePixels(width), DevicePixels(height)),
+        })
+    }
+}
+
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 #[cfg(feature = "runtime_shaders")]
@@ -152,6 +238,7 @@ struct AvailableGroupIntermediateTexture {
     release_sequence: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct GroupIntermediateTexturePoolStats {
     allocations: u64,
@@ -243,6 +330,7 @@ impl GroupIntermediateTexturePool {
         }
     }
 
+    #[cfg(test)]
     fn stats(&self) -> GroupIntermediateTexturePoolStats {
         GroupIntermediateTexturePoolStats {
             allocations: self.allocations,
@@ -322,6 +410,7 @@ pub(crate) struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    path_intermediate_texture_size: Option<Size<DevicePixels>>,
     path_sample_count: u32,
     /// Measured render-group resource counts from the most recent scene render.
     last_render_group_counters: Option<RenderGroupBackendCounters>,
@@ -551,6 +640,7 @@ impl MetalRenderer {
             last_render_group_counters: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            path_intermediate_texture_size: None,
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -653,6 +743,11 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            self.path_intermediate_texture_size = None;
+            return;
+        }
+
+        if self.path_intermediate_texture_size == Some(size) {
             return;
         }
 
@@ -664,6 +759,7 @@ impl MetalRenderer {
         texture_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
+        self.path_intermediate_texture_size = Some(size);
 
         if self.path_sample_count > 1 {
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
@@ -1173,6 +1269,7 @@ impl MetalRenderer {
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        let target_frame = RenderTargetFrame::root(viewport_size);
         if scene.requires_backdrop_effects() {
             let Some(root_texture) = self.acquire_group_intermediate_texture(viewport_size) else {
                 anyhow::bail!("invalid viewport for backdrop render group: {viewport_size:?}");
@@ -1188,7 +1285,7 @@ impl MetalRenderer {
                 instance_buffer,
                 &mut instance_offset,
                 &root_texture,
-                viewport_size,
+                target_frame,
                 command_buffer,
                 Some(alpha),
             ) && self.draw_texture_to_target(
@@ -1196,7 +1293,7 @@ impl MetalRenderer {
                 instance_buffer,
                 &mut instance_offset,
                 drawable.texture(),
-                viewport_size,
+                target_frame,
                 command_buffer,
                 Some(alpha),
             );
@@ -1239,6 +1336,7 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
+        let target_frame = RenderTargetFrame::root(viewport_size);
 
         self.last_render_group_counters = Some(RenderGroupBackendCounters::default());
         let ok = self.encode_primitives_to_texture(
@@ -1246,7 +1344,7 @@ impl MetalRenderer {
             instance_buffer,
             &mut instance_offset,
             texture,
-            viewport_size,
+            target_frame,
             command_buffer,
             Some(alpha),
         );
@@ -1282,14 +1380,14 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_buffer: &metal::CommandBufferRef,
         clear_alpha: Option<f64>,
     ) -> bool {
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
-            viewport_size,
+            target_frame,
             |color_attachment| {
                 if let Some(alpha) = clear_alpha {
                     color_attachment.set_load_action(metal::MTLLoadAction::Clear);
@@ -1306,32 +1404,33 @@ impl MetalRenderer {
                     &scene.shadows[range],
                     instance_buffer,
                     instance_offset,
-                    viewport_size,
+                    target_frame,
                     command_encoder,
                 ),
                 PrimitiveBatch::Quads(range) => self.draw_quads(
                     &scene.quads[range],
                     instance_buffer,
                     instance_offset,
-                    viewport_size,
+                    target_frame,
                     command_encoder,
                 ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
+                    self.update_path_intermediate_textures(target_frame.size);
 
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
                         instance_buffer,
                         instance_offset,
-                        viewport_size,
+                        target_frame,
                         command_buffer,
                     );
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         texture,
-                        viewport_size,
+                        target_frame,
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
@@ -1342,7 +1441,7 @@ impl MetalRenderer {
                             paths,
                             instance_buffer,
                             instance_offset,
-                            viewport_size,
+                            target_frame,
                             command_encoder,
                         )
                     } else {
@@ -1353,7 +1452,7 @@ impl MetalRenderer {
                     &scene.underlines[range],
                     instance_buffer,
                     instance_offset,
-                    viewport_size,
+                    target_frame,
                     command_encoder,
                 ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
@@ -1362,7 +1461,7 @@ impl MetalRenderer {
                         &scene.monochrome_sprites[range],
                         instance_buffer,
                         instance_offset,
-                        viewport_size,
+                        target_frame,
                         command_encoder,
                     ),
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => self
@@ -1371,14 +1470,14 @@ impl MetalRenderer {
                         &scene.polychrome_sprites[range],
                         instance_buffer,
                         instance_offset,
-                        viewport_size,
+                        target_frame,
                         command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range],
                     instance_buffer,
                     instance_offset,
-                    viewport_size,
+                    target_frame,
                     command_encoder,
                 ),
                 PrimitiveBatch::Groups(range) => {
@@ -1388,14 +1487,14 @@ impl MetalRenderer {
                         instance_buffer,
                         instance_offset,
                         texture,
-                        viewport_size,
+                        target_frame,
                         command_buffer,
                     );
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         texture,
-                        viewport_size,
+                        target_frame,
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
@@ -1422,14 +1521,14 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         target_texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_buffer: &metal::CommandBufferRef,
         clear_alpha: Option<f64>,
     ) -> bool {
         let command_encoder = new_command_encoder_for_texture(
             command_buffer,
             target_texture,
-            viewport_size,
+            target_frame,
             |color_attachment| {
                 if let Some(alpha) = clear_alpha {
                     color_attachment.set_load_action(metal::MTLLoadAction::Clear);
@@ -1447,8 +1546,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
         command_encoder
             .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(source_texture));
@@ -1457,8 +1556,8 @@ impl MetalRenderer {
             bounds: Bounds::new(
                 point(ScaledPixels(0.), ScaledPixels(0.)),
                 size(
-                    ScaledPixels(viewport_size.width.0 as f32),
-                    ScaledPixels(viewport_size.height.0 as f32),
+                    ScaledPixels(target_frame.size.width.0 as f32),
+                    ScaledPixels(target_frame.size.height.0 as f32),
                 ),
             ),
         };
@@ -1496,6 +1595,7 @@ impl MetalRenderer {
     /// (group intermediate textures + backdrop copies), or `None` if no scene has
     /// rendered. Validated against the planner's `RenderGroupSupportCounters` in
     /// the metal render-group tests.
+    #[cfg(test)]
     pub fn render_group_backend_counters(&self) -> Option<RenderGroupBackendCounters> {
         self.last_render_group_counters
     }
@@ -1506,7 +1606,7 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         target_texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         for group in groups {
@@ -1515,7 +1615,13 @@ impl MetalRenderer {
                 continue;
             }
 
-            let Some(group_texture) = self.acquire_group_intermediate_texture(viewport_size) else {
+            let Some(source_frame) = RenderTargetFrame::from_bounds(group.capture_bounds()) else {
+                return false;
+            };
+            let source_texture_frame = TextureFrame::from(source_frame);
+
+            let Some(group_texture) = self.acquire_group_intermediate_texture(source_frame.size)
+            else {
                 return false;
             };
             if let Some(counters) = self.last_render_group_counters.as_mut() {
@@ -1527,7 +1633,7 @@ impl MetalRenderer {
                 instance_buffer,
                 instance_offset,
                 &group_texture,
-                viewport_size,
+                source_frame,
                 command_buffer,
                 Some(0.),
             ) {
@@ -1535,37 +1641,48 @@ impl MetalRenderer {
             }
 
             let backdrop_texture;
+            let backdrop_texture_frame;
             let backdrop_texture_ref = if effect_plan.reads_backdrop() {
+                let Some(frame) = TextureFrame::rounded_out_for_bounds_in_target(
+                    group
+                        .capture_bounds()
+                        .dilate(group.plan().requirements().backdrop_outset),
+                    target_frame,
+                ) else {
+                    return false;
+                };
                 let Some(texture) =
-                    self.copy_backdrop_texture(target_texture, viewport_size, command_buffer)
+                    self.copy_backdrop_texture(target_texture, target_frame, frame, command_buffer)
                 else {
                     return false;
                 };
                 backdrop_texture = texture;
+                backdrop_texture_frame = frame;
                 if let Some(counters) = self.last_render_group_counters.as_mut() {
                     counters.intermediate_textures += 1;
                     counters.backdrop_copies += 1;
                 }
                 &backdrop_texture
             } else {
+                backdrop_texture_frame = source_texture_frame;
                 &group_texture
             };
 
-            // Arbitrary-path source mask pre-pass: rasterize the group's path into
-            // a coverage mask in the same screen/device space as all group
-            // geometry, parallel to the backdrop copy. For groups without a path
-            // mask, bind `&group_texture` (a real allocated texture); the
-            // `source_mask_mode` flag gates the sample so the bound-but-unread
-            // texture is harmless. The mask is a path-rasterization intermediate,
-            // which the planner excludes from per-group counts, so it is NOT
-            // counted here.
+            // Arbitrary-path source mask pre-pass: rasterize the group's path
+            // into a coverage mask using the same bounded source frame as the
+            // captured group source. For groups without a path mask, bind
+            // `&group_texture` (a real allocated texture); the source-mask mode
+            // flag gates the sample so the bound-but-unread texture is
+            // harmless. The mask is a path-rasterization intermediate, which
+            // the planner excludes from per-group counts, so it is NOT counted
+            // here.
             let source_mask_texture;
             let source_mask_texture_ref = if let Some(path) = effect_plan.source_mask_path() {
                 let Some(texture) = self.rasterize_source_mask_path(
                     path,
                     instance_buffer,
                     instance_offset,
-                    viewport_size,
+                    source_frame,
                     command_buffer,
                 ) else {
                     return false;
@@ -1579,7 +1696,7 @@ impl MetalRenderer {
             let command_encoder = new_command_encoder_for_texture(
                 command_buffer,
                 target_texture,
-                viewport_size,
+                target_frame,
                 |color_attachment| {
                     color_attachment.set_load_action(metal::MTLLoadAction::Load);
                 },
@@ -1592,7 +1709,9 @@ impl MetalRenderer {
                 source_mask_texture_ref,
                 instance_buffer,
                 instance_offset,
-                viewport_size,
+                target_frame,
+                source_texture_frame,
+                backdrop_texture_frame,
                 command_encoder,
             );
             command_encoder.end_encoding();
@@ -1608,19 +1727,26 @@ impl MetalRenderer {
     fn copy_backdrop_texture(
         &mut self,
         target_texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
+        backdrop_frame: TextureFrame,
         command_buffer: &metal::CommandBufferRef,
     ) -> Option<metal::Texture> {
-        let texture = self.acquire_group_intermediate_texture(viewport_size)?;
+        let texture = self.acquire_group_intermediate_texture(backdrop_frame.size)?;
+        let source_x = (backdrop_frame.origin.x.0 - target_frame.origin.x.0) as u64;
+        let source_y = (backdrop_frame.origin.y.0 - target_frame.origin.y.0) as u64;
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target_texture,
             0,
             0,
-            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLOrigin {
+                x: source_x,
+                y: source_y,
+                z: 0,
+            },
             metal::MTLSize {
-                width: viewport_size.width.0 as u64,
-                height: viewport_size.height.0 as u64,
+                width: backdrop_frame.size.width.0 as u64,
+                height: backdrop_frame.size.height.0 as u64,
                 depth: 1,
             },
             &texture,
@@ -1658,7 +1784,9 @@ impl MetalRenderer {
         source_mask_texture: &metal::TextureRef,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
+        source_texture_frame: TextureFrame,
+        backdrop_texture_frame: TextureFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         command_encoder.set_render_pipeline_state(&self.group_sprites_pipeline_state);
@@ -1669,8 +1797,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
 
         command_encoder
@@ -1753,6 +1881,8 @@ impl MetalRenderer {
                 backdrop_color_offset,
                 backdrop_lens: [0., 0., 0., 0.],
                 backdrop_lens_lighting: [0., 0., 0., 0.],
+                source_texture_frame,
+                backdrop_texture_frame,
             });
         }
 
@@ -1794,6 +1924,8 @@ impl MetalRenderer {
                 backdrop_color_offset,
                 backdrop_lens: [0., 0., 0., 0.],
                 backdrop_lens_lighting: [0., 0., 0., 0.],
+                source_texture_frame,
+                backdrop_texture_frame,
             });
         }
 
@@ -1830,6 +1962,8 @@ impl MetalRenderer {
                 backdrop_color_offset,
                 backdrop_lens: [0., 0., 0., 0.],
                 backdrop_lens_lighting: [0., 0., 0., 0.],
+                source_texture_frame,
+                backdrop_texture_frame,
             });
         }
 
@@ -1873,6 +2007,8 @@ impl MetalRenderer {
             backdrop_color_offset,
             backdrop_lens,
             backdrop_lens_lighting,
+            source_texture_frame,
+            backdrop_texture_frame,
         });
 
         align_offset(instance_offset);
@@ -1961,7 +2097,7 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         if paths.is_empty() {
@@ -1989,6 +2125,14 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: i32::from(target_frame.size.width) as f64,
+            height: i32::from(target_frame.size.height) as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
         align_offset(instance_offset);
@@ -2014,8 +2158,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -2055,10 +2199,10 @@ impl MetalRenderer {
         path: &Path<ScaledPixels>,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_buffer: &metal::CommandBufferRef,
     ) -> Option<metal::Texture> {
-        let mask_texture = self.acquire_group_intermediate_texture(viewport_size)?;
+        let mask_texture = self.acquire_group_intermediate_texture(target_frame.size)?;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -2077,8 +2221,8 @@ impl MetalRenderer {
                 metal::MTLStorageMode::Private
             };
             let descriptor = metal::TextureDescriptor::new();
-            descriptor.set_width(viewport_size.width.0 as u64);
-            descriptor.set_height(viewport_size.height.0 as u64);
+            descriptor.set_width(target_frame.size.width.0 as u64);
+            descriptor.set_height(target_frame.size.height.0 as u64);
             descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
             descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
             descriptor.set_storage_mode(storage_mode);
@@ -2099,6 +2243,14 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: i32::from(target_frame.size.width) as f64,
+            height: i32::from(target_frame.size.height) as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
         align_offset(instance_offset);
@@ -2130,8 +2282,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -2163,7 +2315,7 @@ impl MetalRenderer {
         shadows: &[Shadow],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if shadows.is_empty() {
@@ -2190,8 +2342,8 @@ impl MetalRenderer {
 
         command_encoder.set_vertex_bytes(
             ShadowInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
 
         let shadow_bytes_len = mem::size_of_val(shadows);
@@ -2226,7 +2378,7 @@ impl MetalRenderer {
         quads: &[Quad],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if quads.is_empty() {
@@ -2253,8 +2405,8 @@ impl MetalRenderer {
 
         command_encoder.set_vertex_bytes(
             QuadInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
 
         let quad_bytes_len = mem::size_of_val(quads);
@@ -2285,7 +2437,7 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         let Some(first_path) = paths.first() else {
@@ -2304,8 +2456,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
 
         command_encoder.set_fragment_texture(
@@ -2375,7 +2527,7 @@ impl MetalRenderer {
         underlines: &[Underline],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if underlines.is_empty() {
@@ -2402,8 +2554,8 @@ impl MetalRenderer {
 
         command_encoder.set_vertex_bytes(
             UnderlineInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
 
         let underline_bytes_len = mem::size_of_val(underlines);
@@ -2439,7 +2591,7 @@ impl MetalRenderer {
         sprites: &[MonochromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if sprites.is_empty() {
@@ -2474,8 +2626,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
@@ -2513,7 +2665,7 @@ impl MetalRenderer {
         sprites: &[PolychromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if sprites.is_empty() {
@@ -2539,8 +2691,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
@@ -2586,7 +2738,7 @@ impl MetalRenderer {
         surfaces: &[PaintSurface],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        target_frame: RenderTargetFrame,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         command_encoder.set_vertex_buffer(
@@ -2596,8 +2748,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&target_frame) as u64,
+            &target_frame as *const RenderTargetFrame as *const _,
         );
 
         for surface in surfaces {
@@ -2715,7 +2867,7 @@ impl MetalRenderer {
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
-    viewport_size: Size<DevicePixels>,
+    target_frame: RenderTargetFrame,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
 ) -> &'a metal::RenderCommandEncoderRef {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -2731,8 +2883,8 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder.set_viewport(metal::MTLViewport {
         originX: 0.0,
         originY: 0.0,
-        width: i32::from(viewport_size.width) as f64,
-        height: i32::from(viewport_size.height) as f64,
+        width: i32::from(target_frame.size.width) as f64,
+        height: i32::from(target_frame.size.height) as f64,
         znear: 0.0,
         zfar: 1.0,
     });
@@ -2939,6 +3091,8 @@ pub struct GroupSprite {
     pub backdrop_color_offset: [f32; 4],
     pub backdrop_lens: [f32; 4],
     pub backdrop_lens_lighting: [f32; 4],
+    pub source_texture_frame: TextureFrame,
+    pub backdrop_texture_frame: TextureFrame,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3315,8 +3469,8 @@ mod tests {
             .expect("render metal scene");
     }
 
-    fn group_intermediate_texture_bytes(count: u64) -> u64 {
-        count * IMAGE_SIZE as u64 * IMAGE_SIZE as u64 * GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL
+    fn group_intermediate_texture_bytes(count: u64, width: u64, height: u64) -> u64 {
+        count * width * height * GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL
     }
 
     fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
@@ -3488,7 +3642,7 @@ mod tests {
                 allocations: 2,
                 reuses: 0,
                 available_textures: 2,
-                available_bytes: group_intermediate_texture_bytes(2),
+                available_bytes: group_intermediate_texture_bytes(2, 10, 10),
             }
         );
 
@@ -3500,7 +3654,7 @@ mod tests {
                 allocations: 2,
                 reuses: 2,
                 available_textures: 2,
-                available_bytes: group_intermediate_texture_bytes(2),
+                available_bytes: group_intermediate_texture_bytes(2, 10, 10),
             }
         );
     }
@@ -3509,12 +3663,11 @@ mod tests {
     fn group_intermediate_texture_pool_trims_available_textures_to_budget_metal() {
         let groups = (0..4)
             .map(|ix| {
-                let origin = 2. + ix as f32 * 6.;
                 paint_group_with_effects(
                     ix,
-                    rect(origin, origin, 4., 4.),
+                    viewport(),
                     vec![CompositeEffect::opacity(0.5)],
-                    finished_scene([quad(0, rect(origin, origin, 4., 4.), red())]),
+                    finished_scene([quad(0, viewport(), red())]),
                 )
             })
             .collect::<Vec<_>>();
@@ -3552,7 +3705,11 @@ mod tests {
                 allocations: 4,
                 reuses: 0,
                 available_textures: 3,
-                available_bytes: group_intermediate_texture_bytes(3),
+                available_bytes: group_intermediate_texture_bytes(
+                    3,
+                    IMAGE_SIZE as u64,
+                    IMAGE_SIZE as u64,
+                ),
             }
         );
     }
@@ -3853,5 +4010,35 @@ mod tests {
                 "path mask != analytic mask at ({x}, {y})"
             );
         }
+    }
+
+    #[test]
+    fn render_group_child_path_uses_bounded_source_frame_metal() {
+        let group_bounds = rect(8., 8., 12., 12.);
+        let mut path = rectangle_path(group_bounds).scale(1.);
+        path.color = green().into();
+        path.content_mask = mask();
+
+        let mut group_scene = Scene::default();
+        group_scene.insert_primitive(path);
+        group_scene.finish();
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_effects(
+            1,
+            group_bounds,
+            vec![CompositeEffect::opacity(0.5)],
+            group_scene,
+        ));
+        scene.finish();
+
+        let image = render(&scene);
+        let inside = pixel(&image, 12, 12);
+        assert!(
+            inside[1] > 100,
+            "bounded group source should preserve child path green: {inside:?}"
+        );
+        assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
     }
 }

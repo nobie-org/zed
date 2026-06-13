@@ -45,6 +45,8 @@ mod macos_build {
             "ContentMask".into(),
             "Uniforms".into(),
             "AtlasTile".into(),
+            "RenderTargetFrame".into(),
+            "TextureFrame".into(),
             "PathRasterizationInputIndex".into(),
             "PathVertex_ScaledPixels".into(),
             "PathRasterizationVertex".into(),

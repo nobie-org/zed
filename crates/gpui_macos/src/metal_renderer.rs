@@ -1619,6 +1619,9 @@ impl MetalRenderer {
         target_frame: RenderTargetFrame,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
+        let _render_groups_span =
+            tracing::trace_span!("gpui_macos::render_groups", groups = groups.len()).entered();
+
         for group in groups {
             let effect_plan = group.plan().normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
@@ -1629,25 +1632,54 @@ impl MetalRenderer {
                 return false;
             };
             let source_texture_frame = TextureFrame::from(source_frame);
+            let support_counters = group.plan().support_counters(group.capture_bounds());
+            let _render_group_span = tracing::trace_span!(
+                "gpui_macos::render_group",
+                capture_width = source_frame.size.width.0,
+                capture_height = source_frame.size.height.0,
+                capture_pixels = support_counters.source_capture_pixels,
+                physical_passes = support_counters.physical_passes,
+                intermediate_textures = support_counters.intermediate_textures,
+                backdrop_copies = support_counters.backdrop_copies,
+                content_alpha_separable = support_counters.shadow_modes.content_alpha_separable,
+                content_alpha_exact = support_counters.shadow_modes.content_alpha_exact,
+                content_alpha_downsampled = support_counters.shadow_modes.content_alpha_downsampled,
+                surface_geometry_shadows = support_counters.shadow_modes.surface_geometry,
+                content_alpha_max_kernel_radius =
+                    support_counters.content_alpha_shadow_max_kernel_radius,
+                content_alpha_sample_estimate =
+                    support_counters.content_alpha_shadow_sample_count_estimate,
+            )
+            .entered();
 
-            let Some(group_texture) = self.acquire_group_intermediate_texture(source_frame.size)
-            else {
-                return false;
+            let group_texture = {
+                let _span = tracing::trace_span!("gpui_macos::render_group_acquire_source_texture")
+                    .entered();
+                let Some(group_texture) =
+                    self.acquire_group_intermediate_texture(source_frame.size)
+                else {
+                    return false;
+                };
+                group_texture
             };
             if let Some(counters) = self.last_render_group_counters.as_mut() {
                 counters.intermediate_textures += 1;
             }
 
-            if !self.encode_primitives_to_texture(
-                group.scene(),
-                instance_buffer,
-                instance_offset,
-                &group_texture,
-                source_frame,
-                command_buffer,
-                Some(0.),
-            ) {
-                return false;
+            {
+                let _span =
+                    tracing::trace_span!("gpui_macos::render_group_capture_source").entered();
+                if !self.encode_primitives_to_texture(
+                    group.scene(),
+                    instance_buffer,
+                    instance_offset,
+                    &group_texture,
+                    source_frame,
+                    command_buffer,
+                    Some(0.),
+                ) {
+                    return false;
+                }
             }
 
             let backdrop_texture;
@@ -1661,10 +1693,22 @@ impl MetalRenderer {
                 ) else {
                     return false;
                 };
-                let Some(texture) =
-                    self.copy_backdrop_texture(target_texture, target_frame, frame, command_buffer)
-                else {
-                    return false;
+                let texture = {
+                    let _span = tracing::trace_span!(
+                        "gpui_macos::render_group_copy_backdrop",
+                        width = frame.size.width.0,
+                        height = frame.size.height.0,
+                    )
+                    .entered();
+                    let Some(texture) = self.copy_backdrop_texture(
+                        target_texture,
+                        target_frame,
+                        frame,
+                        command_buffer,
+                    ) else {
+                        return false;
+                    };
+                    texture
                 };
                 backdrop_texture = texture;
                 backdrop_texture_frame = frame;
@@ -1688,14 +1732,20 @@ impl MetalRenderer {
             // here.
             let source_mask_texture;
             let source_mask_texture_ref = if let Some(path) = effect_plan.source_mask_path() {
-                let Some(texture) = self.rasterize_source_mask_path(
-                    path,
-                    instance_buffer,
-                    instance_offset,
-                    source_frame,
-                    command_buffer,
-                ) else {
-                    return false;
+                let texture = {
+                    let _span =
+                        tracing::trace_span!("gpui_macos::render_group_rasterize_source_mask")
+                            .entered();
+                    let Some(texture) = self.rasterize_source_mask_path(
+                        path,
+                        instance_buffer,
+                        instance_offset,
+                        source_frame,
+                        command_buffer,
+                    ) else {
+                        return false;
+                    };
+                    texture
                 };
                 source_mask_texture = texture;
                 &source_mask_texture
@@ -1703,7 +1753,6 @@ impl MetalRenderer {
                 &group_texture
             };
 
-            let support_counters = group.plan().support_counters(group.capture_bounds());
             if let Some(counters) = self.last_render_group_counters.as_mut() {
                 counters.shadow_modes.content_alpha_separable +=
                     support_counters.shadow_modes.content_alpha_separable;
@@ -1741,20 +1790,28 @@ impl MetalRenderer {
                     counters.intermediate_textures += 1;
                 }
 
-                if !self.draw_group_alpha_horizontal_blur_to_texture(
-                    group,
-                    &effect_plan,
-                    shadow.blur_radius,
-                    &group_texture,
-                    source_mask_texture_ref,
-                    &texture,
-                    instance_buffer,
-                    instance_offset,
-                    source_frame,
-                    source_texture_frame,
-                    command_buffer,
-                ) {
-                    return false;
+                {
+                    let _span = tracing::trace_span!(
+                        "gpui_macos::render_group_content_alpha_horizontal_blur",
+                        blur_radius = shadow.blur_radius.0,
+                        kernel_radius = ((shadow.blur_radius.0 * 3.).ceil().max(0.) as u64).min(24),
+                    )
+                    .entered();
+                    if !self.draw_group_alpha_horizontal_blur_to_texture(
+                        group,
+                        &effect_plan,
+                        shadow.blur_radius,
+                        &group_texture,
+                        source_mask_texture_ref,
+                        &texture,
+                        instance_buffer,
+                        instance_offset,
+                        source_frame,
+                        source_texture_frame,
+                        command_buffer,
+                    ) {
+                        return false;
+                    }
                 }
 
                 separable_shadow_textures.insert(key, texture);
@@ -1768,20 +1825,27 @@ impl MetalRenderer {
                     color_attachment.set_load_action(metal::MTLLoadAction::Load);
                 },
             );
-            let ok = self.draw_group_from_texture(
-                group,
-                effect_plan,
-                &group_texture,
-                backdrop_texture_ref,
-                source_mask_texture_ref,
-                instance_buffer,
-                instance_offset,
-                target_frame,
-                source_texture_frame,
-                backdrop_texture_frame,
-                &separable_shadow_textures,
-                command_encoder,
-            );
+            let ok = {
+                let _span = tracing::trace_span!(
+                    "gpui_macos::render_group_composite",
+                    separable_shadow_profiles = separable_shadow_textures.len(),
+                )
+                .entered();
+                self.draw_group_from_texture(
+                    group,
+                    effect_plan,
+                    &group_texture,
+                    backdrop_texture_ref,
+                    source_mask_texture_ref,
+                    instance_buffer,
+                    instance_offset,
+                    target_frame,
+                    source_texture_frame,
+                    backdrop_texture_frame,
+                    &separable_shadow_textures,
+                    command_encoder,
+                )
+            };
             command_encoder.end_encoding();
 
             if !ok {

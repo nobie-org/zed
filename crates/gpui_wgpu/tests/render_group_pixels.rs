@@ -10,7 +10,7 @@ use gpui::{
     RenderSvgParams, ScaledPixels, point, px, rgba,
     scene_protocol::{
         LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
-        RenderGroupBackendCounters, Scene, TransformationMatrix,
+        RenderGroupBackendCounters, RenderGroupShadowModeCounters, Scene, TransformationMatrix,
     },
     size, transparent_black,
 };
@@ -178,6 +178,10 @@ fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
     RenderGroupBackendCounters {
         intermediate_textures: counters.intermediate_textures,
         backdrop_copies: counters.backdrop_copies,
+        shadow_modes: counters.shadow_modes,
+        content_alpha_shadow_max_kernel_radius: counters.content_alpha_shadow_max_kernel_radius,
+        content_alpha_shadow_sample_count_estimate: counters
+            .content_alpha_shadow_sample_count_estimate,
     }
 }
 
@@ -240,6 +244,7 @@ fn backend_counters_match_planner_for_opacity_group() {
         RenderGroupBackendCounters {
             intermediate_textures: 1,
             backdrop_copies: 0,
+            ..RenderGroupBackendCounters::default()
         }
     );
 
@@ -265,6 +270,41 @@ fn backend_counters_match_planner_for_backdrop_blur_group() {
         RenderGroupBackendCounters {
             intermediate_textures: 2,
             backdrop_copies: 1,
+            ..RenderGroupBackendCounters::default()
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(group);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
+}
+
+#[test]
+fn backend_counters_match_planner_for_separable_content_alpha_shadow() {
+    let group = paint_group_with_effects(
+        1,
+        rect(0., 0., 100., 40.),
+        vec![CompositeEffect::drop_shadow(
+            point(px(0.), px(4.)),
+            px(3.),
+            rgba(0x00000080).into(),
+        )],
+        finished_scene([quad(0, rect(20., 10., 40., 12.), white())]),
+    );
+    let predicted = predicted_counters(&group);
+    let mut shadow_modes = RenderGroupShadowModeCounters::default();
+    shadow_modes.content_alpha_separable = 1;
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            intermediate_textures: 2,
+            backdrop_copies: 0,
+            shadow_modes,
+            content_alpha_shadow_max_kernel_radius: 9,
+            content_alpha_shadow_sample_count_estimate: 152_000,
         }
     );
 
@@ -300,6 +340,7 @@ fn backend_counters_exclude_source_mask_path_intermediate() {
         RenderGroupBackendCounters {
             intermediate_textures: 1,
             backdrop_copies: 0,
+            ..RenderGroupBackendCounters::default()
         }
     );
 
@@ -330,12 +371,14 @@ fn backend_counters_sum_across_sibling_groups() {
             + predicted_counters(&backdrop_group).intermediate_textures,
         backdrop_copies: predicted_counters(&opacity_group).backdrop_copies
             + predicted_counters(&backdrop_group).backdrop_copies,
+        ..RenderGroupBackendCounters::default()
     };
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
             intermediate_textures: 3,
             backdrop_copies: 1,
+            ..RenderGroupBackendCounters::default()
         }
     );
 
@@ -392,12 +435,14 @@ fn backend_counters_match_planner_for_nested_groups() {
         intermediate_textures: outer_predicted.intermediate_textures
             + inner_predicted.intermediate_textures,
         backdrop_copies: outer_predicted.backdrop_copies + inner_predicted.backdrop_copies,
+        ..RenderGroupBackendCounters::default()
     };
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
             intermediate_textures: 3,
             backdrop_copies: 1,
+            ..RenderGroupBackendCounters::default()
         }
     );
 

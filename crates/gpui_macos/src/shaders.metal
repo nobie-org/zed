@@ -1419,6 +1419,72 @@ float sample_group_alpha_blurred(texture2d<float> intermediate_texture,
   return alpha / total;
 }
 
+float sample_group_alpha_blurred_horizontal(texture2d<float> intermediate_texture,
+                                            sampler intermediate_texture_sampler,
+                                            texture2d<float> source_mask_texture,
+                                            float2 coords,
+                                            float2 point,
+                                            float2 pixel_size,
+                                            float sigma,
+                                            GroupSpriteVertexOutput input) {
+  if (sigma <= 0.0) {
+    return sample_group_source(intermediate_texture, intermediate_texture_sampler, source_mask_texture, coords, point, input).a;
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float alpha = 0.0;
+  float total = 0.0;
+  for (int x = -24; x <= 24; x++) {
+    if (abs(x) <= radius) {
+      float offset = float(x);
+      float weight = exp(-(offset * offset) / (2.0 * sigma * sigma));
+      alpha += sample_group_source(
+          intermediate_texture,
+          intermediate_texture_sampler,
+          source_mask_texture,
+          coords + float2(offset, 0.0) * pixel_size,
+          point + float2(offset, 0.0),
+          input).a * weight;
+      total += weight;
+    }
+  }
+
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  return alpha / total;
+}
+
+float sample_group_alpha_blurred_vertical(texture2d<float> intermediate_texture,
+                                          sampler intermediate_texture_sampler,
+                                          float2 coords,
+                                          float2 pixel_size,
+                                          float sigma) {
+  if (sigma <= 0.0) {
+    return sample_group_texture(intermediate_texture, intermediate_texture_sampler, coords).a;
+  }
+
+  int radius = min(int(ceil(3.0 * sigma)), 24);
+  float alpha = 0.0;
+  float total = 0.0;
+  for (int y = -24; y <= 24; y++) {
+    if (abs(y) <= radius) {
+      float offset = float(y);
+      float weight = exp(-(offset * offset) / (2.0 * sigma * sigma));
+      alpha += sample_group_texture(
+          intermediate_texture,
+          intermediate_texture_sampler,
+          coords + float2(0.0, offset) * pixel_size).a * weight;
+      total += weight;
+    }
+  }
+
+  if (total <= 0.0) {
+    return 0.0;
+  }
+  return alpha / total;
+}
+
 float sample_material_alpha_blurred(float2 point,
                                     float sigma,
                                     GroupSpriteVertexOutput input) {
@@ -1677,6 +1743,16 @@ fragment float4 group_sprite_fragment(
         input.source_texture_pixel_size,
         input);
   }
+  if (input.effect_kind == 4) {
+    float2 sample_coords = input.source_texture_coords - input.shadow_offset * input.source_texture_pixel_size;
+    float alpha = sample_group_alpha_blurred_vertical(
+        intermediate_texture,
+        intermediate_texture_sampler,
+        sample_coords,
+        input.source_texture_pixel_size,
+        input.shadow_blur_radius) * input.shadow_color.a * input.opacity;
+    return float4(input.shadow_color.rgb * alpha, alpha);
+  }
 
   float4 sample = sample_group_source_blurred(
       intermediate_texture,
@@ -1710,6 +1786,25 @@ fragment float4 group_sprite_fragment(
       intermediate_texture_sampler,
       input.backdrop_texture_coords);
   return apply_group_blend_mode(sample, backdrop, input.blend_mode);
+}
+
+fragment float4 group_alpha_horizontal_blur_fragment(
+  GroupSpriteVertexOutput input [[stage_in]],
+  texture2d<float> intermediate_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+  texture2d<float> backdrop_texture [[texture(SpriteInputIndex_BackdropTexture)]],
+  texture2d<float> source_mask_texture [[texture(SpriteInputIndex_SourceMaskTexture)]]
+) {
+  constexpr sampler intermediate_texture_sampler(mag_filter::nearest, min_filter::nearest);
+  float alpha = sample_group_alpha_blurred_horizontal(
+      intermediate_texture,
+      intermediate_texture_sampler,
+      source_mask_texture,
+      input.source_texture_coords,
+      input.screen_position,
+      input.source_texture_pixel_size,
+      input.shadow_blur_radius,
+      input);
+  return float4(alpha, alpha, alpha, alpha);
 }
 
 struct SurfaceVertexOutput {

@@ -1,8 +1,8 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point, ScaledPixels, Size,
-    get_gamma_correction_ratios, point,
+    AtlasTextureId, Background, Bounds, ContentAlphaShadowMode, Corners, DevicePixels, GpuSpecs,
+    Point, ScaledPixels, Size, get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, PrimitiveBatch,
         Quad, RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite, Underline,
@@ -12,6 +12,7 @@ use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -125,6 +126,7 @@ struct WgpuPipelines {
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
+    group_alpha_horizontal_blur: wgpu::RenderPipeline,
     groups: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
@@ -1127,6 +1129,22 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let group_alpha_horizontal_blur = create_pipeline(
+            "group_alpha_horizontal_blur",
+            "vs_group",
+            "fs_group_alpha_horizontal_blur",
+            &layouts.globals,
+            &layouts.group_composite,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let underlines = create_pipeline(
             "underlines",
             "vs_underline",
@@ -1213,6 +1231,7 @@ impl WgpuRenderer {
             shadows,
             path_rasterization,
             paths,
+            group_alpha_horizontal_blur,
             groups,
             underlines,
             mono_sprites,
@@ -2207,6 +2226,68 @@ impl WgpuRenderer {
                 &group_view
             };
 
+            let support_counters = group.plan().support_counters(group.capture_bounds());
+            group_counters.shadow_modes.content_alpha_separable +=
+                support_counters.shadow_modes.content_alpha_separable;
+            group_counters.shadow_modes.content_alpha_exact +=
+                support_counters.shadow_modes.content_alpha_exact;
+            group_counters.shadow_modes.content_alpha_downsampled +=
+                support_counters.shadow_modes.content_alpha_downsampled;
+            group_counters.shadow_modes.surface_geometry +=
+                support_counters.shadow_modes.surface_geometry;
+            group_counters.content_alpha_shadow_max_kernel_radius = group_counters
+                .content_alpha_shadow_max_kernel_radius
+                .max(support_counters.content_alpha_shadow_max_kernel_radius);
+            group_counters.content_alpha_shadow_sample_count_estimate +=
+                support_counters.content_alpha_shadow_sample_count_estimate;
+
+            let mut separable_shadow_views = HashMap::new();
+            for shadow in effect_plan.drop_shadows() {
+                if shadow.mode != ContentAlphaShadowMode::Separable
+                    || shadow.blur_radius.0 <= f32::EPSILON
+                {
+                    continue;
+                }
+
+                let key = shadow.blur_radius.0.to_bits();
+                if separable_shadow_views.contains_key(&key) {
+                    continue;
+                }
+
+                let (shadow_texture, shadow_view) = self.create_group_intermediate();
+                group_counters.intermediate_textures += 1;
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("group_alpha_horizontal_blur_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &shadow_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+
+                if !self.draw_group_alpha_horizontal_blur_to_view(
+                    group,
+                    &effect_plan,
+                    shadow.blur_radius,
+                    &group_view,
+                    source_mask_view,
+                    instance_offset,
+                    &mut pass,
+                ) {
+                    return false;
+                }
+                drop(pass);
+
+                separable_shadow_views.insert(key, shadow_view);
+                retained_textures.push(shadow_texture);
+            }
+
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("group_composite_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2228,6 +2309,7 @@ impl WgpuRenderer {
                 &group_view,
                 backdrop_view,
                 source_mask_view,
+                &separable_shadow_views,
                 instance_offset,
                 &mut pass,
             ) {
@@ -2263,6 +2345,81 @@ impl WgpuRenderer {
         (texture, view)
     }
 
+    fn draw_group_alpha_horizontal_blur_to_view(
+        &self,
+        group: &PaintGroup,
+        effect_plan: &CompositeEffectPlan,
+        blur_radius: ScaledPixels,
+        group_view: &wgpu::TextureView,
+        source_mask_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let source_mask_mode: u32 = if effect_plan.source_mask_path().is_some() {
+            1
+        } else {
+            0
+        };
+        let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
+            Some(corner_radii) => (1., corner_radii),
+            None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
+            None => (0., Corners::all(ScaledPixels(0.))),
+        };
+        let material_shape_corner_radii = effect_plan
+            .material_shape()
+            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
+        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
+        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let db = effect_plan.source_directional_blur();
+        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
+
+        let sprite = GroupSprite {
+            bounds: group.capture_bounds(),
+            opacity: 1.,
+            effect_kind: 0,
+            source_blur_radius: 0.,
+            source_mask_enabled,
+            shadow_offset: [0., 0.],
+            shadow_blur_radius: blur_radius.0,
+            backdrop_blur_radius: 0.,
+            source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+            derived_luma_threshold: 0.,
+            source_mask_mode,
+            _pad1: 0,
+            shadow_color: [0., 0., 0., 0.],
+            source_mask_bounds: group.bounds(),
+            source_mask_corner_radii,
+            material_shape_bounds: group.bounds(),
+            material_shape_corner_radii,
+            group_shape_params,
+            source_directional_blur,
+            color_matrix: [[0., 0., 0., 0.]; 4],
+            color_offset: [0., 0., 0., 0.],
+            backdrop_active: 0.,
+            blend_mode: 0,
+            source_tone_op: 0,
+            source_tone_param: 0.,
+            backdrop_tint: [0., 0., 0., 0.],
+            backdrop_color_matrix: [[0., 0., 0., 0.]; 4],
+            backdrop_color_offset: [0., 0., 0., 0.],
+            backdrop_lens: [0., 0., 0., 0.],
+            backdrop_lens_lighting: [0., 0., 0., 0.],
+        };
+        let sprite_data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };
+        self.draw_group_instances(
+            sprite_data,
+            1,
+            group_view,
+            group_view,
+            source_mask_view,
+            &self.resources().group_sampler,
+            &self.resources().pipelines.group_alpha_horizontal_blur,
+            instance_offset,
+            pass,
+        )
+    }
+
     fn draw_group_from_intermediate(
         &self,
         group: &PaintGroup,
@@ -2270,6 +2427,7 @@ impl WgpuRenderer {
         group_view: &wgpu::TextureView,
         backdrop_view: &wgpu::TextureView,
         source_mask_view: &wgpu::TextureView,
+        separable_shadow_views: &HashMap<u32, wgpu::TextureView>,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
@@ -2282,12 +2440,6 @@ impl WgpuRenderer {
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
-        let mut sprites = Vec::with_capacity(
-            effect_plan.drop_shadows().len()
-                + effect_plan.surface_shadows().len()
-                + effect_plan.processed_content_glows().len()
-                + 1,
-        );
         // A path source mask supersedes the analytic SDF: enable masking and
         // select sampled mode so the shader reads the rasterized coverage texture.
         let source_mask_mode: u32 = if effect_plan.source_mask_path().is_some() {
@@ -2310,11 +2462,24 @@ impl WgpuRenderer {
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
         for shadow in effect_plan.drop_shadows() {
+            let (effect_kind, shadow_view) = match shadow.mode {
+                ContentAlphaShadowMode::Separable if shadow.blur_radius.0 > f32::EPSILON => {
+                    let Some(view) = separable_shadow_views.get(&shadow.blur_radius.0.to_bits())
+                    else {
+                        return false;
+                    };
+                    (4, view)
+                }
+                ContentAlphaShadowMode::Separable | ContentAlphaShadowMode::Exact => {
+                    (1, group_view)
+                }
+                ContentAlphaShadowMode::Downsampled | _ => return false,
+            };
             let color = shadow.color.to_rgb();
-            sprites.push(GroupSprite {
+            let sprite = GroupSprite {
                 bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
-                effect_kind: 1,
+                effect_kind,
                 source_blur_radius: 0.,
                 source_mask_enabled,
                 shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
@@ -2342,8 +2507,26 @@ impl WgpuRenderer {
                 backdrop_color_offset,
                 backdrop_lens: [0., 0., 0., 0.],
                 backdrop_lens_lighting: [0., 0., 0., 0.],
-            });
+            };
+            let sprite_data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };
+            if !self.draw_group_instances(
+                sprite_data,
+                1,
+                shadow_view,
+                backdrop_view,
+                source_mask_view,
+                &self.resources().group_sampler,
+                &self.resources().pipelines.groups,
+                instance_offset,
+                pass,
+            ) {
+                return false;
+            }
         }
+
+        let mut sprites = Vec::with_capacity(
+            effect_plan.surface_shadows().len() + effect_plan.processed_content_glows().len() + 1,
+        );
 
         for shadow in effect_plan.surface_shadows() {
             let color = shadow.color.to_rgb();

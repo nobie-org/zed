@@ -1099,6 +1099,11 @@ pub enum SurfaceSilhouette<P: Clone + Copy + Debug + Default + PartialEq> {
         shape_kind: GroupShapeKind,
     },
     Union(Vec<SurfacePrimitive<P>>),
+    GroupShapeUnion {
+        corner_radii: Corners<P>,
+        shape_kind: GroupShapeKind,
+        primitives: Vec<SurfacePrimitive<P>>,
+    },
 }
 
 /// Error returned when a surface silhouette cannot be represented by the current
@@ -1149,6 +1154,31 @@ impl SurfaceSilhouette<Pixels> {
         Ok(Self::Union(primitives))
     }
 
+    /// Creates a surface silhouette from the render group's own bounds shape
+    /// plus a small union of explicit analytic primitives.
+    ///
+    /// This lets callers model a group-owned slab joined to child-owned
+    /// scene-space geometry without guessing the group's layout bounds or
+    /// falling back to content-alpha capture.
+    pub fn union_with_group_shape(
+        shape: GroupShape,
+        primitives: impl IntoIterator<Item = SurfacePrimitive<Pixels>>,
+    ) -> Result<Self, SurfaceSilhouetteError> {
+        let primitives = primitives.into_iter().collect::<Vec<_>>();
+        let requested = primitives.len() + 1;
+        if requested > MAX_SURFACE_SILHOUETTE_PRIMITIVES {
+            return Err(SurfaceSilhouetteError::TooManyPrimitives {
+                limit: MAX_SURFACE_SILHOUETTE_PRIMITIVES,
+                requested,
+            });
+        }
+        Ok(Self::GroupShapeUnion {
+            corner_radii: shape.corner_radii(),
+            shape_kind: shape.shape_kind(),
+            primitives,
+        })
+    }
+
     fn scale(&self, factor: f32) -> SurfaceSilhouette<ScaledPixels> {
         match self {
             Self::GroupShape {
@@ -1164,6 +1194,18 @@ impl SurfaceSilhouette<Pixels> {
                     .map(|primitive| primitive.scale(factor))
                     .collect(),
             ),
+            Self::GroupShapeUnion {
+                corner_radii,
+                shape_kind,
+                primitives,
+            } => SurfaceSilhouette::GroupShapeUnion {
+                corner_radii: corner_radii.scale(factor),
+                shape_kind: *shape_kind,
+                primitives: primitives
+                    .iter()
+                    .map(|primitive| primitive.scale(factor))
+                    .collect(),
+            },
         }
     }
 }
@@ -1183,11 +1225,12 @@ impl<P: Clone + Copy + Debug + Default + PartialEq> SurfaceSilhouette<P> {
         matches!(self, Self::GroupShape { .. })
     }
 
-    /// Returns explicit union primitives when this silhouette is a union.
+    /// Returns explicit union primitives when this silhouette contains them.
     pub fn primitives(&self) -> &[SurfacePrimitive<P>] {
         match self {
             Self::GroupShape { .. } => &[],
             Self::Union(primitives) => primitives,
+            Self::GroupShapeUnion { primitives, .. } => primitives,
         }
     }
 
@@ -1210,6 +1253,22 @@ impl<P: Clone + Copy + Debug + Default + PartialEq> SurfaceSilhouette<P> {
                     data.bounds[index] = primitive.bounds;
                     data.corner_radii[index] = primitive.corner_radii;
                     data.shape_kinds[index] = primitive.shape_kind;
+                }
+            }
+            Self::GroupShapeUnion {
+                corner_radii,
+                shape_kind,
+                primitives,
+            } => {
+                data.count = primitives.len() as u32 + 1;
+                data.bounds[0] = group_bounds;
+                data.corner_radii[0] = *corner_radii;
+                data.shape_kinds[0] = *shape_kind;
+                for (index, primitive) in primitives.iter().enumerate() {
+                    let data_index = index + 1;
+                    data.bounds[data_index] = primitive.bounds;
+                    data.corner_radii[data_index] = primitive.corner_radii;
+                    data.shape_kinds[data_index] = primitive.shape_kind;
                 }
             }
         }
@@ -4619,6 +4678,55 @@ mod tests {
     }
 
     #[test]
+    fn surface_silhouette_union_can_include_group_bounds_shape() {
+        let selected_tab = SurfacePrimitive::new(
+            Bounds::new(
+                point(Pixels(24.), Pixels(30.)),
+                size(Pixels(36.), Pixels(14.)),
+            ),
+            GroupShape::rounded_rect(Corners {
+                top_left: Pixels(0.),
+                top_right: Pixels(0.),
+                bottom_right: Pixels(6.),
+                bottom_left: Pixels(6.),
+            }),
+        );
+        let silhouette = SurfaceSilhouette::union_with_group_shape(
+            GroupShape::rounded_rect(Corners::all(Pixels(6.))),
+            [selected_tab],
+        )
+        .unwrap();
+        let plan = CompositeEffectPlan::from_effects(
+            2.,
+            1.,
+            &[CompositeEffect::surface_shadow(
+                silhouette,
+                point(Pixels(0.), Pixels(3.)),
+                Pixels(4.),
+                red(),
+            )],
+        );
+
+        assert_eq!(plan.surface_shadows()[0].silhouette.primitives().len(), 1);
+        let sprite_data = plan.surface_shadows()[0]
+            .silhouette
+            .sprite_data(scaled_bounds(0., 0., 200., 64.));
+        assert_eq!(sprite_data.count, 2);
+        assert_eq!(sprite_data.bounds[0], scaled_bounds(0., 0., 200., 64.));
+        assert_eq!(sprite_data.corner_radii[0], Corners::all(ScaledPixels(12.)));
+        assert_eq!(sprite_data.bounds[1], scaled_bounds(48., 60., 72., 28.));
+        assert_eq!(
+            sprite_data.corner_radii[1],
+            Corners {
+                top_left: ScaledPixels(0.),
+                top_right: ScaledPixels(0.),
+                bottom_right: ScaledPixels(12.),
+                bottom_left: ScaledPixels(12.),
+            }
+        );
+    }
+
+    #[test]
     fn surface_silhouette_union_rejects_empty_and_oversized_inputs() {
         assert_eq!(
             SurfaceSilhouette::union([]),
@@ -4634,6 +4742,16 @@ mod tests {
                 primitive,
                 MAX_SURFACE_SILHOUETTE_PRIMITIVES + 1
             )),
+            Err(SurfaceSilhouetteError::TooManyPrimitives {
+                limit: MAX_SURFACE_SILHOUETTE_PRIMITIVES,
+                requested: MAX_SURFACE_SILHOUETTE_PRIMITIVES + 1,
+            })
+        );
+        assert_eq!(
+            SurfaceSilhouette::union_with_group_shape(
+                GroupShape::rectangle(),
+                std::iter::repeat_n(primitive, MAX_SURFACE_SILHOUETTE_PRIMITIVES),
+            ),
             Err(SurfaceSilhouetteError::TooManyPrimitives {
                 limit: MAX_SURFACE_SILHOUETTE_PRIMITIVES,
                 requested: MAX_SURFACE_SILHOUETTE_PRIMITIVES + 1,

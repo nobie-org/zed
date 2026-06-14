@@ -3436,6 +3436,23 @@ mod tests {
         )
     }
 
+    fn paint_group_with_bounds(
+        order: u32,
+        bounds: Bounds<ScaledPixels>,
+        capture_bounds: Bounds<ScaledPixels>,
+        effects: Vec<CompositeEffect>,
+        scene: Scene,
+    ) -> PaintGroup {
+        PaintGroup::new_for_backend_test(
+            order,
+            bounds,
+            capture_bounds,
+            mask(),
+            LogicalVisualPlan::from_effects(1., 1., effects),
+            scene,
+        )
+    }
+
     fn black() -> Hsla {
         rgba(0x000000ff).into()
     }
@@ -3929,6 +3946,52 @@ mod tests {
             pixel(&image, 18, 16),
             [128, 128, 128, 255],
             "second declared primitive should cast a surface shadow"
+        );
+    }
+
+    #[test]
+    fn render_group_surface_shadow_unions_group_bounds_with_declared_primitive_metal() {
+        let silhouette = SurfaceSilhouette::union_with_group_shape(
+            GroupShape::rectangle(),
+            [SurfacePrimitive::new(
+                pixel_rect(12., 20., 8., 6.),
+                GroupShape::rectangle(),
+            )],
+        )
+        .expect("group-bounds union silhouette fits shader ABI");
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_bounds(
+            1,
+            rect(4., 4., 24., 18.),
+            rect(4., 4., 24., 28.),
+            vec![CompositeEffect::surface_shadow(
+                silhouette,
+                point(px(0.), px(6.)),
+                px(0.),
+                half_white(),
+            )],
+            Scene::default(),
+        ));
+        scene.finish();
+
+        let image = render(&scene);
+
+        assert_eq!(
+            pixel(&image, 8, 16),
+            [128, 128, 128, 255],
+            "group bounds should cast the slab portion of the surface shadow"
+        );
+        assert_eq!(
+            pixel(&image, 14, 30),
+            [128, 128, 128, 255],
+            "declared primitive should cast the hanging-tab portion of the same surface shadow"
+        );
+        assert_eq!(
+            pixel(&image, 22, 30),
+            [0, 0, 0, 255],
+            "pixels below the slab but outside the tab primitive must stay outside the union"
         );
     }
 

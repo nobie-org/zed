@@ -49,14 +49,14 @@ mod scene;
 pub mod scene_protocol {
     pub use crate::scene::{
         CompositeEffectPlan, CompositeProcessedContentGlowPlan, DrawOrder, LogicalVisualPlan,
-        MonochromeSprite, PaintGroup, PaintMetalTexture, Path, PathId, PathVertex,
-        PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
-        PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
+        MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, PaintGroup, PaintMetalTexture, Path,
+        PathId, PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite,
+        Primitive, PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
         RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
         RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
         RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
         RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
-        TransformationMatrix, Underline,
+        SurfaceSilhouetteSpriteData, TransformationMatrix, Underline,
     };
 }
 /// Render-group planning and capability diagnostics for inspectors and tests.
@@ -146,9 +146,10 @@ pub use scene::{
     BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
     CompositeEffect, CompositeProcessedContentGlow, CompositeShadow, CompositeSurfaceShadow,
     ContentLayer, ContentStage, DerivedLayer, DerivedStage, GlassLens, GlassSurface, Glow,
-    GroupShape, GroupShapeKind, LumaThreshold, Path, ProcessedContentDerivedLayer,
-    RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
-    SourceColorFilter, SourceMaskBlurOrder, SourceToneOp, TransformationMatrix,
+    GroupShape, GroupShapeKind, LumaThreshold, MAX_SURFACE_SILHOUETTE_PRIMITIVES, Path,
+    ProcessedContentDerivedLayer, RenderGroupShadowMode, RenderGroupShadowModeCounters,
+    RenderGroupShadowSourceCounters, SourceColorFilter, SourceMaskBlurOrder, SourceToneOp,
+    SurfacePrimitive, SurfaceSilhouette, SurfaceSilhouetteError, TransformationMatrix,
 };
 pub(crate) use scene::{
     MonochromeSprite, PaintGroup, PolychromeSprite, Quad, Scene, Shadow, SubpixelSprite, Underline,

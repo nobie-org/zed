@@ -1,11 +1,13 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point,
-    RenderGroupShadowMode, ScaledPixels, Size, get_gamma_correction_ratios, point,
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, Size,
+    get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, PrimitiveBatch,
-        Quad, RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite, Underline,
+        Quad, RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite,
+        SurfaceSilhouetteSpriteData, Underline,
     },
 };
 use log::warn;
@@ -83,8 +85,11 @@ struct GroupSprite {
     shadow_color: [f32; 4],
     source_mask_bounds: Bounds<ScaledPixels>,
     source_mask_corner_radii: Corners<ScaledPixels>,
-    material_shape_bounds: Bounds<ScaledPixels>,
-    material_shape_corner_radii: Corners<ScaledPixels>,
+    material_shape_count: u32,
+    _pad2: [u32; 3],
+    material_shape_bounds: [Bounds<ScaledPixels>; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+    material_shape_corner_radii: [Corners<ScaledPixels>; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+    material_shape_params: [[f32; 4]; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
     group_shape_params: [f32; 4],
     source_directional_blur: [f32; 4],
     color_matrix: [[f32; 4]; 4],
@@ -2364,12 +2369,9 @@ impl WgpuRenderer {
             None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
-        let material_shape_corner_radii = effect_plan
-            .material_shape()
-            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let material_shape = Self::group_material_shape(effect_plan, group.bounds());
         let (smk, sme) = effect_plan.source_mask_shape().shader_params();
-        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
-        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let group_shape_params = [smk as f32, sme, 0., 0.];
         let db = effect_plan.source_directional_blur();
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
@@ -2389,8 +2391,11 @@ impl WgpuRenderer {
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds(),
             source_mask_corner_radii,
-            material_shape_bounds: group.bounds(),
-            material_shape_corner_radii,
+            material_shape_count: material_shape.count,
+            _pad2: [0; 3],
+            material_shape_bounds: material_shape.bounds,
+            material_shape_corner_radii: material_shape.corner_radii,
+            material_shape_params: material_shape.shape_params(),
             group_shape_params,
             source_directional_blur,
             color_matrix: [[0., 0., 0., 0.]; 4],
@@ -2451,12 +2456,9 @@ impl WgpuRenderer {
             None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
-        let material_shape_corner_radii = effect_plan
-            .material_shape()
-            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let material_shape = Self::group_material_shape(&effect_plan, group.bounds());
         let (smk, sme) = effect_plan.source_mask_shape().shader_params();
-        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
-        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let group_shape_params = [smk as f32, sme, 0., 0.];
         let db = effect_plan.source_directional_blur();
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
@@ -2490,8 +2492,11 @@ impl WgpuRenderer {
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds(),
-                material_shape_corner_radii,
+                material_shape_count: material_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: material_shape.bounds,
+                material_shape_corner_radii: material_shape.corner_radii,
+                material_shape_params: material_shape.shape_params(),
                 group_shape_params,
                 source_directional_blur,
                 color_matrix,
@@ -2532,10 +2537,8 @@ impl WgpuRenderer {
             }
             let color = shadow.shadow.color.to_rgb();
             // The surface-shadow SDF reads the material slot; drive it from the
-            // shadow's own shape so a superellipse shadow gets squircle corners.
-            let (shadow_shape_kind, shadow_shape_exponent) = shadow.shape_kind.shader_params();
-            let shadow_group_shape_params =
-                [0., 0., shadow_shape_kind as f32, shadow_shape_exponent];
+            // shadow's own declared silhouette rather than captured content.
+            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
             sprites.push(GroupSprite {
                 bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
@@ -2552,9 +2555,12 @@ impl WgpuRenderer {
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds(),
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_bounds: group.bounds(),
-                material_shape_corner_radii: shadow.shape,
-                group_shape_params: shadow_group_shape_params,
+                material_shape_count: shadow_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: shadow_shape.bounds,
+                material_shape_corner_radii: shadow_shape.corner_radii,
+                material_shape_params: shadow_shape.shape_params(),
+                group_shape_params,
                 source_directional_blur,
                 color_matrix,
                 color_offset,
@@ -2588,8 +2594,11 @@ impl WgpuRenderer {
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds(),
-                material_shape_corner_radii,
+                material_shape_count: material_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: material_shape.bounds,
+                material_shape_corner_radii: material_shape.corner_radii,
+                material_shape_params: material_shape.shape_params(),
                 group_shape_params,
                 source_directional_blur,
                 color_matrix,
@@ -2622,8 +2631,11 @@ impl WgpuRenderer {
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds(),
             source_mask_corner_radii,
-            material_shape_bounds: group.bounds(),
-            material_shape_corner_radii,
+            material_shape_count: material_shape.count,
+            _pad2: [0; 3],
+            material_shape_bounds: material_shape.bounds,
+            material_shape_corner_radii: material_shape.corner_radii,
+            material_shape_params: material_shape.shape_params(),
             group_shape_params,
             source_directional_blur,
             color_matrix,
@@ -2671,6 +2683,22 @@ impl WgpuRenderer {
                 [0., 0., 0., 1.],
             ],
             [offset[0], offset[1], offset[2], 0.],
+        )
+    }
+
+    fn group_material_shape(
+        effect_plan: &CompositeEffectPlan,
+        group_bounds: Bounds<ScaledPixels>,
+    ) -> SurfaceSilhouetteSpriteData<ScaledPixels> {
+        effect_plan.material_shape().map_or_else(
+            || {
+                let mut shape = SurfaceSilhouetteSpriteData::default();
+                shape.count = 1;
+                shape.bounds[0] = group_bounds;
+                shape.corner_radii[0] = Corners::all(ScaledPixels(0.));
+                shape
+            },
+            |silhouette| silhouette.sprite_data(group_bounds),
         )
     }
 

@@ -10,7 +10,7 @@ use crate::{
     transparent_black,
 };
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Display},
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
@@ -946,7 +946,7 @@ pub enum CompositeEffect {
     BackdropBlur(Pixels),
     BackdropLens(CompositeBackdropLens<Pixels>),
     BackdropTint(Hsla),
-    MaterialShape(GroupShape),
+    MaterialShape(SurfaceSilhouette<Pixels>),
     DropShadow(CompositeDropShadow<Pixels>),
     SurfaceShadow(CompositeSurfaceShadow<Pixels>),
     ProcessedContentGlow(CompositeProcessedContentGlow),
@@ -1035,6 +1035,218 @@ impl GroupShape {
             Self::RoundedRect(_) => GroupShapeKind::RoundedRect,
             Self::Superellipse { exponent, .. } => GroupShapeKind::Superellipse(*exponent),
         }
+    }
+}
+
+/// Maximum number of analytic primitives in a surface silhouette union.
+///
+/// This is a shader ABI bound, not a product limit. Larger arbitrary shapes
+/// should use an explicit sampled/source-mask path rather than silently falling
+/// back from geometry-owned surface semantics.
+pub const MAX_SURFACE_SILHOUETTE_PRIMITIVES: usize = 4;
+
+/// One analytic shape member in a render-group surface silhouette.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct SurfacePrimitive<P: Clone + Copy + Debug + Default + PartialEq> {
+    bounds: Bounds<P>,
+    corner_radii: Corners<P>,
+    shape_kind: GroupShapeKind,
+}
+
+impl SurfacePrimitive<Pixels> {
+    /// Creates a surface primitive from explicit bounds and a group-shape family.
+    pub fn new(bounds: Bounds<Pixels>, shape: GroupShape) -> Self {
+        Self {
+            bounds,
+            corner_radii: shape.corner_radii(),
+            shape_kind: shape.shape_kind(),
+        }
+    }
+
+    fn scale(&self, factor: f32) -> SurfacePrimitive<ScaledPixels> {
+        SurfacePrimitive {
+            bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
+            shape_kind: self.shape_kind,
+        }
+    }
+}
+
+impl<P: Clone + Copy + Debug + Default + PartialEq> SurfacePrimitive<P> {
+    /// Returns this primitive's explicit scene-space bounds.
+    pub fn bounds(&self) -> Bounds<P> {
+        self.bounds
+    }
+
+    /// Returns this primitive's corner radii.
+    pub fn corner_radii(&self) -> Corners<P> {
+        self.corner_radii
+    }
+
+    /// Returns this primitive's analytic shape family.
+    pub fn shape_kind(&self) -> GroupShapeKind {
+        self.shape_kind
+    }
+}
+
+/// A declared material/elevation support region for render-group surface effects.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub enum SurfaceSilhouette<P: Clone + Copy + Debug + Default + PartialEq> {
+    GroupShape {
+        corner_radii: Corners<P>,
+        shape_kind: GroupShapeKind,
+    },
+    Union(Vec<SurfacePrimitive<P>>),
+}
+
+/// Error returned when a surface silhouette cannot be represented by the current
+/// bounded analytic shader ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum SurfaceSilhouetteError {
+    Empty,
+    TooManyPrimitives { limit: usize, requested: usize },
+}
+
+impl Display for SurfaceSilhouetteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(
+                formatter,
+                "surface silhouette union must contain a primitive"
+            ),
+            Self::TooManyPrimitives { limit, requested } => write!(
+                formatter,
+                "surface silhouette union has {requested} primitives, but the current limit is {limit}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SurfaceSilhouetteError {}
+
+impl SurfaceSilhouette<Pixels> {
+    /// Creates a surface silhouette from a small union of analytic primitives.
+    ///
+    /// The union denotes the max/OR of member coverage. It rejects empty or
+    /// oversized inputs instead of silently dropping primitives or falling back
+    /// to content-alpha capture.
+    pub fn union(
+        primitives: impl IntoIterator<Item = SurfacePrimitive<Pixels>>,
+    ) -> Result<Self, SurfaceSilhouetteError> {
+        let primitives = primitives.into_iter().collect::<Vec<_>>();
+        if primitives.is_empty() {
+            return Err(SurfaceSilhouetteError::Empty);
+        }
+        if primitives.len() > MAX_SURFACE_SILHOUETTE_PRIMITIVES {
+            return Err(SurfaceSilhouetteError::TooManyPrimitives {
+                limit: MAX_SURFACE_SILHOUETTE_PRIMITIVES,
+                requested: primitives.len(),
+            });
+        }
+        Ok(Self::Union(primitives))
+    }
+
+    fn scale(&self, factor: f32) -> SurfaceSilhouette<ScaledPixels> {
+        match self {
+            Self::GroupShape {
+                corner_radii,
+                shape_kind,
+            } => SurfaceSilhouette::GroupShape {
+                corner_radii: corner_radii.scale(factor),
+                shape_kind: *shape_kind,
+            },
+            Self::Union(primitives) => SurfaceSilhouette::Union(
+                primitives
+                    .iter()
+                    .map(|primitive| primitive.scale(factor))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<GroupShape> for SurfaceSilhouette<Pixels> {
+    fn from(shape: GroupShape) -> Self {
+        Self::GroupShape {
+            corner_radii: shape.corner_radii(),
+            shape_kind: shape.shape_kind(),
+        }
+    }
+}
+
+impl<P: Clone + Copy + Debug + Default + PartialEq> SurfaceSilhouette<P> {
+    /// Returns whether this silhouette is a group-bounds shape.
+    pub fn is_group_shape(&self) -> bool {
+        matches!(self, Self::GroupShape { .. })
+    }
+
+    /// Returns explicit union primitives when this silhouette is a union.
+    pub fn primitives(&self) -> &[SurfacePrimitive<P>] {
+        match self {
+            Self::GroupShape { .. } => &[],
+            Self::Union(primitives) => primitives,
+        }
+    }
+
+    /// Returns fixed-width renderer-facing data for this silhouette.
+    pub fn sprite_data(&self, group_bounds: Bounds<P>) -> SurfaceSilhouetteSpriteData<P> {
+        let mut data = SurfaceSilhouetteSpriteData::default();
+        match self {
+            Self::GroupShape {
+                corner_radii,
+                shape_kind,
+            } => {
+                data.count = 1;
+                data.bounds[0] = group_bounds;
+                data.corner_radii[0] = *corner_radii;
+                data.shape_kinds[0] = *shape_kind;
+            }
+            Self::Union(primitives) => {
+                data.count = primitives.len() as u32;
+                for (index, primitive) in primitives.iter().enumerate() {
+                    data.bounds[index] = primitive.bounds;
+                    data.corner_radii[index] = primitive.corner_radii;
+                    data.shape_kinds[index] = primitive.shape_kind;
+                }
+            }
+        }
+        data
+    }
+}
+
+/// Renderer-facing fixed-width surface-silhouette data.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct SurfaceSilhouetteSpriteData<P: Clone + Copy + Debug + Default + PartialEq> {
+    pub count: u32,
+    pub bounds: [Bounds<P>; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+    pub corner_radii: [Corners<P>; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+    pub shape_kinds: [GroupShapeKind; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+}
+
+impl<P: Clone + Copy + Debug + Default + PartialEq> Default for SurfaceSilhouetteSpriteData<P> {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            bounds: [Bounds::default(); MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+            corner_radii: [Corners::default(); MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+            shape_kinds: [GroupShapeKind::RoundedRect; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+        }
+    }
+}
+
+impl<P: Clone + Copy + Debug + Default + PartialEq> SurfaceSilhouetteSpriteData<P> {
+    /// Returns packed `(kind, exponent)` shader params for each primitive slot.
+    pub fn shape_params(&self) -> [[f32; 4]; MAX_SURFACE_SILHOUETTE_PRIMITIVES] {
+        let mut params = [[0., 0., 0., 0.]; MAX_SURFACE_SILHOUETTE_PRIMITIVES];
+        for (index, shape_kind) in self.shape_kinds.iter().enumerate() {
+            let (kind, exponent) = shape_kind.shader_params();
+            params[index] = [kind as f32, exponent, 0., 0.];
+        }
+        params
     }
 }
 
@@ -1204,8 +1416,8 @@ impl CompositeEffect {
     }
 
     /// Defines the material domain used by backdrop materials and lens normals.
-    pub fn material_shape(shape: GroupShape) -> Self {
-        Self::MaterialShape(shape)
+    pub fn material_shape(shape: impl Into<SurfaceSilhouette<Pixels>>) -> Self {
+        Self::MaterialShape(shape.into())
     }
 
     /// Draws a drop shadow from the composited source image's alpha channel.
@@ -1233,7 +1445,7 @@ impl CompositeEffect {
 
     /// Draws a drop shadow from an explicit surface/material shape.
     pub fn surface_shadow(
-        shape: GroupShape,
+        shape: impl Into<SurfaceSilhouette<Pixels>>,
         offset: Point<Pixels>,
         blur_radius: Pixels,
         color: Hsla,
@@ -1250,15 +1462,14 @@ impl CompositeEffect {
     /// Draws a drop shadow from an explicit surface/material shape using an
     /// explicit render-group shadow mode.
     pub fn surface_shadow_with_mode(
-        shape: GroupShape,
+        shape: impl Into<SurfaceSilhouette<Pixels>>,
         offset: Point<Pixels>,
         blur_radius: Pixels,
         color: Hsla,
         mode: RenderGroupShadowMode,
     ) -> Self {
         Self::SurfaceShadow(CompositeSurfaceShadow {
-            shape: shape.corner_radii(),
-            shape_kind: shape.shape_kind(),
+            silhouette: shape.into(),
             shadow: CompositeShadow {
                 offset,
                 blur_radius: Pixels(blur_radius.0.max(0.)),
@@ -1360,8 +1571,7 @@ pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
 pub struct CompositeSurfaceShadow<P: Clone + Copy + Debug + Default + PartialEq> {
-    pub shape: Corners<P>,
-    pub shape_kind: GroupShapeKind,
+    pub silhouette: SurfaceSilhouette<P>,
     pub shadow: CompositeShadow<P>,
 }
 
@@ -3483,8 +3693,7 @@ pub struct CompositeEffectPlan {
     backdrop_blur_radius: ScaledPixels,
     backdrop_lens: Option<CompositeBackdropLens<ScaledPixels>>,
     backdrop_tint: Hsla,
-    material_shape: Option<Corners<ScaledPixels>>,
-    material_shape_shape: GroupShapeKind,
+    material_shape: Option<SurfaceSilhouette<ScaledPixels>>,
     drop_shadows: Vec<CompositeDropShadow<ScaledPixels>>,
     surface_shadows: Vec<CompositeSurfaceShadow<ScaledPixels>>,
     processed_content_glows: Vec<CompositeProcessedContentGlowPlan>,
@@ -3569,7 +3778,6 @@ impl CompositeEffectPlan {
             backdrop_lens: None,
             backdrop_tint: transparent_black(),
             material_shape: None,
-            material_shape_shape: GroupShapeKind::RoundedRect,
             drop_shadows: Vec::new(),
             surface_shadows: Vec::new(),
             processed_content_glows: Vec::new(),
@@ -3633,8 +3841,7 @@ impl CompositeEffectPlan {
                     plan.backdrop_tint = composite_tint(plan.backdrop_tint, *color);
                 }
                 CompositeEffect::MaterialShape(shape) => {
-                    plan.material_shape = Some(shape.corner_radii().scale(scale_factor));
-                    plan.material_shape_shape = shape.shape_kind();
+                    plan.material_shape = Some(shape.scale(scale_factor));
                 }
                 CompositeEffect::DropShadow(shadow) => {
                     plan.drop_shadows.push(CompositeDropShadow {
@@ -3648,8 +3855,7 @@ impl CompositeEffectPlan {
                 }
                 CompositeEffect::SurfaceShadow(shadow) => {
                     plan.surface_shadows.push(CompositeSurfaceShadow {
-                        shape: shadow.shape.scale(scale_factor),
-                        shape_kind: shadow.shape_kind,
+                        silhouette: shadow.silhouette.scale(scale_factor),
                         shadow: CompositeShadow {
                             offset: shadow.shadow.offset.scale(scale_factor),
                             blur_radius: shadow.shadow.blur_radius.scale(scale_factor),
@@ -3668,8 +3874,10 @@ impl CompositeEffectPlan {
                     plan.source_mask = Some(corner_radii);
                     plan.source_mask_shape = GroupShapeKind::RoundedRect;
                     plan.source_mask_blur_order = SourceMaskBlurOrder::AfterBlur;
-                    plan.material_shape = Some(corner_radii);
-                    plan.material_shape_shape = GroupShapeKind::RoundedRect;
+                    plan.material_shape = Some(SurfaceSilhouette::GroupShape {
+                        corner_radii,
+                        shape_kind: GroupShapeKind::RoundedRect,
+                    });
                     plan.rounded_mask = Some(corner_radii);
                 }
                 CompositeEffect::BlendMode(mode) => {
@@ -3749,13 +3957,8 @@ impl CompositeEffectPlan {
     }
 
     /// Returns the optional material shape in device pixels.
-    pub fn material_shape(&self) -> Option<Corners<ScaledPixels>> {
-        self.material_shape
-    }
-
-    /// Returns the corner-SDF family of the material shape.
-    pub fn material_shape_shape(&self) -> GroupShapeKind {
-        self.material_shape_shape
+    pub fn material_shape(&self) -> Option<&SurfaceSilhouette<ScaledPixels>> {
+        self.material_shape.as_ref()
     }
 
     /// Returns whether the plan needs a backdrop material layer.
@@ -4145,6 +4348,13 @@ mod tests {
         ContentMask { bounds }
     }
 
+    fn scaled_group_silhouette(corner_radius: f32) -> SurfaceSilhouette<ScaledPixels> {
+        SurfaceSilhouette::GroupShape {
+            corner_radii: Corners::all(ScaledPixels(corner_radius)),
+            shape_kind: GroupShapeKind::RoundedRect,
+        }
+    }
+
     fn group(
         bounds: Bounds<ScaledPixels>,
         capture_bounds: Bounds<ScaledPixels>,
@@ -4302,8 +4512,8 @@ mod tests {
         );
         assert_eq!(plan.drop_shadows()[0].shadow.blur_radius, ScaledPixels(10.));
         assert_eq!(
-            plan.surface_shadows()[0].shape,
-            Corners::all(ScaledPixels(14.))
+            plan.surface_shadows()[0].silhouette,
+            scaled_group_silhouette(14.)
         );
         assert_eq!(
             plan.surface_shadows()[0].shadow.offset,
@@ -4314,7 +4524,7 @@ mod tests {
             ScaledPixels(8.)
         );
         assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(12.))));
-        assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(12.))));
+        assert_eq!(plan.material_shape(), Some(&scaled_group_silhouette(12.)));
         assert_eq!(plan.rounded_mask(), Some(Corners::all(ScaledPixels(12.))));
         assert_eq!(
             CompositeEffectPlan::visual_outset(
@@ -4340,8 +4550,95 @@ mod tests {
         );
 
         assert_eq!(plan.source_mask(), Some(Corners::all(ScaledPixels(8.))));
-        assert_eq!(plan.material_shape(), Some(Corners::all(ScaledPixels(18.))));
+        assert_eq!(plan.material_shape(), Some(&scaled_group_silhouette(18.)));
         assert_eq!(plan.rounded_mask(), None);
+    }
+
+    #[test]
+    fn surface_silhouette_union_scales_material_and_surface_shadow_geometry() {
+        let slab = SurfacePrimitive::new(
+            Bounds::new(
+                point(Pixels(0.), Pixels(0.)),
+                size(Pixels(100.), Pixels(32.)),
+            ),
+            GroupShape::rounded_rect(Corners::all(Pixels(6.))),
+        );
+        let selected_tab = SurfacePrimitive::new(
+            Bounds::new(
+                point(Pixels(24.), Pixels(30.)),
+                size(Pixels(36.), Pixels(14.)),
+            ),
+            GroupShape::rounded_rect(Corners {
+                top_left: Pixels(0.),
+                top_right: Pixels(0.),
+                bottom_right: Pixels(6.),
+                bottom_left: Pixels(6.),
+            }),
+        );
+        let silhouette = SurfaceSilhouette::union([slab, selected_tab]).unwrap();
+        let plan = CompositeEffectPlan::from_effects(
+            2.,
+            1.,
+            &[
+                CompositeEffect::material_shape(silhouette.clone()),
+                CompositeEffect::surface_shadow(
+                    silhouette,
+                    point(Pixels(0.), Pixels(3.)),
+                    Pixels(4.),
+                    red(),
+                ),
+            ],
+        );
+
+        let material_primitives = plan.material_shape().unwrap().primitives();
+        assert_eq!(material_primitives.len(), 2);
+        assert_eq!(
+            material_primitives[0].bounds(),
+            scaled_bounds(0., 0., 200., 64.)
+        );
+        assert_eq!(
+            material_primitives[1].bounds(),
+            scaled_bounds(48., 60., 72., 28.)
+        );
+        assert_eq!(
+            material_primitives[1].corner_radii(),
+            Corners {
+                top_left: ScaledPixels(0.),
+                top_right: ScaledPixels(0.),
+                bottom_right: ScaledPixels(12.),
+                bottom_left: ScaledPixels(12.),
+            }
+        );
+
+        let shadow_primitives = plan.surface_shadows()[0].silhouette.primitives();
+        assert_eq!(shadow_primitives, material_primitives);
+        assert_eq!(
+            plan.surface_shadows()[0].shadow.offset,
+            point(ScaledPixels(0.), ScaledPixels(6.))
+        );
+    }
+
+    #[test]
+    fn surface_silhouette_union_rejects_empty_and_oversized_inputs() {
+        assert_eq!(
+            SurfaceSilhouette::union([]),
+            Err(SurfaceSilhouetteError::Empty)
+        );
+
+        let primitive = SurfacePrimitive::new(
+            Bounds::new(point(Pixels(0.), Pixels(0.)), size(Pixels(1.), Pixels(1.))),
+            GroupShape::rectangle(),
+        );
+        assert_eq!(
+            SurfaceSilhouette::union(std::iter::repeat_n(
+                primitive,
+                MAX_SURFACE_SILHOUETTE_PRIMITIVES + 1
+            )),
+            Err(SurfaceSilhouetteError::TooManyPrimitives {
+                limit: MAX_SURFACE_SILHOUETTE_PRIMITIVES,
+                requested: MAX_SURFACE_SILHOUETTE_PRIMITIVES + 1,
+            })
+        );
     }
 
     #[test]
@@ -4372,8 +4669,8 @@ mod tests {
         assert_eq!(plan.normalized_effects().drop_shadows(), []);
         assert_eq!(plan.normalized_effects().surface_shadows().len(), 1);
         assert_eq!(
-            plan.normalized_effects().surface_shadows()[0].shape,
-            Corners::all(ScaledPixels(20.))
+            plan.normalized_effects().surface_shadows()[0].silhouette,
+            scaled_group_silhouette(20.)
         );
         assert_eq!(
             plan.normalized_effects().surface_shadows()[0].shadow.offset,
@@ -4438,7 +4735,7 @@ mod tests {
         );
         assert_eq!(
             plan.normalized_effects().material_shape(),
-            Some(Corners::all(ScaledPixels(16.)))
+            Some(&scaled_group_silhouette(16.))
         );
         assert!(plan.requirements().reads_backdrop);
         assert_eq!(plan.requirements().source_outset, ScaledPixels(12.));

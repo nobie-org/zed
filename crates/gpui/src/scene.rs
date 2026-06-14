@@ -1210,10 +1210,27 @@ impl CompositeEffect {
 
     /// Draws a drop shadow from the composited source image's alpha channel.
     pub fn drop_shadow(offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
+        Self::drop_shadow_with_mode(
+            offset,
+            blur_radius,
+            color,
+            ContentAlphaShadowMode::Separable,
+        )
+    }
+
+    /// Draws a drop shadow from the composited source image's alpha channel
+    /// using an explicit content-alpha physical mode.
+    pub fn drop_shadow_with_mode(
+        offset: Point<Pixels>,
+        blur_radius: Pixels,
+        color: Hsla,
+        mode: ContentAlphaShadowMode,
+    ) -> Self {
         Self::DropShadow(CompositeDropShadow {
             offset,
             blur_radius: Pixels(blur_radius.0.max(0.)),
             color,
+            mode,
         })
     }
 
@@ -1311,6 +1328,7 @@ pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
     pub offset: Point<P>,
     pub blur_radius: P,
     pub color: Hsla,
+    pub mode: ContentAlphaShadowMode,
 }
 
 /// A drop shadow effect derived from an explicit surface/material shape.
@@ -1330,6 +1348,34 @@ pub struct CompositeSurfaceShadow<P: Clone + Copy + Debug + Default + PartialEq>
 pub struct CompositeProcessedContentGlow {
     pub stages: Vec<DerivedStage>,
     pub color: Hsla,
+}
+
+/// Physical quality mode for shadows derived from captured content alpha.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+#[non_exhaustive]
+pub enum ContentAlphaShadowMode {
+    /// Full-resolution separable Gaussian blur. This is the default content-alpha
+    /// mode because it preserves the Gaussian model with O(2r) samples/pixel.
+    #[default]
+    Separable,
+    /// Full-resolution two-dimensional Gaussian blur. Intended for debug
+    /// comparison against the separable path; cost scales as O(r²).
+    Exact,
+    /// Lower-resolution content-alpha blur. This is a named future quality tier;
+    /// current planners reject it loudly instead of silently substituting another mode.
+    Downsampled,
+}
+
+impl ContentAlphaShadowMode {
+    /// Stable label for diagnostics and inspector surfaces.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Separable => "content-alpha/separable",
+            Self::Exact => "content-alpha/exact-debug",
+            Self::Downsampled => "content-alpha/downsampled",
+        }
+    }
 }
 
 /// A validated processed-content glow in device pixels.
@@ -1761,7 +1807,7 @@ impl ContentLayer {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DerivedLayerSource {
-    ContentAlpha,
+    ContentAlpha(ContentAlphaShadowMode),
     SurfaceShape(GroupShape),
     ProcessedContent,
 }
@@ -1776,8 +1822,14 @@ pub struct DerivedLayer {
 impl DerivedLayer {
     /// Creates an empty content-alpha derived layer builder.
     pub fn from_content_alpha() -> Self {
+        Self::from_content_alpha_shadow_mode(ContentAlphaShadowMode::Separable)
+    }
+
+    /// Creates an empty content-alpha derived layer builder with an explicit
+    /// shadow quality mode for any later [`shadow`](Self::shadow) calls.
+    pub fn from_content_alpha_shadow_mode(mode: ContentAlphaShadowMode) -> Self {
         Self {
-            source: DerivedLayerSource::ContentAlpha,
+            source: DerivedLayerSource::ContentAlpha(mode),
             effects: Vec::new(),
         }
     }
@@ -1809,8 +1861,8 @@ impl DerivedLayer {
     /// element `BoxShadow` primitive instead.
     pub fn shadow(mut self, offset: Point<Pixels>, blur_radius: Pixels, color: Hsla) -> Self {
         let effect = match self.source {
-            DerivedLayerSource::ContentAlpha => {
-                CompositeEffect::drop_shadow(offset, blur_radius, color)
+            DerivedLayerSource::ContentAlpha(mode) => {
+                CompositeEffect::drop_shadow_with_mode(offset, blur_radius, color, mode)
             }
             DerivedLayerSource::SurfaceShape(shape) => {
                 CompositeEffect::surface_shadow(shape, offset, blur_radius, color)
@@ -2158,7 +2210,7 @@ impl LogicalVisualPlan {
             RenderGroupDependencies::from_effect_plan(&accepted_effects, &normalized);
         let requirements =
             RenderGroupRequirements::from_effect_plan(scale_factor, &accepted_effects, &normalized);
-        let physical = PhysicalRenderGroupPlan::from_requirements(&requirements);
+        let physical = PhysicalRenderGroupPlan::from_effect_plan(&requirements, &normalized);
         Self {
             effects,
             accepted_effects,
@@ -2226,6 +2278,22 @@ impl LogicalVisualPlan {
         } else {
             0
         };
+        let content_alpha_shadow_sample_count_estimate = if renders_pixels {
+            self.physical
+                .content_alpha_shadow_sample_count_estimate(capture_bounds, &self.normalized)
+        } else {
+            0
+        };
+        let shadow_modes = if renders_pixels {
+            self.normalized.shadow_mode_counters()
+        } else {
+            RenderGroupShadowModeCounters::default()
+        };
+        let content_alpha_shadow_max_kernel_radius = if renders_pixels {
+            self.normalized.content_alpha_shadow_max_kernel_radius()
+        } else {
+            0
+        };
 
         RenderGroupSupportCounters {
             rendered_groups: u32::from(renders_pixels),
@@ -2238,6 +2306,9 @@ impl LogicalVisualPlan {
             intermediate_textures: u32::from(self.physical.intermediate_textures)
                 * u32::from(renders_pixels),
             backdrop_copies: u32::from(self.physical.backdrop_copies) * u32::from(renders_pixels),
+            shadow_modes,
+            content_alpha_shadow_max_kernel_radius,
+            content_alpha_shadow_sample_count_estimate,
         }
     }
 }
@@ -2311,6 +2382,28 @@ pub struct RenderGroupSupportCounters {
     pub intermediate_textures: u32,
     /// Backdrop texture copies in the current backend summary for accepted visible work.
     pub backdrop_copies: u32,
+    /// Shadow modes present in the accepted visible work.
+    pub shadow_modes: RenderGroupShadowModeCounters,
+    /// Maximum Gaussian kernel radius, in source pixels, among accepted
+    /// content-alpha shadows.
+    pub content_alpha_shadow_max_kernel_radius: u32,
+    /// Estimated source-alpha samples performed for content-alpha shadows over
+    /// the supplied capture bounds. This is a model counter, not a GPU timer.
+    pub content_alpha_shadow_sample_count_estimate: u64,
+}
+
+/// Additive render-group shadow-mode diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderGroupShadowModeCounters {
+    /// Content-alpha shadows using the full-resolution separable path.
+    pub content_alpha_separable: u32,
+    /// Content-alpha shadows using the full 2D exact/debug path.
+    pub content_alpha_exact: u32,
+    /// Content-alpha shadows requesting a lower-resolution tier.
+    pub content_alpha_downsampled: u32,
+    /// Shadows derived from explicit surface/geometry shape.
+    pub surface_geometry: u32,
 }
 
 /// Measured render-group resource counts a backend actually produced while
@@ -2332,6 +2425,14 @@ pub struct RenderGroupBackendCounters {
     pub intermediate_textures: u32,
     /// Backdrop texture copies performed.
     pub backdrop_copies: u32,
+    /// Shadow modes the backend actually drew.
+    pub shadow_modes: RenderGroupShadowModeCounters,
+    /// Maximum Gaussian kernel radius represented by the backend's accepted
+    /// content-alpha shadow work.
+    pub content_alpha_shadow_max_kernel_radius: u32,
+    /// Estimated source-alpha samples represented by the backend's content-alpha
+    /// shadow work.
+    pub content_alpha_shadow_sample_count_estimate: u64,
 }
 
 /// A typed reason why an authored render-group effect could not enter the exact plan.
@@ -2375,6 +2476,9 @@ impl RenderGroupPlanningRejection {
             }
             RenderGroupPlanningRejectionReason::UnsupportedStageSequence { expected } => {
                 format!("unsupported stage sequence (expected {expected})")
+            }
+            RenderGroupPlanningRejectionReason::UnsupportedContentAlphaShadowMode { mode } => {
+                format!("unsupported content-alpha shadow mode {}", mode.label())
             }
         };
         format!("{provenance}: {reason}; {}", self.suggestion)
@@ -2428,6 +2532,9 @@ pub enum RenderGroupPlanningRejectionReason {
     },
     UnsupportedStageSequence {
         expected: &'static str,
+    },
+    UnsupportedContentAlphaShadowMode {
+        mode: ContentAlphaShadowMode,
     },
 }
 
@@ -2836,15 +2943,52 @@ pub struct PhysicalRenderGroupPlan {
     pub pass_count: u8,
     pub intermediate_textures: u8,
     pub backdrop_copies: u8,
+    pub content_alpha_shadow_blur_passes: u8,
 }
 
 impl PhysicalRenderGroupPlan {
-    fn from_requirements(requirements: &RenderGroupRequirements) -> Self {
+    fn from_effect_plan(
+        requirements: &RenderGroupRequirements,
+        normalized: &CompositeEffectPlan,
+    ) -> Self {
+        let content_alpha_shadow_blur_passes =
+            normalized.content_alpha_separable_blur_profile_count();
         Self {
-            pass_count: requirements.pass_count,
-            intermediate_textures: requirements.intermediate_textures,
+            pass_count: requirements
+                .pass_count
+                .saturating_add(content_alpha_shadow_blur_passes),
+            intermediate_textures: requirements
+                .intermediate_textures
+                .saturating_add(content_alpha_shadow_blur_passes),
             backdrop_copies: requirements.backdrop_copies,
+            content_alpha_shadow_blur_passes,
         }
+    }
+
+    fn content_alpha_shadow_sample_count_estimate(
+        &self,
+        capture_bounds: Bounds<ScaledPixels>,
+        normalized: &CompositeEffectPlan,
+    ) -> u64 {
+        let area = bounds_pixel_area(capture_bounds);
+        if area == 0 {
+            return 0;
+        }
+
+        let mut total_samples_per_pixel = 0_u64;
+        for shadow in normalized.drop_shadows() {
+            let kernel_width = gaussian_kernel_width(shadow.blur_radius);
+            total_samples_per_pixel = total_samples_per_pixel.saturating_add(match shadow.mode {
+                ContentAlphaShadowMode::Separable => kernel_width,
+                ContentAlphaShadowMode::Exact => kernel_width.saturating_mul(kernel_width),
+                ContentAlphaShadowMode::Downsampled => 0,
+            });
+        }
+        let horizontal_samples_per_pixel: u64 = normalized
+            .content_alpha_separable_blur_profiles()
+            .map(gaussian_kernel_width)
+            .sum();
+        area.saturating_mul(total_samples_per_pixel.saturating_add(horizontal_samples_per_pixel))
     }
 }
 
@@ -2856,6 +3000,19 @@ fn bounds_pixel_area(bounds: Bounds<ScaledPixels>) -> u64 {
     let width = bounds.size.width.0.max(0.).ceil() as u64;
     let height = bounds.size.height.0.max(0.).ceil() as u64;
     width.saturating_mul(height)
+}
+
+fn gaussian_kernel_radius(sigma: ScaledPixels) -> u64 {
+    if sigma.0 <= f32::EPSILON {
+        return 0;
+    }
+    ((sigma.0 * 3.).ceil().max(0.) as u64).min(24)
+}
+
+fn gaussian_kernel_width(sigma: ScaledPixels) -> u64 {
+    gaussian_kernel_radius(sigma)
+        .saturating_mul(2)
+        .saturating_add(1)
 }
 
 fn plan_has_visual_work(effects: &[CompositeEffect], normalized: &CompositeEffectPlan) -> bool {
@@ -2901,6 +3058,16 @@ fn reject_unsupported_exact_effects(
                 accepted_backdrop_sigma = requested;
             }
             CompositeEffect::DropShadow(shadow) => {
+                if shadow.mode == ContentAlphaShadowMode::Downsampled {
+                    planning_rejections.push(RenderGroupPlanningRejection {
+                        effect: RenderGroupRejectedEffect::DropShadow,
+                        reason: RenderGroupPlanningRejectionReason::UnsupportedContentAlphaShadowMode {
+                            mode: shadow.mode,
+                        },
+                        suggestion: "use ContentAlphaShadowMode::Separable until the downsampled content-alpha backend lands",
+                    });
+                    continue;
+                }
                 let requested = shadow.blur_radius.scale(scale_factor);
                 if requested.0 > MAX_EXACT_GAUSSIAN_SIGMA {
                     planning_rejections.push(exact_blur_limit_rejection(
@@ -3411,6 +3578,7 @@ impl CompositeEffectPlan {
                         offset: shadow.offset.scale(scale_factor),
                         blur_radius: shadow.blur_radius.scale(scale_factor),
                         color: shadow.color,
+                        mode: shadow.mode,
                     });
                 }
                 CompositeEffect::SurfaceShadow(shadow) => {
@@ -3543,6 +3711,51 @@ impl CompositeEffectPlan {
     /// Returns source-alpha drop shadows in declared order.
     pub fn drop_shadows(&self) -> &[CompositeDropShadow<ScaledPixels>] {
         &self.drop_shadows
+    }
+
+    /// Returns the additive shadow-mode counters implied by this normalized plan.
+    pub fn shadow_mode_counters(&self) -> RenderGroupShadowModeCounters {
+        let mut counters = RenderGroupShadowModeCounters::default();
+        for shadow in &self.drop_shadows {
+            match shadow.mode {
+                ContentAlphaShadowMode::Separable => counters.content_alpha_separable += 1,
+                ContentAlphaShadowMode::Exact => counters.content_alpha_exact += 1,
+                ContentAlphaShadowMode::Downsampled => counters.content_alpha_downsampled += 1,
+            }
+        }
+        counters.surface_geometry = self.surface_shadows.len() as u32;
+        counters
+    }
+
+    /// Returns the maximum sampled Gaussian kernel radius for content-alpha
+    /// shadows in this plan.
+    pub fn content_alpha_shadow_max_kernel_radius(&self) -> u32 {
+        self.drop_shadows
+            .iter()
+            .map(|shadow| gaussian_kernel_radius(shadow.blur_radius).min(u32::MAX as u64) as u32)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn content_alpha_separable_blur_profiles(&self) -> impl Iterator<Item = ScaledPixels> + '_ {
+        let mut profiles = Vec::new();
+        for shadow in &self.drop_shadows {
+            if shadow.mode == ContentAlphaShadowMode::Separable
+                && shadow.blur_radius.0 > f32::EPSILON
+                && !profiles.iter().any(|profile: &ScaledPixels| {
+                    profile.0.to_bits() == shadow.blur_radius.0.to_bits()
+                })
+            {
+                profiles.push(shadow.blur_radius);
+            }
+        }
+        profiles.into_iter()
+    }
+
+    fn content_alpha_separable_blur_profile_count(&self) -> u8 {
+        self.content_alpha_separable_blur_profiles()
+            .count()
+            .min(u8::MAX as usize) as u8
     }
 
     /// Returns surface-shape drop shadows in declared order.
@@ -4268,14 +4481,13 @@ mod tests {
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
-                elided_groups: 0,
-                rejected_groups: 0,
                 source_capture_pixels: 4_000,
                 backdrop_read_pixels: 7_936,
                 logical_passes: 3,
                 physical_passes: 3,
                 intermediate_textures: 2,
                 backdrop_copies: 1,
+                ..RenderGroupSupportCounters::default()
             }
         );
     }
@@ -4399,15 +4611,8 @@ mod tests {
         assert_eq!(
             counters,
             RenderGroupSupportCounters {
-                rendered_groups: 0,
-                elided_groups: 0,
                 rejected_groups: 1,
-                source_capture_pixels: 0,
-                backdrop_read_pixels: 0,
-                logical_passes: 0,
-                physical_passes: 0,
-                intermediate_textures: 0,
-                backdrop_copies: 0,
+                ..RenderGroupSupportCounters::default()
             }
         );
     }
@@ -4421,16 +4626,211 @@ mod tests {
         assert_eq!(
             counters,
             RenderGroupSupportCounters {
-                rendered_groups: 0,
                 elided_groups: 1,
-                rejected_groups: 0,
-                source_capture_pixels: 0,
-                backdrop_read_pixels: 0,
-                logical_passes: 0,
-                physical_passes: 0,
-                intermediate_textures: 0,
-                backdrop_copies: 0,
+                ..RenderGroupSupportCounters::default()
             }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_counts_separable_content_alpha_shadow_work() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::drop_shadow(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(3.),
+                red(),
+            )],
+        );
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(
+            plan.physical_plan(),
+            PhysicalRenderGroupPlan {
+                pass_count: 4,
+                intermediate_textures: 2,
+                backdrop_copies: 0,
+                content_alpha_shadow_blur_passes: 1,
+            }
+        );
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 1,
+                source_capture_pixels: 4_000,
+                logical_passes: 3,
+                physical_passes: 4,
+                intermediate_textures: 2,
+                shadow_modes: RenderGroupShadowModeCounters {
+                    content_alpha_separable: 1,
+                    ..RenderGroupShadowModeCounters::default()
+                },
+                content_alpha_shadow_max_kernel_radius: 9,
+                content_alpha_shadow_sample_count_estimate: 152_000,
+                ..RenderGroupSupportCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_counts_explicit_exact_content_alpha_shadow_work() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::drop_shadow_with_mode(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(3.),
+                red(),
+                ContentAlphaShadowMode::Exact,
+            )],
+        );
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(
+            plan.physical_plan(),
+            PhysicalRenderGroupPlan {
+                pass_count: 3,
+                intermediate_textures: 1,
+                backdrop_copies: 0,
+                content_alpha_shadow_blur_passes: 0,
+            }
+        );
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 1,
+                source_capture_pixels: 4_000,
+                logical_passes: 3,
+                physical_passes: 3,
+                intermediate_textures: 1,
+                shadow_modes: RenderGroupShadowModeCounters {
+                    content_alpha_exact: 1,
+                    ..RenderGroupShadowModeCounters::default()
+                },
+                content_alpha_shadow_max_kernel_radius: 9,
+                content_alpha_shadow_sample_count_estimate: 1_444_000,
+                ..RenderGroupSupportCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_keeps_zero_blur_content_alpha_shadow_single_pass() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::drop_shadow(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(0.),
+                red(),
+            )],
+        );
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(
+            plan.physical_plan(),
+            PhysicalRenderGroupPlan {
+                pass_count: 3,
+                intermediate_textures: 1,
+                backdrop_copies: 0,
+                content_alpha_shadow_blur_passes: 0,
+            }
+        );
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 1,
+                source_capture_pixels: 4_000,
+                logical_passes: 3,
+                physical_passes: 3,
+                intermediate_textures: 1,
+                shadow_modes: RenderGroupShadowModeCounters {
+                    content_alpha_separable: 1,
+                    ..RenderGroupShadowModeCounters::default()
+                },
+                content_alpha_shadow_max_kernel_radius: 0,
+                content_alpha_shadow_sample_count_estimate: 4_000,
+                ..RenderGroupSupportCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_shares_separable_blur_profile_across_matching_shadows() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![
+                CompositeEffect::drop_shadow(point(Pixels(0.), Pixels(4.)), Pixels(3.), red()),
+                CompositeEffect::drop_shadow(point(Pixels(2.), Pixels(6.)), Pixels(3.), red()),
+            ],
+        );
+
+        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+
+        assert_eq!(
+            plan.physical_plan(),
+            PhysicalRenderGroupPlan {
+                pass_count: 4,
+                intermediate_textures: 2,
+                backdrop_copies: 0,
+                content_alpha_shadow_blur_passes: 1,
+            }
+        );
+        assert_eq!(
+            counters,
+            RenderGroupSupportCounters {
+                rendered_groups: 1,
+                source_capture_pixels: 4_000,
+                logical_passes: 3,
+                physical_passes: 4,
+                intermediate_textures: 2,
+                shadow_modes: RenderGroupShadowModeCounters {
+                    content_alpha_separable: 2,
+                    ..RenderGroupShadowModeCounters::default()
+                },
+                content_alpha_shadow_max_kernel_radius: 9,
+                content_alpha_shadow_sample_count_estimate: 228_000,
+                ..RenderGroupSupportCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_visual_plan_rejects_unimplemented_downsampled_content_alpha_shadow() {
+        let plan = LogicalVisualPlan::from_effects(
+            1.,
+            1.,
+            vec![CompositeEffect::drop_shadow_with_mode(
+                point(Pixels(0.), Pixels(4.)),
+                Pixels(3.),
+                red(),
+                ContentAlphaShadowMode::Downsampled,
+            )],
+        );
+
+        assert_eq!(plan.accepted_effects(), []);
+        assert_eq!(plan.normalized_effects().drop_shadows(), []);
+        assert_eq!(
+            plan.planning_rejections(),
+            &[RenderGroupPlanningRejection {
+                effect: RenderGroupRejectedEffect::DropShadow,
+                reason: RenderGroupPlanningRejectionReason::UnsupportedContentAlphaShadowMode {
+                    mode: ContentAlphaShadowMode::Downsampled,
+                },
+                suggestion: "use ContentAlphaShadowMode::Separable until the downsampled content-alpha backend lands",
+            }]
+        );
+        assert_eq!(
+            plan.planning_rejections()[0].describe(),
+            concat!(
+                "derived.content_alpha.shadow: unsupported content-alpha shadow mode content-alpha/downsampled; ",
+                "use ContentAlphaShadowMode::Separable until the downsampled content-alpha backend lands"
+            )
         );
     }
 

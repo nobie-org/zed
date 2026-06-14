@@ -2739,7 +2739,10 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
-        self.invalidate_entities();
+        {
+            profiling::scope!("gpui::window::draw_invalidate_entities");
+            self.invalidate_entities();
+        }
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -2763,6 +2766,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            profiling::scope!("gpui::window::draw_roots");
             self.draw_roots(cx);
         }
         self.dirty_views.clear();
@@ -2783,9 +2787,12 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
-        self.text_system().finish_frame();
-        self.next_frame.finish(&mut self.rendered_frame);
+        {
+            profiling::scope!("gpui::window::finish_next_frame");
+            self.layout_engine.as_mut().unwrap().clear();
+            self.text_system().finish_frame();
+            self.next_frame.finish(&mut self.rendered_frame);
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -2822,8 +2829,14 @@ impl Window {
         }
 
         debug_assert!(self.rendered_entity_stack.is_empty());
-        self.record_entities_accessed(cx);
-        self.reset_cursor_style(cx);
+        {
+            profiling::scope!("gpui::window::record_entities_accessed");
+            self.record_entities_accessed(cx);
+        }
+        {
+            profiling::scope!("gpui::window::reset_cursor_style");
+            self.reset_cursor_style(cx);
+        }
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);

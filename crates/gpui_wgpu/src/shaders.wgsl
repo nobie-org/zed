@@ -1577,6 +1577,68 @@ fn sample_group_alpha_blurred(
     return alpha / total;
 }
 
+fn sample_group_alpha_blurred_horizontal(
+    coords: vec2<f32>,
+    point: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+    sprite: GroupSprite,
+) -> f32 {
+    if (sigma <= 0.0) {
+        return sample_group_source(coords, point, sprite).a;
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var alpha = 0.0;
+    var total = 0.0;
+
+    for (var x = -24; x <= 24; x = x + 1) {
+        if (abs(x) <= radius) {
+            let offset = f32(x);
+            let weight = exp(-(offset * offset) / (2.0 * sigma * sigma));
+            alpha += sample_group_source(
+                coords + vec2<f32>(offset, 0.0) * pixel_size,
+                point + vec2<f32>(offset, 0.0),
+                sprite,
+            ).a * weight;
+            total += weight;
+        }
+    }
+
+    if (total <= 0.0) {
+        return 0.0;
+    }
+    return alpha / total;
+}
+
+fn sample_group_alpha_blurred_vertical(
+    coords: vec2<f32>,
+    pixel_size: vec2<f32>,
+    sigma: f32,
+) -> f32 {
+    if (sigma <= 0.0) {
+        return sample_group_texture(coords).a;
+    }
+
+    let radius = min(i32(ceil(3.0 * sigma)), 24);
+    var alpha = 0.0;
+    var total = 0.0;
+
+    for (var y = -24; y <= 24; y = y + 1) {
+        if (abs(y) <= radius) {
+            let offset = f32(y);
+            let weight = exp(-(offset * offset) / (2.0 * sigma * sigma));
+            alpha += sample_group_texture(coords + vec2<f32>(0.0, offset) * pixel_size).a * weight;
+            total += weight;
+        }
+    }
+
+    if (total <= 0.0) {
+        return 0.0;
+    }
+    return alpha / total;
+}
+
 fn sample_material_alpha_blurred(point: vec2<f32>, sigma: f32, sprite: GroupSprite) -> f32 {
     if (sigma <= 0.0) {
         return group_material_alpha(point, sprite);
@@ -1815,6 +1877,15 @@ fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
             sprite,
         );
     }
+    if (sprite.effect_kind == 4u) {
+        let sample_coords = input.texture_coords - sprite.shadow_offset * input.texture_pixel_size;
+        let alpha = sample_group_alpha_blurred_vertical(
+            sample_coords,
+            input.texture_pixel_size,
+            sprite.shadow_blur_radius,
+        ) * sprite.shadow_color.a * sprite.opacity;
+        return vec4<f32>(sprite.shadow_color.rgb * alpha, alpha);
+    }
 
     var sample = sample_group_source_blurred(
         input.texture_coords,
@@ -1842,6 +1913,19 @@ fn fs_group(input: GroupVarying) -> @location(0) vec4<f32> {
     sample *= sprite.opacity;
     let backdrop = sample_backdrop_texture(input.texture_coords);
     return apply_group_blend_mode(sample, backdrop, sprite.blend_mode);
+}
+
+@fragment
+fn fs_group_alpha_horizontal_blur(input: GroupVarying) -> @location(0) vec4<f32> {
+    let sprite = b_group_sprites[input.sprite_id];
+    let alpha = sample_group_alpha_blurred_horizontal(
+        input.texture_coords,
+        input.screen_position,
+        input.texture_pixel_size,
+        sprite.shadow_blur_radius,
+        sprite,
+    );
+    return vec4<f32>(alpha, alpha, alpha, alpha);
 }
 
 // --- underlines --- //

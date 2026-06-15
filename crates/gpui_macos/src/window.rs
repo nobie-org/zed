@@ -564,17 +564,13 @@ impl MacWindowState {
         let had_display_link = self.display_link.is_some();
         self.stop_display_link();
         let occlusion_visible = unsafe {
-            self.native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            trace_native_window_snapshot(
+                "display_link_start_decision",
+                self.native_window,
+                had_display_link,
+                "start_display_link",
+            )
         };
-        nobie_platform_trace::trace(
-            "display_link_start_decision",
-            format_args!(
-                "occlusion_visible={} had_display_link={}",
-                occlusion_visible, had_display_link
-            ),
-        );
         if !occlusion_visible {
             nobie_platform_trace::trace(
                 "display_link_start_skipped",
@@ -1115,6 +1111,44 @@ impl Drop for MacWindow {
 fn if_window_not_closed(closed: Arc<AtomicBool>, f: impl FnOnce()) {
     if !closed.load(Ordering::Acquire) {
         f();
+    }
+}
+
+unsafe fn trace_native_window_snapshot(
+    event: &'static str,
+    native_window: id,
+    had_display_link: bool,
+    reason: &'static str,
+) -> bool {
+    unsafe {
+        let occlusion_state = native_window.occlusionState();
+        let occlusion_visible =
+            occlusion_state.contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible);
+        let is_visible: BOOL = msg_send![native_window, isVisible];
+        let is_miniaturized: BOOL = msg_send![native_window, isMiniaturized];
+        let is_key_window: BOOL = msg_send![native_window, isKeyWindow];
+        let is_main_window: BOOL = msg_send![native_window, isMainWindow];
+        let window_number: NSInteger = msg_send![native_window, windowNumber];
+        let display_id = display_id_for_screen(native_window.screen());
+        nobie_platform_trace::trace(
+            event,
+            format_args!(
+                "occlusion_visible={} occlusion_bits={} had_display_link={} \
+                 appkit_visible={} miniaturized={} key_window={} main_window={} \
+                 window_number={} display_id={} reason={}",
+                occlusion_visible,
+                occlusion_state.bits(),
+                had_display_link,
+                is_visible == YES,
+                is_miniaturized == YES,
+                is_key_window == YES,
+                is_main_window == YES,
+                window_number,
+                display_id,
+                reason
+            ),
+        );
+        occlusion_visible
     }
 }
 
@@ -2312,13 +2346,11 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let lock = &mut *window_state.lock();
     unsafe {
-        let occlusion_visible = lock
-            .native_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible);
-        nobie_platform_trace::trace(
+        let occlusion_visible = trace_native_window_snapshot(
             "window_occlusion_state_changed",
-            format_args!("visible={}", occlusion_visible),
+            lock.native_window,
+            lock.display_link.is_some(),
+            "notification",
         );
         if occlusion_visible {
             lock.move_traffic_light();
@@ -2564,18 +2596,14 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        nobie_platform_trace::trace(
-            "display_layer_request_frame",
-            format_args!(
-                "had_display_link={} occlusion_visible={}",
+        unsafe {
+            trace_native_window_snapshot(
+                "display_layer_request_frame",
+                lock.native_window,
                 lock.display_link.is_some(),
-                unsafe {
-                    lock.native_window
-                        .occlusionState()
-                        .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-                }
-            ),
-        );
+                "display_layer",
+            );
+        }
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);

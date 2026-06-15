@@ -153,10 +153,30 @@ impl WindowInvalidator {
 
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
+        let dirty_before = inner.dirty;
+        let pending_dirty_views_before = inner.dirty_views.len();
+        let draw_phase = inner.draw_phase;
         inner.update_count += 1;
-        inner.dirty_views.insert(entity);
-        if inner.draw_phase == DrawPhase::None {
+        let inserted_dirty_view = inner.dirty_views.insert(entity);
+        let scheduled_notify = draw_phase == DrawPhase::None;
+        if scheduled_notify {
             inner.dirty = true;
+        }
+        let dirty_after = inner.dirty;
+        let pending_dirty_views_after = inner.dirty_views.len();
+        let update_count = inner.update_count;
+        crate::nobie_platform_trace::trace(
+            "window_invalidate_view",
+            format_args!(
+                "entity_id={entity} draw_phase={draw_phase:?} \
+                 dirty_before={dirty_before} dirty_after={dirty_after} \
+                 pending_dirty_views_before={pending_dirty_views_before} \
+                 pending_dirty_views_after={pending_dirty_views_after} \
+                 inserted_dirty_view={inserted_dirty_view} \
+                 scheduled_notify={scheduled_notify} update_count={update_count}"
+            ),
+        );
+        if scheduled_notify {
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
@@ -1391,6 +1411,32 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                let request_frame_id = crate::nobie_platform_trace::current_request_frame_id();
+                let display_link_signal_id =
+                    crate::nobie_platform_trace::current_display_link_signal_id();
+                let latest_display_link_signal_id =
+                    crate::nobie_platform_trace::latest_display_link_signal_id();
+                let display_link_coalesced_count =
+                    crate::nobie_platform_trace::current_display_link_coalesced_count();
+                let callbacks_pending_at_start = next_frame_callbacks.borrow().len();
+                let invalidator_dirty_at_start = invalidator.is_dirty();
+                let pending_dirty_views_at_start = invalidator.pending_dirty_view_count();
+                crate::nobie_platform_trace::trace(
+                    "request_frame_callback_start",
+                    format_args!(
+                        "request_frame_id={request_frame_id} active={} \
+                         invalidator_dirty={invalidator_dirty_at_start} \
+                         force_render={} require_presentation={} \
+                         display_link_signal_id={display_link_signal_id} \
+                         latest_display_link_signal_id={latest_display_link_signal_id} \
+                         display_link_coalesced_count={display_link_coalesced_count} \
+                         pending_dirty_views={pending_dirty_views_at_start} \
+                         callbacks_pending={callbacks_pending_at_start}",
+                        active.get(),
+                        request_frame_options.force_render,
+                        request_frame_options.require_presentation
+                    ),
+                );
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
                     .log_err();
@@ -1407,29 +1453,57 @@ impl Window {
                 // `WindowOptions::throttle_inactive_frame_rate` /
                 // `WindowOptions::throttle_under_thermal_pressure` or the
                 // matching `Window::set_*` runtime setters.
-                let min_frame_interval = if !request_frame_options.force_render
+                let (min_frame_interval, throttle_reason) = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
-                    None
+                    (None, "none")
                 } else if !active.get() && throttle_inactive_frame_rate.get() {
-                    Some(Duration::from_micros(33333))
+                    (Some(Duration::from_micros(33333)), "inactive_window")
                 } else if throttle_under_thermal_pressure.get()
                     && matches!(
                         thermal_state,
                         Some(ThermalState::Critical | ThermalState::Serious)
                     )
                 {
-                    Some(Duration::from_micros(16667))
+                    (Some(Duration::from_micros(16667)), "thermal_pressure")
                 } else {
-                    None
+                    (None, "none")
                 };
 
                 let now = Instant::now();
+                crate::nobie_platform_trace::trace(
+                    "request_frame_throttle_decision",
+                    format_args!(
+                        "request_frame_id={request_frame_id} active={} \
+                         throttle_reason={throttle_reason} min_interval_us={} \
+                         force_render={} require_presentation={} \
+                         callbacks_pending={} thermal_state={:?}",
+                        active.get(),
+                        min_frame_interval
+                            .map(|duration| duration.as_micros())
+                            .unwrap_or(0),
+                        request_frame_options.force_render,
+                        request_frame_options.require_presentation,
+                        next_frame_callbacks.borrow().len(),
+                        thermal_state
+                    ),
+                );
                 if let Some(min_interval) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
                     {
+                        crate::nobie_platform_trace::trace(
+                            "request_frame_early_complete",
+                            format_args!(
+                                "request_frame_id={request_frame_id} active={} \
+                                 reason=throttled throttle_reason={throttle_reason} \
+                                 elapsed_since_last_frame_us={} min_interval_us={}",
+                                active.get(),
+                                now.duration_since(last_frame).as_micros(),
+                                min_interval.as_micros()
+                            ),
+                        );
                         // Must still complete the frame on platforms that require it.
                         // On Wayland, `surface.frame()` was already called to request the
                         // next frame callback, so we must call `surface.commit()` (via
@@ -1443,6 +1517,7 @@ impl Window {
                 last_frame_time.set(Some(now));
 
                 let next_frame_callbacks = next_frame_callbacks.take();
+                let callbacks_pending_at_decision = next_frame_callbacks.len();
                 if !next_frame_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
@@ -1462,8 +1537,27 @@ impl Window {
                 let should_present = request_frame_options.require_presentation
                     || stored_needs_present
                     || active_high_rate_input;
+                let invalidator_dirty_at_decision = invalidator.is_dirty();
+                let pending_dirty_views_at_decision = invalidator.pending_dirty_view_count();
+                crate::nobie_platform_trace::trace(
+                    "request_frame_render_decision",
+                    format_args!(
+                        "request_frame_id={request_frame_id} active={} \
+                         invalidator_dirty={invalidator_dirty_at_decision} \
+                         force_render={} require_presentation={} \
+                         should_present={should_present} \
+                         stored_needs_present={stored_needs_present} \
+                         active_high_rate_input={active_high_rate_input} \
+                         pending_dirty_views={pending_dirty_views_at_decision} \
+                         callbacks_pending={}",
+                        active.get(),
+                        request_frame_options.force_render,
+                        request_frame_options.require_presentation,
+                        callbacks_pending_at_decision
+                    ),
+                );
 
-                if invalidator.is_dirty() || request_frame_options.force_render {
+                if invalidator_dirty_at_decision || request_frame_options.force_render {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1499,6 +1593,14 @@ impl Window {
                             })
                             .log_err();
                     }
+                } else {
+                    crate::nobie_platform_trace::trace(
+                        "request_frame_noop",
+                        format_args!(
+                            "request_frame_id={request_frame_id} active={} reason=clean",
+                            active.get()
+                        ),
+                    );
                 }
 
                 handle

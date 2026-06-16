@@ -265,6 +265,15 @@ impl TaffyLayoutEngine {
         node_id
     }
 
+    fn commit_root_layout(&mut self, id: LayoutId) -> NodeId {
+        let node_id = self.commit_layout(id);
+        assert!(
+            self.taffy.parent(node_id).is_none(),
+            "layout root must not already be committed under a parent"
+        );
+        node_id
+    }
+
     fn commit_descriptor(
         &mut self,
         id: LayoutId,
@@ -422,6 +431,21 @@ impl TaffyLayoutEngine {
             .expect(EXPECT_MESSAGE);
     }
 
+    fn invalidate_cached_bounds_for_subtree(&mut self, node_id: NodeId) {
+        let stack = &mut self.layout_bounds_scratch_space;
+        stack.push(node_id);
+        while let Some(node_id) = stack.pop() {
+            self.absolute_layout_bounds.remove(&node_id);
+            self.absolute_outer_origins.remove(&node_id);
+            stack.extend(
+                self.taffy
+                    .children(node_id)
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter(),
+            );
+        }
+    }
+
     #[stacksafe]
     pub fn compute_layout(
         &mut self,
@@ -430,7 +454,7 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let node_id = self.commit_layout(id);
+        let node_id = self.commit_root_layout(id);
         // Leaving this here until we have a better instrumentation approach.
         // println!("Laying out {} children", self.count_all_children(id)?);
         // println!("Max layout depth: {}", self.max_depth(0, id)?);
@@ -443,18 +467,7 @@ impl TaffyLayoutEngine {
         //
 
         if !self.computed_layouts.insert(node_id) {
-            let stack = &mut self.layout_bounds_scratch_space;
-            stack.push(node_id);
-            while let Some(node_id) = stack.pop() {
-                self.absolute_layout_bounds.remove(&node_id);
-                self.absolute_outer_origins.remove(&node_id);
-                stack.extend(
-                    self.taffy
-                        .children(node_id)
-                        .expect(EXPECT_MESSAGE)
-                        .into_iter(),
-                );
-            }
+            self.invalidate_cached_bounds_for_subtree(node_id);
         }
 
         let scale_factor = window.scale_factor();
@@ -674,6 +687,16 @@ mod retained_layout_tests {
         engine.request_layout(Style::default(), px(16.0), 1.0, children)
     }
 
+    fn request_full_container(engine: &mut TaffyLayoutEngine, children: &[LayoutId]) -> LayoutId {
+        let mut style = Style::default();
+        style.size = Size::full();
+        engine.request_layout(style, px(16.0), 1.0, children)
+    }
+
+    fn request_full_leaf(engine: &mut TaffyLayoutEngine) -> LayoutId {
+        request_full_container(engine, &[])
+    }
+
     fn request_measured(engine: &mut TaffyLayoutEngine, width: f32) -> LayoutId {
         engine.request_measured_layout(style_with_width(width), px(16.0), 1.0, move |_, _, _, _| {
             size(px(width), px(10.0))
@@ -700,6 +723,42 @@ mod retained_layout_tests {
                 .map(|child| taffy_shape(engine, child))
                 .collect(),
         }
+    }
+
+    fn compute_layout_without_measure(
+        engine: &mut TaffyLayoutEngine,
+        root: LayoutId,
+        width: f32,
+        height: f32,
+    ) -> NodeId {
+        let root_node = engine.commit_root_layout(root);
+        if !engine.computed_layouts.insert(root_node) {
+            engine.invalidate_cached_bounds_for_subtree(root_node);
+        }
+        engine
+            .taffy
+            .compute_layout_with_measure(
+                root_node,
+                size(
+                    AvailableSpace::Definite(px(width)),
+                    AvailableSpace::Definite(px(height)),
+                )
+                .into(),
+                |_known_dimensions, _available_space, _id, _node_context, _style| {
+                    taffy::geometry::Size::default()
+                },
+            )
+            .expect(EXPECT_MESSAGE);
+        root_node
+    }
+
+    fn taffy_node_size(engine: &TaffyLayoutEngine, node_id: NodeId) -> Size<f32> {
+        engine
+            .taffy
+            .layout(node_id)
+            .expect(EXPECT_MESSAGE)
+            .size
+            .into()
     }
 
     fn assert_descriptor_committed_exactly(engine: &TaffyLayoutEngine, id: LayoutId) {
@@ -855,6 +914,73 @@ mod retained_layout_tests {
         let root = request_container(&mut engine, &[child, child]);
 
         engine.commit_layout(root);
+    }
+
+    #[test]
+    fn retained_layout_recomputes_when_root_available_space_changes() {
+        let mut retained = TaffyLayoutEngine::new();
+        let child = request_full_leaf(&mut retained);
+        let root = request_full_container(&mut retained, &[child]);
+        compute_layout_without_measure(&mut retained, root, 0.0, 100.0);
+        retained.clear();
+
+        let child = request_full_leaf(&mut retained);
+        let root = request_full_container(&mut retained, &[child]);
+        let retained_root = compute_layout_without_measure(&mut retained, root, 800.0, 100.0);
+        let retained_child = retained.committed_layout_nodes[&child];
+
+        let mut fresh = TaffyLayoutEngine::new();
+        let child = request_full_leaf(&mut fresh);
+        let root = request_full_container(&mut fresh, &[child]);
+        let fresh_root = compute_layout_without_measure(&mut fresh, root, 800.0, 100.0);
+        let fresh_child = fresh.committed_layout_nodes[&child];
+
+        assert_eq!(
+            taffy_node_size(&retained, retained_root),
+            taffy_node_size(&fresh, fresh_root)
+        );
+        assert_eq!(
+            taffy_node_size(&retained, retained_child),
+            taffy_node_size(&fresh, fresh_child)
+        );
+        assert_eq!(
+            taffy_node_size(&retained, retained_child),
+            size(800.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn repeated_root_layout_recompute_is_allowed() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = request_full_leaf(&mut engine);
+        let root = request_full_container(&mut engine, &[child]);
+
+        compute_layout_without_measure(&mut engine, root, 0.0, 100.0);
+        let child_node = engine.committed_layout_nodes[&child];
+        assert_eq!(
+            engine.layout_bounds_for_node(child_node, 1.0).size,
+            size(px(0.0), px(100.0))
+        );
+
+        let root_node = compute_layout_without_measure(&mut engine, root, 800.0, 100.0);
+
+        assert_eq!(taffy_node_size(&engine, root_node), size(800.0, 100.0));
+        assert_eq!(taffy_node_size(&engine, child_node), size(800.0, 100.0));
+        assert_eq!(
+            engine.layout_bounds_for_node(child_node, 1.0).size,
+            size(px(800.0), px(100.0))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "layout root must not already be committed under a parent")]
+    fn descriptor_committed_under_parent_cannot_be_computed_as_root() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = request_full_leaf(&mut engine);
+        let root = request_full_container(&mut engine, &[child]);
+
+        compute_layout_without_measure(&mut engine, root, 800.0, 100.0);
+        engine.commit_root_layout(child);
     }
 }
 

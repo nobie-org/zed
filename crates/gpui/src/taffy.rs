@@ -1307,6 +1307,38 @@ mod tests {
     }
 
     #[test]
+    fn retained_layout_updates_measured_context_in_place() {
+        let mut engine = TaffyLayoutEngine::new();
+        let first = engine.request_measured_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            |_, _, _, _| size(Pixels(10.0), Pixels(20.0)),
+        );
+        finish_frame(&mut engine);
+
+        let second = engine.request_measured_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            |_, _, _, _| size(Pixels(30.0), Pixels(40.0)),
+        );
+
+        assert_eq!(second, first);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 1,
+                context_updates: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
+    }
+
+    #[test]
     fn retained_layout_sweeps_unseen_retained_nodes() {
         let mut engine = TaffyLayoutEngine::new();
         let retained = request_retained_leaf(&mut engine, 1, Style::default());

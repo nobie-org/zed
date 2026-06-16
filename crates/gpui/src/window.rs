@@ -1,5 +1,6 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::taffy::LayoutKey;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
@@ -2789,7 +2790,7 @@ impl Window {
 
         {
             profiling::scope!("gpui::window::finish_next_frame");
-            self.layout_engine.as_mut().unwrap().clear();
+            self.layout_engine.as_mut().unwrap().finish_frame();
             self.text_system().finish_frame();
             self.next_frame.finish(&mut self.rendered_frame);
         }
@@ -4388,6 +4389,31 @@ impl Window {
         children: impl IntoIterator<Item = LayoutId>,
         cx: &mut App,
     ) -> LayoutId {
+        self.request_layout_with_key(None, style, children, cx)
+    }
+
+    pub(crate) fn request_layout_for_id(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.request_layout_with_key(
+            global_id.map(LayoutKey::from_global_id),
+            style,
+            children,
+            cx,
+        )
+    }
+
+    fn request_layout_with_key(
+        &mut self,
+        layout_key: Option<LayoutKey>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
         cx.layout_id_buffer.clear();
@@ -4396,6 +4422,7 @@ impl Window {
         let scale_factor = self.scale_factor();
 
         self.layout_engine.as_mut().unwrap().request_layout(
+            layout_key,
             style,
             rem_size,
             scale_factor,
@@ -4416,6 +4443,36 @@ impl Window {
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
+        self.request_measured_layout_with_key(None, style, measure)
+    }
+
+    pub(crate) fn request_measured_layout_for_id<F>(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        style: Style,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        self.request_measured_layout_with_key(
+            global_id.map(LayoutKey::from_global_id),
+            style,
+            measure,
+        )
+    }
+
+    fn request_measured_layout_with_key<F>(
+        &mut self,
+        layout_key: Option<LayoutKey>,
+        style: Style,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
@@ -4423,7 +4480,7 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(layout_key, style, rem_size, scale_factor, measure)
     }
 
     /// Compute the layout for the given id within the given available space.

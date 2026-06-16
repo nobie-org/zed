@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, ElementId, GlobalElementId, GridTemplate,
+    Length, Pixels, Point, Size, Style, Window, size,
     util::{
         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
@@ -8,7 +8,7 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
-use std::{fmt::Debug, ops::Range};
+use std::{fmt::Debug, ops::Range, sync::Arc};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -31,8 +31,62 @@ type NodeMeasureFn = StackSafe<
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct LayoutKey(Arc<[LayoutKeySegment]>);
+
+impl LayoutKey {
+    pub(crate) fn from_global_id(global_id: &GlobalElementId) -> Self {
+        Self(Arc::from(
+            global_id
+                .0
+                .iter()
+                .cloned()
+                .map(LayoutKeySegment::Element)
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum LayoutKeySegment {
+    Element(ElementId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedNodeKind {
+    Normal,
+    Measured,
+}
+
+#[derive(Debug)]
+struct RetainedLayoutNode {
+    id: LayoutId,
+    kind: RetainedNodeKind,
+    style: taffy::style::Style,
+    children: Vec<LayoutId>,
+    last_seen_frame: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetainedLayoutStats {
+    creates: usize,
+    reuses: usize,
+    style_updates: usize,
+    children_updates: usize,
+    context_updates: usize,
+    duplicate_misses: usize,
+    scratch_creates: usize,
+    removes: usize,
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    retained_nodes: FxHashMap<LayoutKey, RetainedLayoutNode>,
+    claimed_layout_keys: FxHashSet<LayoutKey>,
+    scratch_nodes: FxHashSet<LayoutId>,
+    current_frame: u64,
+    retained_stats: RetainedLayoutStats,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -48,6 +102,11 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            retained_nodes: FxHashMap::default(),
+            claimed_layout_keys: FxHashSet::default(),
+            scratch_nodes: FxHashSet::default(),
+            current_frame: 0,
+            retained_stats: RetainedLayoutStats::default(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -55,38 +114,137 @@ impl TaffyLayoutEngine {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.taffy.clear();
+    pub fn finish_frame(&mut self) {
+        self.remove_scratch_nodes();
+        self.remove_unclaimed_retained_nodes();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.claimed_layout_keys.clear();
+        self.current_frame += 1;
     }
 
     pub fn request_layout(
         &mut self,
+        layout_key: Option<LayoutKey>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        if let Some(layout_key) = layout_key {
+            return self.request_retained_layout(layout_key, taffy_style, children);
+        }
 
+        self.request_scratch_layout(taffy_style, children)
+    }
+
+    fn request_scratch_layout(
+        &mut self,
+        taffy_style: taffy::style::Style,
+        children: &[LayoutId],
+    ) -> LayoutId {
         if children.is_empty() {
-            self.taffy
+            let id = self
+                .taffy
                 .new_leaf(taffy_style)
+                .expect(EXPECT_MESSAGE)
+                .into();
+            self.scratch_nodes.insert(id);
+            self.retained_stats.scratch_creates += 1;
+            id
+        } else {
+            let id = self
+                .taffy
+                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
+                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
+                .expect(EXPECT_MESSAGE)
+                .into();
+            self.scratch_nodes.insert(id);
+            self.retained_stats.scratch_creates += 1;
+            id
+        }
+    }
+
+    fn request_retained_layout(
+        &mut self,
+        layout_key: LayoutKey,
+        taffy_style: taffy::style::Style,
+        children: &[LayoutId],
+    ) -> LayoutId {
+        if !self.claimed_layout_keys.insert(layout_key.clone()) {
+            self.retained_stats.duplicate_misses += 1;
+            return self.request_scratch_layout(taffy_style, children);
+        }
+
+        if matches!(
+            self.retained_nodes.get(&layout_key),
+            Some(node) if node.kind != RetainedNodeKind::Normal
+        ) && let Some(old_node) = self.retained_nodes.remove(&layout_key)
+        {
+            let mut removed = FxHashSet::default();
+            self.remove_subtree(old_node.id, &mut removed);
+        }
+
+        if let Some(node) = self.retained_nodes.get_mut(&layout_key) {
+            let id = node.id;
+            let mut reused_without_mutation = true;
+
+            if node.style != taffy_style {
+                self.taffy
+                    .set_style(id.into(), taffy_style.clone())
+                    .expect(EXPECT_MESSAGE);
+                node.style = taffy_style;
+                self.retained_stats.style_updates += 1;
+                reused_without_mutation = false;
+            }
+
+            if node.children.as_slice() != children {
+                self.taffy
+                    .set_children(id.into(), LayoutId::to_taffy_slice(children))
+                    .expect(EXPECT_MESSAGE);
+                node.children.clear();
+                node.children.extend_from_slice(children);
+                self.retained_stats.children_updates += 1;
+                reused_without_mutation = false;
+            }
+
+            node.last_seen_frame = self.current_frame;
+            if reused_without_mutation {
+                self.retained_stats.reuses += 1;
+            }
+            return id;
+        }
+
+        let id = if children.is_empty() {
+            self.taffy
+                .new_leaf(taffy_style.clone())
                 .expect(EXPECT_MESSAGE)
                 .into()
         } else {
             self.taffy
-                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
+                .new_with_children(taffy_style.clone(), LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE)
                 .into()
-        }
+        };
+        self.retained_nodes.insert(
+            layout_key,
+            RetainedLayoutNode {
+                id,
+                kind: RetainedNodeKind::Normal,
+                style: taffy_style,
+                children: children.to_vec(),
+                last_seen_frame: self.current_frame,
+            },
+        );
+        self.retained_stats.creates += 1;
+        id
     }
 
     pub fn request_measured_layout(
         &mut self,
+        layout_key: Option<LayoutKey>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
@@ -99,16 +257,135 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let context = NodeContext {
+            measure: StackSafe::new(Box::new(measure)),
+        };
+        if let Some(layout_key) = layout_key {
+            return self.request_retained_measured_layout(layout_key, taffy_style, context);
+        }
 
-        self.taffy
-            .new_leaf_with_context(
-                taffy_style,
-                NodeContext {
-                    measure: StackSafe::new(Box::new(measure)),
-                },
-            )
+        let id = self
+            .taffy
+            .new_leaf_with_context(taffy_style, context)
             .expect(EXPECT_MESSAGE)
-            .into()
+            .into();
+        self.scratch_nodes.insert(id);
+        self.retained_stats.scratch_creates += 1;
+        id
+    }
+
+    fn request_retained_measured_layout(
+        &mut self,
+        layout_key: LayoutKey,
+        taffy_style: taffy::style::Style,
+        context: NodeContext,
+    ) -> LayoutId {
+        if !self.claimed_layout_keys.insert(layout_key.clone()) {
+            self.retained_stats.duplicate_misses += 1;
+            let id = self
+                .taffy
+                .new_leaf_with_context(taffy_style, context)
+                .expect(EXPECT_MESSAGE)
+                .into();
+            self.scratch_nodes.insert(id);
+            self.retained_stats.scratch_creates += 1;
+            return id;
+        }
+
+        if matches!(
+            self.retained_nodes.get(&layout_key),
+            Some(node) if node.kind != RetainedNodeKind::Measured
+        ) && let Some(old_node) = self.retained_nodes.remove(&layout_key)
+        {
+            let mut removed = FxHashSet::default();
+            self.remove_subtree(old_node.id, &mut removed);
+        }
+
+        if let Some(node) = self.retained_nodes.get_mut(&layout_key) {
+            let id = node.id;
+            if node.style != taffy_style {
+                self.taffy
+                    .set_style(id.into(), taffy_style.clone())
+                    .expect(EXPECT_MESSAGE);
+                node.style = taffy_style;
+                self.retained_stats.style_updates += 1;
+            }
+
+            self.taffy
+                .set_node_context(id.into(), Some(context))
+                .expect(EXPECT_MESSAGE);
+            self.retained_stats.context_updates += 1;
+            node.last_seen_frame = self.current_frame;
+            return id;
+        }
+
+        let id = self
+            .taffy
+            .new_leaf_with_context(taffy_style.clone(), context)
+            .expect(EXPECT_MESSAGE)
+            .into();
+        self.retained_nodes.insert(
+            layout_key,
+            RetainedLayoutNode {
+                id,
+                kind: RetainedNodeKind::Measured,
+                style: taffy_style,
+                children: Vec::new(),
+                last_seen_frame: self.current_frame,
+            },
+        );
+        self.retained_stats.creates += 1;
+        id
+    }
+
+    fn remove_scratch_nodes(&mut self) {
+        let scratch_nodes = self.scratch_nodes.drain().collect::<Vec<_>>();
+        for id in scratch_nodes {
+            self.remove_node(id);
+        }
+    }
+
+    fn remove_unclaimed_retained_nodes(&mut self) {
+        let obsolete_nodes = self
+            .retained_nodes
+            .iter()
+            .filter_map(|(key, node)| {
+                (node.last_seen_frame != self.current_frame).then_some((key.clone(), node.id))
+            })
+            .collect::<Vec<_>>();
+        for (key, _) in &obsolete_nodes {
+            self.retained_nodes.remove(key);
+        }
+
+        let mut removed = FxHashSet::default();
+        for (_, id) in obsolete_nodes {
+            self.remove_subtree(id, &mut removed);
+        }
+    }
+
+    fn remove_subtree(&mut self, id: LayoutId, removed: &mut FxHashSet<LayoutId>) {
+        if !removed.insert(id) {
+            return;
+        }
+
+        let children = self.taffy.children(id.into()).expect(EXPECT_MESSAGE);
+        for child in children {
+            let child = LayoutId::from(child);
+            if self.retained_nodes.values().any(|node| node.id == child) {
+                continue;
+            }
+            self.remove_subtree(child, removed);
+        }
+
+        self.remove_node(id);
+    }
+
+    fn remove_node(&mut self, id: LayoutId) {
+        self.taffy.remove(id.into()).expect(EXPECT_MESSAGE);
+        self.absolute_layout_bounds.remove(&id);
+        self.absolute_outer_origins.remove(&id);
+        self.computed_layouts.remove(&id);
+        self.retained_stats.removes += 1;
     }
 
     // Used to understand performance
@@ -720,6 +997,34 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn key(id: u64) -> LayoutKey {
+        let ids = [ElementId::Integer(id)];
+        LayoutKey::from_global_id(&GlobalElementId(Arc::from(&ids[..])))
+    }
+
+    fn request_retained_leaf(engine: &mut TaffyLayoutEngine, id: u64, style: Style) -> LayoutId {
+        engine.request_layout(Some(key(id)), style, Pixels(16.0), 1.0, &[])
+    }
+
+    fn finish_frame(engine: &mut TaffyLayoutEngine) {
+        engine.finish_frame();
+    }
+
+    fn taffy_children(engine: &TaffyLayoutEngine, id: LayoutId) -> Vec<LayoutId> {
+        engine
+            .taffy
+            .children(id.into())
+            .unwrap()
+            .into_iter()
+            .map(LayoutId::from)
+            .collect()
+    }
+
+    fn node_count(engine: &TaffyLayoutEngine) -> usize {
+        engine.taffy.total_node_count()
+    }
 
     #[test]
     fn border_widths_to_taffy_use_stroke_snapping() {
@@ -747,5 +1052,192 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+
+    #[test]
+    fn retained_layout_reuses_unchanged_node() {
+        let mut engine = TaffyLayoutEngine::new();
+        let first = request_retained_leaf(&mut engine, 1, Style::default());
+        finish_frame(&mut engine);
+
+        let second = request_retained_leaf(&mut engine, 1, Style::default());
+
+        assert_eq!(second, first);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 1,
+                reuses: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
+    }
+
+    #[test]
+    fn retained_layout_updates_style_in_place() {
+        let mut engine = TaffyLayoutEngine::new();
+        let first = request_retained_leaf(&mut engine, 1, Style::default());
+        finish_frame(&mut engine);
+
+        let mut changed_style = Style::default();
+        changed_style.flex_grow = 1.0;
+        let second = request_retained_leaf(&mut engine, 1, changed_style);
+
+        assert_eq!(second, first);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 1,
+                style_updates: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
+    }
+
+    #[test]
+    fn retained_layout_updates_child_list_in_place() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child_a = request_retained_leaf(&mut engine, 2, Style::default());
+        let child_b = request_retained_leaf(&mut engine, 3, Style::default());
+        let parent = engine.request_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[child_a, child_b],
+        );
+        finish_frame(&mut engine);
+
+        let child_b = request_retained_leaf(&mut engine, 3, Style::default());
+        let child_a = request_retained_leaf(&mut engine, 2, Style::default());
+        let parent_again = engine.request_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[child_b, child_a],
+        );
+
+        assert_eq!(parent_again, parent);
+        assert_eq!(taffy_children(&engine, parent), vec![child_b, child_a]);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 3,
+                reuses: 2,
+                children_updates: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 3);
+    }
+
+    #[test]
+    fn retained_layout_duplicate_claim_uses_scratch_node() {
+        let mut engine = TaffyLayoutEngine::new();
+        let retained = request_retained_leaf(&mut engine, 1, Style::default());
+        let scratch = request_retained_leaf(&mut engine, 1, Style::default());
+
+        assert_ne!(scratch, retained);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 1,
+                duplicate_misses: 1,
+                scratch_creates: 1,
+                ..Default::default()
+            }
+        );
+
+        finish_frame(&mut engine);
+
+        assert_eq!(node_count(&engine), 1);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 1,
+                duplicate_misses: 1,
+                scratch_creates: 1,
+                removes: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn retained_layout_replaces_node_on_kind_change() {
+        let mut engine = TaffyLayoutEngine::new();
+        request_retained_leaf(&mut engine, 1, Style::default());
+        finish_frame(&mut engine);
+
+        engine.request_measured_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            |_, _, _, _| size(Pixels(10.0), Pixels(20.0)),
+        );
+
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 2,
+                removes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
+    }
+
+    #[test]
+    fn retained_layout_sweeps_unseen_retained_nodes() {
+        let mut engine = TaffyLayoutEngine::new();
+        let retained = request_retained_leaf(&mut engine, 1, Style::default());
+        request_retained_leaf(&mut engine, 2, Style::default());
+        finish_frame(&mut engine);
+
+        let retained_again = request_retained_leaf(&mut engine, 1, Style::default());
+        finish_frame(&mut engine);
+
+        assert_eq!(retained_again, retained);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 2,
+                reuses: 1,
+                removes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
+    }
+
+    #[test]
+    fn retained_layout_scratch_cleanup_detaches_without_removing_retained_child() {
+        let mut engine = TaffyLayoutEngine::new();
+        let retained_child = request_retained_leaf(&mut engine, 1, Style::default());
+        let scratch_parent =
+            engine.request_layout(None, Style::default(), Pixels(16.0), 1.0, &[retained_child]);
+
+        assert_eq!(
+            taffy_children(&engine, scratch_parent),
+            vec![retained_child]
+        );
+
+        finish_frame(&mut engine);
+
+        assert_eq!(engine.taffy.parent(retained_child.into()), None);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 1,
+                scratch_creates: 1,
+                removes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
     }
 }

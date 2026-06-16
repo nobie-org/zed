@@ -1,5 +1,6 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::taffy::{LayoutKey, LayoutKeySegment};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
@@ -996,6 +997,8 @@ pub struct Window {
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    layout_key_stack: SmallVec<[LayoutKeySegment; 32]>,
+    layout_child_index_stack: SmallVec<[u32; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -1685,6 +1688,8 @@ impl Window {
             layout_engine: Some(TaffyLayoutEngine::new()),
             root: None,
             element_id_stack: SmallVec::default(),
+            layout_key_stack: SmallVec::default(),
+            layout_child_index_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -2523,6 +2528,58 @@ impl Window {
         result
     }
 
+    pub(crate) fn with_layout_site<R>(
+        &mut self,
+        element_id: Option<ElementId>,
+        element_type: &'static str,
+        source_location: Option<&'static core::panic::Location<'static>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let sibling_index = self
+            .layout_child_index_stack
+            .last_mut()
+            .map(|next_child_index| {
+                let sibling_index = *next_child_index;
+                *next_child_index += 1;
+                sibling_index
+            })
+            .unwrap_or(0);
+
+        let segment = match element_id {
+            Some(element_id) => LayoutKeySegment::Element(element_id),
+            None => {
+                let (source_file, source_line, source_column) = source_location
+                    .map(|location| (Some(location.file()), location.line(), location.column()))
+                    .unwrap_or((None, 0, 0));
+                LayoutKeySegment::Anonymous {
+                    element_type,
+                    source_file,
+                    source_line,
+                    source_column,
+                    sibling_index,
+                }
+            }
+        };
+
+        self.layout_key_stack.push(segment);
+        self.layout_child_index_stack.push(0);
+        let self_ptr = self as *mut Self;
+        let _pop_layout_site = gpui_util::defer(move || {
+            // SAFETY: `with_layout_site` owns `&mut self` until this guard is
+            // dropped. The guard only restores the two stacks it pushed above,
+            // including while unwinding through `f`.
+            let this = unsafe { &mut *self_ptr };
+            this.layout_child_index_stack.pop();
+            this.layout_key_stack.pop();
+        });
+        f(self)
+    }
+
+    fn current_layout_key(&self) -> Option<LayoutKey> {
+        (!self.layout_key_stack.is_empty())
+            .then(|| LayoutKey::from_segments(&self.layout_key_stack))
+    }
+
     /// Executes the provided function with the specified rem size.
     ///
     /// This method must only be called as part of element drawing.
@@ -2789,7 +2846,7 @@ impl Window {
 
         {
             profiling::scope!("gpui::window::finish_next_frame");
-            self.layout_engine.as_mut().unwrap().clear();
+            self.layout_engine.as_mut().unwrap().finish_frame();
             self.text_system().finish_frame();
             self.next_frame.finish(&mut self.rendered_frame);
         }
@@ -4388,6 +4445,33 @@ impl Window {
         children: impl IntoIterator<Item = LayoutId>,
         cx: &mut App,
     ) -> LayoutId {
+        self.request_layout_with_key(self.current_layout_key(), style, children, cx)
+    }
+
+    pub(crate) fn request_layout_for_id(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.request_layout_with_key(
+            global_id
+                .map(LayoutKey::from_global_id)
+                .or_else(|| self.current_layout_key()),
+            style,
+            children,
+            cx,
+        )
+    }
+
+    fn request_layout_with_key(
+        &mut self,
+        layout_key: Option<LayoutKey>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
         cx.layout_id_buffer.clear();
@@ -4396,6 +4480,7 @@ impl Window {
         let scale_factor = self.scale_factor();
 
         self.layout_engine.as_mut().unwrap().request_layout(
+            layout_key,
             style,
             rem_size,
             scale_factor,
@@ -4416,6 +4501,38 @@ impl Window {
         F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
             + 'static,
     {
+        self.request_measured_layout_with_key(self.current_layout_key(), style, measure)
+    }
+
+    pub(crate) fn request_measured_layout_for_id<F>(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        style: Style,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        self.request_measured_layout_with_key(
+            global_id
+                .map(LayoutKey::from_global_id)
+                .or_else(|| self.current_layout_key()),
+            style,
+            measure,
+        )
+    }
+
+    fn request_measured_layout_with_key<F>(
+        &mut self,
+        layout_key: Option<LayoutKey>,
+        style: Style,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
@@ -4423,7 +4540,7 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(layout_key, style, rem_size, scale_factor, measure)
     }
 
     /// Compute the layout for the given id within the given available space.

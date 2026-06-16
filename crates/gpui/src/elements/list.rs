@@ -1285,7 +1285,7 @@ impl Element for List {
 
     fn request_layout(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
@@ -1323,7 +1323,8 @@ impl Element for List {
                     let summary = state.items.summary();
                     let total_height = summary.height;
 
-                    window.request_measured_layout(
+                    window.request_measured_layout_for_id(
+                        global_id,
                         style,
                         move |known_dimensions, available_space, _window, _cx| {
                             let width =
@@ -1350,7 +1351,7 @@ impl Element for List {
                 let mut style = Style::default();
                 style.refine(&self.style);
                 window.with_text_style(style.text_style().cloned(), |window| {
-                    window.request_layout(style, None, cx)
+                    window.request_layout_for_id(global_id, style, None, cx)
                 })
             }
         };

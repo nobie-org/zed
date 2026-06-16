@@ -417,7 +417,7 @@ impl Element for Img {
                         }
                     }
 
-                    window.request_layout(style, replacement_id, cx)
+                    window.request_layout_for_id(global_id, style, replacement_id, cx)
                 },
             );
 

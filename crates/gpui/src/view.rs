@@ -106,7 +106,7 @@ impl Element for AnyView {
 
     fn request_layout(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
@@ -118,7 +118,7 @@ impl Element for AnyView {
                 Some(style) if !caching_disabled => {
                     let mut root_style = Style::default();
                     root_style.refine(style);
-                    let layout_id = window.request_layout(root_style, None, cx);
+                    let layout_id = window.request_layout_for_id(global_id, root_style, None, cx);
                     (layout_id, None)
                 }
                 _ => {

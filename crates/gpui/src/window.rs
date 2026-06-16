@@ -2563,10 +2563,16 @@ impl Window {
 
         self.layout_key_stack.push(segment);
         self.layout_child_index_stack.push(0);
-        let result = f(self);
-        self.layout_child_index_stack.pop();
-        self.layout_key_stack.pop();
-        result
+        let self_ptr = self as *mut Self;
+        let _pop_layout_site = gpui_util::defer(move || {
+            // SAFETY: `with_layout_site` owns `&mut self` until this guard is
+            // dropped. The guard only restores the two stacks it pushed above,
+            // including while unwinding through `f`.
+            let this = unsafe { &mut *self_ptr };
+            this.layout_child_index_stack.pop();
+            this.layout_key_stack.pop();
+        });
+        f(self)
     }
 
     fn current_layout_key(&self) -> Option<LayoutKey> {

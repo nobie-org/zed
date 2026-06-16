@@ -46,11 +46,22 @@ impl LayoutKey {
                 .collect::<Vec<_>>(),
         ))
     }
+
+    pub(crate) fn from_segments(segments: &[LayoutKeySegment]) -> Self {
+        Self(Arc::from(segments))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum LayoutKeySegment {
     Element(ElementId),
+    Anonymous {
+        element_type: &'static str,
+        source_file: Option<&'static str>,
+        source_line: u32,
+        source_column: u32,
+        sibling_index: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1004,6 +1015,16 @@ mod tests {
         LayoutKey::from_global_id(&GlobalElementId(Arc::from(&ids[..])))
     }
 
+    fn anonymous_key(sibling_index: u32) -> LayoutKey {
+        LayoutKey::from_segments(&[LayoutKeySegment::Anonymous {
+            element_type: "gpui::tests::Anonymous",
+            source_file: Some("anonymous.rs"),
+            source_line: 7,
+            source_column: 11,
+            sibling_index,
+        }])
+    }
+
     fn request_retained_leaf(engine: &mut TaffyLayoutEngine, id: u64, style: Style) -> LayoutId {
         engine.request_layout(Some(key(id)), style, Pixels(16.0), 1.0, &[])
     }
@@ -1068,6 +1089,48 @@ mod tests {
             RetainedLayoutStats {
                 creates: 1,
                 reuses: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
+    }
+
+    #[test]
+    fn retained_layout_reuses_anonymous_site_key() {
+        let mut engine = TaffyLayoutEngine::new();
+        let first = engine.request_layout(
+            Some(anonymous_key(0)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[],
+        );
+        let sibling = engine.request_layout(
+            Some(anonymous_key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[],
+        );
+        finish_frame(&mut engine);
+
+        let second = engine.request_layout(
+            Some(anonymous_key(0)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[],
+        );
+        finish_frame(&mut engine);
+
+        assert_eq!(second, first);
+        assert_ne!(sibling, first);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 2,
+                reuses: 1,
+                removes: 1,
                 ..Default::default()
             }
         );

@@ -305,6 +305,12 @@ impl Display for GlobalElementId {
 trait ElementObject {
     fn inner_element(&mut self) -> &mut dyn Any;
 
+    fn element_id(&self) -> Option<ElementId>;
+
+    fn element_type_name(&self) -> &'static str;
+
+    fn source_location(&self) -> Option<&'static panic::Location<'static>>;
+
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId;
 
     fn prepaint(&mut self, window: &mut Window, cx: &mut App);
@@ -563,6 +569,18 @@ where
         &mut self.element
     }
 
+    fn element_id(&self) -> Option<ElementId> {
+        self.element.id()
+    }
+
+    fn element_type_name(&self) -> &'static str {
+        type_name::<E>()
+    }
+
+    fn source_location(&self) -> Option<&'static panic::Location<'static>> {
+        self.element.source_location()
+    }
+
     #[inline]
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         Drawable::request_layout(self, window, cx)
@@ -611,7 +629,12 @@ impl AnyElement {
     /// Request the layout ID of the element stored in this `AnyElement`.
     /// Used for laying out child elements in a parent element.
     pub fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
-        self.0.request_layout(window, cx)
+        let element_id = self.0.element_id();
+        let element_type = self.0.element_type_name();
+        let source_location = self.0.source_location();
+        window.with_layout_site(element_id, element_type, source_location, |window| {
+            self.0.request_layout(window, cx)
+        })
     }
 
     /// Prepares the element to be painted by storing its bounds, giving it a chance to draw hitboxes and

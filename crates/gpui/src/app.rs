@@ -2397,6 +2397,7 @@ impl App {
                 .entry(entity_id)
                 .or_default(),
         );
+        let invalidator_count = window_invalidators.len();
 
         // `window_invalidators_by_entity` is monotonic, so an entry alone
         // doesn't mean the window is currently rendering the entity. Filter
@@ -2413,11 +2414,31 @@ impl App {
             .collect();
 
         if live_invalidators.is_empty() {
-            if self.pending_notifications.insert(entity_id) {
+            let pending_inserted = self.pending_notifications.insert(entity_id);
+            crate::nobie_platform_trace::trace(
+                "app_notify",
+                format_args!(
+                    "entity_id={entity_id} invalidator_count={invalidator_count} \
+                     live_invalidator_count=0 pending_inserted={pending_inserted} \
+                     pending_notification_count={}",
+                    self.pending_notifications.len()
+                ),
+            );
+            if pending_inserted {
                 self.pending_effects
                     .push_back(Effect::Notify { emitter: entity_id });
             }
         } else {
+            crate::nobie_platform_trace::trace(
+                "app_notify",
+                format_args!(
+                    "entity_id={entity_id} invalidator_count={invalidator_count} \
+                     live_invalidator_count={} pending_inserted=false \
+                     pending_notification_count={}",
+                    live_invalidators.len(),
+                    self.pending_notifications.len()
+                ),
+            );
             for invalidator in &live_invalidators {
                 invalidator.invalidate_view(entity_id, self);
             }

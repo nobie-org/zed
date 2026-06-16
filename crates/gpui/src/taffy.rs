@@ -184,7 +184,7 @@ impl TaffyLayoutEngine {
         let attachable_children = children
             .iter()
             .copied()
-            .filter(|child| self.taffy.parent((*child).into()).is_none())
+            .filter(|child| self.child_can_attach_to_scratch(*child))
             .collect::<Vec<_>>();
         if attachable_children.len() == children.len() {
             Cow::Borrowed(children)
@@ -193,6 +193,21 @@ impl TaffyLayoutEngine {
                 children.len() - attachable_children.len();
             Cow::Owned(attachable_children)
         }
+    }
+
+    fn child_can_attach_to_scratch(&self, child: LayoutId) -> bool {
+        let Some(parent) = self.taffy.parent(child.into()).map(LayoutId::from) else {
+            return true;
+        };
+
+        if self.scratch_nodes.contains(&parent) {
+            return false;
+        }
+
+        self.retained_nodes
+            .values()
+            .find(|node| node.id == parent)
+            .is_none_or(|node| node.last_seen_frame != self.current_frame)
     }
 
     fn request_retained_layout(
@@ -1330,6 +1345,39 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn retained_layout_scratch_parent_can_adopt_child_from_unseen_retained_parent() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = request_retained_leaf(&mut engine, 2, Style::default());
+        engine.request_layout(Some(key(1)), Style::default(), Pixels(16.0), 1.0, &[child]);
+        finish_frame(&mut engine);
+
+        let child = request_retained_leaf(&mut engine, 2, Style::default());
+        let scratch_parent =
+            engine.request_layout(None, Style::default(), Pixels(16.0), 1.0, &[child]);
+
+        assert_eq!(taffy_children(&engine, scratch_parent), vec![child]);
+        assert_eq!(
+            engine.taffy.parent(child.into()),
+            Some(scratch_parent.into())
+        );
+
+        finish_frame(&mut engine);
+
+        assert_eq!(engine.taffy.parent(child.into()), None);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 2,
+                reuses: 1,
+                scratch_creates: 1,
+                removes: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 1);
     }
 
     #[test]

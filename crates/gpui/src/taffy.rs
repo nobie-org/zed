@@ -8,7 +8,7 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
-use std::{fmt::Debug, ops::Range, time::Duration};
+use std::{fmt::Debug, mem, ops::Range, time::Duration};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -54,13 +54,48 @@ pub struct LayoutWorkSample {
     pub measured_layout_duration: Duration,
 }
 
+struct LayoutDescriptor {
+    style: taffy::style::Style,
+    kind: LayoutDescriptorKind,
+}
+
+enum LayoutDescriptorKind {
+    Leaf,
+    Container { children: Vec<LayoutId> },
+    Measured { measure: Option<NodeMeasureFn> },
+}
+
+enum LayoutCommitKind {
+    Leaf,
+    Container { children: Vec<LayoutId> },
+    Measured { measure: NodeMeasureFn },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedLayoutKind {
+    Leaf,
+    Container,
+    Measured,
+}
+
+struct RetainedLayoutNode {
+    node_id: NodeId,
+    kind: RetainedLayoutKind,
+    children: Vec<RetainedLayoutNode>,
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
-    absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
+    layout_descriptors: Vec<LayoutDescriptor>,
+    committed_layout_nodes: FxHashMap<LayoutId, NodeId>,
+    retained_roots: Vec<Option<RetainedLayoutNode>>,
+    current_roots: Vec<RetainedLayoutNode>,
+    root_commit_index: usize,
+    absolute_layout_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
-    absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
-    computed_layouts: FxHashSet<LayoutId>,
-    layout_bounds_scratch_space: Vec<LayoutId>,
+    absolute_outer_origins: FxHashMap<NodeId, Point<f32>>,
+    computed_layouts: FxHashSet<NodeId>,
+    layout_bounds_scratch_space: Vec<NodeId>,
     layout_work: LayoutWorkSample,
 }
 
@@ -72,6 +107,11 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            layout_descriptors: Vec::new(),
+            committed_layout_nodes: FxHashMap::default(),
+            retained_roots: Vec::new(),
+            current_roots: Vec::new(),
+            root_commit_index: 0,
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -82,7 +122,14 @@ impl TaffyLayoutEngine {
 
     pub fn finish_frame(&mut self) -> LayoutWorkSample {
         let layout_work = self.layout_work;
-        self.taffy.clear();
+        for retained_root in mem::take(&mut self.retained_roots).into_iter().flatten() {
+            self.remove_retained_subtree(retained_root);
+        }
+
+        self.retained_roots = self.current_roots.drain(..).map(Some).collect();
+        self.layout_descriptors.clear();
+        self.committed_layout_nodes.clear();
+        self.root_commit_index = 0;
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
@@ -110,18 +157,18 @@ impl TaffyLayoutEngine {
         self.layout_work.layout_node_requests += 1;
         self.layout_work.child_edges += children.len() as u64;
 
-        if children.is_empty() {
-            self.taffy
-                .new_leaf(taffy_style)
-                .expect(EXPECT_MESSAGE)
-                .into()
+        let kind = if children.is_empty() {
+            LayoutDescriptorKind::Leaf
         } else {
-            self.taffy
-                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
-                .expect(EXPECT_MESSAGE)
-                .into()
-        }
+            LayoutDescriptorKind::Container {
+                children: children.to_vec(),
+            }
+        };
+
+        self.push_descriptor(LayoutDescriptor {
+            style: taffy_style,
+            kind,
+        })
     }
 
     pub fn request_measured_layout(
@@ -140,28 +187,31 @@ impl TaffyLayoutEngine {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         self.layout_work.measured_layout_node_requests += 1;
 
-        self.taffy
-            .new_leaf_with_context(
-                taffy_style,
-                NodeContext {
-                    measure: StackSafe::new(Box::new(measure)),
-                },
-            )
-            .expect(EXPECT_MESSAGE)
-            .into()
+        self.push_descriptor(LayoutDescriptor {
+            style: taffy_style,
+            kind: LayoutDescriptorKind::Measured {
+                measure: Some(StackSafe::new(Box::new(measure))),
+            },
+        })
+    }
+
+    fn push_descriptor(&mut self, descriptor: LayoutDescriptor) -> LayoutId {
+        let id = LayoutId(self.layout_descriptors.len());
+        self.layout_descriptors.push(descriptor);
+        id
     }
 
     // Used to understand performance
     #[allow(dead_code)]
-    fn count_all_children(&self, parent: LayoutId) -> anyhow::Result<u32> {
+    fn count_all_children(&self, parent: NodeId) -> anyhow::Result<u32> {
         let mut count = 0;
 
-        for child in self.taffy.children(parent.0)? {
+        for child in self.taffy.children(parent)? {
             // Count this child.
             count += 1;
 
             // Count all of this child's children.
-            count += self.count_all_children(LayoutId(child))?
+            count += self.count_all_children(child)?
         }
 
         Ok(count)
@@ -169,16 +219,16 @@ impl TaffyLayoutEngine {
 
     // Used to understand performance
     #[allow(dead_code)]
-    fn max_depth(&self, depth: u32, parent: LayoutId) -> anyhow::Result<u32> {
+    fn max_depth(&self, depth: u32, parent: NodeId) -> anyhow::Result<u32> {
         println!(
             "{parent:?} at depth {depth} has {} children",
-            self.taffy.child_count(parent.0)
+            self.taffy.child_count(parent)
         );
 
         let mut max_child_depth = 0;
 
-        for child in self.taffy.children(parent.0)? {
-            max_child_depth = std::cmp::max(max_child_depth, self.max_depth(0, LayoutId(child))?);
+        for child in self.taffy.children(parent)? {
+            max_child_depth = std::cmp::max(max_child_depth, self.max_depth(0, child)?);
         }
 
         Ok(depth + 1 + max_child_depth)
@@ -186,16 +236,190 @@ impl TaffyLayoutEngine {
 
     // Used to understand performance
     #[allow(dead_code)]
-    fn get_edges(&self, parent: LayoutId) -> anyhow::Result<Vec<(LayoutId, LayoutId)>> {
+    fn get_edges(&self, parent: NodeId) -> anyhow::Result<Vec<(NodeId, NodeId)>> {
         let mut edges = Vec::new();
 
-        for child in self.taffy.children(parent.0)? {
-            edges.push((parent, LayoutId(child)));
+        for child in self.taffy.children(parent)? {
+            edges.push((parent, child));
 
-            edges.extend(self.get_edges(LayoutId(child))?);
+            edges.extend(self.get_edges(child)?);
         }
 
         Ok(edges)
+    }
+
+    fn commit_layout(&mut self, id: LayoutId) -> NodeId {
+        if let Some(node_id) = self.committed_layout_nodes.get(&id) {
+            return *node_id;
+        }
+
+        let retained_root = self
+            .retained_roots
+            .get_mut(self.root_commit_index)
+            .and_then(Option::take);
+        self.root_commit_index += 1;
+
+        let retained_root = self.commit_descriptor(id, retained_root);
+        let node_id = retained_root.node_id;
+        self.current_roots.push(retained_root);
+        node_id
+    }
+
+    fn commit_descriptor(
+        &mut self,
+        id: LayoutId,
+        previous: Option<RetainedLayoutNode>,
+    ) -> RetainedLayoutNode {
+        assert!(
+            !self.committed_layout_nodes.contains_key(&id),
+            "layout descriptor should appear only once in a committed layout tree"
+        );
+
+        let descriptor = self.descriptor_mut(id);
+        let style = descriptor.style.clone();
+        let kind = match &mut descriptor.kind {
+            LayoutDescriptorKind::Leaf => LayoutCommitKind::Leaf,
+            LayoutDescriptorKind::Container { children } => LayoutCommitKind::Container {
+                children: children.clone(),
+            },
+            LayoutDescriptorKind::Measured { measure } => LayoutCommitKind::Measured {
+                measure: measure
+                    .take()
+                    .expect("measured layout descriptor should be committed only once"),
+            },
+        };
+
+        match kind {
+            LayoutCommitKind::Leaf => {
+                let node_id = self.node_for_kind(previous, RetainedLayoutKind::Leaf, &style);
+                self.set_style_if_changed(node_id, style);
+                self.clear_node_context_if_present(node_id);
+                self.set_children_if_changed(node_id, &[]);
+                self.committed_layout_nodes.insert(id, node_id);
+                RetainedLayoutNode {
+                    node_id,
+                    kind: RetainedLayoutKind::Leaf,
+                    children: Vec::new(),
+                }
+            }
+            LayoutCommitKind::Container { children } => {
+                let (node_id, previous_children) =
+                    self.container_node_and_children(previous, &style);
+                self.set_style_if_changed(node_id, style);
+                self.clear_node_context_if_present(node_id);
+
+                let mut previous_children = previous_children.into_iter();
+                let mut retained_children = Vec::with_capacity(children.len());
+                let mut child_node_ids = Vec::with_capacity(children.len());
+                for child in children {
+                    let retained_child = self.commit_descriptor(child, previous_children.next());
+                    child_node_ids.push(retained_child.node_id);
+                    retained_children.push(retained_child);
+                }
+                for unused_child in previous_children {
+                    self.remove_retained_subtree(unused_child);
+                }
+
+                self.set_children_if_changed(node_id, &child_node_ids);
+
+                self.committed_layout_nodes.insert(id, node_id);
+                RetainedLayoutNode {
+                    node_id,
+                    kind: RetainedLayoutKind::Container,
+                    children: retained_children,
+                }
+            }
+            LayoutCommitKind::Measured { measure } => {
+                let node_id = self.node_for_kind(previous, RetainedLayoutKind::Measured, &style);
+                self.set_style_if_changed(node_id, style);
+                self.taffy
+                    .set_node_context(node_id, Some(NodeContext { measure }))
+                    .expect(EXPECT_MESSAGE);
+                self.set_children_if_changed(node_id, &[]);
+                self.committed_layout_nodes.insert(id, node_id);
+                RetainedLayoutNode {
+                    node_id,
+                    kind: RetainedLayoutKind::Measured,
+                    children: Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn descriptor_mut(&mut self, id: LayoutId) -> &mut LayoutDescriptor {
+        self.layout_descriptors
+            .get_mut(id.0)
+            .expect("layout descriptor id should come from the current frame")
+    }
+
+    fn node_for_kind(
+        &mut self,
+        previous: Option<RetainedLayoutNode>,
+        kind: RetainedLayoutKind,
+        style: &taffy::style::Style,
+    ) -> NodeId {
+        match previous {
+            Some(previous) if previous.kind == kind => previous.node_id,
+            Some(previous) => {
+                self.remove_retained_subtree(previous);
+                self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE)
+            }
+            None => self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE),
+        }
+    }
+
+    fn container_node_and_children(
+        &mut self,
+        previous: Option<RetainedLayoutNode>,
+        style: &taffy::style::Style,
+    ) -> (NodeId, Vec<RetainedLayoutNode>) {
+        match previous {
+            Some(previous) if previous.kind == RetainedLayoutKind::Container => {
+                (previous.node_id, previous.children)
+            }
+            Some(previous) => {
+                self.remove_retained_subtree(previous);
+                (
+                    self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE),
+                    Vec::new(),
+                )
+            }
+            None => (
+                self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE),
+                Vec::new(),
+            ),
+        }
+    }
+
+    fn set_style_if_changed(&mut self, node_id: NodeId, style: taffy::style::Style) {
+        if self.taffy.style(node_id).expect(EXPECT_MESSAGE) != &style {
+            self.taffy.set_style(node_id, style).expect(EXPECT_MESSAGE);
+        }
+    }
+
+    fn set_children_if_changed(&mut self, node_id: NodeId, children: &[NodeId]) {
+        if self.taffy.children(node_id).expect(EXPECT_MESSAGE) != children {
+            self.taffy
+                .set_children(node_id, children)
+                .expect(EXPECT_MESSAGE);
+        }
+    }
+
+    fn clear_node_context_if_present(&mut self, node_id: NodeId) {
+        if self.taffy.get_node_context(node_id).is_some() {
+            self.taffy
+                .set_node_context(node_id, None)
+                .expect(EXPECT_MESSAGE);
+        }
+    }
+
+    fn remove_retained_subtree(&mut self, retained_node: RetainedLayoutNode) {
+        for child in retained_node.children {
+            self.remove_retained_subtree(child);
+        }
+        self.taffy
+            .remove(retained_node.node_id)
+            .expect(EXPECT_MESSAGE);
     }
 
     #[stacksafe]
@@ -206,6 +430,7 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let node_id = self.commit_layout(id);
         // Leaving this here until we have a better instrumentation approach.
         // println!("Laying out {} children", self.count_all_children(id)?);
         // println!("Max layout depth: {}", self.max_depth(0, id)?);
@@ -217,18 +442,17 @@ impl TaffyLayoutEngine {
         // }
         //
 
-        if !self.computed_layouts.insert(id) {
+        if !self.computed_layouts.insert(node_id) {
             let stack = &mut self.layout_bounds_scratch_space;
-            stack.push(id);
-            while let Some(id) = stack.pop() {
-                self.absolute_layout_bounds.remove(&id);
-                self.absolute_outer_origins.remove(&id);
+            stack.push(node_id);
+            while let Some(node_id) = stack.pop() {
+                self.absolute_layout_bounds.remove(&node_id);
+                self.absolute_outer_origins.remove(&node_id);
                 stack.extend(
                     self.taffy
-                        .children(id.into())
+                        .children(node_id)
                         .expect(EXPECT_MESSAGE)
-                        .into_iter()
-                        .map(LayoutId::from),
+                        .into_iter(),
                 );
             }
         }
@@ -254,7 +478,7 @@ impl TaffyLayoutEngine {
 
         self.taffy
             .compute_layout_with_measure(
-                id.into(),
+                node_id,
                 available_space.into(),
                 |known_dimensions, available_space, _id, node_context, _style| {
                     let Some(node_context) = node_context else {
@@ -370,19 +594,26 @@ impl TaffyLayoutEngine {
     // 1dp residual into descendants.
 
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
-        if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
+        let node_id = *self
+            .committed_layout_nodes
+            .get(&id)
+            .expect("layout bounds should only be requested after layout is committed");
+        self.layout_bounds_for_node(node_id, scale_factor)
+    }
+
+    fn layout_bounds_for_node(&mut self, node_id: NodeId, scale_factor: f32) -> Bounds<Pixels> {
+        if let Some(layout) = self.absolute_layout_bounds.get(&node_id).cloned() {
             return layout;
         }
 
-        let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
+        let layout = self.taffy.layout(node_id).expect(EXPECT_MESSAGE);
         let layout_location = layout.location;
         let layout_size = layout.size;
-        let parent = self.taffy.parent(id.0);
+        let parent = self.taffy.parent(node_id);
 
         let absolute_outer_origin = match parent {
             Some(parent_id) => {
-                let parent_id = LayoutId::from(parent_id);
-                self.layout_bounds(parent_id, scale_factor);
+                self.layout_bounds_for_node(parent_id, scale_factor);
                 let parent_origin = *self
                     .absolute_outer_origins
                     .get(&parent_id)
@@ -392,7 +623,7 @@ impl TaffyLayoutEngine {
             None => Point::from(layout_location),
         };
         self.absolute_outer_origins
-            .insert(id, absolute_outer_origin);
+            .insert(node_id, absolute_outer_origin);
 
         let absolute_far = absolute_outer_origin + Point::from(Size::from(layout_size));
         let snapped_bounds = Bounds::from_corners(
@@ -401,38 +632,229 @@ impl TaffyLayoutEngine {
         );
 
         let bounds = (snapped_bounds / scale_factor).map(Pixels);
-        self.absolute_layout_bounds.insert(id, bounds);
+        self.absolute_layout_bounds.insert(node_id, bounds);
         bounds
     }
 }
 
-/// A unique identifier for a layout node, generated when requesting a layout from Taffy
+/// A unique identifier for a layout descriptor generated during the current frame.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-#[repr(transparent)]
-pub struct LayoutId(NodeId);
-
-impl LayoutId {
-    fn to_taffy_slice(node_ids: &[Self]) -> &[taffy::NodeId] {
-        // SAFETY: LayoutId is repr(transparent) to taffy::tree::NodeId.
-        unsafe { std::mem::transmute::<&[LayoutId], &[taffy::NodeId]>(node_ids) }
-    }
-}
+pub struct LayoutId(usize);
 
 impl std::hash::Hash for LayoutId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        u64::from(self.0).hash(state);
+        self.0.hash(state);
     }
 }
 
-impl From<NodeId> for LayoutId {
-    fn from(node_id: NodeId) -> Self {
-        Self(node_id)
-    }
-}
+#[cfg(test)]
+mod retained_layout_tests {
+    use super::*;
+    use crate::{AbsoluteLength, DefiniteLength, Length, px};
 
-impl From<LayoutId> for NodeId {
-    fn from(layout_id: LayoutId) -> NodeId {
-        layout_id.0
+    #[derive(Debug, PartialEq)]
+    struct TaffyShape {
+        style: taffy::style::Style,
+        has_measure_context: bool,
+        children: Vec<TaffyShape>,
+    }
+
+    fn style_with_width(width: f32) -> Style {
+        let mut style = Style::default();
+        style.size.width =
+            Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(width))));
+        style
+    }
+
+    fn request_leaf(engine: &mut TaffyLayoutEngine, width: f32) -> LayoutId {
+        engine.request_layout(style_with_width(width), px(16.0), 1.0, &[])
+    }
+
+    fn request_container(engine: &mut TaffyLayoutEngine, children: &[LayoutId]) -> LayoutId {
+        engine.request_layout(Style::default(), px(16.0), 1.0, children)
+    }
+
+    fn request_measured(engine: &mut TaffyLayoutEngine, width: f32) -> LayoutId {
+        engine.request_measured_layout(style_with_width(width), px(16.0), 1.0, move |_, _, _, _| {
+            size(px(width), px(10.0))
+        })
+    }
+
+    fn request_row(engine: &mut TaffyLayoutEngine, widths: &[f32]) -> LayoutId {
+        let children = widths
+            .iter()
+            .map(|width| request_leaf(engine, *width))
+            .collect::<Vec<_>>();
+        request_container(engine, &children)
+    }
+
+    fn taffy_shape(engine: &TaffyLayoutEngine, node_id: NodeId) -> TaffyShape {
+        TaffyShape {
+            style: engine.taffy.style(node_id).expect(EXPECT_MESSAGE).clone(),
+            has_measure_context: engine.taffy.get_node_context(node_id).is_some(),
+            children: engine
+                .taffy
+                .children(node_id)
+                .expect(EXPECT_MESSAGE)
+                .into_iter()
+                .map(|child| taffy_shape(engine, child))
+                .collect(),
+        }
+    }
+
+    fn assert_descriptor_committed_exactly(engine: &TaffyLayoutEngine, id: LayoutId) {
+        let node_id = engine.committed_layout_nodes[&id];
+        let descriptor = &engine.layout_descriptors[id.0];
+        assert_eq!(
+            engine.taffy.style(node_id).expect(EXPECT_MESSAGE),
+            &descriptor.style
+        );
+
+        match &descriptor.kind {
+            LayoutDescriptorKind::Leaf => {
+                assert!(engine.taffy.get_node_context(node_id).is_none());
+                assert_eq!(
+                    engine.taffy.children(node_id).expect(EXPECT_MESSAGE),
+                    Vec::<NodeId>::new()
+                );
+            }
+            LayoutDescriptorKind::Container { children } => {
+                assert!(engine.taffy.get_node_context(node_id).is_none());
+                let child_node_ids = children
+                    .iter()
+                    .map(|child| engine.committed_layout_nodes[child])
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    engine.taffy.children(node_id).expect(EXPECT_MESSAGE),
+                    child_node_ids
+                );
+                for child in children {
+                    assert_descriptor_committed_exactly(engine, *child);
+                }
+            }
+            LayoutDescriptorKind::Measured { .. } => {
+                assert!(engine.taffy.get_node_context(node_id).is_some());
+                assert_eq!(
+                    engine.taffy.children(node_id).expect(EXPECT_MESSAGE),
+                    Vec::<NodeId>::new()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_commit_matches_fresh_commit_after_insert_delete_and_reorder() {
+        let mut retained = TaffyLayoutEngine::new();
+        let retained_first_root = request_row(&mut retained, &[10.0, 20.0, 30.0]);
+        retained.commit_layout(retained_first_root);
+        retained.clear();
+
+        let retained_second_root = request_row(&mut retained, &[30.0, 10.0, 40.0, 20.0]);
+        let retained_root_node = retained.commit_layout(retained_second_root);
+        assert_descriptor_committed_exactly(&retained, retained_second_root);
+
+        let mut fresh = TaffyLayoutEngine::new();
+        let fresh_root = request_row(&mut fresh, &[30.0, 10.0, 40.0, 20.0]);
+        let fresh_root_node = fresh.commit_layout(fresh_root);
+
+        assert_eq!(
+            taffy_shape(&retained, retained_root_node),
+            taffy_shape(&fresh, fresh_root_node)
+        );
+    }
+
+    #[test]
+    fn retained_commit_matches_fresh_commit_for_frame_sequence_gallery() {
+        let frames: &[&[f32]] = &[
+            &[],
+            &[10.0],
+            &[10.0, 20.0],
+            &[20.0, 10.0],
+            &[10.0],
+            &[30.0, 10.0, 20.0],
+            &[],
+            &[40.0, 10.0],
+        ];
+        let mut retained = TaffyLayoutEngine::new();
+
+        for widths in frames {
+            let retained_root = request_row(&mut retained, widths);
+            let retained_root_node = retained.commit_layout(retained_root);
+            assert_descriptor_committed_exactly(&retained, retained_root);
+
+            let mut fresh = TaffyLayoutEngine::new();
+            let fresh_root = request_row(&mut fresh, widths);
+            let fresh_root_node = fresh.commit_layout(fresh_root);
+            assert_descriptor_committed_exactly(&fresh, fresh_root);
+
+            assert_eq!(
+                taffy_shape(&retained, retained_root_node),
+                taffy_shape(&fresh, fresh_root_node)
+            );
+
+            retained.clear();
+        }
+    }
+
+    #[test]
+    fn moved_child_has_exactly_the_current_descriptor_parent() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = request_leaf(&mut engine, 10.0);
+        let left = request_container(&mut engine, &[child]);
+        let right = request_container(&mut engine, &[]);
+        let root = request_container(&mut engine, &[left, right]);
+        engine.commit_layout(root);
+        engine.clear();
+
+        let left = request_container(&mut engine, &[]);
+        let child = request_leaf(&mut engine, 10.0);
+        let right = request_container(&mut engine, &[child]);
+        let root = request_container(&mut engine, &[left, right]);
+        engine.commit_layout(root);
+        assert_descriptor_committed_exactly(&engine, root);
+
+        let left_node = engine.committed_layout_nodes[&left];
+        let right_node = engine.committed_layout_nodes[&right];
+        let child_node = engine.committed_layout_nodes[&child];
+
+        assert_eq!(
+            engine.taffy.children(left_node).expect(EXPECT_MESSAGE),
+            Vec::<NodeId>::new()
+        );
+        assert_eq!(
+            engine.taffy.children(right_node).expect(EXPECT_MESSAGE),
+            vec![child_node]
+        );
+        assert_eq!(engine.taffy.parent(child_node), Some(right_node));
+    }
+
+    #[test]
+    fn node_kind_changes_do_not_reuse_stale_measured_context() {
+        let mut engine = TaffyLayoutEngine::new();
+        let measured = request_measured(&mut engine, 10.0);
+        engine.commit_layout(measured);
+        engine.clear();
+
+        let leaf = request_leaf(&mut engine, 10.0);
+        engine.commit_layout(leaf);
+        assert_descriptor_committed_exactly(&engine, leaf);
+
+        let leaf_node = engine.committed_layout_nodes[&leaf];
+        assert!(engine.taffy.get_node_context(leaf_node).is_none());
+        assert_eq!(
+            engine.taffy.children(leaf_node).expect(EXPECT_MESSAGE),
+            Vec::<NodeId>::new()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "layout descriptor should appear only once")]
+    fn duplicate_descriptor_references_fail_loudly() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = request_leaf(&mut engine, 10.0);
+        let root = request_container(&mut engine, &[child, child]);
+
+        engine.commit_layout(root);
     }
 }
 

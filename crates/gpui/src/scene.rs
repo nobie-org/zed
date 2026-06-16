@@ -909,6 +909,11 @@ impl PaintGroup {
         self.capture_bounds
     }
 
+    /// Returns the content mask constraining this group.
+    pub fn content_mask(&self) -> ContentMask<ScaledPixels> {
+        self.content_mask
+    }
+
     /// Returns the logical effect plan for this group.
     pub fn plan(&self) -> &LogicalVisualPlan {
         &self.plan
@@ -1309,6 +1314,19 @@ impl<P: Clone + Copy + Debug + Default + PartialEq> SurfaceSilhouetteSpriteData<
     }
 }
 
+impl SurfaceSilhouetteSpriteData<ScaledPixels> {
+    /// Returns the visual bounds of all packed surface primitives.
+    pub fn bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        let count = (self.count as usize).min(MAX_SURFACE_SILHOUETTE_PRIMITIVES);
+        let mut packed_bounds = self.bounds[..count].iter();
+        let mut bounds = *packed_bounds.next()?;
+        for next_bounds in packed_bounds {
+            bounds = bounds.union(next_bounds);
+        }
+        Some(bounds)
+    }
+}
+
 impl CompositeEffect {
     /// Creates an opacity effect for a render group.
     pub fn opacity(alpha: f32) -> Self {
@@ -1632,6 +1650,21 @@ pub struct CompositeDropShadow<P: Clone + Debug + Default + PartialEq> {
 pub struct CompositeSurfaceShadow<P: Clone + Copy + Debug + Default + PartialEq> {
     pub silhouette: SurfaceSilhouette<P>,
     pub shadow: CompositeShadow<P>,
+}
+
+impl CompositeSurfaceShadow<ScaledPixels> {
+    /// Returns the tight draw bounds for this shadow under a group content mask.
+    pub fn draw_bounds(
+        &self,
+        group_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> Option<Bounds<ScaledPixels>> {
+        let silhouette_bounds = self.silhouette.sprite_data(group_bounds).bounds()?;
+        let bounds = (silhouette_bounds + self.shadow.offset)
+            .dilate(gaussian_kernel_outset(self.shadow.blur_radius))
+            .intersect(&content_mask.bounds);
+        (!bounds.is_empty()).then_some(bounds)
+    }
 }
 
 /// A glow derived from processed content pixels.
@@ -2559,10 +2592,12 @@ impl LogicalVisualPlan {
         self.physical
     }
 
-    /// Returns stable support counters for this plan over an already computed capture region.
+    /// Returns stable support counters for this plan over an already computed group region.
     pub fn support_counters(
         &self,
+        group_bounds: Bounds<ScaledPixels>,
         capture_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
     ) -> RenderGroupSupportCounters {
         let has_rejections = !self.planning_rejections.is_empty();
         let has_accepted_visual_work =
@@ -2583,6 +2618,15 @@ impl LogicalVisualPlan {
         let content_alpha_shadow_sample_count_estimate = if renders_pixels {
             self.physical
                 .content_alpha_shadow_sample_count_estimate(capture_bounds, &self.normalized)
+        } else {
+            0
+        };
+        let surface_shadow_draw_pixels = if renders_pixels {
+            self.normalized
+                .surface_shadow_draw_bounds(group_bounds, content_mask)
+                .into_iter()
+                .map(bounds_pixel_area)
+                .sum()
         } else {
             0
         };
@@ -2607,8 +2651,16 @@ impl LogicalVisualPlan {
             rendered_groups: u32::from(renders_pixels),
             elided_groups: u32::from(!renders_pixels && !has_rejections),
             rejected_groups: u32::from(has_rejections),
+            source_capture_groups: u32::from(
+                renders_pixels && self.physical.kind == RenderGroupPhysicalPlanKind::SourceCapture,
+            ),
+            direct_surface_groups: u32::from(
+                renders_pixels
+                    && self.physical.kind == RenderGroupPhysicalPlanKind::DirectSurfaceEffects,
+            ),
             source_capture_pixels,
             backdrop_read_pixels,
+            surface_shadow_draw_pixels,
             logical_passes: u32::from(self.requirements.pass_count) * u32::from(renders_pixels),
             physical_passes: u32::from(self.physical.pass_count) * u32::from(renders_pixels),
             intermediate_textures: u32::from(self.physical.intermediate_textures)
@@ -2644,7 +2696,8 @@ pub struct RenderGroupDependencies {
 
 impl RenderGroupDependencies {
     fn from_effect_plan(effects: &[CompositeEffect], normalized: &CompositeEffectPlan) -> Self {
-        let source_pixels = plan_has_visual_work(effects, normalized);
+        let source_pixels = plan_has_visual_work(effects, normalized)
+            && !normalized.can_render_direct_surface_effects();
         let source_alpha = !normalized.drop_shadows().is_empty();
         let source_mask =
             normalized.source_mask().is_some() || normalized.source_mask_path().is_some();
@@ -2679,10 +2732,16 @@ pub struct RenderGroupSupportCounters {
     pub elided_groups: u32,
     /// Groups with at least one typed planning rejection.
     pub rejected_groups: u32,
+    /// Rendered groups that require source-pixel capture.
+    pub source_capture_groups: u32,
+    /// Rendered groups whose effects can be drawn directly from surface geometry.
+    pub direct_surface_groups: u32,
     /// Device pixels in the source capture region.
     pub source_capture_pixels: u64,
     /// Device-pixel footprint that backdrop-sampling effects may read.
     pub backdrop_read_pixels: u64,
+    /// Device-pixel footprint shaded by surface-geometry shadows.
+    pub surface_shadow_draw_pixels: u64,
     /// Logical passes required by accepted visible work.
     pub logical_passes: u32,
     /// Physical passes in the current backend summary for accepted visible work.
@@ -2740,6 +2799,14 @@ pub struct RenderGroupShadowModeCounters {
 /// capture bounds). See `gpui_wgpu/tests/render_group_pixels.rs`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderGroupBackendCounters {
+    /// Rendered groups that captured source pixels.
+    pub source_capture_groups: u32,
+    /// Rendered groups that drew direct surface effects and replayed children inline.
+    pub direct_surface_groups: u32,
+    /// Source capture pixels represented by rendered groups.
+    pub source_capture_pixels: u64,
+    /// Surface-shadow pixels shaded by rendered groups.
+    pub surface_shadow_draw_pixels: u64,
     /// Group intermediate textures allocated (group target + backdrop-copy target).
     pub intermediate_textures: u32,
     /// Backdrop texture copies performed.
@@ -2754,6 +2821,26 @@ pub struct RenderGroupBackendCounters {
     /// Estimated source-alpha samples represented by the backend's content-alpha
     /// shadow work.
     pub content_alpha_shadow_sample_count_estimate: u64,
+}
+
+impl RenderGroupBackendCounters {
+    /// Adds backend-visible support counters for one rendered group.
+    pub fn add_support_counters(&mut self, support: RenderGroupSupportCounters) {
+        self.source_capture_groups += support.source_capture_groups;
+        self.direct_surface_groups += support.direct_surface_groups;
+        self.source_capture_pixels += support.source_capture_pixels;
+        self.surface_shadow_draw_pixels += support.surface_shadow_draw_pixels;
+        self.shadow_sources.content_alpha += support.shadow_sources.content_alpha;
+        self.shadow_sources.surface_geometry += support.shadow_sources.surface_geometry;
+        self.shadow_modes.separable += support.shadow_modes.separable;
+        self.shadow_modes.exact += support.shadow_modes.exact;
+        self.shadow_modes.downsampled += support.shadow_modes.downsampled;
+        self.content_alpha_shadow_max_kernel_radius = self
+            .content_alpha_shadow_max_kernel_radius
+            .max(support.content_alpha_shadow_max_kernel_radius);
+        self.content_alpha_shadow_sample_count_estimate +=
+            support.content_alpha_shadow_sample_count_estimate;
+    }
 }
 
 /// A typed reason why an authored render-group effect could not enter the exact plan.
@@ -3235,32 +3322,50 @@ impl RenderGroupRequirements {
                     _ => outset,
                 });
         let reads_backdrop = normalized.reads_backdrop();
+        let direct_surface_effects = normalized.can_render_direct_surface_effects();
         let has_derived = !normalized.drop_shadows().is_empty()
             || !normalized.surface_shadows().is_empty()
             || !normalized.processed_content_glows().is_empty();
-        let pass_count = 1
-            + u8::from(reads_backdrop)
-            + u8::from(has_derived)
-            + u8::from(normalized.opacity() > 0.);
-        let intermediate_textures = 1 + u8::from(reads_backdrop);
+        let pass_count = if direct_surface_effects {
+            1
+        } else {
+            1 + u8::from(reads_backdrop)
+                + u8::from(has_derived)
+                + u8::from(normalized.opacity() > 0.)
+        };
+        let intermediate_textures = if direct_surface_effects {
+            0
+        } else {
+            1 + u8::from(reads_backdrop)
+        };
 
         Self {
             reads_backdrop,
             source_outset,
             backdrop_outset,
             output_outset,
-            requires_source_capture: true,
+            requires_source_capture: !direct_surface_effects,
             pass_count,
             intermediate_textures,
-            backdrop_copies: u8::from(reads_backdrop),
+            backdrop_copies: u8::from(reads_backdrop && !direct_surface_effects),
         }
     }
+}
+
+/// Backend execution family selected for a render group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum RenderGroupPhysicalPlanKind {
+    #[default]
+    SourceCapture,
+    DirectSurfaceEffects,
 }
 
 /// Backend-specific execution summary for the current render-group renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub struct PhysicalRenderGroupPlan {
+    pub kind: RenderGroupPhysicalPlanKind,
     pub pass_count: u8,
     pub intermediate_textures: u8,
     pub backdrop_copies: u8,
@@ -3274,7 +3379,13 @@ impl PhysicalRenderGroupPlan {
     ) -> Self {
         let content_alpha_shadow_blur_passes =
             normalized.content_alpha_separable_blur_profile_count();
+        let kind = if requirements.requires_source_capture {
+            RenderGroupPhysicalPlanKind::SourceCapture
+        } else {
+            RenderGroupPhysicalPlanKind::DirectSurfaceEffects
+        };
         Self {
+            kind,
             pass_count: requirements
                 .pass_count
                 .saturating_add(content_alpha_shadow_blur_passes),
@@ -4038,6 +4149,24 @@ impl CompositeEffectPlan {
         self.has_backdrop_material() || self.blend_mode != CompositeBlendMode::Normal
     }
 
+    /// Returns whether accepted visual effects can render without capturing
+    /// source pixels into an offscreen group texture.
+    pub fn can_render_direct_surface_effects(&self) -> bool {
+        !self.surface_shadows.is_empty()
+            && self.drop_shadows.is_empty()
+            && self.processed_content_glows.is_empty()
+            && (self.opacity - 1.).abs() <= f32::EPSILON
+            && self.source_color_filter.is_identity()
+            && self.source_blur_radius.0 <= f32::EPSILON
+            && self.source_directional_blur.x.0.abs() <= f32::EPSILON
+            && self.source_directional_blur.y.0.abs() <= f32::EPSILON
+            && self.source_mask.is_none()
+            && self.source_mask_path.is_none()
+            && self.rounded_mask.is_none()
+            && !self.has_backdrop_material()
+            && self.blend_mode == CompositeBlendMode::Normal
+    }
+
     /// Returns source-alpha drop shadows in declared order.
     pub fn drop_shadows(&self) -> &[CompositeDropShadow<ScaledPixels>] {
         &self.drop_shadows
@@ -4107,6 +4236,18 @@ impl CompositeEffectPlan {
     /// Returns surface-shape drop shadows in declared order.
     pub fn surface_shadows(&self) -> &[CompositeSurfaceShadow<ScaledPixels>] {
         &self.surface_shadows
+    }
+
+    /// Returns the tight draw bounds for surface-shadow work in declared order.
+    pub fn surface_shadow_draw_bounds(
+        &self,
+        group_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> Vec<Bounds<ScaledPixels>> {
+        self.surface_shadows
+            .iter()
+            .filter_map(|shadow| shadow.draw_bounds(group_bounds, content_mask))
+            .collect()
     }
 
     /// Returns processed-content glows in declared order.
@@ -4405,6 +4546,13 @@ mod tests {
 
     fn mask(bounds: Bounds<ScaledPixels>) -> ContentMask<ScaledPixels> {
         ContentMask { bounds }
+    }
+
+    fn support_counters(
+        plan: &LogicalVisualPlan,
+        bounds: Bounds<ScaledPixels>,
+    ) -> RenderGroupSupportCounters {
+        plan.support_counters(bounds, bounds, mask(bounds))
     }
 
     fn scaled_group_silhouette(corner_radius: f32) -> SurfaceSilhouette<ScaledPixels> {
@@ -4979,12 +5127,13 @@ mod tests {
             ],
         );
 
-        let counters = plan.support_counters(scaled_bounds(10., 20., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(10., 20., 100., 40.));
 
         assert_eq!(
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
+                source_capture_groups: 1,
                 source_capture_pixels: 4_000,
                 backdrop_read_pixels: 7_936,
                 logical_passes: 3,
@@ -5074,7 +5223,7 @@ mod tests {
         assert_eq!(
             plan.dependencies(),
             RenderGroupDependencies {
-                source_pixels: true,
+                source_pixels: false,
                 source_alpha: false,
                 source_mask: false,
                 backdrop_pixels: false,
@@ -5098,16 +5247,26 @@ mod tests {
             )],
         );
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
+        assert_eq!(
+            plan.physical_plan(),
+            PhysicalRenderGroupPlan {
+                kind: RenderGroupPhysicalPlanKind::DirectSurfaceEffects,
+                pass_count: 1,
+                intermediate_textures: 0,
+                backdrop_copies: 0,
+                content_alpha_shadow_blur_passes: 0,
+            }
+        );
         assert_eq!(
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
-                source_capture_pixels: 4_000,
-                logical_passes: 3,
-                physical_passes: 3,
-                intermediate_textures: 1,
+                direct_surface_groups: 1,
+                surface_shadow_draw_pixels: 4_000,
+                logical_passes: 1,
+                physical_passes: 1,
                 shadow_sources: RenderGroupShadowSourceCounters {
                     surface_geometry: 1,
                     ..RenderGroupShadowSourceCounters::default()
@@ -5145,7 +5304,7 @@ mod tests {
             vec![CompositeEffect::source_blur(Pixels(20.))],
         );
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(plan.accepted_effects(), []);
         assert_eq!(
@@ -5161,7 +5320,7 @@ mod tests {
     fn logical_visual_plan_support_counters_elide_identity_work() {
         let plan = LogicalVisualPlan::from_effects(1., 1., Vec::new());
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(
             counters,
@@ -5184,11 +5343,12 @@ mod tests {
             )],
         );
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(
             plan.physical_plan(),
             PhysicalRenderGroupPlan {
+                kind: RenderGroupPhysicalPlanKind::SourceCapture,
                 pass_count: 4,
                 intermediate_textures: 2,
                 backdrop_copies: 0,
@@ -5199,6 +5359,7 @@ mod tests {
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
+                source_capture_groups: 1,
                 source_capture_pixels: 4_000,
                 logical_passes: 3,
                 physical_passes: 4,
@@ -5231,11 +5392,12 @@ mod tests {
             )],
         );
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(
             plan.physical_plan(),
             PhysicalRenderGroupPlan {
+                kind: RenderGroupPhysicalPlanKind::SourceCapture,
                 pass_count: 3,
                 intermediate_textures: 1,
                 backdrop_copies: 0,
@@ -5246,6 +5408,7 @@ mod tests {
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
+                source_capture_groups: 1,
                 source_capture_pixels: 4_000,
                 logical_passes: 3,
                 physical_passes: 3,
@@ -5277,11 +5440,12 @@ mod tests {
             )],
         );
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(
             plan.physical_plan(),
             PhysicalRenderGroupPlan {
+                kind: RenderGroupPhysicalPlanKind::SourceCapture,
                 pass_count: 3,
                 intermediate_textures: 1,
                 backdrop_copies: 0,
@@ -5292,6 +5456,7 @@ mod tests {
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
+                source_capture_groups: 1,
                 source_capture_pixels: 4_000,
                 logical_passes: 3,
                 physical_passes: 3,
@@ -5322,11 +5487,12 @@ mod tests {
             ],
         );
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(
             plan.physical_plan(),
             PhysicalRenderGroupPlan {
+                kind: RenderGroupPhysicalPlanKind::SourceCapture,
                 pass_count: 4,
                 intermediate_textures: 2,
                 backdrop_copies: 0,
@@ -5337,6 +5503,7 @@ mod tests {
             counters,
             RenderGroupSupportCounters {
                 rendered_groups: 1,
+                source_capture_groups: 1,
                 source_capture_pixels: 4_000,
                 logical_passes: 3,
                 physical_passes: 4,
@@ -5429,10 +5596,11 @@ mod tests {
     fn logical_visual_plan_support_counters_count_boundary_opacity() {
         let plan = LogicalVisualPlan::from_effects(1., 0.5, Vec::new());
 
-        let counters = plan.support_counters(scaled_bounds(0., 0., 100., 40.));
+        let counters = support_counters(&plan, scaled_bounds(0., 0., 100., 40.));
 
         assert_eq!(counters.rendered_groups, 1);
         assert_eq!(counters.elided_groups, 0);
+        assert_eq!(counters.source_capture_groups, 1);
         assert_eq!(counters.source_capture_pixels, 4_000);
         assert_eq!(counters.logical_passes, 2);
         assert_eq!(counters.physical_passes, 2);

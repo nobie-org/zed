@@ -6,8 +6,8 @@ use gpui::{
     get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, PrimitiveBatch,
-        Quad, RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite,
-        SurfaceSilhouetteSpriteData, Underline,
+        Quad, RenderGroupBackendCounters, RenderGroupPhysicalPlanKind, Scene, Shadow,
+        SubpixelSprite, SurfaceSilhouetteSpriteData, Underline,
     },
 };
 use log::warn;
@@ -163,6 +163,8 @@ struct WgpuResources {
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     group_sampler: wgpu::Sampler,
+    _group_binding_placeholder_texture: wgpu::Texture,
+    group_binding_placeholder_view: wgpu::TextureView,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -475,6 +477,22 @@ impl WgpuRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let group_binding_placeholder_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("group_binding_placeholder_texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: surface_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let group_binding_placeholder_view =
+            group_binding_placeholder_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
@@ -563,6 +581,8 @@ impl WgpuRenderer {
             bind_group_layouts,
             atlas_sampler,
             group_sampler,
+            _group_binding_placeholder_texture: group_binding_placeholder_texture,
+            group_binding_placeholder_view,
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -2149,6 +2169,59 @@ impl WgpuRenderer {
                 continue;
             }
 
+            let support_counters = group.plan().support_counters(
+                group.bounds(),
+                group.capture_bounds(),
+                group.content_mask(),
+            );
+            group_counters.add_support_counters(support_counters);
+
+            if group.plan().physical_plan().kind
+                == RenderGroupPhysicalPlanKind::DirectSurfaceEffects
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("direct_surface_effect_group_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                if !self.draw_group_surface_shadows(
+                    group,
+                    &effect_plan,
+                    &self.resources().group_binding_placeholder_view,
+                    &self.resources().group_binding_placeholder_view,
+                    &self.resources().group_binding_placeholder_view,
+                    instance_offset,
+                    &mut pass,
+                ) {
+                    return false;
+                }
+                drop(pass);
+
+                if !self.encode_scene_batches_to_view(
+                    group.scene(),
+                    target_texture,
+                    target_can_copy,
+                    target_view,
+                    encoder,
+                    instance_offset,
+                    false,
+                    retained_textures,
+                    group_counters,
+                ) {
+                    return false;
+                }
+                continue;
+            }
+
             let (group_texture, group_view) = self.create_group_intermediate();
             group_counters.intermediate_textures += 1;
 
@@ -2230,20 +2303,6 @@ impl WgpuRenderer {
             } else {
                 &group_view
             };
-
-            let support_counters = group.plan().support_counters(group.capture_bounds());
-            group_counters.shadow_sources.content_alpha +=
-                support_counters.shadow_sources.content_alpha;
-            group_counters.shadow_sources.surface_geometry +=
-                support_counters.shadow_sources.surface_geometry;
-            group_counters.shadow_modes.separable += support_counters.shadow_modes.separable;
-            group_counters.shadow_modes.exact += support_counters.shadow_modes.exact;
-            group_counters.shadow_modes.downsampled += support_counters.shadow_modes.downsampled;
-            group_counters.content_alpha_shadow_max_kernel_radius = group_counters
-                .content_alpha_shadow_max_kernel_radius
-                .max(support_counters.content_alpha_shadow_max_kernel_radius);
-            group_counters.content_alpha_shadow_sample_count_estimate +=
-                support_counters.content_alpha_shadow_sample_count_estimate;
 
             let mut separable_shadow_views = HashMap::new();
             for shadow in effect_plan.drop_shadows() {
@@ -2424,6 +2483,82 @@ impl WgpuRenderer {
         )
     }
 
+    fn draw_group_surface_shadows(
+        &self,
+        group: &PaintGroup,
+        effect_plan: &CompositeEffectPlan,
+        group_view: &wgpu::TextureView,
+        backdrop_view: &wgpu::TextureView,
+        source_mask_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
+        let group_shape_params = [smk as f32, sme, 0., 0.];
+        let db = effect_plan.source_directional_blur();
+        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
+        let mut sprites = Vec::with_capacity(effect_plan.surface_shadows().len());
+
+        for shadow in effect_plan.surface_shadows() {
+            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
+                return false;
+            }
+            let Some(draw_bounds) = shadow.draw_bounds(group.bounds(), group.content_mask()) else {
+                continue;
+            };
+            let color = shadow.shadow.color.to_rgb();
+            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
+            sprites.push(GroupSprite {
+                bounds: draw_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 2,
+                source_blur_radius: 0.,
+                source_mask_enabled: 0.,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                source_mask_mode: 0,
+                _pad1: 0,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds(),
+                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
+                material_shape_count: shadow_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: shadow_shape.bounds,
+                material_shape_corner_radii: shadow_shape.corner_radii,
+                material_shape_params: shadow_shape.shape_params(),
+                group_shape_params,
+                source_directional_blur,
+                color_matrix: [[0., 0., 0., 0.]; 4],
+                color_offset: [0., 0., 0., 0.],
+                backdrop_active: 0.,
+                blend_mode: 0,
+                source_tone_op: 0,
+                source_tone_param: 0.,
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix: [[0., 0., 0., 0.]; 4],
+                backdrop_color_offset: [0., 0., 0., 0.],
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        let sprite_data = unsafe { Self::instance_bytes(&sprites) };
+        self.draw_group_instances(
+            sprite_data,
+            sprites.len() as u32,
+            group_view,
+            backdrop_view,
+            source_mask_view,
+            &self.resources().group_sampler,
+            &self.resources().pipelines.groups,
+            instance_offset,
+            pass,
+        )
+    }
+
     fn draw_group_from_intermediate(
         &self,
         group: &PaintGroup,
@@ -2527,54 +2662,19 @@ impl WgpuRenderer {
             }
         }
 
-        let mut sprites = Vec::with_capacity(
-            effect_plan.surface_shadows().len() + effect_plan.processed_content_glows().len() + 1,
-        );
-
-        for shadow in effect_plan.surface_shadows() {
-            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
-                return false;
-            }
-            let color = shadow.shadow.color.to_rgb();
-            // The surface-shadow SDF reads the material slot; drive it from the
-            // shadow's own declared silhouette rather than captured content.
-            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
-            sprites.push(GroupSprite {
-                bounds: group.capture_bounds(),
-                opacity: effect_plan.opacity(),
-                effect_kind: 2,
-                source_blur_radius: 0.,
-                source_mask_enabled: 0.,
-                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
-                shadow_blur_radius: shadow.shadow.blur_radius.0,
-                backdrop_blur_radius: 0.,
-                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
-                derived_luma_threshold: 0.,
-                source_mask_mode: 0,
-                _pad1: 0,
-                shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds(),
-                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_count: shadow_shape.count,
-                _pad2: [0; 3],
-                material_shape_bounds: shadow_shape.bounds,
-                material_shape_corner_radii: shadow_shape.corner_radii,
-                material_shape_params: shadow_shape.shape_params(),
-                group_shape_params,
-                source_directional_blur,
-                color_matrix,
-                color_offset,
-                backdrop_active: 0.,
-                blend_mode: 0,
-                source_tone_op: 0,
-                source_tone_param: 0.,
-                backdrop_tint: [0., 0., 0., 0.],
-                backdrop_color_matrix,
-                backdrop_color_offset,
-                backdrop_lens: [0., 0., 0., 0.],
-                backdrop_lens_lighting: [0., 0., 0., 0.],
-            });
+        if !self.draw_group_surface_shadows(
+            group,
+            &effect_plan,
+            group_view,
+            backdrop_view,
+            source_mask_view,
+            instance_offset,
+            pass,
+        ) {
+            return false;
         }
+
+        let mut sprites = Vec::with_capacity(effect_plan.processed_content_glows().len() + 1);
 
         for glow in effect_plan.processed_content_glows() {
             let color = glow.color.to_rgb();

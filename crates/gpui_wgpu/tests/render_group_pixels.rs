@@ -180,16 +180,15 @@ fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
 
 /// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
 fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
-    let counters = group.plan().support_counters(group.capture_bounds());
-    RenderGroupBackendCounters {
-        intermediate_textures: counters.intermediate_textures,
-        backdrop_copies: counters.backdrop_copies,
-        shadow_sources: counters.shadow_sources,
-        shadow_modes: counters.shadow_modes,
-        content_alpha_shadow_max_kernel_radius: counters.content_alpha_shadow_max_kernel_radius,
-        content_alpha_shadow_sample_count_estimate: counters
-            .content_alpha_shadow_sample_count_estimate,
-    }
+    let support =
+        group
+            .plan()
+            .support_counters(group.bounds(), group.capture_bounds(), group.content_mask());
+    let mut counters = RenderGroupBackendCounters::default();
+    counters.add_support_counters(support);
+    counters.intermediate_textures = support.intermediate_textures;
+    counters.backdrop_copies = support.backdrop_copies;
+    counters
 }
 
 fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
@@ -249,6 +248,8 @@ fn backend_counters_match_planner_for_opacity_group() {
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
+            source_capture_groups: 1,
+            source_capture_pixels: 256,
             intermediate_textures: 1,
             backdrop_copies: 0,
             ..RenderGroupBackendCounters::default()
@@ -275,6 +276,8 @@ fn backend_counters_match_planner_for_backdrop_blur_group() {
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
+            source_capture_groups: 1,
+            source_capture_pixels: 256,
             intermediate_textures: 2,
             backdrop_copies: 1,
             ..RenderGroupBackendCounters::default()
@@ -309,12 +312,54 @@ fn backend_counters_match_planner_for_separable_content_alpha_shadow() {
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
+            source_capture_groups: 1,
+            source_capture_pixels: 4_000,
             intermediate_textures: 2,
             backdrop_copies: 0,
             shadow_sources,
             shadow_modes,
             content_alpha_shadow_max_kernel_radius: 9,
             content_alpha_shadow_sample_count_estimate: 152_000,
+            ..RenderGroupBackendCounters::default()
+        }
+    );
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(group);
+    scene.finish();
+
+    assert_eq!(backend_counters(&scene), predicted);
+}
+
+#[test]
+fn backend_counters_match_planner_for_direct_surface_shadow() {
+    let group = paint_group_with_effects(
+        1,
+        rect(8., 8., 16., 16.),
+        vec![CompositeEffect::surface_shadow(
+            GroupShape::rectangle(),
+            point(px(4.), px(0.)),
+            px(0.),
+            rgba(0x00000080).into(),
+        )],
+        Scene::default(),
+    );
+    let predicted = predicted_counters(&group);
+    let mut shadow_sources = RenderGroupShadowSourceCounters::default();
+    shadow_sources.surface_geometry = 1;
+    let mut shadow_modes = RenderGroupShadowModeCounters::default();
+    shadow_modes.exact = 1;
+    assert_eq!(
+        predicted,
+        RenderGroupBackendCounters {
+            direct_surface_groups: 1,
+            surface_shadow_draw_pixels: 256,
+            intermediate_textures: 0,
+            backdrop_copies: 0,
+            shadow_sources,
+            shadow_modes,
+            ..RenderGroupBackendCounters::default()
         }
     );
 
@@ -348,6 +393,8 @@ fn backend_counters_exclude_source_mask_path_intermediate() {
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
+            source_capture_groups: 1,
+            source_capture_pixels: 400,
             intermediate_textures: 1,
             backdrop_copies: 0,
             ..RenderGroupBackendCounters::default()
@@ -377,6 +424,10 @@ fn backend_counters_sum_across_sibling_groups() {
         finished_scene([quad(0, rect(16., 16., 6., 6.), blue_half())]),
     );
     let predicted = RenderGroupBackendCounters {
+        source_capture_groups: predicted_counters(&opacity_group).source_capture_groups
+            + predicted_counters(&backdrop_group).source_capture_groups,
+        source_capture_pixels: predicted_counters(&opacity_group).source_capture_pixels
+            + predicted_counters(&backdrop_group).source_capture_pixels,
         intermediate_textures: predicted_counters(&opacity_group).intermediate_textures
             + predicted_counters(&backdrop_group).intermediate_textures,
         backdrop_copies: predicted_counters(&opacity_group).backdrop_copies
@@ -386,6 +437,8 @@ fn backend_counters_sum_across_sibling_groups() {
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
+            source_capture_groups: 2,
+            source_capture_pixels: 244,
             intermediate_textures: 3,
             backdrop_copies: 1,
             ..RenderGroupBackendCounters::default()
@@ -442,6 +495,10 @@ fn backend_counters_match_planner_for_nested_groups() {
     let outer_predicted = predicted_counters(&outer);
 
     let predicted = RenderGroupBackendCounters {
+        source_capture_groups: outer_predicted.source_capture_groups
+            + inner_predicted.source_capture_groups,
+        source_capture_pixels: outer_predicted.source_capture_pixels
+            + inner_predicted.source_capture_pixels,
         intermediate_textures: outer_predicted.intermediate_textures
             + inner_predicted.intermediate_textures,
         backdrop_copies: outer_predicted.backdrop_copies + inner_predicted.backdrop_copies,
@@ -450,6 +507,8 @@ fn backend_counters_match_planner_for_nested_groups() {
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
+            source_capture_groups: 2,
+            source_capture_pixels: 544,
             intermediate_textures: 3,
             backdrop_copies: 1,
             ..RenderGroupBackendCounters::default()
@@ -987,6 +1046,39 @@ fn render_group_surface_shadow_uses_material_shape_without_source_alpha() {
         pixel(&surface_image, 19, 12),
         [128, 128, 128, 255],
         "surface shadow should be generated from the material shape even with no source alpha"
+    );
+}
+
+#[test]
+fn render_group_surface_shadow_replays_child_content_inline() {
+    let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), green())]);
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::surface_shadow(
+            GroupShape::rectangle(),
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+        )],
+        group_scene,
+    ));
+    scene.finish();
+
+    let image = render(&scene);
+
+    assert_eq!(
+        pixel(&image, 12, 12),
+        [0, 255, 0, 255],
+        "direct surface-effect groups should replay child scene content"
+    );
+    assert_eq!(
+        pixel(&image, 19, 12),
+        [128, 128, 128, 255],
+        "surface shadow should still draw from geometry beside replayed content"
     );
 }
 

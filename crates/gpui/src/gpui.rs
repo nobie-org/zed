@@ -52,11 +52,12 @@ pub mod scene_protocol {
         MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, PaintGroup, PaintMetalTexture, Path,
         PathId, PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite,
         Primitive, PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
-        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
-        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
-        RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
-        RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
-        SurfaceSilhouetteSpriteData, TransformationMatrix, Underline,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPhysicalPlanKind,
+        RenderGroupPlanningRejection, RenderGroupPlanningRejectionReason,
+        RenderGroupRejectedEffect, RenderGroupRequirements, RenderGroupShadowMode,
+        RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters, RenderGroupSupportCounters,
+        Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite, SurfaceSilhouetteSpriteData,
+        TransformationMatrix, Underline,
     };
 }
 /// Render-group planning and capability diagnostics for inspectors and tests.
@@ -68,10 +69,11 @@ pub mod render_group_diagnostics {
         LogicalVisualPlan, PhysicalRenderGroupPlan, RenderGroupBackendCounters,
         RenderGroupCapabilityProbe, RenderGroupCapabilityRejectionReason,
         RenderGroupCapabilityReport, RenderGroupCapabilityStatus, RenderGroupDependencies,
-        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
-        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
-        RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
-        RenderGroupSupportCounters, SemanticRenderGroupSpec,
+        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPhysicalPlanKind,
+        RenderGroupPlanningRejection, RenderGroupPlanningRejectionReason,
+        RenderGroupRejectedEffect, RenderGroupRequirements, RenderGroupShadowMode,
+        RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters, RenderGroupSupportCounters,
+        SemanticRenderGroupSpec,
     };
 }
 mod shared_uri;

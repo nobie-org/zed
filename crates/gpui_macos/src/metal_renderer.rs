@@ -12,8 +12,8 @@ use gpui::{
     point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintMetalTexture, Path,
-        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters, Scene, Shadow,
-        SurfaceSilhouetteSpriteData, Underline,
+        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
+        RenderGroupPhysicalPlanKind, Scene, Shadow, SurfaceSilhouetteSpriteData, Underline,
     },
     size,
 };
@@ -411,6 +411,7 @@ pub(crate) struct MetalRenderer {
     #[allow(clippy::arc_with_non_send_sync)]
     group_intermediate_texture_pool: Arc<Mutex<GroupIntermediateTexturePool>>,
     group_intermediate_textures_in_flight: Vec<GroupIntermediateTexture>,
+    group_binding_placeholder_texture: metal::Texture,
     sprite_atlas: Arc<MetalAtlas>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
@@ -476,6 +477,16 @@ impl MetalRenderer {
                 std::process::exit(1);
             })
         }
+    }
+
+    fn new_group_binding_placeholder_texture(device: &metal::Device) -> metal::Texture {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(1);
+        texture_descriptor.set_height(1);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        texture_descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        device.new_texture(&texture_descriptor)
     }
 
     fn new_internal(
@@ -612,6 +623,8 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+        let group_binding_placeholder_texture =
+            Self::new_group_binding_placeholder_texture(&device);
 
         Self {
             device,
@@ -637,6 +650,7 @@ impl MetalRenderer {
                 GroupIntermediateTexturePool::default(),
             )),
             group_intermediate_textures_in_flight: Vec::new(),
+            group_binding_placeholder_texture,
             sprite_atlas,
             last_render_group_counters: None,
             path_intermediate_texture: None,
@@ -1628,12 +1642,18 @@ impl MetalRenderer {
                 return false;
             };
             let source_texture_frame = TextureFrame::from(source_frame);
-            let support_counters = group.plan().support_counters(group.capture_bounds());
+            let support_counters = group.plan().support_counters(
+                group.bounds(),
+                group.capture_bounds(),
+                group.content_mask(),
+            );
             let _render_group_span = tracing::trace_span!(
                 "gpui_macos::render_group",
+                physical_plan = ?group.plan().physical_plan().kind,
                 capture_width = source_frame.size.width.0,
                 capture_height = source_frame.size.height.0,
                 capture_pixels = support_counters.source_capture_pixels,
+                surface_shadow_draw_pixels = support_counters.surface_shadow_draw_pixels,
                 physical_passes = support_counters.physical_passes,
                 intermediate_textures = support_counters.intermediate_textures,
                 backdrop_copies = support_counters.backdrop_copies,
@@ -1648,6 +1668,27 @@ impl MetalRenderer {
                     support_counters.content_alpha_shadow_sample_count_estimate,
             )
             .entered();
+
+            if group.plan().physical_plan().kind
+                == RenderGroupPhysicalPlanKind::DirectSurfaceEffects
+            {
+                if let Some(counters) = self.last_render_group_counters.as_mut() {
+                    counters.add_support_counters(support_counters);
+                }
+
+                if !self.draw_direct_surface_effect_group(
+                    group,
+                    effect_plan,
+                    instance_buffer,
+                    instance_offset,
+                    target_texture,
+                    target_frame,
+                    command_buffer,
+                ) {
+                    return false;
+                }
+                continue;
+            }
 
             let group_texture = {
                 let _span = tracing::trace_span!("gpui_macos::render_group_acquire_source_texture")
@@ -1751,18 +1792,7 @@ impl MetalRenderer {
             };
 
             if let Some(counters) = self.last_render_group_counters.as_mut() {
-                counters.shadow_sources.content_alpha +=
-                    support_counters.shadow_sources.content_alpha;
-                counters.shadow_sources.surface_geometry +=
-                    support_counters.shadow_sources.surface_geometry;
-                counters.shadow_modes.separable += support_counters.shadow_modes.separable;
-                counters.shadow_modes.exact += support_counters.shadow_modes.exact;
-                counters.shadow_modes.downsampled += support_counters.shadow_modes.downsampled;
-                counters.content_alpha_shadow_max_kernel_radius = counters
-                    .content_alpha_shadow_max_kernel_radius
-                    .max(support_counters.content_alpha_shadow_max_kernel_radius);
-                counters.content_alpha_shadow_sample_count_estimate +=
-                    support_counters.content_alpha_shadow_sample_count_estimate;
+                counters.add_support_counters(support_counters);
             }
 
             let mut separable_shadow_textures = HashMap::new();
@@ -1851,6 +1881,53 @@ impl MetalRenderer {
         }
 
         true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_direct_surface_effect_group(
+        &mut self,
+        group: &PaintGroup,
+        effect_plan: CompositeEffectPlan,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        target_texture: &metal::TextureRef,
+        target_frame: RenderTargetFrame,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> bool {
+        let command_encoder = new_command_encoder_for_texture(
+            command_buffer,
+            target_texture,
+            target_frame,
+            |color_attachment| {
+                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+            },
+        );
+        let placeholder_texture = self.group_binding_placeholder_texture.as_ref();
+        let texture_frame = TextureFrame::from(target_frame);
+        let ok = self.draw_group_surface_shadows(
+            group,
+            &effect_plan,
+            placeholder_texture,
+            placeholder_texture,
+            placeholder_texture,
+            instance_buffer,
+            instance_offset,
+            target_frame,
+            texture_frame,
+            texture_frame,
+            command_encoder,
+        );
+        command_encoder.end_encoding();
+
+        ok && self.encode_primitives_to_texture(
+            group.scene(),
+            instance_buffer,
+            instance_offset,
+            target_texture,
+            target_frame,
+            command_buffer,
+            None,
+        )
     }
 
     fn copy_backdrop_texture(
@@ -1997,6 +2074,88 @@ impl MetalRenderer {
         Some(texture)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_group_surface_shadows(
+        &self,
+        group: &PaintGroup,
+        effect_plan: &CompositeEffectPlan,
+        group_texture: &metal::TextureRef,
+        backdrop_texture: &metal::TextureRef,
+        source_mask_texture: &metal::TextureRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        target_frame: RenderTargetFrame,
+        source_texture_frame: TextureFrame,
+        backdrop_texture_frame: TextureFrame,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
+        let group_shape_params = [smk as f32, sme, 0., 0.];
+        let db = effect_plan.source_directional_blur();
+        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
+        let mut sprites = Vec::with_capacity(effect_plan.surface_shadows().len());
+
+        for shadow in effect_plan.surface_shadows() {
+            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
+                return false;
+            }
+            let Some(draw_bounds) = shadow.draw_bounds(group.bounds(), group.content_mask()) else {
+                continue;
+            };
+            let color = shadow.shadow.color.to_rgb();
+            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
+            sprites.push(GroupSprite {
+                bounds: draw_bounds,
+                opacity: effect_plan.opacity(),
+                effect_kind: 2,
+                source_blur_radius: 0.,
+                source_mask_enabled: 0.,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                source_mask_mode: 0,
+                _pad1: 0,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds(),
+                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
+                material_shape_count: shadow_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: shadow_shape.bounds,
+                material_shape_corner_radii: shadow_shape.corner_radii,
+                material_shape_params: shadow_shape.shape_params(),
+                group_shape_params,
+                source_directional_blur,
+                color_matrix: [[0., 0., 0., 0.]; 4],
+                color_offset: [0., 0., 0., 0.],
+                backdrop_active: 0.,
+                blend_mode: 0,
+                source_tone_op: 0,
+                source_tone_param: 0.,
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix: [[0., 0., 0., 0.]; 4],
+                backdrop_color_offset: [0., 0., 0., 0.],
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+                source_texture_frame,
+                backdrop_texture_frame,
+            });
+        }
+
+        self.encode_group_sprites(
+            &self.group_sprites_pipeline_state,
+            &sprites,
+            group_texture,
+            backdrop_texture,
+            source_mask_texture,
+            instance_buffer,
+            instance_offset,
+            target_frame,
+            command_encoder,
+        )
+    }
+
     fn draw_group_from_texture(
         &self,
         group: &PaintGroup,
@@ -2107,56 +2266,23 @@ impl MetalRenderer {
             }
         }
 
-        let mut sprites = Vec::with_capacity(
-            effect_plan.surface_shadows().len() + effect_plan.processed_content_glows().len() + 1,
-        );
-
-        for shadow in effect_plan.surface_shadows() {
-            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
-                return false;
-            }
-            let color = shadow.shadow.color.to_rgb();
-            // The surface-shadow SDF reads the material slot; drive it from the
-            // shadow's own declared silhouette rather than captured content.
-            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
-            sprites.push(GroupSprite {
-                bounds: group.capture_bounds(),
-                opacity: effect_plan.opacity(),
-                effect_kind: 2,
-                source_blur_radius: 0.,
-                source_mask_enabled: 0.,
-                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
-                shadow_blur_radius: shadow.shadow.blur_radius.0,
-                backdrop_blur_radius: 0.,
-                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
-                derived_luma_threshold: 0.,
-                source_mask_mode: 0,
-                _pad1: 0,
-                shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds(),
-                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_count: shadow_shape.count,
-                _pad2: [0; 3],
-                material_shape_bounds: shadow_shape.bounds,
-                material_shape_corner_radii: shadow_shape.corner_radii,
-                material_shape_params: shadow_shape.shape_params(),
-                group_shape_params,
-                source_directional_blur,
-                color_matrix,
-                color_offset,
-                backdrop_active: 0.,
-                blend_mode: 0,
-                source_tone_op: 0,
-                source_tone_param: 0.,
-                backdrop_tint: [0., 0., 0., 0.],
-                backdrop_color_matrix,
-                backdrop_color_offset,
-                backdrop_lens: [0., 0., 0., 0.],
-                backdrop_lens_lighting: [0., 0., 0., 0.],
-                source_texture_frame,
-                backdrop_texture_frame,
-            });
+        if !self.draw_group_surface_shadows(
+            group,
+            &effect_plan,
+            group_texture,
+            backdrop_texture,
+            source_mask_texture,
+            instance_buffer,
+            instance_offset,
+            target_frame,
+            source_texture_frame,
+            backdrop_texture_frame,
+            command_encoder,
+        ) {
+            return false;
         }
+
+        let mut sprites = Vec::with_capacity(effect_plan.processed_content_glows().len() + 1);
 
         for glow in effect_plan.processed_content_glows() {
             let color = glow.color.to_rgb();
@@ -3750,16 +3876,16 @@ mod tests {
 
     /// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
     fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
-        let counters = group.plan().support_counters(group.capture_bounds());
-        RenderGroupBackendCounters {
-            intermediate_textures: counters.intermediate_textures,
-            backdrop_copies: counters.backdrop_copies,
-            shadow_sources: counters.shadow_sources,
-            shadow_modes: counters.shadow_modes,
-            content_alpha_shadow_max_kernel_radius: counters.content_alpha_shadow_max_kernel_radius,
-            content_alpha_shadow_sample_count_estimate: counters
-                .content_alpha_shadow_sample_count_estimate,
-        }
+        let support = group.plan().support_counters(
+            group.bounds(),
+            group.capture_bounds(),
+            group.content_mask(),
+        );
+        let mut counters = RenderGroupBackendCounters::default();
+        counters.add_support_counters(support);
+        counters.intermediate_textures = support.intermediate_textures;
+        counters.backdrop_copies = support.backdrop_copies;
+        counters
     }
 
     fn render_with_renderer(renderer: &mut MetalRenderer, scene: &Scene) {
@@ -3791,6 +3917,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 1,
+                source_capture_pixels: 256,
                 intermediate_textures: 1,
                 backdrop_copies: 0,
                 ..RenderGroupBackendCounters::default()
@@ -3825,6 +3953,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 1,
+                source_capture_pixels: 400,
                 intermediate_textures: 1,
                 backdrop_copies: 0,
                 ..RenderGroupBackendCounters::default()
@@ -3851,6 +3981,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 1,
+                source_capture_pixels: 256,
                 intermediate_textures: 2,
                 backdrop_copies: 1,
                 ..RenderGroupBackendCounters::default()
@@ -3885,12 +4017,15 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 1,
+                source_capture_pixels: 4_000,
                 intermediate_textures: 2,
                 backdrop_copies: 0,
                 shadow_sources,
                 shadow_modes,
                 content_alpha_shadow_max_kernel_radius: 9,
                 content_alpha_shadow_sample_count_estimate: 152_000,
+                ..RenderGroupBackendCounters::default()
             }
         );
 
@@ -3900,6 +4035,78 @@ mod tests {
         scene.finish();
 
         assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn backend_counters_match_planner_for_direct_surface_shadow_metal() {
+        let group = paint_group_with_effects(
+            1,
+            rect(8., 8., 16., 16.),
+            vec![CompositeEffect::surface_shadow(
+                GroupShape::rectangle(),
+                point(px(4.), px(0.)),
+                px(0.),
+                rgba(0x00000080).into(),
+            )],
+            Scene::default(),
+        );
+        let predicted = predicted_counters(&group);
+        let mut shadow_sources = RenderGroupShadowSourceCounters::default();
+        shadow_sources.surface_geometry = 1;
+        let mut shadow_modes = RenderGroupShadowModeCounters::default();
+        shadow_modes.exact = 1;
+        assert_eq!(
+            predicted,
+            RenderGroupBackendCounters {
+                direct_surface_groups: 1,
+                surface_shadow_draw_pixels: 256,
+                intermediate_textures: 0,
+                backdrop_copies: 0,
+                shadow_sources,
+                shadow_modes,
+                ..RenderGroupBackendCounters::default()
+            }
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(group);
+        scene.finish();
+
+        assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn render_group_surface_shadow_replays_child_content_inline_metal() {
+        let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), green())]);
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_effects(
+            1,
+            rect(8., 8., 14., 8.),
+            vec![CompositeEffect::surface_shadow(
+                GroupShape::rectangle(),
+                point(px(6.), px(0.)),
+                px(0.),
+                half_white(),
+            )],
+            group_scene,
+        ));
+        scene.finish();
+
+        let image = render(&scene);
+
+        assert_eq!(
+            pixel(&image, 12, 12),
+            [0, 255, 0, 255],
+            "direct surface-effect groups should replay child scene content"
+        );
+        assert_eq!(
+            pixel(&image, 19, 12),
+            [128, 128, 128, 255],
+            "surface shadow should still draw from geometry beside replayed content"
+        );
     }
 
     #[test]
@@ -4010,6 +4217,10 @@ mod tests {
             finished_scene([quad(0, rect(16., 16., 6., 6.), black())]),
         );
         let predicted = RenderGroupBackendCounters {
+            source_capture_groups: predicted_counters(&opacity_group).source_capture_groups
+                + predicted_counters(&backdrop_group).source_capture_groups,
+            source_capture_pixels: predicted_counters(&opacity_group).source_capture_pixels
+                + predicted_counters(&backdrop_group).source_capture_pixels,
             intermediate_textures: predicted_counters(&opacity_group).intermediate_textures
                 + predicted_counters(&backdrop_group).intermediate_textures,
             backdrop_copies: predicted_counters(&opacity_group).backdrop_copies
@@ -4019,6 +4230,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 2,
+                source_capture_pixels: 244,
                 intermediate_textures: 3,
                 backdrop_copies: 1,
                 ..RenderGroupBackendCounters::default()
@@ -4049,6 +4262,10 @@ mod tests {
             finished_scene([quad(0, rect(16., 16., 10., 10.), green())]),
         );
         let predicted = RenderGroupBackendCounters {
+            source_capture_groups: predicted_counters(&left_group).source_capture_groups
+                + predicted_counters(&right_group).source_capture_groups,
+            source_capture_pixels: predicted_counters(&left_group).source_capture_pixels
+                + predicted_counters(&right_group).source_capture_pixels,
             intermediate_textures: predicted_counters(&left_group).intermediate_textures
                 + predicted_counters(&right_group).intermediate_textures,
             backdrop_copies: 0,
@@ -4057,6 +4274,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 2,
+                source_capture_pixels: 200,
                 intermediate_textures: 2,
                 backdrop_copies: 0,
                 ..RenderGroupBackendCounters::default()
@@ -4111,6 +4330,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let predicted = RenderGroupBackendCounters {
+            source_capture_groups: groups
+                .iter()
+                .map(|group| predicted_counters(group).source_capture_groups)
+                .sum(),
+            source_capture_pixels: groups
+                .iter()
+                .map(|group| predicted_counters(group).source_capture_pixels)
+                .sum(),
             intermediate_textures: groups
                 .iter()
                 .map(|group| predicted_counters(group).intermediate_textures)
@@ -4121,6 +4348,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 4,
+                source_capture_pixels: 4_096,
                 intermediate_textures: 4,
                 backdrop_copies: 0,
                 ..RenderGroupBackendCounters::default()
@@ -4201,6 +4430,10 @@ mod tests {
         let outer_predicted = predicted_counters(&outer);
 
         let predicted = RenderGroupBackendCounters {
+            source_capture_groups: outer_predicted.source_capture_groups
+                + inner_predicted.source_capture_groups,
+            source_capture_pixels: outer_predicted.source_capture_pixels
+                + inner_predicted.source_capture_pixels,
             intermediate_textures: outer_predicted.intermediate_textures
                 + inner_predicted.intermediate_textures,
             backdrop_copies: outer_predicted.backdrop_copies + inner_predicted.backdrop_copies,
@@ -4209,6 +4442,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
+                source_capture_groups: 2,
+                source_capture_pixels: 544,
                 intermediate_textures: 3,
                 backdrop_copies: 1,
                 ..RenderGroupBackendCounters::default()

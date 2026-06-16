@@ -71,7 +71,7 @@ impl Element for Svg {
             inspector_id,
             window,
             cx,
-            |style, window, cx| window.request_layout_for_id(global_id, style, None, cx),
+            |style, window, cx| window.request_layout(style, None, cx),
         );
         (layout_id, ())
     }

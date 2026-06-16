@@ -1198,6 +1198,58 @@ mod tests {
     }
 
     #[test]
+    fn retained_layout_inserts_and_deletes_children_in_place() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child_a = request_retained_leaf(&mut engine, 2, Style::default());
+        let parent = engine.request_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[child_a],
+        );
+        finish_frame(&mut engine);
+
+        let child_a = request_retained_leaf(&mut engine, 2, Style::default());
+        let child_b = request_retained_leaf(&mut engine, 3, Style::default());
+        let parent_after_insert = engine.request_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[child_a, child_b],
+        );
+
+        assert_eq!(parent_after_insert, parent);
+        assert_eq!(taffy_children(&engine, parent), vec![child_a, child_b]);
+        finish_frame(&mut engine);
+
+        let child_b = request_retained_leaf(&mut engine, 3, Style::default());
+        let parent_after_delete = engine.request_layout(
+            Some(key(1)),
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[child_b],
+        );
+        finish_frame(&mut engine);
+
+        assert_eq!(parent_after_delete, parent);
+        assert_eq!(taffy_children(&engine, parent), vec![child_b]);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 3,
+                reuses: 2,
+                children_updates: 2,
+                removes: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(node_count(&engine), 2);
+    }
+
+    #[test]
     fn retained_layout_duplicate_claim_uses_scratch_node() {
         let mut engine = TaffyLayoutEngine::new();
         let retained = request_retained_leaf(&mut engine, 1, Style::default());

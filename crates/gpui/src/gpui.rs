@@ -49,8 +49,8 @@ mod scene;
 pub mod scene_protocol {
     pub use crate::scene::{
         CompositeEffectPlan, CompositeProcessedContentGlowPlan, ContentAlphaShadowMode, DrawOrder,
-        LogicalVisualPlan, MonochromeSprite, PaintGroup, PaintSurface, Path, PathId, PathVertex,
-        PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
+        LogicalVisualPlan, MonochromeSprite, PaintGroup, PaintMetalTexture, Path, PathId,
+        PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite, Primitive,
         PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
         RenderGroupInput, RenderGroupLimitUnit, RenderGroupPlanningRejection,
         RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
@@ -140,7 +140,7 @@ pub use profiler::*;
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 #[cfg(target_os = "macos")]
-pub(crate) use scene::PaintSurface;
+pub(crate) use scene::PaintMetalTexture;
 pub use scene::{
     BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
     CompositeEffect, CompositeProcessedContentGlow, CompositeSurfaceShadow, ContentAlphaShadowMode,

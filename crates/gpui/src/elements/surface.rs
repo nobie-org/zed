@@ -3,21 +3,21 @@ use crate::{
     ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
 };
 #[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
+use metal::Texture;
 use refineable::Refineable;
 
 /// A source of a surface's content.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum SurfaceSource {
-    /// A macOS image buffer from CoreVideo
+    /// A macOS Metal texture.
     #[cfg(target_os = "macos")]
-    Surface(CVPixelBuffer),
+    MetalTexture(Texture),
 }
 
 #[cfg(target_os = "macos")]
-impl From<CVPixelBuffer> for SurfaceSource {
-    fn from(value: CVPixelBuffer) -> Self {
-        SurfaceSource::Surface(value)
+impl From<Texture> for SurfaceSource {
+    fn from(value: Texture) -> Self {
+        SurfaceSource::MetalTexture(value)
     }
 }
 
@@ -94,11 +94,11 @@ impl Element for Surface {
     ) {
         match &self.source {
             #[cfg(target_os = "macos")]
-            SurfaceSource::Surface(surface) => {
-                let size = crate::size(surface.get_width().into(), surface.get_height().into());
+            SurfaceSource::MetalTexture(texture) => {
+                let size = crate::size(texture.width().into(), texture.height().into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
                 // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
+                window.paint_metal_texture(new_bounds, texture.clone());
             }
             #[allow(unreachable_patterns)]
             _ => {}

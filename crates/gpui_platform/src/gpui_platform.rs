@@ -67,7 +67,12 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 /// headless GPU adapter is an environment misconfiguration and fails loudly.
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::metal_renderer::current_headless_renderer()
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
     {
         match gpui_wgpu::WgpuHeadlessRenderer::new() {
             Ok(renderer) => Some(Box::new(renderer)),

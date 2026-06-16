@@ -1566,6 +1566,29 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
     }
 
+    fn request_frame(&self) {
+        let mut lock = self.0.as_ref().lock();
+        let display_link_active = lock.display_link.is_some();
+        if !display_link_active {
+            lock.start_display_link();
+        }
+        gpui::nobie_platform_trace::trace(
+            "platform_window_request_frame",
+            format_args!(
+                "display_link_active={} visible={}",
+                display_link_active,
+                unsafe {
+                    lock.native_window
+                        .occlusionState()
+                        .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+                }
+            ),
+        );
+        unsafe {
+            let _: () = msg_send![lock.native_view.as_ptr(), setNeedsDisplay: YES];
+        }
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
         self.0.as_ref().lock().event_callback = Some(callback);
     }

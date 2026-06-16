@@ -25,8 +25,6 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -71,7 +69,6 @@ pub use prompts::*;
 
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
-const INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET: Duration = Duration::from_millis(16);
 
 /// A 6:5 aspect ratio minimum window size to be used for functional,
 /// additional-to-main-Zed windows, like the settings and rules library windows.
@@ -1028,10 +1025,8 @@ pub struct Window {
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     present_epoch: Rc<Cell<u64>>,
-    input_boundary_present_epoch: Rc<Cell<Option<u64>>>,
     draw_will_present: Cell<bool>,
     nobie_trace_last_draw_id: Cell<u64>,
-    last_present_timestamp: Rc<Cell<Instant>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1052,12 +1047,6 @@ pub struct Window {
     captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct InputBoundaryPresentation {
-    eligible: bool,
-    present_epoch_at_start: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1353,11 +1342,9 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let present_epoch = Rc::new(Cell::new(0));
-        let input_boundary_present_epoch = Rc::new(Cell::new(None));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
-        let last_present_timestamp = Rc::new(Cell::new(Instant::now()));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1386,8 +1373,6 @@ impl Window {
             let throttle_inactive_frame_rate = throttle_inactive_frame_rate.clone();
             let throttle_under_thermal_pressure = throttle_under_thermal_pressure.clone();
             let needs_present = needs_present.clone();
-            let present_epoch = present_epoch.clone();
-            let input_boundary_present_epoch = input_boundary_present_epoch.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
@@ -1475,30 +1460,16 @@ impl Window {
                                 let arena_clear_needed =
                                     window.draw_with_presentation_intent(cx, true);
                                 window.present();
-                                input_boundary_present_epoch.set(None);
                                 arena_clear_needed.clear();
                             })
                             .log_err();
                     })
                 } else if should_present {
-                    let suppress_after_input_boundary = !request_frame_options.require_presentation
-                        && !stored_needs_present
-                        && active_high_rate_input
-                        && input_boundary_present_epoch.get() == Some(present_epoch.get());
-                    if suppress_after_input_boundary {
-                        crate::nobie_platform_trace::trace(
-                            "request_frame_present_only_suppressed_after_input_boundary",
-                            format_args!("present_epoch={}", present_epoch.get()),
-                        );
-                        input_boundary_present_epoch.set(None);
-                    } else {
-                        handle
-                            .update(&mut cx, |_, window, _| {
-                                window.present();
-                                input_boundary_present_epoch.set(None);
-                            })
-                            .log_err();
-                    }
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            window.present();
+                        })
+                        .log_err();
                 }
 
                 handle
@@ -1576,24 +1547,10 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 let _input_boundary_trace = crate::nobie_platform_trace::begin_input_boundary();
-                let Some((dispatch_result, input_boundary)) = handle
-                    .update(&mut cx, |_, window, cx| {
-                        let input_boundary = window.input_boundary_presentation(&event);
-                        let dispatch_result = window.dispatch_event(event, cx);
-                        (dispatch_result, input_boundary)
-                    })
-                    .log_err()
-                else {
-                    return DispatchEventResult::default();
-                };
-
                 handle
-                    .update(&mut cx, |_, window, cx| {
-                        window.present_after_input_boundary_if_starved(input_boundary, cx);
-                    })
-                    .log_err();
-
-                dispatch_result
+                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .log_err()
+                    .unwrap_or_default()
             })
         });
         platform_window.on_hit_test_window_control({
@@ -1716,10 +1673,8 @@ impl Window {
             hovered,
             needs_present,
             present_epoch,
-            input_boundary_present_epoch,
             draw_will_present: Cell::new(false),
             nobie_trace_last_draw_id: Cell::new(0),
-            last_present_timestamp,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
             input_latency_tracker: InputLatencyTracker::new()?,
@@ -1862,6 +1817,7 @@ impl Window {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
+            self.platform_window.request_frame();
         }
     }
 
@@ -2907,7 +2863,6 @@ impl Window {
         self.present_epoch
             .set(self.present_epoch.get().saturating_add(1));
         self.needs_present.set(false);
-        self.last_present_timestamp.set(Instant::now());
         crate::nobie_platform_trace::trace(
             "window_present_finish",
             format_args!(
@@ -2919,100 +2874,6 @@ impl Window {
             ),
         );
         profiling::finish_frame!();
-    }
-
-    fn input_boundary_presentation(&self, event: &PlatformInput) -> InputBoundaryPresentation {
-        InputBoundaryPresentation {
-            eligible: matches!(
-                event,
-                PlatformInput::KeyDown(_)
-                    | PlatformInput::MouseMove(_)
-                    | PlatformInput::MouseUp(_)
-                    | PlatformInput::ScrollWheel(_)
-            ),
-            present_epoch_at_start: self.present_epoch.get(),
-        }
-    }
-
-    fn present_after_input_boundary_if_starved(
-        &mut self,
-        input_boundary: InputBoundaryPresentation,
-        cx: &mut App,
-    ) {
-        // High-frequency local input can continuously re-enter the input
-        // boundary while starving the request-frame callback that normally
-        // presents the dirty scene. This is an explicit framework fairness
-        // path: only visible-input kinds are eligible, normal request-frame
-        // callbacks win, and any presentation during dispatch suppresses it.
-        if !input_boundary.eligible {
-            return;
-        }
-
-        if self.present_epoch.get() != input_boundary.present_epoch_at_start {
-            crate::nobie_platform_trace::trace(
-                "input_boundary_present_skip",
-                format_args!(
-                    "reason=already_presented present_epoch_start={} present_epoch_now={}",
-                    input_boundary.present_epoch_at_start,
-                    self.present_epoch.get()
-                ),
-            );
-            return;
-        }
-
-        let last_present_age = self.last_present_timestamp.get().elapsed();
-        if Self::input_boundary_present_is_fresh(last_present_age) {
-            crate::nobie_platform_trace::trace(
-                "input_boundary_present_skip",
-                format_args!(
-                    "reason=frame_progress_fresh last_present_age_us={} budget_us={}",
-                    last_present_age.as_micros(),
-                    INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET.as_micros()
-                ),
-            );
-            return;
-        }
-
-        if self.invalidator.is_dirty() {
-            crate::nobie_platform_trace::trace(
-                "input_boundary_present_draw_present",
-                format_args!(
-                    "last_present_age_us={} present_epoch={}",
-                    last_present_age.as_micros(),
-                    self.present_epoch.get()
-                ),
-            );
-            crate::nobie_platform_trace::set_current_draw_reason("input_boundary_present");
-            let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
-            crate::nobie_platform_trace::clear_current_draw_reason();
-            self.present();
-            self.input_boundary_present_epoch
-                .set(Some(self.present_epoch.get()));
-            arena_clear_needed.clear();
-            self.complete_frame();
-        } else if self.needs_present.get() {
-            crate::nobie_platform_trace::trace(
-                "input_boundary_present_present_only",
-                format_args!(
-                    "last_present_age_us={} present_epoch={}",
-                    last_present_age.as_micros(),
-                    self.present_epoch.get()
-                ),
-            );
-            self.present();
-            self.input_boundary_present_epoch
-                .set(Some(self.present_epoch.get()));
-            self.complete_frame();
-        } else {
-            crate::nobie_platform_trace::trace(
-                "input_boundary_present_skip",
-                format_args!("reason=clean"),
-            );
-        }
-    }
-
-    fn input_boundary_present_is_fresh(last_present_age: Duration) -> bool {
-        last_present_age < INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET
     }
 
     /// Returns a snapshot of the current input-latency histograms.
@@ -4327,21 +4188,21 @@ impl Window {
         Ok(())
     }
 
-    /// Paint a surface into the scene for the next frame at the current z-index.
+    /// Paint a Metal texture into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
+    pub fn paint_metal_texture(&mut self, bounds: Bounds<Pixels>, texture: metal::Texture) {
+        use crate::PaintMetalTexture;
 
         self.invalidator.debug_assert_paint();
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         crate::nobie_platform_trace::trace(
-            "window_paint_surface",
+            "window_paint_metal_texture",
             format_args!(
-                "draw_id={} surface_index={} bounds=({:.3},{:.3},{:.3},{:.3}) content_mask=({:.3},{:.3},{:.3},{:.3})",
+                "draw_id={} texture_index={} bounds=({:.3},{:.3},{:.3},{:.3}) content_mask=({:.3},{:.3},{:.3},{:.3})",
                 crate::nobie_platform_trace::current_draw_id(),
                 self.next_frame.scene.surfaces.len().saturating_add(1),
                 bounds.origin.x.0,
@@ -4354,11 +4215,11 @@ impl Window {
                 content_mask.bounds.size.height.0
             ),
         );
-        self.next_frame.scene.insert_primitive(PaintSurface {
+        self.next_frame.scene.insert_primitive(PaintMetalTexture {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            texture,
         });
     }
 
@@ -4966,10 +4827,6 @@ impl Window {
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
-        if self.invalidator.is_dirty() {
-            self.draw(cx).clear();
-        }
-
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
 
@@ -6485,28 +6342,34 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn input_boundary_present_freshness_uses_strict_starvation_budget() {
-        assert!(Window::input_boundary_present_is_fresh(
-            INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET - Duration::from_nanos(1),
-        ));
-        assert!(!Window::input_boundary_present_is_fresh(
-            INPUT_BOUNDARY_PRESENT_STARVATION_BUDGET,
-        ));
-    }
-
-    #[test]
-    fn input_boundary_freshness_source_uses_present_not_request_frame_callback() {
+    fn input_boundary_cannot_present_outside_request_frame_callback() {
         let source = include_str!("window.rs");
 
-        assert!(source.contains("last_present_timestamp: Rc<Cell<Instant>>"));
-        assert!(source.contains("self.last_present_timestamp.set(Instant::now());"));
+        assert!(!source.contains(&["input", "boundary", "present", "epoch"].join("_")));
+        assert!(!source.contains(&["present", "after", "input", "boundary"].join("_")));
+        assert!(!source.contains(&["input", "boundary", "present", "draw", "present"].join("_")));
+        assert!(!source.contains(&["input", "boundary", "present", "present", "only"].join("_")));
         assert!(
-            source.contains("let last_present_age = self.last_present_timestamp.get().elapsed();")
+            !source.contains(
+                &[
+                    "request",
+                    "frame",
+                    "present",
+                    "only",
+                    "suppressed",
+                    "after",
+                    "input",
+                    "boundary"
+                ]
+                .join("_")
+            )
         );
-        assert!(!source.contains(&["last", "request", "frame", "timestamp"].join("_")));
-        assert!(!source.contains(&["request", "frame", "at", "start"].join("_")));
+        let key_dispatch_prefix = source
+            .split("fn dispatch_key_event")
+            .nth(1)
+            .and_then(|tail| tail.split("let node_id").next())
+            .expect("dispatch_key_event should still exist");
+        assert!(!key_dispatch_prefix.contains(&["self", "draw(cx)", "clear();"].join(".")));
     }
 }

@@ -8,7 +8,7 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
-use std::{fmt::Debug, ops::Range, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, ops::Range, sync::Arc};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -87,6 +87,7 @@ struct RetainedLayoutStats {
     children_updates: usize,
     context_updates: usize,
     duplicate_misses: usize,
+    already_parented_child_misses: usize,
     scratch_creates: usize,
     removes: usize,
 }
@@ -156,6 +157,7 @@ impl TaffyLayoutEngine {
         taffy_style: taffy::style::Style,
         children: &[LayoutId],
     ) -> LayoutId {
+        let children = self.attachable_scratch_children(children);
         if children.is_empty() {
             let id = self
                 .taffy
@@ -169,12 +171,27 @@ impl TaffyLayoutEngine {
             let id = self
                 .taffy
                 // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
+                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children.as_ref()))
                 .expect(EXPECT_MESSAGE)
                 .into();
             self.scratch_nodes.insert(id);
             self.retained_stats.scratch_creates += 1;
             id
+        }
+    }
+
+    fn attachable_scratch_children<'a>(&mut self, children: &'a [LayoutId]) -> Cow<'a, [LayoutId]> {
+        let attachable_children = children
+            .iter()
+            .copied()
+            .filter(|child| self.taffy.parent((*child).into()).is_none())
+            .collect::<Vec<_>>();
+        if attachable_children.len() == children.len() {
+            Cow::Borrowed(children)
+        } else {
+            self.retained_stats.already_parented_child_misses +=
+                children.len() - attachable_children.len();
+            Cow::Owned(attachable_children)
         }
     }
 
@@ -1274,6 +1291,40 @@ mod tests {
             RetainedLayoutStats {
                 creates: 1,
                 duplicate_misses: 1,
+                scratch_creates: 1,
+                removes: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn retained_layout_duplicate_parent_does_not_steal_children() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child = request_retained_leaf(&mut engine, 2, Style::default());
+        let retained_parent =
+            engine.request_layout(Some(key(1)), Style::default(), Pixels(16.0), 1.0, &[child]);
+
+        let scratch_parent =
+            engine.request_layout(Some(key(1)), Style::default(), Pixels(16.0), 1.0, &[child]);
+
+        assert_ne!(scratch_parent, retained_parent);
+        assert_eq!(taffy_children(&engine, retained_parent), vec![child]);
+        assert_eq!(taffy_children(&engine, scratch_parent), Vec::new());
+        assert_eq!(
+            engine.taffy.parent(child.into()),
+            Some(retained_parent.into())
+        );
+
+        finish_frame(&mut engine);
+
+        assert_eq!(node_count(&engine), 2);
+        assert_eq!(
+            engine.retained_stats,
+            RetainedLayoutStats {
+                creates: 2,
+                duplicate_misses: 1,
+                already_parented_child_misses: 1,
                 scratch_creates: 1,
                 removes: 1,
                 ..Default::default()

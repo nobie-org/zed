@@ -49,15 +49,15 @@ mod scene;
 pub mod scene_protocol {
     pub use crate::scene::{
         CompositeEffectPlan, CompositeProcessedContentGlowPlan, DrawOrder, LogicalVisualPlan,
-        MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, PaintGroup, PaintMetalTexture, Path,
-        PathId, PathVertex, PathVertex_ScaledPixels, PhysicalRenderGroupPlan, PolychromeSprite,
-        Primitive, PrimitiveBatch, Quad, RenderGroupBackendCounters, RenderGroupDependencies,
-        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPhysicalPlanKind,
-        RenderGroupPlanningRejection, RenderGroupPlanningRejectionReason,
-        RenderGroupRejectedEffect, RenderGroupRequirements, RenderGroupShadowMode,
-        RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters, RenderGroupSupportCounters,
-        Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite, SurfaceSilhouetteSpriteData,
-        TransformationMatrix, Underline,
+        MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, PaintGroup, PaintSurface,
+        PaintSurfaceSource, Path, PathId, PathVertex, PathVertex_ScaledPixels,
+        PhysicalRenderGroupPlan, PolychromeSprite, Primitive, PrimitiveBatch, Quad,
+        RenderGroupBackendCounters, RenderGroupDependencies, RenderGroupInput,
+        RenderGroupLimitUnit, RenderGroupPhysicalPlanKind, RenderGroupPlanningRejection,
+        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
+        RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
+        RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
+        SurfaceSilhouetteSpriteData, TransformationMatrix, Underline,
     };
 }
 /// Render-group planning and capability diagnostics for inspectors and tests.
@@ -142,8 +142,6 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
-#[cfg(target_os = "macos")]
-pub(crate) use scene::PaintMetalTexture;
 pub use scene::{
     BorderStyle, Composite, CompositeBackdropLens, CompositeBlendMode, CompositeDropShadow,
     CompositeEffect, CompositeProcessedContentGlow, CompositeShadow, CompositeSurfaceShadow,
@@ -156,6 +154,7 @@ pub use scene::{
 pub(crate) use scene::{
     MonochromeSprite, PaintGroup, PolychromeSprite, Quad, Scene, Shadow, SubpixelSprite, Underline,
 };
+pub(crate) use scene::{PaintSurface, PaintSurfaceSource};
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;

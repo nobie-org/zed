@@ -4202,7 +4202,7 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_metal_texture(&mut self, bounds: Bounds<Pixels>, texture: metal::Texture) {
-        use crate::PaintMetalTexture;
+        use crate::{PaintSurface, PaintSurfaceSource};
 
         self.invalidator.debug_assert_paint();
 
@@ -4224,11 +4224,45 @@ impl Window {
                 content_mask.bounds.size.height.0
             ),
         );
-        self.next_frame.scene.insert_primitive(PaintMetalTexture {
+        self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
-            texture,
+            source: PaintSurfaceSource::MetalTexture(texture),
+        });
+    }
+
+    /// Paint a wgpu texture view into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_wgpu_texture(&mut self, bounds: Bounds<Pixels>, texture: wgpu::TextureView) {
+        use crate::{PaintSurface, PaintSurfaceSource};
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        crate::nobie_platform_trace::trace(
+            "window_paint_wgpu_texture",
+            format_args!(
+                "draw_id={} texture_index={} bounds=({:.3},{:.3},{:.3},{:.3}) content_mask=({:.3},{:.3},{:.3},{:.3})",
+                crate::nobie_platform_trace::current_draw_id(),
+                self.next_frame.scene.surfaces.len().saturating_add(1),
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+                bounds.size.width.0,
+                bounds.size.height.0,
+                content_mask.bounds.origin.x.0,
+                content_mask.bounds.origin.y.0,
+                content_mask.bounds.size.width.0,
+                content_mask.bounds.size.height.0
+            ),
+        );
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: PaintSurfaceSource::WgpuTexture(texture),
         });
     }
 

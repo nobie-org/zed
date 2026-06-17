@@ -5,9 +5,10 @@ use gpui::{
     MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, Size,
     get_gamma_correction_ratios, point,
     scene_protocol::{
-        CompositeEffectPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, PrimitiveBatch,
-        Quad, RenderGroupBackendCounters, RenderGroupPhysicalPlanKind, Scene, Shadow,
-        SubpixelSprite, SurfaceSilhouetteSpriteData, Underline,
+        CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
+        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
+        RenderGroupPhysicalPlanKind, Scene, Shadow, SubpixelSprite, SurfaceSilhouetteSpriteData,
+        Underline,
     },
 };
 use log::warn;
@@ -18,6 +19,26 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+#[derive(Clone)]
+pub struct WgpuHeadlessContextParts {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+thread_local! {
+    static ACTIVE_HEADLESS_WGPU_CONTEXT: RefCell<Option<WgpuHeadlessContextParts>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+pub fn clone_active_headless_wgpu_context() -> Option<WgpuHeadlessContextParts> {
+    ACTIVE_HEADLESS_WGPU_CONTEXT.with(|context| context.borrow().clone())
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -137,7 +158,6 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
-    #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
 
@@ -931,16 +951,6 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -1789,9 +1799,8 @@ impl WgpuRenderer {
                         instance_offset,
                         &mut pass,
                     ),
-                PrimitiveBatch::Surfaces(_surfaces) => {
-                    // Surfaces are macOS-only for video playback.
-                    true
+                PrimitiveBatch::Surfaces(range) => {
+                    self.draw_surfaces(&scene.surfaces[range], &mut pass)
                 }
                 PrimitiveBatch::Groups(range) => {
                     drop(pass);
@@ -1943,6 +1952,75 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    fn register_active_headless_wgpu_context(context: &WgpuContext) {
+        ACTIVE_HEADLESS_WGPU_CONTEXT.with(|active| {
+            *active.borrow_mut() = Some(WgpuHeadlessContextParts {
+                instance: context.instance.clone(),
+                adapter: context.adapter.clone(),
+                device: (*context.device).clone(),
+                queue: (*context.queue).clone(),
+            });
+        });
+    }
+
+    fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut wgpu::RenderPass<'_>) -> bool {
+        if surfaces.is_empty() {
+            return true;
+        }
+
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.surfaces);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+
+        for surface in surfaces {
+            let PaintSurfaceSource::WgpuTexture(texture_view) = &surface.source else {
+                panic!("GPUI wgpu renderer cannot draw non-wgpu texture surfaces");
+            };
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+            };
+            let params_size = std::mem::size_of::<SurfaceParams>() as u64;
+            let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("surface_params"),
+                size: params_size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &buffer,
+                                offset: 0,
+                                size: Some(NonZeroU64::new(params_size).unwrap()),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        true
     }
 
     fn draw_instances(
@@ -3417,6 +3495,7 @@ impl WgpuHeadlessRenderer {
                 height: DevicePixels(1),
             },
         )?;
+        WgpuRenderer::register_active_headless_wgpu_context(&context);
         Ok(Self { renderer })
     }
 

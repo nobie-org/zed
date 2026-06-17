@@ -37,7 +37,7 @@ pub struct Scene {
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
-    pub surfaces: Vec<PaintMetalTexture>,
+    pub surfaces: Vec<PaintSurface>,
     pub groups: Vec<PaintGroup>,
 }
 
@@ -317,7 +317,7 @@ pub enum Primitive {
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
-    Surface(PaintMetalTexture),
+    Surface(PaintSurface),
     Group(PaintGroup),
 }
 
@@ -375,7 +375,7 @@ struct BatchIterator<'a> {
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
-    surfaces_iter: Peekable<slice::Iter<'a, PaintMetalTexture>>,
+    surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     groups_start: usize,
     groups_iter: Peekable<slice::Iter<'a, PaintGroup>>,
 }
@@ -841,16 +841,23 @@ impl From<PolychromeSprite> for Primitive {
 
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
-pub struct PaintMetalTexture {
+pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub texture: metal::Texture,
+    pub source: PaintSurfaceSource,
 }
 
-impl From<PaintMetalTexture> for Primitive {
-    fn from(surface: PaintMetalTexture) -> Self {
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub enum PaintSurfaceSource {
+    #[cfg(target_os = "macos")]
+    MetalTexture(metal::Texture),
+    WgpuTexture(wgpu::TextureView),
+}
+
+impl From<PaintSurface> for Primitive {
+    fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
     }
 }

@@ -2,18 +2,17 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
-    base::{NO, YES},
+    base::{NO, YES, id},
     foundation::{NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, Size, Surface,
-    point,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, ScaledPixels, Size, Surface, point,
     scene_protocol::{
-        CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintMetalTexture, Path,
-        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
-        RenderGroupPhysicalPlanKind, Scene, Shadow, SurfaceSilhouetteSpriteData, Underline,
+        CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
+        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters, Scene, Shadow,
+        SurfaceSilhouetteSpriteData, Underline,
     },
     size,
 };
@@ -30,99 +29,20 @@ use metal::{
 };
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
+use raw_window_handle as rwh;
 
 use crate::quartzcore_time::ca_current_media_time;
 
-use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ffi::c_void,
+    fmt, mem,
+    ptr::{self, NonNull},
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct RenderTargetFrame {
-    pub origin: Point<ScaledPixels>,
-    pub size: Size<DevicePixels>,
-}
-
-impl RenderTargetFrame {
-    fn root(size: Size<DevicePixels>) -> Self {
-        Self {
-            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
-            size,
-        }
-    }
-
-    fn from_bounds(bounds: Bounds<ScaledPixels>) -> Option<Self> {
-        let left = bounds.origin.x.0.floor();
-        let top = bounds.origin.y.0.floor();
-        let right = (bounds.origin.x.0 + bounds.size.width.0).ceil();
-        let bottom = (bounds.origin.y.0 + bounds.size.height.0).ceil();
-        let width = (right - left) as i32;
-        let height = (bottom - top) as i32;
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-
-        Some(Self {
-            origin: point(ScaledPixels(left), ScaledPixels(top)),
-            size: size(DevicePixels(width), DevicePixels(height)),
-        })
-    }
-
-    fn bounds(self) -> Bounds<ScaledPixels> {
-        Bounds::new(
-            self.origin,
-            size(
-                ScaledPixels(self.size.width.0 as f32),
-                ScaledPixels(self.size.height.0 as f32),
-            ),
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct TextureFrame {
-    pub origin: Point<ScaledPixels>,
-    pub size: Size<DevicePixels>,
-}
-
-impl From<RenderTargetFrame> for TextureFrame {
-    fn from(frame: RenderTargetFrame) -> Self {
-        Self {
-            origin: frame.origin,
-            size: frame.size,
-        }
-    }
-}
-
-impl TextureFrame {
-    fn rounded_out_for_bounds_in_target(
-        bounds: Bounds<ScaledPixels>,
-        target_frame: RenderTargetFrame,
-    ) -> Option<Self> {
-        let bounds = bounds.intersect(&target_frame.bounds());
-        if bounds.is_empty() {
-            return None;
-        }
-
-        let left = bounds.origin.x.0.floor();
-        let top = bounds.origin.y.0.floor();
-        let right = (bounds.origin.x.0 + bounds.size.width.0).ceil();
-        let bottom = (bounds.origin.y.0 + bounds.size.height.0).ceil();
-        let width = (right - left) as i32;
-        let height = (bottom - top) as i32;
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-
-        Some(Self {
-            origin: point(ScaledPixels(left), ScaledPixels(top)),
-            size: size(DevicePixels(width), DevicePixels(height)),
-        })
-    }
-}
 
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
@@ -132,26 +52,505 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
 
-pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
-pub(crate) type Renderer = MetalRenderer;
+type MetalRendererInitResult<T> = std::result::Result<T, MetalRendererInitError>;
+type MetalRenderResult<T> = std::result::Result<T, MetalRenderError>;
+
+#[derive(Debug)]
+enum MetalRendererInitError {
+    NoCompatibleDevice,
+    BuildLibrary {
+        source: String,
+    },
+    MissingPipelineFunction {
+        pipeline: &'static str,
+        stage: ShaderStage,
+        function: &'static str,
+        source: String,
+    },
+    MissingPipelineColorAttachment {
+        pipeline: &'static str,
+    },
+    CreatePipelineState {
+        pipeline: &'static str,
+        source: String,
+    },
+}
+
+impl fmt::Display for MetalRendererInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCompatibleDevice => f.write_str("unable to access a compatible Metal device"),
+            Self::BuildLibrary { source } => write!(f, "failed to build Metal library: {source}"),
+            Self::MissingPipelineFunction {
+                pipeline,
+                stage,
+                function,
+                source,
+            } => write!(
+                f,
+                "failed to locate {stage} function `{function}` for Metal pipeline `{pipeline}`: {source}"
+            ),
+            Self::MissingPipelineColorAttachment { pipeline } => write!(
+                f,
+                "Metal pipeline `{pipeline}` descriptor did not expose color attachment 0"
+            ),
+            Self::CreatePipelineState { pipeline, source } => write!(
+                f,
+                "failed to create Metal render pipeline state `{pipeline}`: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetalRendererInitError {}
+
+#[derive(Debug, Clone, Copy)]
+enum ShaderStage {
+    Vertex,
+    Fragment,
+}
+
+impl fmt::Display for ShaderStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vertex => f.write_str("vertex"),
+            Self::Fragment => f.write_str("fragment"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimitiveEncodeStatus {
+    Complete,
+    InstanceBufferExceeded,
+}
+
+impl PrimitiveEncodeStatus {
+    fn from_instance_capacity(fits_current_buffer: bool) -> Self {
+        if fits_current_buffer {
+            Self::Complete
+        } else {
+            Self::InstanceBufferExceeded
+        }
+    }
+
+    fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScenePrimitiveCounts {
+    paths: usize,
+    shadows: usize,
+    quads: usize,
+    underlines: usize,
+    monochrome_sprites: usize,
+    polychrome_sprites: usize,
+    surfaces: usize,
+    groups: usize,
+}
+
+impl ScenePrimitiveCounts {
+    fn from_scene(scene: &Scene) -> Self {
+        Self {
+            paths: scene.paths.len(),
+            shadows: scene.shadows.len(),
+            quads: scene.quads.len(),
+            underlines: scene.underlines.len(),
+            monochrome_sprites: scene.monochrome_sprites.len(),
+            polychrome_sprites: scene.polychrome_sprites.len(),
+            surfaces: scene.surfaces.len(),
+            groups: scene.groups.len(),
+        }
+    }
+}
+
+impl fmt::Display for ScenePrimitiveCounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} groups",
+            self.paths,
+            self.shadows,
+            self.quads,
+            self.underlines,
+            self.monochrome_sprites,
+            self.polychrome_sprites,
+            self.surfaces,
+            self.groups
+        )
+    }
+}
+
+#[derive(Debug)]
+enum MetalRenderError {
+    InstanceBufferExceeded { counts: ScenePrimitiveCounts },
+    InvalidBackdropViewport { width: i32, height: i32 },
+    MissingRenderPassColorAttachment { context: &'static str },
+    UnsupportedPrimitiveBatch { batch: String },
+}
+
+impl MetalRenderError {
+    fn instance_buffer_exceeded(scene: &Scene) -> Self {
+        Self::InstanceBufferExceeded {
+            counts: ScenePrimitiveCounts::from_scene(scene),
+        }
+    }
+
+    fn invalid_backdrop_viewport(viewport_size: Size<DevicePixels>) -> Self {
+        Self::InvalidBackdropViewport {
+            width: viewport_size.width.0,
+            height: viewport_size.height.0,
+        }
+    }
+}
+
+impl fmt::Display for MetalRenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InstanceBufferExceeded { counts } => write!(f, "scene too large: {counts}"),
+            Self::InvalidBackdropViewport { width, height } => write!(
+                f,
+                "invalid viewport for backdrop render group: width={width}, height={height}"
+            ),
+            Self::MissingRenderPassColorAttachment { context } => write!(
+                f,
+                "Metal render pass `{context}` descriptor did not expose color attachment 0"
+            ),
+            Self::UnsupportedPrimitiveBatch { batch } => {
+                write!(f, "unsupported GPUI primitive batch: {batch}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetalRenderError {}
+
+const NOBIE_GPUI_RENDERER_ENV: &str = "NOBIE_GPUI_RENDERER";
+type NobieGpuiMetalHandleExport = extern "C" fn() -> *mut std::ffi::c_void;
+
+#[derive(Clone)]
+pub(crate) struct Context {
+    metal_instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+    wgpu_context: gpui_wgpu::GpuContext,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            metal_instance_buffer_pool: Arc::new(Mutex::new(InstanceBufferPool::default())),
+            wgpu_context: Default::default(),
+        }
+    }
+}
+
+pub(crate) enum Renderer {
+    Metal(MetalRenderer),
+    Wgpu {
+        renderer: gpui_wgpu::WgpuRenderer,
+        layer: metal::MetalLayer,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererChoice {
+    Metal,
+    Wgpu,
+}
+
+impl RendererChoice {
+    fn from_env() -> Self {
+        match std::env::var(NOBIE_GPUI_RENDERER_ENV) {
+            Ok(value) if value.is_empty() || value == "metal" => Self::Metal,
+            Ok(value) if value == "wgpu" => Self::Wgpu,
+            Ok(value) => panic!(
+                "{NOBIE_GPUI_RENDERER_ENV} must be unset, empty, 'metal', or 'wgpu'; got {value:?}"
+            ),
+            Err(std::env::VarError::NotPresent) => Self::Metal,
+            Err(std::env::VarError::NotUnicode(value)) => {
+                panic!("{NOBIE_GPUI_RENDERER_ENV} must be valid UTF-8; got {value:?}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WgpuWindowHandle {
+    native_view: NonNull<c_void>,
+}
+
+unsafe impl Send for WgpuWindowHandle {}
+unsafe impl Sync for WgpuWindowHandle {}
+
+impl rwh::HasWindowHandle for WgpuWindowHandle {
+    fn window_handle(&self) -> std::result::Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        unsafe {
+            Ok(rwh::WindowHandle::borrow_raw(rwh::RawWindowHandle::AppKit(
+                rwh::AppKitWindowHandle::new(self.native_view),
+            )))
+        }
+    }
+}
+
+impl rwh::HasDisplayHandle for WgpuWindowHandle {
+    fn display_handle(&self) -> std::result::Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
+        Ok(rwh::DisplayHandle::appkit())
+    }
+}
+
+#[repr(C)]
+pub struct GpuiWgpuContextParts {
+    pub instance: gpui_wgpu::wgpu::Instance,
+    pub adapter: gpui_wgpu::wgpu::Adapter,
+    pub device: gpui_wgpu::wgpu::Device,
+    pub queue: gpui_wgpu::wgpu::Queue,
+}
+
+thread_local! {
+    static ACTIVE_DEVICE: std::cell::Cell<*mut std::ffi::c_void> = std::cell::Cell::new(std::ptr::null_mut());
+    static ACTIVE_QUEUE: std::cell::Cell<*mut std::ffi::c_void> = std::cell::Cell::new(std::ptr::null_mut());
+    static ACTIVE_WGPU_CONTEXT: RefCell<Option<gpui_wgpu::GpuContext>> = const { RefCell::new(None) };
+}
+
+/// cbindgen:ignore
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_macos_get_active_device() -> *mut std::ffi::c_void {
+    ACTIVE_DEVICE.with(|cell| cell.get())
+}
+
+/// cbindgen:ignore
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_macos_get_active_queue() -> *mut std::ffi::c_void {
+    ACTIVE_QUEUE.with(|cell| cell.get())
+}
+
+#[used]
+static NOBIE_GPUI_METAL_DEVICE_EXPORT: NobieGpuiMetalHandleExport = gpui_macos_get_active_device;
+
+#[used]
+static NOBIE_GPUI_METAL_QUEUE_EXPORT: NobieGpuiMetalHandleExport = gpui_macos_get_active_queue;
+
+/// cbindgen:ignore
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_macos_clone_active_wgpu_context(out: *mut GpuiWgpuContextParts) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    ACTIVE_WGPU_CONTEXT.with(|cell| {
+        let Some(context) = cell.borrow().as_ref().cloned() else {
+            return false;
+        };
+        let context = context.borrow();
+        let Some(context) = context.as_ref() else {
+            return false;
+        };
+        let parts = GpuiWgpuContextParts {
+            instance: context.instance.clone(),
+            adapter: context.adapter.clone(),
+            device: (*context.device).clone(),
+            queue: (*context.queue).clone(),
+        };
+        unsafe {
+            out.write(parts);
+        }
+        true
+    })
+}
 
 pub(crate) unsafe fn new_renderer(
     context: self::Context,
     _native_window: *mut c_void,
-    _native_view: *mut c_void,
-    _bounds: gpui::Size<f32>,
+    native_view: *mut c_void,
+    bounds: gpui::Size<f32>,
     transparent: bool,
 ) -> Renderer {
-    MetalRenderer::new(context, transparent)
+    match RendererChoice::from_env() {
+        RendererChoice::Metal => {
+            ACTIVE_WGPU_CONTEXT.with(|cell| cell.borrow_mut().take());
+            Renderer::Metal(MetalRenderer::new(
+                context.metal_instance_buffer_pool,
+                transparent,
+            ))
+        }
+        RendererChoice::Wgpu => {
+            ACTIVE_DEVICE.with(|cell| cell.set(ptr::null_mut()));
+            ACTIVE_QUEUE.with(|cell| cell.set(ptr::null_mut()));
+            let native_view =
+                NonNull::new(native_view).expect("GPUI wgpu renderer requires a native NSView");
+            let layer = metal::MetalLayer::new();
+            layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            layer.set_opaque(!transparent);
+            let native_view_id = native_view.as_ptr() as id;
+            unsafe {
+                let _: () = msg_send![native_view_id, setLayer: layer.as_ref()];
+                let _: () = msg_send![native_view_id, setWantsLayer: YES];
+            }
+            let window = WgpuWindowHandle { native_view };
+            let config = gpui_wgpu::WgpuSurfaceConfig {
+                size: size(
+                    DevicePixels(bounds.width.max(1.0).ceil() as i32),
+                    DevicePixels(bounds.height.max(1.0).ceil() as i32),
+                ),
+                transparent,
+                preferred_present_mode: None,
+            };
+            let renderer =
+                gpui_wgpu::WgpuRenderer::new(context.wgpu_context.clone(), &window, config, None)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{NOBIE_GPUI_RENDERER_ENV}=wgpu failed to initialize GPUI wgpu renderer: {error}"
+                        )
+                    });
+            {
+                let active_context = context.wgpu_context.borrow();
+                let active_context = active_context
+                    .as_ref()
+                    .expect("GPUI wgpu renderer initialized without a context");
+                let backend = active_context.adapter.get_info().backend;
+                if backend != gpui_wgpu::wgpu::Backend::Metal {
+                    panic!(
+                        "{NOBIE_GPUI_RENDERER_ENV}=wgpu on macOS requires a Metal-backed wgpu adapter, got {backend:?}"
+                    );
+                }
+            }
+            ACTIVE_WGPU_CONTEXT.with(|cell| {
+                *cell.borrow_mut() = Some(context.wgpu_context);
+            });
+            Renderer::Wgpu { renderer, layer }
+        }
+    }
+}
+
+impl Renderer {
+    pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
+        match self {
+            Self::Metal(renderer) => renderer.layer(),
+            Self::Wgpu { layer, .. } => Some(layer.as_ref()),
+        }
+    }
+
+    pub fn layer_ptr(&self) -> *mut CAMetalLayer {
+        match self {
+            Self::Metal(renderer) => renderer.layer_ptr(),
+            Self::Wgpu { layer, .. } => layer.as_ptr(),
+        }
+    }
+
+    pub fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+        match self {
+            Self::Metal(renderer) => renderer.sprite_atlas().clone(),
+            Self::Wgpu { renderer, .. } => renderer.sprite_atlas().clone(),
+        }
+    }
+
+    pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
+        match self {
+            Self::Metal(renderer) => {
+                renderer.set_presents_with_transaction(presents_with_transaction)
+            }
+            Self::Wgpu { layer, .. } => {
+                layer.set_presents_with_transaction(presents_with_transaction)
+            }
+        }
+    }
+
+    pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        match self {
+            Self::Metal(renderer) => renderer.update_drawable_size(size),
+            Self::Wgpu { renderer, layer } => {
+                let ns_size = NSSize {
+                    width: size.width.0 as f64,
+                    height: size.height.0 as f64,
+                };
+                unsafe {
+                    let _: () = msg_send![
+                        layer.as_ref(),
+                        setDrawableSize: ns_size
+                    ];
+                }
+                renderer.update_drawable_size(size);
+            }
+        }
+    }
+
+    pub fn update_transparency(&mut self, transparent: bool) {
+        match self {
+            Self::Metal(renderer) => renderer.update_transparency(transparent),
+            Self::Wgpu { renderer, layer } => {
+                layer.set_opaque(!transparent);
+                renderer.update_transparency(transparent);
+            }
+        }
+    }
+
+    pub fn destroy(&mut self) {
+        match self {
+            Self::Metal(renderer) => renderer.destroy(),
+            Self::Wgpu { renderer, .. } => renderer.destroy(),
+        }
+    }
+
+    pub fn draw(&mut self, scene: &Scene) {
+        match self {
+            Self::Metal(renderer) => renderer.draw(scene),
+            Self::Wgpu { renderer, .. } => {
+                let _ = renderer.draw(scene);
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
+        match self {
+            Self::Metal(renderer) => renderer.render_to_image(scene),
+            Self::Wgpu { renderer, .. } => {
+                let size = renderer.viewport_size();
+                renderer.render_scene_to_image(scene, size)
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture_scene(&mut self, scene: &Scene) -> Result<SceneCapture> {
+        match self {
+            Self::Metal(renderer) => renderer.capture_scene(scene),
+            Self::Wgpu { renderer, .. } => {
+                let image = renderer.render_scene_to_image(scene, renderer.viewport_size())?;
+                let width_px = image.width();
+                let height_px = image.height();
+                Ok(SceneCapture {
+                    rgba: image.into_raw(),
+                    width_px,
+                    height_px,
+                    backend: wgpu_capture_backend(renderer.adapter_backend()),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn wgpu_capture_backend(backend: gpui_wgpu::wgpu::Backend) -> SceneCaptureBackend {
+    match backend {
+        gpui_wgpu::wgpu::Backend::Metal => SceneCaptureBackend::Metal,
+        gpui_wgpu::wgpu::Backend::Vulkan => SceneCaptureBackend::Vulkan,
+        gpui_wgpu::wgpu::Backend::Dx12 => SceneCaptureBackend::Dx12,
+        gpui_wgpu::wgpu::Backend::Gl => SceneCaptureBackend::Gl,
+        _ => SceneCaptureBackend::Other,
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
     let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-    let device = MetalRenderer::create_device();
-    Some(Box::new(MetalRenderer::new_internal(
-        device, None, true, pool,
-    )))
+    match MetalRenderer::try_new_internal(None, true, pool) {
+        Ok(renderer) => Some(Box::new(renderer)),
+        Err(error) => {
+            log::error!("failed to initialize headless Metal renderer: {error}");
+            None
+        }
+    }
 }
 
 pub(crate) struct InstanceBufferPool {
@@ -176,178 +575,6 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
-}
-
-const GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL: u64 = 4;
-
-#[cfg(test)]
-const GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS: u64 = 32;
-
-#[cfg(test)]
-const GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES: u64 = 3
-    * GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS
-    * GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS
-    * GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL;
-
-#[cfg(not(test))]
-const GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES: u64 = 512 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct GroupIntermediateTextureKey {
-    width: u64,
-    height: u64,
-    pixel_format: metal::MTLPixelFormat,
-    storage_mode: metal::MTLStorageMode,
-    usage: metal::MTLTextureUsage,
-}
-
-impl GroupIntermediateTextureKey {
-    fn viewport_bgra_render_target(viewport_size: Size<DevicePixels>) -> Option<Self> {
-        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
-            return None;
-        }
-
-        Some(Self {
-            width: viewport_size.width.0 as u64,
-            height: viewport_size.height.0 as u64,
-            pixel_format: metal::MTLPixelFormat::BGRA8Unorm,
-            storage_mode: metal::MTLStorageMode::Private,
-            usage: metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-        })
-    }
-
-    fn new_texture(&self, device: &metal::Device) -> metal::Texture {
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(self.width);
-        texture_descriptor.set_height(self.height);
-        texture_descriptor.set_pixel_format(self.pixel_format);
-        texture_descriptor.set_storage_mode(self.storage_mode);
-        texture_descriptor.set_usage(self.usage);
-        device.new_texture(&texture_descriptor)
-    }
-
-    fn byte_len(&self) -> u64 {
-        self.width
-            .saturating_mul(self.height)
-            .saturating_mul(GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL)
-    }
-}
-
-struct GroupIntermediateTexture {
-    key: GroupIntermediateTextureKey,
-    texture: metal::Texture,
-}
-
-struct AvailableGroupIntermediateTexture {
-    texture: metal::Texture,
-    release_sequence: u64,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct GroupIntermediateTexturePoolStats {
-    allocations: u64,
-    reuses: u64,
-    available_textures: usize,
-    available_bytes: u64,
-}
-
-#[derive(Default)]
-struct GroupIntermediateTexturePool {
-    textures: HashMap<GroupIntermediateTextureKey, Vec<AvailableGroupIntermediateTexture>>,
-    allocations: u64,
-    reuses: u64,
-    available_bytes: u64,
-    next_release_sequence: u64,
-}
-
-impl GroupIntermediateTexturePool {
-    fn acquire(
-        &mut self,
-        device: &metal::Device,
-        key: GroupIntermediateTextureKey,
-    ) -> metal::Texture {
-        if let Some(texture) = self
-            .textures
-            .get_mut(&key)
-            .and_then(|textures| textures.pop())
-        {
-            self.reuses += 1;
-            self.available_bytes = self.available_bytes.saturating_sub(key.byte_len());
-            texture.texture
-        } else {
-            self.allocations += 1;
-            key.new_texture(device)
-        }
-    }
-
-    fn release_many(&mut self, textures: Vec<GroupIntermediateTexture>) {
-        for texture in textures {
-            let byte_len = texture.key.byte_len();
-            if byte_len > GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES {
-                continue;
-            }
-
-            let release_sequence = self.next_release_sequence;
-            self.next_release_sequence = self.next_release_sequence.wrapping_add(1);
-            self.available_bytes = self.available_bytes.saturating_add(byte_len);
-            self.textures
-                .entry(texture.key)
-                .or_default()
-                .push(AvailableGroupIntermediateTexture {
-                    texture: texture.texture,
-                    release_sequence,
-                });
-        }
-
-        self.trim_to_budget();
-    }
-
-    fn trim_to_budget(&mut self) {
-        while self.available_bytes > GROUP_INTERMEDIATE_TEXTURE_POOL_MAX_AVAILABLE_BYTES {
-            let Some((oldest_key, oldest_index)) = self
-                .textures
-                .iter()
-                .filter_map(|(key, textures)| {
-                    textures
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, texture)| texture.release_sequence)
-                        .map(|(index, texture)| (*key, index, texture.release_sequence))
-                })
-                .min_by_key(|(_, _, release_sequence)| *release_sequence)
-                .map(|(key, index, _)| (key, index))
-            else {
-                self.available_bytes = 0;
-                break;
-            };
-
-            let mut remove_key = false;
-            if let Some(textures) = self.textures.get_mut(&oldest_key) {
-                let removed = textures.swap_remove(oldest_index);
-                drop(removed);
-                self.available_bytes = self.available_bytes.saturating_sub(oldest_key.byte_len());
-                remove_key = textures.is_empty();
-            }
-            if remove_key {
-                self.textures.remove(&oldest_key);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn stats(&self) -> GroupIntermediateTexturePoolStats {
-        GroupIntermediateTexturePoolStats {
-            allocations: self.allocations,
-            reuses: self.reuses,
-            available_textures: self
-                .textures
-                .values()
-                .map(std::vec::Vec::len)
-                .sum::<usize>(),
-            available_bytes: self.available_bytes,
-        }
-    }
 }
 
 impl InstanceBufferPool {
@@ -397,7 +624,6 @@ pub(crate) struct MetalRenderer {
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
-    group_alpha_horizontal_blur_pipeline_state: metal::RenderPipelineState,
     group_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
@@ -408,14 +634,9 @@ pub(crate) struct MetalRenderer {
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-    #[allow(clippy::arc_with_non_send_sync)]
-    group_intermediate_texture_pool: Arc<Mutex<GroupIntermediateTexturePool>>,
-    group_intermediate_textures_in_flight: Vec<GroupIntermediateTexture>,
-    group_binding_placeholder_texture: metal::Texture,
     sprite_atlas: Arc<MetalAtlas>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
-    path_intermediate_texture_size: Option<Size<DevicePixels>>,
     path_sample_count: u32,
     /// Measured render-group resource counts from the most recent scene render.
     last_render_group_counters: Option<RenderGroupBackendCounters>,
@@ -429,13 +650,51 @@ pub struct PathRasterizationVertex {
     pub bounds: Bounds<ScaledPixels>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+pub struct RenderTargetFrame {
+    pub origin: PointF,
+    pub size: Size<DevicePixels>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+pub struct TextureFrame {
+    pub origin: PointF,
+    pub size: Size<DevicePixels>,
+}
+
+fn viewport_render_target_frame(viewport_size: Size<DevicePixels>) -> RenderTargetFrame {
+    RenderTargetFrame {
+        origin: point(0., 0.),
+        size: viewport_size,
+    }
+}
+
+fn viewport_texture_frame(viewport_size: Size<DevicePixels>) -> TextureFrame {
+    TextureFrame {
+        origin: point(0., 0.),
+        size: viewport_size,
+    }
+}
+
+fn set_render_target_frame_bytes(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    buffer_index: u64,
+    viewport_size: Size<DevicePixels>,
+) {
+    let target_frame = viewport_render_target_frame(viewport_size);
+    command_encoder.set_vertex_bytes(
+        buffer_index,
+        mem::size_of::<RenderTargetFrame>() as u64,
+        &target_frame as *const RenderTargetFrame as *const _,
+    );
+}
+
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
-        let device = Self::create_device();
-
         let layer = metal::MetalLayer::new();
-        layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
@@ -454,10 +713,16 @@ impl MetalRenderer {
             ];
         }
 
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        match Self::try_new_internal(Some(layer), !transparent, instance_buffer_pool) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                log::error!("failed to initialize Metal renderer: {error}");
+                std::process::exit(1);
+            }
+        }
     }
 
-    fn create_device() -> metal::Device {
+    fn create_device() -> MetalRendererInitResult<metal::Device> {
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
@@ -465,44 +730,35 @@ impl MetalRenderer {
             .into_iter()
             .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
         {
-            d
+            Ok(d)
         } else {
             // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689
             // In that case, we fall back to the system default device.
             log::error!(
                 "Unable to enumerate Metal devices; attempting to use system default device"
             );
-            metal::Device::system_default().unwrap_or_else(|| {
-                log::error!("unable to access a compatible graphics device");
-                std::process::exit(1);
-            })
+            metal::Device::system_default().ok_or(MetalRendererInitError::NoCompatibleDevice)
         }
     }
 
-    fn new_group_binding_placeholder_texture(device: &metal::Device) -> metal::Texture {
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(1);
-        texture_descriptor.set_height(1);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        texture_descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
-        device.new_texture(&texture_descriptor)
-    }
-
-    fn new_internal(
-        device: metal::Device,
+    fn try_new_internal(
         layer: Option<metal::MetalLayer>,
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-    ) -> Self {
+    ) -> MetalRendererInitResult<Self> {
+        let device = Self::create_device()?;
+        if let Some(layer) = layer.as_ref() {
+            layer.set_device(&device);
+        }
+
         #[cfg(feature = "runtime_shaders")]
         let library = device
             .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
-            .expect("error building metal library");
+            .map_err(|source| MetalRendererInitError::BuildLibrary { source })?;
         #[cfg(not(feature = "runtime_shaders"))]
         let library = device
             .new_library_with_data(SHADERS_METALLIB)
-            .expect("error building metal library");
+            .map_err(|source| MetalRendererInitError::BuildLibrary { source })?;
 
         fn to_float2_bits(point: PointF) -> u64 {
             let mut output = point.y.to_bits() as u64;
@@ -547,7 +803,7 @@ impl MetalRenderer {
             "path_rasterization_fragment",
             MTLPixelFormat::BGRA8Unorm,
             PATH_SAMPLE_COUNT,
-        );
+        )?;
         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
             &device,
             &library,
@@ -555,7 +811,7 @@ impl MetalRenderer {
             "path_sprite_vertex",
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let group_sprites_pipeline_state = build_path_sprite_pipeline_state(
             &device,
             &library,
@@ -563,15 +819,7 @@ impl MetalRenderer {
             "group_sprite_vertex",
             "group_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
-        let group_alpha_horizontal_blur_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &library,
-            "group_alpha_horizontal_blur",
-            "group_sprite_vertex",
-            "group_alpha_horizontal_blur_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let shadows_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -579,7 +827,7 @@ impl MetalRenderer {
             "shadow_vertex",
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let quads_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -587,7 +835,7 @@ impl MetalRenderer {
             "quad_vertex",
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let underlines_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -595,7 +843,7 @@ impl MetalRenderer {
             "underline_vertex",
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -603,7 +851,7 @@ impl MetalRenderer {
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -611,7 +859,7 @@ impl MetalRenderer {
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
         let bgra_surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -619,14 +867,17 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_bgra_fragment",
             MTLPixelFormat::BGRA8Unorm,
-        );
+        )?;
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
-        let group_binding_placeholder_texture =
-            Self::new_group_binding_placeholder_texture(&device);
 
-        Self {
+        let device_ptr = device.as_ptr() as *mut std::ffi::c_void;
+        let queue_ptr = command_queue.as_ptr() as *mut std::ffi::c_void;
+        ACTIVE_DEVICE.with(|cell| cell.set(device_ptr));
+        ACTIVE_QUEUE.with(|cell| cell.set(queue_ptr));
+
+        Ok(Self {
             device,
             layer,
             presents_with_transaction: false,
@@ -636,7 +887,6 @@ impl MetalRenderer {
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
-            group_alpha_horizontal_blur_pipeline_state,
             group_sprites_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
@@ -646,75 +896,16 @@ impl MetalRenderer {
             bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
-            group_intermediate_texture_pool: Arc::new(Mutex::new(
-                GroupIntermediateTexturePool::default(),
-            )),
-            group_intermediate_textures_in_flight: Vec::new(),
-            group_binding_placeholder_texture,
             sprite_atlas,
             last_render_group_counters: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
-            path_intermediate_texture_size: None,
             path_sample_count: PATH_SAMPLE_COUNT,
-        }
+        })
     }
 
     pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
         self.layer.as_ref().map(|l| l.as_ref())
-    }
-
-    fn add_completed_resource_release_handler(
-        &mut self,
-        command_buffer: &metal::CommandBufferRef,
-        instance_buffer: InstanceBuffer,
-        trace_ids: Option<(u64, u64, u64)>,
-    ) {
-        let instance_buffer_pool = self.instance_buffer_pool.clone();
-        let group_intermediate_texture_pool = self.group_intermediate_texture_pool.clone();
-        let group_intermediate_textures = Cell::new(Some(mem::take(
-            &mut self.group_intermediate_textures_in_flight,
-        )));
-        let instance_buffer = Cell::new(Some(instance_buffer));
-        let block = ConcreteBlock::new(move |_| {
-            if let Some(instance_buffer) = instance_buffer.take() {
-                instance_buffer_pool.lock().release(instance_buffer);
-            }
-            if let Some(group_intermediate_textures) = group_intermediate_textures.take() {
-                group_intermediate_texture_pool
-                    .lock()
-                    .release_many(group_intermediate_textures);
-            }
-            if let Some((metal_draw_id, draw_id, present_id)) = trace_ids {
-                nobie_platform_trace::trace(
-                    "metal_command_buffer_completed",
-                    format_args!(
-                        "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
-                        metal_draw_id,
-                        draw_id,
-                        present_id,
-                        ca_current_media_time()
-                    ),
-                );
-            }
-        });
-        let block = block.copy();
-        command_buffer.add_completed_handler(&block);
-    }
-
-    fn release_group_intermediate_textures_now(&mut self) {
-        let group_intermediate_textures =
-            mem::take(&mut self.group_intermediate_textures_in_flight);
-        if !group_intermediate_textures.is_empty() {
-            self.group_intermediate_texture_pool
-                .lock()
-                .release_many(group_intermediate_textures);
-        }
-    }
-
-    #[cfg(test)]
-    fn group_intermediate_texture_pool_stats(&self) -> GroupIntermediateTexturePoolStats {
-        self.group_intermediate_texture_pool.lock().stats()
     }
 
     pub fn layer_ptr(&self) -> *mut CAMetalLayer {
@@ -758,11 +949,6 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
-            self.path_intermediate_texture_size = None;
-            return;
-        }
-
-        if self.path_intermediate_texture_size == Some(size) {
             return;
         }
 
@@ -774,7 +960,6 @@ impl MetalRenderer {
         texture_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
-        self.path_intermediate_texture_size = Some(size);
 
         if self.path_sample_count > 1 {
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
@@ -896,11 +1081,31 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    self.add_completed_resource_release_handler(
-                        &command_buffer,
-                        instance_buffer,
-                        trace_enabled.then_some((metal_draw_id, draw_id, present_id)),
-                    );
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let completed_metal_draw_id = metal_draw_id;
+                    let completed_draw_id = draw_id;
+                    let completed_present_id = present_id;
+                    let completed_trace_enabled = trace_enabled;
+                    let block = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                        if completed_trace_enabled {
+                            nobie_platform_trace::trace(
+                                "metal_command_buffer_completed",
+                                format_args!(
+                                    "metal_draw_id={} draw_id={} present_id={} callback_ca_time={:.9}",
+                                    completed_metal_draw_id,
+                                    completed_draw_id,
+                                    completed_present_id,
+                                    ca_current_media_time()
+                                ),
+                            );
+                        }
+                    });
+                    let block = block.copy();
+                    command_buffer.add_completed_handler(&block);
 
                     if trace_enabled {
                         let presented_metal_draw_id = metal_draw_id;
@@ -1002,8 +1207,7 @@ impl MetalRenderer {
                     }
                     return;
                 }
-                Err(err) => {
-                    self.release_group_intermediate_textures_now();
+                Err(err @ MetalRenderError::InstanceBufferExceeded { .. }) => {
                     // Designed growth path, not a failure: the frame is
                     // re-encoded after the pool doubles, so report it at the
                     // same level as the matching "increased instance buffer
@@ -1032,6 +1236,19 @@ impl MetalRenderer {
                         "increased instance buffer size to {}",
                         instance_buffer_pool.buffer_size
                     );
+                }
+                Err(err) => {
+                    log::error!("failed to encode Metal draw: {err}");
+                    if trace_enabled {
+                        nobie_platform_trace::trace(
+                            "metal_draw_failed",
+                            format_args!(
+                                "metal_draw_id={} draw_id={} present_id={} error={:?}",
+                                metal_draw_id, draw_id, present_id, err
+                            ),
+                        );
+                    }
+                    return;
                 }
             }
         }
@@ -1069,11 +1286,15 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    self.add_completed_resource_release_handler(
-                        &command_buffer,
-                        instance_buffer,
-                        None,
-                    );
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let block = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                    });
+                    let block = block.copy();
+                    command_buffer.add_completed_handler(&block);
 
                     // Commit and wait for completion without presenting
                     command_buffer.commit();
@@ -1113,8 +1334,7 @@ impl MetalRenderer {
                         anyhow::anyhow!("Failed to create RgbaImage from pixel data")
                     });
                 }
-                Err(err) => {
-                    self.release_group_intermediate_textures_now();
+                Err(err @ MetalRenderError::InstanceBufferExceeded { .. }) => {
                     // Designed growth path, not a failure: the frame is
                     // re-encoded after the pool doubles, so report it at the
                     // same level as the matching "increased instance buffer
@@ -1134,6 +1354,7 @@ impl MetalRenderer {
                         instance_buffer_pool.buffer_size
                     );
                 }
+                Err(err) => return Err(err.into()),
             }
         }
     }
@@ -1199,11 +1420,15 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
-                    self.add_completed_resource_release_handler(
-                        &command_buffer,
-                        instance_buffer,
-                        None,
-                    );
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let block = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                    });
+                    let block = block.copy();
+                    command_buffer.add_completed_handler(&block);
 
                     // On discrete GPUs (non-unified memory), Managed textures
                     // require an explicit blit synchronize before the CPU can
@@ -1252,8 +1477,7 @@ impl MetalRenderer {
                         anyhow::anyhow!("Failed to create RgbaImage from pixel data")
                     });
                 }
-                Err(err) => {
-                    self.release_group_intermediate_textures_now();
+                Err(err @ MetalRenderError::InstanceBufferExceeded { .. }) => {
                     // Designed growth path, not a failure: the frame is
                     // re-encoded after the pool doubles, so report it at the
                     // same level as the matching "increased instance buffer
@@ -1273,6 +1497,7 @@ impl MetalRenderer {
                         instance_buffer_pool.buffer_size
                     );
                 }
+                Err(err) => return Err(err.into()),
             }
         }
     }
@@ -1283,11 +1508,10 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
-        let target_frame = RenderTargetFrame::root(viewport_size);
+    ) -> MetalRenderResult<metal::CommandBuffer> {
         if scene.requires_backdrop_effects() {
-            let Some(root_texture) = self.acquire_group_intermediate_texture(viewport_size) else {
-                anyhow::bail!("invalid viewport for backdrop render group: {viewport_size:?}");
+            let Some(root_texture) = self.new_group_intermediate_texture(viewport_size) else {
+                return Err(MetalRenderError::invalid_backdrop_viewport(viewport_size));
             };
             let command_queue = self.command_queue.clone();
             let command_buffer = command_queue.new_command_buffer();
@@ -1295,36 +1519,31 @@ impl MetalRenderer {
             let mut instance_offset = 0;
 
             self.last_render_group_counters = Some(RenderGroupBackendCounters::default());
-            let ok = self.encode_primitives_to_texture(
+            let encoded_root = self.encode_primitives_to_texture(
                 scene,
                 instance_buffer,
                 &mut instance_offset,
                 &root_texture,
-                target_frame,
+                viewport_size,
                 command_buffer,
                 Some(alpha),
-            ) && self.draw_texture_to_target(
-                &root_texture,
-                instance_buffer,
-                &mut instance_offset,
-                drawable.texture(),
-                target_frame,
-                command_buffer,
-                Some(alpha),
-            );
+            )?;
+            let encoded_target = if encoded_root.is_complete() {
+                self.draw_texture_to_target(
+                    &root_texture,
+                    instance_buffer,
+                    &mut instance_offset,
+                    drawable.texture(),
+                    viewport_size,
+                    command_buffer,
+                    Some(alpha),
+                )?
+            } else {
+                encoded_root
+            };
 
-            if !ok {
-                anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} groups",
-                    scene.paths.len(),
-                    scene.shadows.len(),
-                    scene.quads.len(),
-                    scene.underlines.len(),
-                    scene.monochrome_sprites.len(),
-                    scene.polychrome_sprites.len(),
-                    scene.surfaces.len(),
-                    scene.groups.len(),
-                );
+            if !encoded_target.is_complete() {
+                return Err(MetalRenderError::instance_buffer_exceeded(scene));
             }
 
             if !self.is_unified_memory {
@@ -1346,36 +1565,25 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
+    ) -> MetalRenderResult<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
-        let target_frame = RenderTargetFrame::root(viewport_size);
 
         self.last_render_group_counters = Some(RenderGroupBackendCounters::default());
-        let ok = self.encode_primitives_to_texture(
+        let encoded = self.encode_primitives_to_texture(
             scene,
             instance_buffer,
             &mut instance_offset,
             texture,
-            target_frame,
+            viewport_size,
             command_buffer,
             Some(alpha),
-        );
+        )?;
 
-        if !ok {
-            anyhow::bail!(
-                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces, {} groups",
-                scene.paths.len(),
-                scene.shadows.len(),
-                scene.quads.len(),
-                scene.underlines.len(),
-                scene.monochrome_sprites.len(),
-                scene.polychrome_sprites.len(),
-                scene.surfaces.len(),
-                scene.groups.len(),
-            );
+        if !encoded.is_complete() {
+            return Err(MetalRenderError::instance_buffer_exceeded(scene));
         }
 
         if !self.is_unified_memory {
@@ -1395,14 +1603,15 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         texture: &metal::TextureRef,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
         clear_alpha: Option<f64>,
-    ) -> bool {
+    ) -> MetalRenderResult<PrimitiveEncodeStatus> {
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
-            target_frame,
+            viewport_size,
+            "scene target",
             |color_attachment| {
                 if let Some(alpha) = clear_alpha {
                     color_attachment.set_load_action(metal::MTLLoadAction::Clear);
@@ -1411,123 +1620,144 @@ impl MetalRenderer {
                     color_attachment.set_load_action(metal::MTLLoadAction::Load);
                 }
             },
-        );
+        )?;
 
         for batch in scene.batches() {
-            let ok = match batch {
-                PrimitiveBatch::Shadows(range) => self.draw_shadows(
-                    &scene.shadows[range],
-                    instance_buffer,
-                    instance_offset,
-                    target_frame,
-                    command_encoder,
-                ),
-                PrimitiveBatch::Quads(range) => self.draw_quads(
-                    &scene.quads[range],
-                    instance_buffer,
-                    instance_offset,
-                    target_frame,
-                    command_encoder,
-                ),
+            let encoded = match batch {
+                PrimitiveBatch::Shadows(range) => {
+                    PrimitiveEncodeStatus::from_instance_capacity(self.draw_shadows(
+                        &scene.shadows[range],
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ))
+                }
+                PrimitiveBatch::Quads(range) => {
+                    PrimitiveEncodeStatus::from_instance_capacity(self.draw_quads(
+                        &scene.quads[range],
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ))
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
-                    self.update_path_intermediate_textures(target_frame.size);
 
-                    let did_draw = self.draw_paths_to_intermediate(
+                    let rasterized = self.draw_paths_to_intermediate(
                         paths,
                         instance_buffer,
                         instance_offset,
-                        target_frame,
+                        viewport_size,
                         command_buffer,
-                    );
+                    )?;
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         texture,
-                        target_frame,
+                        viewport_size,
+                        "scene target after paths",
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
-                    );
+                    )?;
 
-                    if did_draw {
-                        self.draw_paths_from_intermediate(
-                            paths,
-                            instance_buffer,
-                            instance_offset,
-                            target_frame,
-                            command_encoder,
+                    if rasterized.is_complete() {
+                        PrimitiveEncodeStatus::from_instance_capacity(
+                            self.draw_paths_from_intermediate(
+                                paths,
+                                instance_buffer,
+                                instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            ),
                         )
                     } else {
-                        false
+                        rasterized
                     }
                 }
-                PrimitiveBatch::Underlines(range) => self.draw_underlines(
-                    &scene.underlines[range],
-                    instance_buffer,
-                    instance_offset,
-                    target_frame,
-                    command_encoder,
-                ),
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
+                PrimitiveBatch::Underlines(range) => {
+                    PrimitiveEncodeStatus::from_instance_capacity(self.draw_underlines(
+                        &scene.underlines[range],
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ))
+                }
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                    PrimitiveEncodeStatus::from_instance_capacity(self.draw_monochrome_sprites(
                         texture_id,
                         &scene.monochrome_sprites[range],
                         instance_buffer,
                         instance_offset,
-                        target_frame,
+                        viewport_size,
                         command_encoder,
-                    ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
+                    ))
+                }
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                    PrimitiveEncodeStatus::from_instance_capacity(self.draw_polychrome_sprites(
                         texture_id,
                         &scene.polychrome_sprites[range],
                         instance_buffer,
                         instance_offset,
-                        target_frame,
+                        viewport_size,
                         command_encoder,
-                    ),
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
-                    &scene.surfaces[range],
-                    instance_buffer,
-                    instance_offset,
-                    target_frame,
-                    command_encoder,
-                ),
+                    ))
+                }
+                PrimitiveBatch::Surfaces(range) => {
+                    PrimitiveEncodeStatus::from_instance_capacity(self.draw_surfaces(
+                        &scene.surfaces[range],
+                        instance_buffer,
+                        instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ))
+                }
                 PrimitiveBatch::Groups(range) => {
                     command_encoder.end_encoding();
-                    let did_draw = self.draw_groups(
+                    let encoded_groups = self.draw_groups(
                         &scene.groups[range],
                         instance_buffer,
                         instance_offset,
                         texture,
-                        target_frame,
+                        viewport_size,
                         command_buffer,
-                    );
+                    )?;
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         texture,
-                        target_frame,
+                        viewport_size,
+                        "scene target after groups",
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
-                    );
+                    )?;
 
-                    did_draw
+                    encoded_groups
                 }
-                PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
-                unknown => panic!("unsupported GPUI primitive batch: {unknown:?}"),
+                PrimitiveBatch::SubpixelSprites { .. } => {
+                    return Err(MetalRenderError::UnsupportedPrimitiveBatch {
+                        batch: "SubpixelSprites".to_string(),
+                    });
+                }
+                unknown => {
+                    return Err(MetalRenderError::UnsupportedPrimitiveBatch {
+                        batch: format!("{unknown:?}"),
+                    });
+                }
             };
-            if !ok {
+            if !encoded.is_complete() {
                 command_encoder.end_encoding();
-                return false;
+                return Ok(encoded);
             }
         }
 
         command_encoder.end_encoding();
-        true
+        Ok(PrimitiveEncodeStatus::Complete)
     }
 
     fn draw_texture_to_target(
@@ -1536,14 +1766,15 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         target_texture: &metal::TextureRef,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
         clear_alpha: Option<f64>,
-    ) -> bool {
+    ) -> MetalRenderResult<PrimitiveEncodeStatus> {
         let command_encoder = new_command_encoder_for_texture(
             command_buffer,
             target_texture,
-            target_frame,
+            viewport_size,
+            "copy texture to target",
             |color_attachment| {
                 if let Some(alpha) = clear_alpha {
                     color_attachment.set_load_action(metal::MTLLoadAction::Clear);
@@ -1552,17 +1783,17 @@ impl MetalRenderer {
                     color_attachment.set_load_action(metal::MTLLoadAction::Load);
                 }
             },
-        );
+        )?;
         command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
             0,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
         command_encoder
             .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(source_texture));
@@ -1571,8 +1802,8 @@ impl MetalRenderer {
             bounds: Bounds::new(
                 point(ScaledPixels(0.), ScaledPixels(0.)),
                 size(
-                    ScaledPixels(target_frame.size.width.0 as f32),
-                    ScaledPixels(target_frame.size.height.0 as f32),
+                    ScaledPixels(viewport_size.width.0 as f32),
+                    ScaledPixels(viewport_size.height.0 as f32),
                 ),
             ),
         };
@@ -1581,15 +1812,10 @@ impl MetalRenderer {
         let next_offset = *instance_offset + sprite_bytes_len;
         if next_offset > instance_buffer.size {
             command_encoder.end_encoding();
-            return false;
+            return Ok(PrimitiveEncodeStatus::InstanceBufferExceeded);
         }
 
         command_encoder.set_vertex_buffer(
-            SpriteInputIndex::Sprites as u64,
-            Some(&instance_buffer.metal_buffer),
-            *instance_offset as u64,
-        );
-        command_encoder.set_fragment_buffer(
             SpriteInputIndex::Sprites as u64,
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
@@ -1608,14 +1834,13 @@ impl MetalRenderer {
         command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
         command_encoder.end_encoding();
         *instance_offset = next_offset;
-        true
+        Ok(PrimitiveEncodeStatus::Complete)
     }
 
     /// Measured render-group resource counts from the most recent scene render
     /// (group intermediate textures + backdrop copies), or `None` if no scene has
     /// rendered. Validated against the planner's `RenderGroupSupportCounters` in
     /// the metal render-group tests.
-    #[cfg(test)]
     pub fn render_group_backend_counters(&self) -> Option<RenderGroupBackendCounters> {
         self.last_render_group_counters
     }
@@ -1626,164 +1851,71 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         target_texture: &metal::TextureRef,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
-    ) -> bool {
-        let _render_groups_span =
-            tracing::trace_span!("gpui_macos::render_groups", groups = groups.len()).entered();
-
+    ) -> MetalRenderResult<PrimitiveEncodeStatus> {
         for group in groups {
             let effect_plan = group.plan().normalized_effects().clone();
             if effect_plan.opacity() <= 0. {
                 continue;
             }
 
-            let Some(source_frame) = RenderTargetFrame::from_bounds(group.capture_bounds()) else {
-                return false;
-            };
-            let source_texture_frame = TextureFrame::from(source_frame);
-            let support_counters = group.plan().support_counters(
-                group.bounds(),
-                group.capture_bounds(),
-                group.content_mask(),
-            );
-            let _render_group_span = tracing::trace_span!(
-                "gpui_macos::render_group",
-                physical_plan = ?group.plan().physical_plan().kind,
-                capture_width = source_frame.size.width.0,
-                capture_height = source_frame.size.height.0,
-                capture_pixels = support_counters.source_capture_pixels,
-                surface_shadow_draw_pixels = support_counters.surface_shadow_draw_pixels,
-                physical_passes = support_counters.physical_passes,
-                intermediate_textures = support_counters.intermediate_textures,
-                backdrop_copies = support_counters.backdrop_copies,
-                shadow_source_content_alpha = support_counters.shadow_sources.content_alpha,
-                shadow_source_surface_geometry = support_counters.shadow_sources.surface_geometry,
-                shadow_mode_separable = support_counters.shadow_modes.separable,
-                shadow_mode_exact = support_counters.shadow_modes.exact,
-                shadow_mode_downsampled = support_counters.shadow_modes.downsampled,
-                content_alpha_max_kernel_radius =
-                    support_counters.content_alpha_shadow_max_kernel_radius,
-                content_alpha_sample_estimate =
-                    support_counters.content_alpha_shadow_sample_count_estimate,
-            )
-            .entered();
-
-            if group.plan().physical_plan().kind
-                == RenderGroupPhysicalPlanKind::DirectSurfaceEffects
-            {
-                if let Some(counters) = self.last_render_group_counters.as_mut() {
-                    counters.add_support_counters(support_counters);
-                }
-
-                if !self.draw_direct_surface_effect_group(
-                    group,
-                    effect_plan,
-                    instance_buffer,
-                    instance_offset,
-                    target_texture,
-                    target_frame,
-                    command_buffer,
-                ) {
-                    return false;
-                }
-                continue;
-            }
-
-            let group_texture = {
-                let _span = tracing::trace_span!("gpui_macos::render_group_acquire_source_texture")
-                    .entered();
-                let Some(group_texture) =
-                    self.acquire_group_intermediate_texture(source_frame.size)
-                else {
-                    return false;
-                };
-                group_texture
+            let Some(group_texture) = self.new_group_intermediate_texture(viewport_size) else {
+                return Err(MetalRenderError::invalid_backdrop_viewport(viewport_size));
             };
             if let Some(counters) = self.last_render_group_counters.as_mut() {
                 counters.intermediate_textures += 1;
             }
 
-            {
-                let _span =
-                    tracing::trace_span!("gpui_macos::render_group_capture_source").entered();
-                if !self.encode_primitives_to_texture(
-                    group.scene(),
-                    instance_buffer,
-                    instance_offset,
-                    &group_texture,
-                    source_frame,
-                    command_buffer,
-                    Some(0.),
-                ) {
-                    return false;
-                }
+            let encoded_group = self.encode_primitives_to_texture(
+                group.scene(),
+                instance_buffer,
+                instance_offset,
+                &group_texture,
+                viewport_size,
+                command_buffer,
+                Some(0.),
+            )?;
+            if !encoded_group.is_complete() {
+                return Ok(encoded_group);
             }
 
             let backdrop_texture;
-            let backdrop_texture_frame;
             let backdrop_texture_ref = if effect_plan.reads_backdrop() {
-                let Some(frame) = TextureFrame::rounded_out_for_bounds_in_target(
-                    group
-                        .capture_bounds()
-                        .dilate(group.plan().requirements().backdrop_outset),
-                    target_frame,
-                ) else {
-                    return false;
-                };
-                let texture = {
-                    let _span = tracing::trace_span!(
-                        "gpui_macos::render_group_copy_backdrop",
-                        width = frame.size.width.0,
-                        height = frame.size.height.0,
-                    )
-                    .entered();
-                    let Some(texture) = self.copy_backdrop_texture(
-                        target_texture,
-                        target_frame,
-                        frame,
-                        command_buffer,
-                    ) else {
-                        return false;
-                    };
-                    texture
+                let Some(texture) =
+                    self.copy_backdrop_texture(target_texture, viewport_size, command_buffer)
+                else {
+                    return Err(MetalRenderError::invalid_backdrop_viewport(viewport_size));
                 };
                 backdrop_texture = texture;
-                backdrop_texture_frame = frame;
                 if let Some(counters) = self.last_render_group_counters.as_mut() {
                     counters.intermediate_textures += 1;
                     counters.backdrop_copies += 1;
                 }
                 &backdrop_texture
             } else {
-                backdrop_texture_frame = source_texture_frame;
                 &group_texture
             };
 
-            // Arbitrary-path source mask pre-pass: rasterize the group's path
-            // into a coverage mask using the same bounded source frame as the
-            // captured group source. For groups without a path mask, bind
-            // `&group_texture` (a real allocated texture); the source-mask mode
-            // flag gates the sample so the bound-but-unread texture is
-            // harmless. The mask is a path-rasterization intermediate, which
-            // the planner excludes from per-group counts, so it is NOT counted
-            // here.
+            // Arbitrary-path source mask pre-pass: rasterize the group's path into
+            // a coverage mask in the same screen/device space as all group
+            // geometry, parallel to the backdrop copy. For groups without a path
+            // mask, bind `&group_texture` (a real allocated texture); the
+            // `source_mask_mode` flag gates the sample so the bound-but-unread
+            // texture is harmless. The mask is a path-rasterization intermediate,
+            // which the planner excludes from per-group counts, so it is NOT
+            // counted here.
             let source_mask_texture;
             let source_mask_texture_ref = if let Some(path) = effect_plan.source_mask_path() {
-                let texture = {
-                    let _span =
-                        tracing::trace_span!("gpui_macos::render_group_rasterize_source_mask")
-                            .entered();
-                    let Some(texture) = self.rasterize_source_mask_path(
-                        path,
-                        instance_buffer,
-                        instance_offset,
-                        source_frame,
-                        command_buffer,
-                    ) else {
-                        return false;
-                    };
-                    texture
+                let Some(texture) = self.rasterize_source_mask_path(
+                    path,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_buffer,
+                )?
+                else {
+                    return Ok(PrimitiveEncodeStatus::InstanceBufferExceeded);
                 };
                 source_mask_texture = texture;
                 &source_mask_texture
@@ -1791,168 +1923,52 @@ impl MetalRenderer {
                 &group_texture
             };
 
-            if let Some(counters) = self.last_render_group_counters.as_mut() {
-                counters.add_support_counters(support_counters);
-            }
-
-            let mut separable_shadow_textures = HashMap::new();
-            for shadow in effect_plan.drop_shadows() {
-                if shadow.shadow.mode != RenderGroupShadowMode::Separable
-                    || shadow.shadow.blur_radius.0 <= f32::EPSILON
-                {
-                    continue;
-                }
-
-                let key = shadow.shadow.blur_radius.0.to_bits();
-                if separable_shadow_textures.contains_key(&key) {
-                    continue;
-                }
-
-                let Some(texture) = self.acquire_group_intermediate_texture(source_frame.size)
-                else {
-                    return false;
-                };
-                if let Some(counters) = self.last_render_group_counters.as_mut() {
-                    counters.intermediate_textures += 1;
-                }
-
-                {
-                    let _span = tracing::trace_span!(
-                        "gpui_macos::render_group_content_alpha_horizontal_blur",
-                        blur_radius = shadow.shadow.blur_radius.0,
-                        kernel_radius =
-                            ((shadow.shadow.blur_radius.0 * 3.).ceil().max(0.) as u64).min(24),
-                    )
-                    .entered();
-                    if !self.draw_group_alpha_horizontal_blur_to_texture(
-                        group,
-                        &effect_plan,
-                        shadow.shadow.blur_radius,
-                        &group_texture,
-                        source_mask_texture_ref,
-                        &texture,
-                        instance_buffer,
-                        instance_offset,
-                        source_frame,
-                        source_texture_frame,
-                        command_buffer,
-                    ) {
-                        return false;
-                    }
-                }
-
-                separable_shadow_textures.insert(key, texture);
-            }
-
             let command_encoder = new_command_encoder_for_texture(
                 command_buffer,
                 target_texture,
-                target_frame,
+                viewport_size,
+                "composite render group",
                 |color_attachment| {
                     color_attachment.set_load_action(metal::MTLLoadAction::Load);
                 },
+            )?;
+            let ok = self.draw_group_from_texture(
+                group,
+                effect_plan,
+                &group_texture,
+                backdrop_texture_ref,
+                source_mask_texture_ref,
+                instance_buffer,
+                instance_offset,
+                viewport_size,
+                command_encoder,
             );
-            let ok = {
-                let _span = tracing::trace_span!(
-                    "gpui_macos::render_group_composite",
-                    separable_shadow_profiles = separable_shadow_textures.len(),
-                )
-                .entered();
-                self.draw_group_from_texture(
-                    group,
-                    effect_plan,
-                    &group_texture,
-                    backdrop_texture_ref,
-                    source_mask_texture_ref,
-                    instance_buffer,
-                    instance_offset,
-                    target_frame,
-                    source_texture_frame,
-                    backdrop_texture_frame,
-                    &separable_shadow_textures,
-                    command_encoder,
-                )
-            };
             command_encoder.end_encoding();
 
             if !ok {
-                return false;
+                return Ok(PrimitiveEncodeStatus::InstanceBufferExceeded);
             }
         }
 
-        true
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_direct_surface_effect_group(
-        &mut self,
-        group: &PaintGroup,
-        effect_plan: CompositeEffectPlan,
-        instance_buffer: &mut InstanceBuffer,
-        instance_offset: &mut usize,
-        target_texture: &metal::TextureRef,
-        target_frame: RenderTargetFrame,
-        command_buffer: &metal::CommandBufferRef,
-    ) -> bool {
-        let command_encoder = new_command_encoder_for_texture(
-            command_buffer,
-            target_texture,
-            target_frame,
-            |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Load);
-            },
-        );
-        let placeholder_texture = self.group_binding_placeholder_texture.as_ref();
-        let texture_frame = TextureFrame::from(target_frame);
-        let ok = self.draw_group_surface_shadows(
-            group,
-            &effect_plan,
-            placeholder_texture,
-            placeholder_texture,
-            placeholder_texture,
-            instance_buffer,
-            instance_offset,
-            target_frame,
-            texture_frame,
-            texture_frame,
-            command_encoder,
-        );
-        command_encoder.end_encoding();
-
-        ok && self.encode_primitives_to_texture(
-            group.scene(),
-            instance_buffer,
-            instance_offset,
-            target_texture,
-            target_frame,
-            command_buffer,
-            None,
-        )
+        Ok(PrimitiveEncodeStatus::Complete)
     }
 
     fn copy_backdrop_texture(
-        &mut self,
+        &self,
         target_texture: &metal::TextureRef,
-        target_frame: RenderTargetFrame,
-        backdrop_frame: TextureFrame,
+        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
     ) -> Option<metal::Texture> {
-        let texture = self.acquire_group_intermediate_texture(backdrop_frame.size)?;
-        let source_x = (backdrop_frame.origin.x.0 - target_frame.origin.x.0) as u64;
-        let source_y = (backdrop_frame.origin.y.0 - target_frame.origin.y.0) as u64;
+        let texture = self.new_group_intermediate_texture(viewport_size)?;
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target_texture,
             0,
             0,
-            metal::MTLOrigin {
-                x: source_x,
-                y: source_y,
-                z: 0,
-            },
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
             metal::MTLSize {
-                width: backdrop_frame.size.width.0 as u64,
-                height: backdrop_frame.size.height.0 as u64,
+                width: viewport_size.width.0 as u64,
+                height: viewport_size.height.0 as u64,
                 depth: 1,
             },
             &texture,
@@ -1964,196 +1980,22 @@ impl MetalRenderer {
         Some(texture)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_group_alpha_horizontal_blur_to_texture(
+    fn new_group_intermediate_texture(
         &self,
-        group: &PaintGroup,
-        effect_plan: &CompositeEffectPlan,
-        blur_radius: ScaledPixels,
-        group_texture: &metal::TextureRef,
-        source_mask_texture: &metal::TextureRef,
-        output_texture: &metal::TextureRef,
-        instance_buffer: &mut InstanceBuffer,
-        instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
-        source_texture_frame: TextureFrame,
-        command_buffer: &metal::CommandBufferRef,
-    ) -> bool {
-        let source_mask_mode: u32 = if effect_plan.source_mask_path().is_some() {
-            1
-        } else {
-            0
-        };
-        let (source_mask_enabled, source_mask_corner_radii) = match effect_plan.source_mask() {
-            Some(corner_radii) => (1., corner_radii),
-            None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
-            None => (0., Corners::all(ScaledPixels(0.))),
-        };
-        let material_shape = Self::group_material_shape(effect_plan, group.bounds());
-        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
-        let group_shape_params = [smk as f32, sme, 0., 0.];
-        let db = effect_plan.source_directional_blur();
-        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
-
-        let sprite = GroupSprite {
-            bounds: group.capture_bounds(),
-            opacity: 1.,
-            effect_kind: 0,
-            source_blur_radius: 0.,
-            source_mask_enabled,
-            shadow_offset: [0., 0.],
-            shadow_blur_radius: blur_radius.0,
-            backdrop_blur_radius: 0.,
-            source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
-            derived_luma_threshold: 0.,
-            source_mask_mode,
-            _pad1: 0,
-            shadow_color: [0., 0., 0., 0.],
-            source_mask_bounds: group.bounds(),
-            source_mask_corner_radii,
-            material_shape_count: material_shape.count,
-            _pad2: [0; 3],
-            material_shape_bounds: material_shape.bounds,
-            material_shape_corner_radii: material_shape.corner_radii,
-            material_shape_params: material_shape.shape_params(),
-            group_shape_params,
-            source_directional_blur,
-            color_matrix: [[0., 0., 0., 0.]; 4],
-            color_offset: [0., 0., 0., 0.],
-            backdrop_active: 0.,
-            blend_mode: 0,
-            source_tone_op: 0,
-            source_tone_param: 0.,
-            backdrop_tint: [0., 0., 0., 0.],
-            backdrop_color_matrix: [[0., 0., 0., 0.]; 4],
-            backdrop_color_offset: [0., 0., 0., 0.],
-            backdrop_lens: [0., 0., 0., 0.],
-            backdrop_lens_lighting: [0., 0., 0., 0.],
-            source_texture_frame,
-            backdrop_texture_frame: source_texture_frame,
-        };
-
-        let command_encoder = new_command_encoder_for_texture(
-            command_buffer,
-            output_texture,
-            target_frame,
-            |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
-            },
-        );
-        let ok = self.encode_group_sprites(
-            &self.group_alpha_horizontal_blur_pipeline_state,
-            std::slice::from_ref(&sprite),
-            group_texture,
-            group_texture,
-            source_mask_texture,
-            instance_buffer,
-            instance_offset,
-            target_frame,
-            command_encoder,
-        );
-        command_encoder.end_encoding();
-        ok
-    }
-
-    fn acquire_group_intermediate_texture(
-        &mut self,
         viewport_size: Size<DevicePixels>,
     ) -> Option<metal::Texture> {
-        let key = GroupIntermediateTextureKey::viewport_bgra_render_target(viewport_size)?;
-        let texture = self
-            .group_intermediate_texture_pool
-            .lock()
-            .acquire(&self.device, key);
-        self.group_intermediate_textures_in_flight
-            .push(GroupIntermediateTexture {
-                key,
-                texture: texture.clone(),
-            });
-        Some(texture)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_group_surface_shadows(
-        &self,
-        group: &PaintGroup,
-        effect_plan: &CompositeEffectPlan,
-        group_texture: &metal::TextureRef,
-        backdrop_texture: &metal::TextureRef,
-        source_mask_texture: &metal::TextureRef,
-        instance_buffer: &mut InstanceBuffer,
-        instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
-        source_texture_frame: TextureFrame,
-        backdrop_texture_frame: TextureFrame,
-        command_encoder: &metal::RenderCommandEncoderRef,
-    ) -> bool {
-        let (smk, sme) = effect_plan.source_mask_shape().shader_params();
-        let group_shape_params = [smk as f32, sme, 0., 0.];
-        let db = effect_plan.source_directional_blur();
-        let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
-        let mut sprites = Vec::with_capacity(effect_plan.surface_shadows().len());
-
-        for shadow in effect_plan.surface_shadows() {
-            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
-                return false;
-            }
-            let Some(draw_bounds) = shadow.draw_bounds(group.bounds(), group.content_mask()) else {
-                continue;
-            };
-            let color = shadow.shadow.color.to_rgb();
-            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
-            sprites.push(GroupSprite {
-                bounds: draw_bounds,
-                opacity: effect_plan.opacity(),
-                effect_kind: 2,
-                source_blur_radius: 0.,
-                source_mask_enabled: 0.,
-                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
-                shadow_blur_radius: shadow.shadow.blur_radius.0,
-                backdrop_blur_radius: 0.,
-                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
-                derived_luma_threshold: 0.,
-                source_mask_mode: 0,
-                _pad1: 0,
-                shadow_color: [color.r, color.g, color.b, color.a],
-                source_mask_bounds: group.bounds(),
-                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_count: shadow_shape.count,
-                _pad2: [0; 3],
-                material_shape_bounds: shadow_shape.bounds,
-                material_shape_corner_radii: shadow_shape.corner_radii,
-                material_shape_params: shadow_shape.shape_params(),
-                group_shape_params,
-                source_directional_blur,
-                color_matrix: [[0., 0., 0., 0.]; 4],
-                color_offset: [0., 0., 0., 0.],
-                backdrop_active: 0.,
-                blend_mode: 0,
-                source_tone_op: 0,
-                source_tone_param: 0.,
-                backdrop_tint: [0., 0., 0., 0.],
-                backdrop_color_matrix: [[0., 0., 0., 0.]; 4],
-                backdrop_color_offset: [0., 0., 0., 0.],
-                backdrop_lens: [0., 0., 0., 0.],
-                backdrop_lens_lighting: [0., 0., 0., 0.],
-                source_texture_frame,
-                backdrop_texture_frame,
-            });
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            return None;
         }
 
-        self.encode_group_sprites(
-            &self.group_sprites_pipeline_state,
-            &sprites,
-            group_texture,
-            backdrop_texture,
-            source_mask_texture,
-            instance_buffer,
-            instance_offset,
-            target_frame,
-            command_encoder,
-        )
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(viewport_size.width.0 as u64);
+        texture_descriptor.set_height(viewport_size.height.0 as u64);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        Some(self.device.new_texture(&texture_descriptor))
     }
 
     fn draw_group_from_texture(
@@ -2165,12 +2007,32 @@ impl MetalRenderer {
         source_mask_texture: &metal::TextureRef,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
-        source_texture_frame: TextureFrame,
-        backdrop_texture_frame: TextureFrame,
-        separable_shadow_textures: &HashMap<u32, metal::Texture>,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
+        command_encoder.set_render_pipeline_state(&self.group_sprites_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            SpriteInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        set_render_target_frame_bytes(
+            command_encoder,
+            SpriteInputIndex::ViewportSize as u64,
+            viewport_size,
+        );
+
+        command_encoder
+            .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(group_texture));
+        command_encoder.set_fragment_texture(
+            SpriteInputIndex::BackdropTexture as u64,
+            Some(backdrop_texture),
+        );
+        command_encoder.set_fragment_texture(
+            SpriteInputIndex::SourceMaskTexture as u64,
+            Some(source_mask_texture),
+        );
+
         let (color_matrix, color_offset) = Self::group_source_color_filter(&effect_plan);
         let (source_tone_op, source_tone_param) = effect_plan
             .source_color_filter()
@@ -2180,6 +2042,12 @@ impl MetalRenderer {
             Self::group_backdrop_color_filter(&effect_plan);
         let backdrop_tint = effect_plan.backdrop_tint().to_rgb();
         let (backdrop_lens, backdrop_lens_lighting) = Self::group_backdrop_lens(&effect_plan);
+        let mut sprites = Vec::with_capacity(
+            effect_plan.drop_shadows().len()
+                + effect_plan.surface_shadows().len()
+                + effect_plan.processed_content_glows().len()
+                + 1,
+        );
         // A path source mask supersedes the analytic SDF: enable masking and
         // select sampled mode so the shader reads the rasterized coverage texture.
         let source_mask_mode: u32 = if effect_plan.source_mask_path().is_some() {
@@ -2197,27 +2065,17 @@ impl MetalRenderer {
         let group_shape_params = [smk as f32, sme, 0., 0.];
         let db = effect_plan.source_directional_blur();
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
+        let source_texture_frame = viewport_texture_frame(viewport_size);
+        let backdrop_texture_frame = viewport_texture_frame(viewport_size);
 
         for shadow in effect_plan.drop_shadows() {
-            let (effect_kind, source_texture) = match shadow.shadow.mode {
-                RenderGroupShadowMode::Separable if shadow.shadow.blur_radius.0 > f32::EPSILON => {
-                    let Some(texture) =
-                        separable_shadow_textures.get(&shadow.shadow.blur_radius.0.to_bits())
-                    else {
-                        return false;
-                    };
-                    (4, texture.as_ref())
-                }
-                RenderGroupShadowMode::Separable | RenderGroupShadowMode::Exact => {
-                    (1, group_texture)
-                }
-                RenderGroupShadowMode::Downsampled | _ => return false,
-            };
             let color = shadow.shadow.color.to_rgb();
-            let sprite = GroupSprite {
+            sprites.push(GroupSprite {
                 bounds: group.capture_bounds(),
+                source_texture_frame,
+                backdrop_texture_frame,
                 opacity: effect_plan.opacity(),
-                effect_kind,
+                effect_kind: 1,
                 source_blur_radius: 0.,
                 source_mask_enabled,
                 shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
@@ -2248,46 +2106,59 @@ impl MetalRenderer {
                 backdrop_color_offset,
                 backdrop_lens: [0., 0., 0., 0.],
                 backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
+        }
+
+        for shadow in effect_plan.surface_shadows() {
+            let color = shadow.shadow.color.to_rgb();
+            // The surface-shadow SDF reads the material slot; drive it from the
+            // shadow's own declared silhouette rather than captured content.
+            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
+            sprites.push(GroupSprite {
+                bounds: group.capture_bounds(),
                 source_texture_frame,
                 backdrop_texture_frame,
-            };
-            if !self.encode_group_sprites(
-                &self.group_sprites_pipeline_state,
-                std::slice::from_ref(&sprite),
-                source_texture,
-                backdrop_texture,
-                source_mask_texture,
-                instance_buffer,
-                instance_offset,
-                target_frame,
-                command_encoder,
-            ) {
-                return false;
-            }
+                opacity: effect_plan.opacity(),
+                effect_kind: 2,
+                source_blur_radius: 0.,
+                source_mask_enabled: 0.,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
+                backdrop_blur_radius: 0.,
+                source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
+                derived_luma_threshold: 0.,
+                source_mask_mode: 0,
+                _pad1: 0,
+                shadow_color: [color.r, color.g, color.b, color.a],
+                source_mask_bounds: group.bounds(),
+                source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
+                material_shape_count: shadow_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: shadow_shape.bounds,
+                material_shape_corner_radii: shadow_shape.corner_radii,
+                material_shape_params: shadow_shape.shape_params(),
+                group_shape_params,
+                source_directional_blur,
+                color_matrix,
+                color_offset,
+                backdrop_active: 0.,
+                blend_mode: 0,
+                source_tone_op: 0,
+                source_tone_param: 0.,
+                backdrop_tint: [0., 0., 0., 0.],
+                backdrop_color_matrix,
+                backdrop_color_offset,
+                backdrop_lens: [0., 0., 0., 0.],
+                backdrop_lens_lighting: [0., 0., 0., 0.],
+            });
         }
-
-        if !self.draw_group_surface_shadows(
-            group,
-            &effect_plan,
-            group_texture,
-            backdrop_texture,
-            source_mask_texture,
-            instance_buffer,
-            instance_offset,
-            target_frame,
-            source_texture_frame,
-            backdrop_texture_frame,
-            command_encoder,
-        ) {
-            return false;
-        }
-
-        let mut sprites = Vec::with_capacity(effect_plan.processed_content_glows().len() + 1);
 
         for glow in effect_plan.processed_content_glows() {
             let color = glow.color.to_rgb();
             sprites.push(GroupSprite {
                 bounds: group.capture_bounds(),
+                source_texture_frame,
+                backdrop_texture_frame,
                 opacity: effect_plan.opacity(),
                 effect_kind: 3,
                 source_blur_radius: effect_plan.source_blur_radius().0,
@@ -2320,13 +2191,13 @@ impl MetalRenderer {
                 backdrop_color_offset,
                 backdrop_lens: [0., 0., 0., 0.],
                 backdrop_lens_lighting: [0., 0., 0., 0.],
-                source_texture_frame,
-                backdrop_texture_frame,
             });
         }
 
         sprites.push(GroupSprite {
             bounds: group.capture_bounds(),
+            source_texture_frame,
+            backdrop_texture_frame,
             opacity: effect_plan.opacity(),
             effect_kind: 0,
             source_blur_radius: effect_plan.source_blur_radius().0,
@@ -2368,76 +2239,16 @@ impl MetalRenderer {
             backdrop_color_offset,
             backdrop_lens,
             backdrop_lens_lighting,
-            source_texture_frame,
-            backdrop_texture_frame,
         });
 
-        self.encode_group_sprites(
-            &self.group_sprites_pipeline_state,
-            &sprites,
-            group_texture,
-            backdrop_texture,
-            source_mask_texture,
-            instance_buffer,
-            instance_offset,
-            target_frame,
-            command_encoder,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn encode_group_sprites(
-        &self,
-        pipeline_state: &metal::RenderPipelineState,
-        sprites: &[GroupSprite],
-        group_texture: &metal::TextureRef,
-        backdrop_texture: &metal::TextureRef,
-        source_mask_texture: &metal::TextureRef,
-        instance_buffer: &mut InstanceBuffer,
-        instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
-        command_encoder: &metal::RenderCommandEncoderRef,
-    ) -> bool {
-        if sprites.is_empty() {
-            return true;
-        }
-
-        command_encoder.set_render_pipeline_state(pipeline_state);
-        command_encoder.set_vertex_buffer(
-            SpriteInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
-            0,
-        );
-        command_encoder.set_vertex_bytes(
-            SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
-        );
-
-        command_encoder
-            .set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(group_texture));
-        command_encoder.set_fragment_texture(
-            SpriteInputIndex::BackdropTexture as u64,
-            Some(backdrop_texture),
-        );
-        command_encoder.set_fragment_texture(
-            SpriteInputIndex::SourceMaskTexture as u64,
-            Some(source_mask_texture),
-        );
-
         align_offset(instance_offset);
-        let sprite_bytes_len = mem::size_of_val(sprites);
+        let sprite_bytes_len = mem::size_of_val(sprites.as_slice());
         let next_offset = *instance_offset + sprite_bytes_len;
         if next_offset > instance_buffer.size {
             return false;
         }
 
         command_encoder.set_vertex_buffer(
-            SpriteInputIndex::Sprites as u64,
-            Some(&instance_buffer.metal_buffer),
-            *instance_offset as u64,
-        );
-        command_encoder.set_fragment_buffer(
             SpriteInputIndex::Sprites as u64,
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
@@ -2532,21 +2343,19 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
-    ) -> bool {
+    ) -> MetalRenderResult<PrimitiveEncodeStatus> {
         if paths.is_empty() {
-            return true;
+            return Ok(PrimitiveEncodeStatus::Complete);
         }
         let Some(intermediate_texture) = &self.path_intermediate_texture else {
-            return false;
+            return Err(MetalRenderError::invalid_backdrop_viewport(viewport_size));
         };
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
-        let color_attachment = render_pass_descriptor
-            .color_attachments()
-            .object_at(0)
-            .unwrap();
+        let color_attachment =
+            render_pass_color_attachment(render_pass_descriptor, "paths intermediate")?;
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
@@ -2560,14 +2369,6 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_viewport(metal::MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: i32::from(target_frame.size.width) as f64,
-            height: i32::from(target_frame.size.height) as f64,
-            znear: 0.0,
-            zfar: 1.0,
-        });
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
         align_offset(instance_offset);
@@ -2584,17 +2385,17 @@ impl MetalRenderer {
         let next_offset = *instance_offset + vertices_bytes_len;
         if next_offset > instance_buffer.size {
             command_encoder.end_encoding();
-            return false;
+            return Ok(PrimitiveEncodeStatus::InstanceBufferExceeded);
         }
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -2618,7 +2419,7 @@ impl MetalRenderer {
         *instance_offset = next_offset;
 
         command_encoder.end_encoding();
-        true
+        Ok(PrimitiveEncodeStatus::Complete)
     }
 
     /// Rasterizes a render group's arbitrary source-mask path into a fresh
@@ -2630,20 +2431,20 @@ impl MetalRenderer {
     /// its forced-opaque-white fill makes the cleared-transparent target's alpha
     /// channel hold pure coverage (`mask.a == coverage`).
     fn rasterize_source_mask_path(
-        &mut self,
+        &self,
         path: &Path<ScaledPixels>,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
-    ) -> Option<metal::Texture> {
-        let mask_texture = self.acquire_group_intermediate_texture(target_frame.size)?;
+    ) -> MetalRenderResult<Option<metal::Texture>> {
+        let Some(mask_texture) = self.new_group_intermediate_texture(viewport_size) else {
+            return Err(MetalRenderError::invalid_backdrop_viewport(viewport_size));
+        };
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
-        let color_attachment = render_pass_descriptor
-            .color_attachments()
-            .object_at(0)
-            .unwrap();
+        let color_attachment =
+            render_pass_color_attachment(render_pass_descriptor, "source mask path")?;
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
@@ -2656,8 +2457,8 @@ impl MetalRenderer {
                 metal::MTLStorageMode::Private
             };
             let descriptor = metal::TextureDescriptor::new();
-            descriptor.set_width(target_frame.size.width.0 as u64);
-            descriptor.set_height(target_frame.size.height.0 as u64);
+            descriptor.set_width(viewport_size.width.0 as u64);
+            descriptor.set_height(viewport_size.height.0 as u64);
             descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
             descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
             descriptor.set_storage_mode(storage_mode);
@@ -2678,14 +2479,6 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_viewport(metal::MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: i32::from(target_frame.size.width) as f64,
-            height: i32::from(target_frame.size.height) as f64,
-            znear: 0.0,
-            zfar: 1.0,
-        });
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
         align_offset(instance_offset);
@@ -2702,23 +2495,23 @@ impl MetalRenderer {
             .collect();
         if vertices.is_empty() {
             command_encoder.end_encoding();
-            return Some(mask_texture);
+            return Ok(Some(mask_texture));
         }
         let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
         let next_offset = *instance_offset + vertices_bytes_len;
         if next_offset > instance_buffer.size {
             command_encoder.end_encoding();
-            return None;
+            return Ok(None);
         }
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -2742,7 +2535,7 @@ impl MetalRenderer {
         *instance_offset = next_offset;
 
         command_encoder.end_encoding();
-        Some(mask_texture)
+        Ok(Some(mask_texture))
     }
 
     fn draw_shadows(
@@ -2750,7 +2543,7 @@ impl MetalRenderer {
         shadows: &[Shadow],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if shadows.is_empty() {
@@ -2775,10 +2568,10 @@ impl MetalRenderer {
             *instance_offset as u64,
         );
 
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             ShadowInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
 
         let shadow_bytes_len = mem::size_of_val(shadows);
@@ -2813,7 +2606,7 @@ impl MetalRenderer {
         quads: &[Quad],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if quads.is_empty() {
@@ -2838,10 +2631,10 @@ impl MetalRenderer {
             *instance_offset as u64,
         );
 
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             QuadInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
 
         let quad_bytes_len = mem::size_of_val(quads);
@@ -2872,10 +2665,10 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        let Some(first_path) = paths.first() else {
+        let Some((first_path, last_path)) = first_and_last_path(paths) else {
             return true;
         };
 
@@ -2889,10 +2682,10 @@ impl MetalRenderer {
             Some(&self.unit_vertices),
             0,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
 
         command_encoder.set_fragment_texture(
@@ -2908,7 +2701,7 @@ impl MetalRenderer {
         // batch combines different draw orders, we perform a single copy
         // for a minimal spanning rect.
         let sprites;
-        if paths.last().unwrap().order == first_path.order {
+        if last_path.order == first_path.order {
             sprites = paths
                 .iter()
                 .map(|path| PathSprite {
@@ -2962,7 +2755,7 @@ impl MetalRenderer {
         underlines: &[Underline],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if underlines.is_empty() {
@@ -2987,10 +2780,10 @@ impl MetalRenderer {
             *instance_offset as u64,
         );
 
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             UnderlineInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
 
         let underline_bytes_len = mem::size_of_val(underlines);
@@ -3026,7 +2819,7 @@ impl MetalRenderer {
         sprites: &[MonochromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if sprites.is_empty() {
@@ -3059,10 +2852,10 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
@@ -3100,7 +2893,7 @@ impl MetalRenderer {
         sprites: &[PolychromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if sprites.is_empty() {
@@ -3124,10 +2917,10 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
@@ -3170,10 +2963,10 @@ impl MetalRenderer {
 
     fn draw_surfaces(
         &mut self,
-        surfaces: &[PaintMetalTexture],
+        surfaces: &[PaintSurface],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        target_frame: RenderTargetFrame,
+        viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         command_encoder.set_vertex_buffer(
@@ -3181,16 +2974,19 @@ impl MetalRenderer {
             Some(&self.unit_vertices),
             0,
         );
-        command_encoder.set_vertex_bytes(
+        set_render_target_frame_bytes(
+            command_encoder,
             SurfaceInputIndex::ViewportSize as u64,
-            mem::size_of_val(&target_frame) as u64,
-            &target_frame as *const RenderTargetFrame as *const _,
+            viewport_size,
         );
 
         for surface in surfaces {
+            let PaintSurfaceSource::MetalTexture(texture) = &surface.source else {
+                panic!("direct Metal GPUI renderer cannot draw wgpu texture surfaces");
+            };
             let texture_size = size(
-                DevicePixels::from(surface.texture.width() as i32),
-                DevicePixels::from(surface.texture.height() as i32),
+                DevicePixels::from(texture.width() as i32),
+                DevicePixels::from(texture.height() as i32),
             );
 
             align_offset(instance_offset);
@@ -3210,10 +3006,8 @@ impl MetalRenderer {
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
             command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
-            command_encoder.set_fragment_texture(
-                SurfaceInputIndex::YTexture as u64,
-                Some(surface.texture.as_ref()),
-            );
+            command_encoder
+                .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(texture.as_ref()));
             command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, None);
 
             unsafe {
@@ -3234,6 +3028,14 @@ impl MetalRenderer {
         }
         true
     }
+}
+
+fn first_and_last_path(
+    paths: &[Path<ScaledPixels>],
+) -> Option<(&Path<ScaledPixels>, &Path<ScaledPixels>)> {
+    let first_path = paths.first()?;
+    let last_path = paths.last()?;
+    Some((first_path, last_path))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -3258,14 +3060,12 @@ impl gpui::PlatformHeadlessRenderer for MetalRenderer {
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
-    target_frame: RenderTargetFrame,
+    viewport_size: Size<DevicePixels>,
+    context: &'static str,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
-) -> &'a metal::RenderCommandEncoderRef {
+) -> MetalRenderResult<&'a metal::RenderCommandEncoderRef> {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
-    let color_attachment = render_pass_descriptor
-        .color_attachments()
-        .object_at(0)
-        .unwrap();
+    let color_attachment = render_pass_color_attachment(render_pass_descriptor, context)?;
     color_attachment.set_texture(Some(texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
@@ -3274,34 +3074,40 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder.set_viewport(metal::MTLViewport {
         originX: 0.0,
         originY: 0.0,
-        width: i32::from(target_frame.size.width) as f64,
-        height: i32::from(target_frame.size.height) as f64,
+        width: i32::from(viewport_size.width) as f64,
+        height: i32::from(viewport_size.height) as f64,
         znear: 0.0,
         zfar: 1.0,
     });
-    command_encoder
+    Ok(command_encoder)
+}
+
+fn render_pass_color_attachment<'a>(
+    descriptor: &'a metal::RenderPassDescriptorRef,
+    context: &'static str,
+) -> MetalRenderResult<&'a RenderPassColorAttachmentDescriptorRef> {
+    descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or(MetalRenderError::MissingRenderPassColorAttachment { context })
 }
 
 fn build_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
-    label: &str,
-    vertex_fn_name: &str,
-    fragment_fn_name: &str,
+    label: &'static str,
+    vertex_fn_name: &'static str,
+    fragment_fn_name: &'static str,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+) -> MetalRendererInitResult<metal::RenderPipelineState> {
+    let vertex_fn = pipeline_function(library, label, ShaderStage::Vertex, vertex_fn_name)?;
+    let fragment_fn = pipeline_function(library, label, ShaderStage::Fragment, fragment_fn_name)?;
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
     descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
     descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    let color_attachment = pipeline_color_attachment(&descriptor, label)?;
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
@@ -3313,29 +3119,28 @@ fn build_pipeline_state(
 
     device
         .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+        .map_err(|source| MetalRendererInitError::CreatePipelineState {
+            pipeline: label,
+            source,
+        })
 }
 
 fn build_path_sprite_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
-    label: &str,
-    vertex_fn_name: &str,
-    fragment_fn_name: &str,
+    label: &'static str,
+    vertex_fn_name: &'static str,
+    fragment_fn_name: &'static str,
     pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+) -> MetalRendererInitResult<metal::RenderPipelineState> {
+    let vertex_fn = pipeline_function(library, label, ShaderStage::Vertex, vertex_fn_name)?;
+    let fragment_fn = pipeline_function(library, label, ShaderStage::Fragment, fragment_fn_name)?;
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
     descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
     descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    let color_attachment = pipeline_color_attachment(&descriptor, label)?;
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
@@ -3347,24 +3152,23 @@ fn build_path_sprite_pipeline_state(
 
     device
         .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+        .map_err(|source| MetalRendererInitError::CreatePipelineState {
+            pipeline: label,
+            source,
+        })
 }
 
 fn build_path_rasterization_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
-    label: &str,
-    vertex_fn_name: &str,
-    fragment_fn_name: &str,
+    label: &'static str,
+    vertex_fn_name: &'static str,
+    fragment_fn_name: &'static str,
     pixel_format: metal::MTLPixelFormat,
     path_sample_count: u32,
-) -> metal::RenderPipelineState {
-    let vertex_fn = library
-        .get_function(vertex_fn_name, None)
-        .expect("error locating vertex function");
-    let fragment_fn = library
-        .get_function(fragment_fn_name, None)
-        .expect("error locating fragment function");
+) -> MetalRendererInitResult<metal::RenderPipelineState> {
+    let vertex_fn = pipeline_function(library, label, ShaderStage::Vertex, vertex_fn_name)?;
+    let fragment_fn = pipeline_function(library, label, ShaderStage::Fragment, fragment_fn_name)?;
 
     let descriptor = metal::RenderPipelineDescriptor::new();
     descriptor.set_label(label);
@@ -3374,7 +3178,7 @@ fn build_path_rasterization_pipeline_state(
         descriptor.set_raster_sample_count(path_sample_count as _);
         descriptor.set_alpha_to_coverage_enabled(false);
     }
-    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    let color_attachment = pipeline_color_attachment(&descriptor, label)?;
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
@@ -3386,7 +3190,36 @@ fn build_path_rasterization_pipeline_state(
 
     device
         .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
+        .map_err(|source| MetalRendererInitError::CreatePipelineState {
+            pipeline: label,
+            source,
+        })
+}
+
+fn pipeline_function(
+    library: &metal::LibraryRef,
+    pipeline: &'static str,
+    stage: ShaderStage,
+    function: &'static str,
+) -> MetalRendererInitResult<metal::Function> {
+    library.get_function(function, None).map_err(|source| {
+        MetalRendererInitError::MissingPipelineFunction {
+            pipeline,
+            stage,
+            function,
+            source,
+        }
+    })
+}
+
+fn pipeline_color_attachment<'a>(
+    descriptor: &'a metal::RenderPipelineDescriptorRef,
+    pipeline: &'static str,
+) -> MetalRendererInitResult<&'a metal::RenderPipelineColorAttachmentDescriptorRef> {
+    descriptor
+        .color_attachments()
+        .object_at(0)
+        .ok_or(MetalRendererInitError::MissingPipelineColorAttachment { pipeline })
 }
 
 // Align to multiples of 256 make Metal happy.
@@ -3500,18 +3333,14 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, Pixels,
-        SurfacePrimitive, SurfaceSilhouette, px, rgba,
-        scene_protocol::{
-            LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters,
-            RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
-        },
+        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, px, rgba,
+        scene_protocol::{LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters},
         transparent_black,
     };
     use image::RgbaImage;
     use std::sync::Arc;
 
-    const IMAGE_SIZE: i32 = GROUP_INTERMEDIATE_TEXTURE_POOL_TEST_TEXTURE_SIDE_PIXELS as i32;
+    const IMAGE_SIZE: i32 = 32;
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels(value)
@@ -3519,10 +3348,6 @@ mod tests {
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
         Bounds::new(point(sp(x), sp(y)), size(sp(width), sp(height)))
-    }
-
-    fn pixel_rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
-        Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
     }
 
     fn viewport() -> Bounds<ScaledPixels> {
@@ -3562,23 +3387,6 @@ mod tests {
         )
     }
 
-    fn paint_group_with_bounds(
-        order: u32,
-        bounds: Bounds<ScaledPixels>,
-        capture_bounds: Bounds<ScaledPixels>,
-        effects: Vec<CompositeEffect>,
-        scene: Scene,
-    ) -> PaintGroup {
-        PaintGroup::new_for_backend_test(
-            order,
-            bounds,
-            capture_bounds,
-            mask(),
-            LogicalVisualPlan::from_effects(1., 1., effects),
-            scene,
-        )
-    }
-
     fn black() -> Hsla {
         rgba(0x000000ff).into()
     }
@@ -3599,12 +3407,8 @@ mod tests {
         rgba(0xffffffff).into()
     }
 
-    fn half_white() -> Hsla {
-        rgba(0xffffff80).into()
-    }
-
     #[test]
-    fn render_group_difference_blend_mode_metal() {
+    fn render_group_difference_blend_mode_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), rgba(0x0000ffff)));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3615,11 +3419,12 @@ mod tests {
         ));
         grouped.finish();
 
-        assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 0, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [255, 255, 0, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_exclusion_blend_mode_metal() {
+    fn render_group_exclusion_blend_mode_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), rgba(0xffffffff)));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3630,11 +3435,12 @@ mod tests {
         ));
         grouped.finish();
 
-        assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [0, 0, 0, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_hard_light_blend_mode_metal() {
+    fn render_group_hard_light_blend_mode_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), rgba(0x808080ff)));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3645,11 +3451,12 @@ mod tests {
         ));
         grouped.finish();
 
-        assert_eq!(pixel(&render(&grouped), 12, 12), [255, 255, 255, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [255, 255, 255, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_posterize_quantizes_source_metal() {
+    fn render_group_posterize_quantizes_source_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3661,11 +3468,12 @@ mod tests {
         grouped.finish();
 
         // 3 bands: gray(0.502) → floor(1.506)=1 → 1/2 = 0.5.
-        assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [128, 128, 128, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_threshold_splits_source_by_luma_metal() {
+    fn render_group_threshold_splits_source_by_luma_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3677,11 +3485,12 @@ mod tests {
         grouped.finish();
 
         // red luma 0.2126 < 0.5 → black.
-        assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [0, 0, 0, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_solarize_inverts_above_threshold_metal() {
+    fn render_group_solarize_inverts_above_threshold_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3693,11 +3502,12 @@ mod tests {
         grouped.finish();
 
         // white ≥ 0.5 → inverted to black.
-        assert_eq!(pixel(&render(&grouped), 12, 12), [0, 0, 0, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [0, 0, 0, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_sepia_tones_source_red_metal() {
+    fn render_group_sepia_tones_source_red_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3708,11 +3518,12 @@ mod tests {
         ));
         grouped.finish();
 
-        assert_eq!(pixel(&render(&grouped), 12, 12), [100, 89, 69, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [100, 89, 69, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_duotone_black_white_is_grayscale_metal() {
+    fn render_group_duotone_black_white_is_grayscale_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3724,11 +3535,12 @@ mod tests {
         grouped.finish();
 
         // duotone(black, white) == grayscale; gray(0.502) luma stays 128.
-        assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [128, 128, 128, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_duotone_maps_luma_to_color_gradient_metal() {
+    fn render_group_duotone_maps_luma_to_color_gradient_metal() -> Result<()> {
         // duotone(blue, yellow): white source (luma 1) -> yellow endpoint.
         let mut light = Scene::default();
         light.insert_primitive(quad(0, viewport(), black()));
@@ -3739,7 +3551,7 @@ mod tests {
             finished_scene([quad(0, rect(8., 8., 8., 8.), white())]),
         ));
         light.finish();
-        assert_eq!(pixel(&render(&light), 12, 12), [255, 255, 0, 255]);
+        assert_eq!(pixel(&render(&light)?, 12, 12), [255, 255, 0, 255]);
 
         // Black source (luma 0) -> blue endpoint.
         let mut dark = Scene::default();
@@ -3751,11 +3563,12 @@ mod tests {
             finished_scene([quad(0, rect(8., 8., 8., 8.), black())]),
         ));
         dark.finish();
-        assert_eq!(pixel(&render(&dark), 12, 12), [0, 0, 255, 255]);
+        assert_eq!(pixel(&render(&dark)?, 12, 12), [0, 0, 255, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_hue_rotate_keeps_gray_fixed_metal() {
+    fn render_group_hue_rotate_keeps_gray_fixed_metal() -> Result<()> {
         let mut grouped = Scene::default();
         grouped.insert_primitive(quad(0, viewport(), black()));
         grouped.insert_primitive(paint_group_with_effects(
@@ -3767,11 +3580,12 @@ mod tests {
         grouped.finish();
 
         // Neutral gray is a fixed point of hue rotation.
-        assert_eq!(pixel(&render(&grouped), 12, 12), [128, 128, 128, 255]);
+        assert_eq!(pixel(&render(&grouped)?, 12, 12), [128, 128, 128, 255]);
+        Ok(())
     }
 
     #[test]
-    fn render_group_directional_blur_smears_along_x_only_metal() {
+    fn render_group_directional_blur_smears_along_x_only_metal() -> Result<()> {
         // A small bright green square inside a group with a horizontal directional
         // (motion) blur. The streak must smear the source along +x but leave the
         // cross-axis (+y) untouched.
@@ -3785,25 +3599,27 @@ mod tests {
         ));
         grouped.finish();
 
-        let image = render(&grouped);
+        let image = render(&grouped)?;
         // +x of the square edge (square spans x in [14,18)): smeared green.
         let smeared_x = pixel(&image, 20, 16);
         // +y of the square edge: NOT smeared vertically -> stays black.
         let cross_axis_y = pixel(&image, 16, 20);
 
-        assert!(
-            smeared_x[1] > 0,
-            "horizontal blur should smear green into +x neighbor: {smeared_x:?}"
-        );
         assert_eq!(
-            cross_axis_y,
-            [0, 0, 0, 255],
-            "horizontal blur must not smear vertically: {cross_axis_y:?}"
+            DirectionalBlurAxisEvidence {
+                smeared_green_visible: smeared_x[1] > 0,
+                cross_axis_pixel: cross_axis_y,
+            },
+            DirectionalBlurAxisEvidence {
+                smeared_green_visible: true,
+                cross_axis_pixel: [0, 0, 0, 255],
+            }
         );
+        Ok(())
     }
 
     #[test]
-    fn render_group_directional_blur_smears_along_y_only_metal() {
+    fn render_group_directional_blur_smears_along_y_only_metal() -> Result<()> {
         // Same source, but a vertical directional blur (angle = 90 degrees). The
         // streak must now smear along +y and leave +x untouched, proving the angle
         // parameter rotates the streak.
@@ -3820,33 +3636,32 @@ mod tests {
         ));
         grouped.finish();
 
-        let image = render(&grouped);
+        let image = render(&grouped)?;
         // +y of the square edge: smeared green.
         let smeared_y = pixel(&image, 16, 20);
         // +x of the square edge: NOT smeared horizontally -> stays black.
         let cross_axis_x = pixel(&image, 20, 16);
 
-        assert!(
-            smeared_y[1] > 0,
-            "vertical blur should smear green into +y neighbor: {smeared_y:?}"
-        );
         assert_eq!(
-            cross_axis_x,
-            [0, 0, 0, 255],
-            "vertical blur must not smear horizontally: {cross_axis_x:?}"
+            DirectionalBlurAxisEvidence {
+                smeared_green_visible: smeared_y[1] > 0,
+                cross_axis_pixel: cross_axis_x,
+            },
+            DirectionalBlurAxisEvidence {
+                smeared_green_visible: true,
+                cross_axis_pixel: [0, 0, 0, 255],
+            }
         );
+        Ok(())
     }
 
-    fn render(scene: &Scene) -> RgbaImage {
+    fn render(scene: &Scene) -> Result<RgbaImage> {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let device = MetalRenderer::create_device();
-        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
-        renderer
-            .render_scene_to_image(
-                scene,
-                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-            )
-            .expect("render metal scene")
+        let mut renderer = MetalRenderer::try_new_internal(None, true, pool)?;
+        renderer.render_scene_to_image(
+            scene,
+            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+        )
     }
 
     fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
@@ -3859,54 +3674,56 @@ mod tests {
     }
 
     /// Render `scene` headlessly and return the metal backend's measured counters.
-    fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
+    fn backend_counters(scene: &Scene) -> Result<RenderGroupBackendCounters> {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let device = MetalRenderer::create_device();
-        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
-        renderer
-            .render_scene_to_image(
-                scene,
-                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-            )
-            .expect("render metal scene");
+        let mut renderer = MetalRenderer::try_new_internal(None, true, pool)?;
+        renderer.render_scene_to_image(
+            scene,
+            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+        )?;
         renderer
             .render_group_backend_counters()
-            .expect("counters recorded after a successful render")
+            .ok_or_else(|| anyhow::anyhow!("counters missing after successful Metal render"))
     }
 
     /// The planner's predicted intermediate-texture / backdrop-copy counts for one group.
     fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
-        let support = group.plan().support_counters(
-            group.bounds(),
-            group.capture_bounds(),
-            group.content_mask(),
-        );
-        let mut counters = RenderGroupBackendCounters::default();
-        counters.add_support_counters(support);
-        counters.intermediate_textures = support.intermediate_textures;
-        counters.backdrop_copies = support.backdrop_copies;
-        counters
-    }
-
-    fn render_with_renderer(renderer: &mut MetalRenderer, scene: &Scene) {
-        renderer
-            .render_scene_to_image(
-                scene,
-                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-            )
-            .expect("render metal scene");
-    }
-
-    fn group_intermediate_texture_bytes(count: u64, width: u64, height: u64) -> u64 {
-        count * width * height * GROUP_INTERMEDIATE_TEXTURE_BYTES_PER_PIXEL
+        let counters = group.plan().support_counters(group.capture_bounds());
+        RenderGroupBackendCounters {
+            intermediate_textures: counters.intermediate_textures,
+            backdrop_copies: counters.backdrop_copies,
+        }
     }
 
     fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
         image.get_pixel(x, y).0
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct DirectionalBlurAxisEvidence {
+        smeared_green_visible: bool,
+        cross_axis_pixel: [u8; 4],
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct BackdropLensEdgeEvidence {
+        outer_edge_lit: bool,
+        outer_shoulder_lit: bool,
+        mid_bevel_lit: bool,
+        focus_ridge_stronger_than_mid_bevel: bool,
+        inner_falloff_lit: bool,
+        ramp_continuous: bool,
+        stable_center: [u8; 4],
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct BackdropLensReflectionEvidence {
+        edge_reflects_blue: bool,
+        stable_center: [u8; 4],
+    }
+
     #[test]
-    fn backend_counters_match_planner_for_opacity_group_metal() {
+    fn backend_counters_match_planner_for_opacity_group_metal() -> Result<()> {
         let group = paint_group_with_effects(
             1,
             rect(4., 4., 16., 16.),
@@ -3917,11 +3734,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
-                source_capture_groups: 1,
-                source_capture_pixels: 256,
                 intermediate_textures: 1,
                 backdrop_copies: 0,
-                ..RenderGroupBackendCounters::default()
             }
         );
 
@@ -3930,11 +3744,12 @@ mod tests {
         scene.insert_primitive(group);
         scene.finish();
 
-        assert_eq!(backend_counters(&scene), predicted);
+        assert_eq!(backend_counters(&scene)?, predicted);
+        Ok(())
     }
 
     #[test]
-    fn backend_counters_exclude_source_mask_path_intermediate_metal() {
+    fn backend_counters_exclude_source_mask_path_intermediate_metal() -> Result<()> {
         // Parity with the wgpu law: the path source-mask intermediate is a
         // path-rasterization target, not a group-composite/backdrop-copy target,
         // so the planner does not predict it and the renderer does not count it.
@@ -3953,11 +3768,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
-                source_capture_groups: 1,
-                source_capture_pixels: 400,
                 intermediate_textures: 1,
                 backdrop_copies: 0,
-                ..RenderGroupBackendCounters::default()
             }
         );
 
@@ -3966,11 +3778,12 @@ mod tests {
         scene.insert_primitive(group);
         scene.finish();
 
-        assert_eq!(backend_counters(&scene), predicted);
+        assert_eq!(backend_counters(&scene)?, predicted);
+        Ok(())
     }
 
     #[test]
-    fn backend_counters_match_planner_for_backdrop_blur_group_metal() {
+    fn backend_counters_match_planner_for_backdrop_blur_group_metal() -> Result<()> {
         let group = paint_group_with_effects(
             1,
             rect(4., 4., 16., 16.),
@@ -3981,11 +3794,8 @@ mod tests {
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
-                source_capture_groups: 1,
-                source_capture_pixels: 256,
                 intermediate_textures: 2,
                 backdrop_copies: 1,
-                ..RenderGroupBackendCounters::default()
             }
         );
 
@@ -3994,216 +3804,12 @@ mod tests {
         scene.insert_primitive(group);
         scene.finish();
 
-        assert_eq!(backend_counters(&scene), predicted);
+        assert_eq!(backend_counters(&scene)?, predicted);
+        Ok(())
     }
 
     #[test]
-    fn backend_counters_match_planner_for_separable_content_alpha_shadow_metal() {
-        let group = paint_group_with_effects(
-            1,
-            rect(0., 0., 100., 40.),
-            vec![CompositeEffect::drop_shadow(
-                point(px(0.), px(4.)),
-                px(3.),
-                rgba(0x00000080).into(),
-            )],
-            finished_scene([quad(0, rect(20., 10., 40., 12.), white())]),
-        );
-        let predicted = predicted_counters(&group);
-        let mut shadow_sources = RenderGroupShadowSourceCounters::default();
-        shadow_sources.content_alpha = 1;
-        let mut shadow_modes = RenderGroupShadowModeCounters::default();
-        shadow_modes.separable = 1;
-        assert_eq!(
-            predicted,
-            RenderGroupBackendCounters {
-                source_capture_groups: 1,
-                source_capture_pixels: 4_000,
-                intermediate_textures: 2,
-                backdrop_copies: 0,
-                shadow_sources,
-                shadow_modes,
-                content_alpha_shadow_max_kernel_radius: 9,
-                content_alpha_shadow_sample_count_estimate: 152_000,
-                ..RenderGroupBackendCounters::default()
-            }
-        );
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(group);
-        scene.finish();
-
-        assert_eq!(backend_counters(&scene), predicted);
-    }
-
-    #[test]
-    fn backend_counters_match_planner_for_direct_surface_shadow_metal() {
-        let group = paint_group_with_effects(
-            1,
-            rect(8., 8., 16., 16.),
-            vec![CompositeEffect::surface_shadow(
-                GroupShape::rectangle(),
-                point(px(4.), px(0.)),
-                px(0.),
-                rgba(0x00000080).into(),
-            )],
-            Scene::default(),
-        );
-        let predicted = predicted_counters(&group);
-        let mut shadow_sources = RenderGroupShadowSourceCounters::default();
-        shadow_sources.surface_geometry = 1;
-        let mut shadow_modes = RenderGroupShadowModeCounters::default();
-        shadow_modes.exact = 1;
-        assert_eq!(
-            predicted,
-            RenderGroupBackendCounters {
-                direct_surface_groups: 1,
-                surface_shadow_draw_pixels: 256,
-                intermediate_textures: 0,
-                backdrop_copies: 0,
-                shadow_sources,
-                shadow_modes,
-                ..RenderGroupBackendCounters::default()
-            }
-        );
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(group);
-        scene.finish();
-
-        assert_eq!(backend_counters(&scene), predicted);
-    }
-
-    #[test]
-    fn render_group_surface_shadow_replays_child_content_inline_metal() {
-        let group_scene = finished_scene([quad(0, rect(8., 8., 8., 8.), green())]);
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(paint_group_with_effects(
-            1,
-            rect(8., 8., 14., 8.),
-            vec![CompositeEffect::surface_shadow(
-                GroupShape::rectangle(),
-                point(px(6.), px(0.)),
-                px(0.),
-                half_white(),
-            )],
-            group_scene,
-        ));
-        scene.finish();
-
-        let image = render(&scene);
-
-        assert_eq!(
-            pixel(&image, 12, 12),
-            [0, 255, 0, 255],
-            "direct surface-effect groups should replay child scene content"
-        );
-        assert_eq!(
-            pixel(&image, 19, 12),
-            [128, 128, 128, 255],
-            "surface shadow should still draw from geometry beside replayed content"
-        );
-    }
-
-    #[test]
-    fn render_group_surface_shadow_unions_declared_primitives_metal() {
-        let silhouette = SurfaceSilhouette::union([
-            SurfacePrimitive::new(pixel_rect(6., 8., 6., 6.), GroupShape::rectangle()),
-            SurfacePrimitive::new(pixel_rect(16., 8., 6., 6.), GroupShape::rectangle()),
-        ])
-        .expect("union silhouette fits shader ABI");
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(paint_group_with_effects(
-            1,
-            rect(4., 4., 24., 20.),
-            vec![CompositeEffect::surface_shadow(
-                silhouette,
-                point(px(0.), px(6.)),
-                px(0.),
-                half_white(),
-            )],
-            Scene::default(),
-        ));
-        scene.finish();
-
-        let image = render(&scene);
-
-        assert_eq!(
-            pixel(&image, 8, 10),
-            [0, 0, 0, 255],
-            "offset surface shadow should not fill the original primitive location"
-        );
-        assert_eq!(
-            pixel(&image, 8, 16),
-            [128, 128, 128, 255],
-            "first declared primitive should cast a surface shadow"
-        );
-        assert_eq!(
-            pixel(&image, 14, 16),
-            [0, 0, 0, 255],
-            "gap between declared primitives must stay outside the union"
-        );
-        assert_eq!(
-            pixel(&image, 18, 16),
-            [128, 128, 128, 255],
-            "second declared primitive should cast a surface shadow"
-        );
-    }
-
-    #[test]
-    fn render_group_surface_shadow_unions_group_bounds_with_declared_primitive_metal() {
-        let silhouette = SurfaceSilhouette::union_with_group_shape(
-            GroupShape::rectangle(),
-            [SurfacePrimitive::new(
-                pixel_rect(12., 20., 8., 6.),
-                GroupShape::rectangle(),
-            )],
-        )
-        .expect("group-bounds union silhouette fits shader ABI");
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(paint_group_with_bounds(
-            1,
-            rect(4., 4., 24., 18.),
-            rect(4., 4., 24., 28.),
-            vec![CompositeEffect::surface_shadow(
-                silhouette,
-                point(px(0.), px(6.)),
-                px(0.),
-                half_white(),
-            )],
-            Scene::default(),
-        ));
-        scene.finish();
-
-        let image = render(&scene);
-
-        assert_eq!(
-            pixel(&image, 8, 16),
-            [128, 128, 128, 255],
-            "group bounds should cast the slab portion of the surface shadow"
-        );
-        assert_eq!(
-            pixel(&image, 14, 30),
-            [128, 128, 128, 255],
-            "declared primitive should cast the hanging-tab portion of the same surface shadow"
-        );
-        assert_eq!(
-            pixel(&image, 22, 30),
-            [0, 0, 0, 255],
-            "pixels below the slab but outside the tab primitive must stay outside the union"
-        );
-    }
-
-    #[test]
-    fn backend_counters_sum_across_sibling_groups_metal() {
+    fn backend_counters_sum_across_sibling_groups_metal() -> Result<()> {
         let opacity_group = paint_group_with_effects(
             1,
             rect(2., 2., 10., 10.),
@@ -4217,24 +3823,16 @@ mod tests {
             finished_scene([quad(0, rect(16., 16., 6., 6.), black())]),
         );
         let predicted = RenderGroupBackendCounters {
-            source_capture_groups: predicted_counters(&opacity_group).source_capture_groups
-                + predicted_counters(&backdrop_group).source_capture_groups,
-            source_capture_pixels: predicted_counters(&opacity_group).source_capture_pixels
-                + predicted_counters(&backdrop_group).source_capture_pixels,
             intermediate_textures: predicted_counters(&opacity_group).intermediate_textures
                 + predicted_counters(&backdrop_group).intermediate_textures,
             backdrop_copies: predicted_counters(&opacity_group).backdrop_copies
                 + predicted_counters(&backdrop_group).backdrop_copies,
-            ..RenderGroupBackendCounters::default()
         };
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
-                source_capture_groups: 2,
-                source_capture_pixels: 244,
                 intermediate_textures: 3,
                 backdrop_copies: 1,
-                ..RenderGroupBackendCounters::default()
             }
         );
 
@@ -4244,148 +3842,12 @@ mod tests {
         scene.insert_primitive(backdrop_group);
         scene.finish();
 
-        assert_eq!(backend_counters(&scene), predicted);
+        assert_eq!(backend_counters(&scene)?, predicted);
+        Ok(())
     }
 
     #[test]
-    fn group_intermediate_texture_pool_reuses_sibling_group_targets_metal() {
-        let left_group = paint_group_with_effects(
-            1,
-            rect(2., 2., 10., 10.),
-            vec![CompositeEffect::opacity(0.5)],
-            finished_scene([quad(0, rect(2., 2., 10., 10.), red())]),
-        );
-        let right_group = paint_group_with_effects(
-            2,
-            rect(16., 16., 10., 10.),
-            vec![CompositeEffect::opacity(0.5)],
-            finished_scene([quad(0, rect(16., 16., 10., 10.), green())]),
-        );
-        let predicted = RenderGroupBackendCounters {
-            source_capture_groups: predicted_counters(&left_group).source_capture_groups
-                + predicted_counters(&right_group).source_capture_groups,
-            source_capture_pixels: predicted_counters(&left_group).source_capture_pixels
-                + predicted_counters(&right_group).source_capture_pixels,
-            intermediate_textures: predicted_counters(&left_group).intermediate_textures
-                + predicted_counters(&right_group).intermediate_textures,
-            backdrop_copies: 0,
-            ..RenderGroupBackendCounters::default()
-        };
-        assert_eq!(
-            predicted,
-            RenderGroupBackendCounters {
-                source_capture_groups: 2,
-                source_capture_pixels: 200,
-                intermediate_textures: 2,
-                backdrop_copies: 0,
-                ..RenderGroupBackendCounters::default()
-            }
-        );
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(left_group);
-        scene.insert_primitive(right_group);
-        scene.finish();
-
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let device = MetalRenderer::create_device();
-        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
-
-        render_with_renderer(&mut renderer, &scene);
-        assert_eq!(renderer.render_group_backend_counters(), Some(predicted));
-        assert_eq!(
-            renderer.group_intermediate_texture_pool_stats(),
-            GroupIntermediateTexturePoolStats {
-                allocations: 2,
-                reuses: 0,
-                available_textures: 2,
-                available_bytes: group_intermediate_texture_bytes(2, 10, 10),
-            }
-        );
-
-        render_with_renderer(&mut renderer, &scene);
-        assert_eq!(renderer.render_group_backend_counters(), Some(predicted));
-        assert_eq!(
-            renderer.group_intermediate_texture_pool_stats(),
-            GroupIntermediateTexturePoolStats {
-                allocations: 2,
-                reuses: 2,
-                available_textures: 2,
-                available_bytes: group_intermediate_texture_bytes(2, 10, 10),
-            }
-        );
-    }
-
-    #[test]
-    fn group_intermediate_texture_pool_trims_available_textures_to_budget_metal() {
-        let groups = (0..4)
-            .map(|ix| {
-                paint_group_with_effects(
-                    ix,
-                    viewport(),
-                    vec![CompositeEffect::opacity(0.5)],
-                    finished_scene([quad(0, viewport(), red())]),
-                )
-            })
-            .collect::<Vec<_>>();
-        let predicted = RenderGroupBackendCounters {
-            source_capture_groups: groups
-                .iter()
-                .map(|group| predicted_counters(group).source_capture_groups)
-                .sum(),
-            source_capture_pixels: groups
-                .iter()
-                .map(|group| predicted_counters(group).source_capture_pixels)
-                .sum(),
-            intermediate_textures: groups
-                .iter()
-                .map(|group| predicted_counters(group).intermediate_textures)
-                .sum(),
-            backdrop_copies: 0,
-            ..RenderGroupBackendCounters::default()
-        };
-        assert_eq!(
-            predicted,
-            RenderGroupBackendCounters {
-                source_capture_groups: 4,
-                source_capture_pixels: 4_096,
-                intermediate_textures: 4,
-                backdrop_copies: 0,
-                ..RenderGroupBackendCounters::default()
-            }
-        );
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        for group in groups {
-            scene.insert_primitive(group);
-        }
-        scene.finish();
-
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let device = MetalRenderer::create_device();
-        let mut renderer = MetalRenderer::new_internal(device, None, true, pool);
-
-        render_with_renderer(&mut renderer, &scene);
-        assert_eq!(renderer.render_group_backend_counters(), Some(predicted));
-        assert_eq!(
-            renderer.group_intermediate_texture_pool_stats(),
-            GroupIntermediateTexturePoolStats {
-                allocations: 4,
-                reuses: 0,
-                available_textures: 3,
-                available_bytes: group_intermediate_texture_bytes(
-                    3,
-                    IMAGE_SIZE as u64,
-                    IMAGE_SIZE as u64,
-                ),
-            }
-        );
-    }
-
-    #[test]
-    fn backend_counters_zero_for_elided_opacity_zero_group_metal() {
+    fn backend_counters_zero_for_elided_opacity_zero_group_metal() -> Result<()> {
         let group = paint_group_with_effects(
             1,
             rect(4., 4., 16., 16.),
@@ -4401,13 +3863,14 @@ mod tests {
         scene.finish();
 
         assert_eq!(
-            backend_counters(&scene),
+            backend_counters(&scene)?,
             RenderGroupBackendCounters::default()
         );
+        Ok(())
     }
 
     #[test]
-    fn backend_counters_match_planner_for_nested_groups_metal() {
+    fn backend_counters_match_planner_for_nested_groups_metal() -> Result<()> {
         let inner = paint_group_with_effects(
             0,
             rect(6., 6., 12., 12.),
@@ -4430,23 +3893,15 @@ mod tests {
         let outer_predicted = predicted_counters(&outer);
 
         let predicted = RenderGroupBackendCounters {
-            source_capture_groups: outer_predicted.source_capture_groups
-                + inner_predicted.source_capture_groups,
-            source_capture_pixels: outer_predicted.source_capture_pixels
-                + inner_predicted.source_capture_pixels,
             intermediate_textures: outer_predicted.intermediate_textures
                 + inner_predicted.intermediate_textures,
             backdrop_copies: outer_predicted.backdrop_copies + inner_predicted.backdrop_copies,
-            ..RenderGroupBackendCounters::default()
         };
         assert_eq!(
             predicted,
             RenderGroupBackendCounters {
-                source_capture_groups: 2,
-                source_capture_pixels: 544,
                 intermediate_textures: 3,
                 backdrop_copies: 1,
-                ..RenderGroupBackendCounters::default()
             }
         );
 
@@ -4455,11 +3910,12 @@ mod tests {
         scene.insert_primitive(outer);
         scene.finish();
 
-        assert_eq!(backend_counters(&scene), predicted);
+        assert_eq!(backend_counters(&scene)?, predicted);
+        Ok(())
     }
 
     #[test]
-    fn render_group_backdrop_lens_metal_lights_continuous_bevel_profile() {
+    fn render_group_backdrop_lens_metal_lights_continuous_bevel_profile() -> Result<()> {
         let group_scene = Scene::default();
 
         let mut grouped = Scene::default();
@@ -4479,7 +3935,7 @@ mod tests {
         ));
         grouped.finish();
 
-        let image = render(&grouped);
+        let image = render(&grouped)?;
         let outer_edge = pixel(&image, 8, 16);
         let outer_shoulder = pixel(&image, 9, 16);
         let mid_bevel = pixel(&image, 10, 16);
@@ -4495,41 +3951,34 @@ mod tests {
             stable_center[0],
         ];
 
-        assert!(
-            outer_edge[0] > stable_center[0],
-            "outer edge should catch glancing light: outer_edge {outer_edge:?} center {stable_center:?}"
-        );
-        assert!(
-            outer_shoulder[0] > stable_center[0],
-            "rounded side should stay lit after the outer edge instead of collapsing into a dark band: outer_shoulder {outer_shoulder:?} center {stable_center:?}"
-        );
-        assert!(
-            mid_bevel[0] > stable_center[0],
-            "mid-bevel should stay optically active between the outer wall and inner focus ridge: mid_bevel {mid_bevel:?} center {stable_center:?}"
-        );
-        assert!(
-            focus_ridge[0] > mid_bevel[0],
-            "inner focus ridge should concentrate more light than the rounded bevel body for tangent-guided light: focus_ridge {focus_ridge:?} mid_bevel {mid_bevel:?}"
-        );
-        assert!(
-            inner_falloff[0] > stable_center[0],
-            "rounded side should decay back to the stable pane after the focus ridge: inner_falloff {inner_falloff:?} center {stable_center:?}"
-        );
-        assert!(
-            bevel_samples
-                .windows(2)
-                .all(|samples| samples[0].abs_diff(samples[1]) <= 48),
-            "rounded side should ramp continuously instead of forming separate visual rails: {bevel_samples:?}"
-        );
         assert_eq!(
-            stable_center,
-            [64, 64, 64, 255],
-            "center should stay the unchanged backdrop when the edge band is outside the sample point"
+            BackdropLensEdgeEvidence {
+                outer_edge_lit: outer_edge[0] > stable_center[0],
+                outer_shoulder_lit: outer_shoulder[0] > stable_center[0],
+                mid_bevel_lit: mid_bevel[0] > stable_center[0],
+                focus_ridge_stronger_than_mid_bevel: focus_ridge[0] > mid_bevel[0],
+                inner_falloff_lit: inner_falloff[0] > stable_center[0],
+                ramp_continuous: bevel_samples
+                    .windows(2)
+                    .all(|samples| samples[0].abs_diff(samples[1]) <= 48),
+                stable_center,
+            },
+            BackdropLensEdgeEvidence {
+                outer_edge_lit: true,
+                outer_shoulder_lit: true,
+                mid_bevel_lit: true,
+                focus_ridge_stronger_than_mid_bevel: true,
+                inner_falloff_lit: true,
+                ramp_continuous: true,
+                stable_center: [64, 64, 64, 255],
+            }
         );
+        Ok(())
     }
 
     #[test]
-    fn render_group_backdrop_lens_metal_reflects_backdrop_color_along_material_edge() {
+    fn render_group_backdrop_lens_metal_reflects_backdrop_color_along_material_edge() -> Result<()>
+    {
         let group_scene = Scene::default();
 
         let mut grouped = Scene::default();
@@ -4550,20 +3999,22 @@ mod tests {
         ));
         grouped.finish();
 
-        let image = render(&grouped);
+        let image = render(&grouped)?;
         let reflected_edge = pixel(&image, 9, 16);
         let stable_center = pixel(&image, 16, 16);
 
-        assert!(
-            reflected_edge[2] > reflected_edge[0] + 16
-                && reflected_edge[2] > reflected_edge[1] + 16,
-            "edge reflection should carry backdrop color along the tangent instead of only whitening the bevel: {reflected_edge:?}"
-        );
         assert_eq!(
-            stable_center,
-            [0, 0, 0, 255],
-            "center pane should not pick up the edge reflection sample"
+            BackdropLensReflectionEvidence {
+                edge_reflects_blue: reflected_edge[2] > reflected_edge[0] + 16
+                    && reflected_edge[2] > reflected_edge[1] + 16,
+                stable_center,
+            },
+            BackdropLensReflectionEvidence {
+                edge_reflects_blue: true,
+                stable_center: [0, 0, 0, 255],
+            }
         );
+        Ok(())
     }
 
     fn superellipse_clip_scene(shape: GroupShape) -> Scene {
@@ -4583,29 +4034,31 @@ mod tests {
     /// A superellipse with exponent 2.0 must render byte-identical to a rounded
     /// rectangle with the same radii: this guards the shared corner-SDF refactor.
     #[test]
-    fn render_group_superellipse_n2_matches_rounded_rect_metal() {
+    fn render_group_superellipse_n2_matches_rounded_rect_metal() -> Result<()> {
         let radii = Corners::all(px(8.));
-        let rounded = render(&superellipse_clip_scene(GroupShape::rounded_rect(radii)));
+        let rounded = render(&superellipse_clip_scene(GroupShape::rounded_rect(radii)))?;
         let superellipse = render(&superellipse_clip_scene(GroupShape::superellipse(
             radii, 2.0,
-        )));
+        )))?;
         assert_eq!(rounded.as_raw(), superellipse.as_raw());
+        Ok(())
     }
 
     /// A fuller superellipse corner (exponent 4) keeps a near-corner pixel that
     /// the circular rounded-rect corner (exponent 2) clips to background.
     #[test]
-    fn render_group_superellipse_keeps_fuller_corner_metal() {
+    fn render_group_superellipse_keeps_fuller_corner_metal() -> Result<()> {
         let radii = Corners::all(px(8.));
-        let rounded = render(&superellipse_clip_scene(GroupShape::rounded_rect(radii)));
+        let rounded = render(&superellipse_clip_scene(GroupShape::rounded_rect(radii)))?;
         let superellipse = render(&superellipse_clip_scene(GroupShape::superellipse(
             radii, 4.0,
-        )));
+        )))?;
 
         // Pixel (6, 5) sits in the corner crescent that the circular corner clips
         // away to background black but the squircle (n=4) keeps as opaque source.
         assert_eq!(pixel(&rounded, 6, 5), [0, 0, 0, 255]);
         assert_eq!(pixel(&superellipse, 6, 5), [0, 255, 0, 255]);
+        Ok(())
     }
 
     /// Builds a filled-rectangle `Path` (two solid triangles) in logical pixels,
@@ -4642,7 +4095,7 @@ mod tests {
     /// mask. AfterBlur, no source blur => the mask multiplies once at integer
     /// pixel centers where the rasterized path coverage and analytic SDF agree.
     #[test]
-    fn render_group_source_mask_path_matches_analytic_rectangle_mask_metal() {
+    fn render_group_source_mask_path_matches_analytic_rectangle_mask_metal() -> Result<()> {
         let group_bounds = rect(4., 4., 20., 20.);
 
         let analytic = {
@@ -4655,7 +4108,7 @@ mod tests {
                 finished_scene([quad(0, group_bounds, green())]),
             ));
             scene.finish();
-            render(&scene)
+            render(&scene)?
         };
 
         let path_mask = {
@@ -4670,7 +4123,7 @@ mod tests {
                 finished_scene([quad(0, group_bounds, green())]),
             ));
             scene.finish();
-            render(&scene)
+            render(&scene)?
         };
 
         // Interior lit green (coverage 1); exterior clipped to black (coverage 0).
@@ -4688,35 +4141,6 @@ mod tests {
                 "path mask != analytic mask at ({x}, {y})"
             );
         }
-    }
-
-    #[test]
-    fn render_group_child_path_uses_bounded_source_frame_metal() {
-        let group_bounds = rect(8., 8., 12., 12.);
-        let mut path = rectangle_path(group_bounds).scale(1.);
-        path.color = green().into();
-        path.content_mask = mask();
-
-        let mut group_scene = Scene::default();
-        group_scene.insert_primitive(path);
-        group_scene.finish();
-
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(0, viewport(), black()));
-        scene.insert_primitive(paint_group_with_effects(
-            1,
-            group_bounds,
-            vec![CompositeEffect::opacity(0.5)],
-            group_scene,
-        ));
-        scene.finish();
-
-        let image = render(&scene);
-        let inside = pixel(&image, 12, 12);
-        assert!(
-            inside[1] > 100,
-            "bounded group source should preserve child path green: {inside:?}"
-        );
-        assert_eq!(pixel(&image, 4, 4), [0, 0, 0, 255]);
+        Ok(())
     }
 }

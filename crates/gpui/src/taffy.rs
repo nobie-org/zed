@@ -8,7 +8,7 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
-use std::{fmt::Debug, ops::Range};
+use std::{fmt::Debug, ops::Range, time::Duration};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -31,6 +31,29 @@ type NodeMeasureFn = StackSafe<
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+
+/// Layout work performed by GPUI for one completed window draw.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LayoutWorkSample {
+    /// Monotonic window-local draw index that produced this sample.
+    pub draw_index: u64,
+    /// Non-measured nodes requested through [`Window::request_layout`](crate::Window::request_layout).
+    pub layout_node_requests: u64,
+    /// Measured nodes requested through [`Window::request_measured_layout`](crate::Window::request_measured_layout).
+    pub measured_layout_node_requests: u64,
+    /// Parent-to-child layout edges passed to Taffy.
+    pub child_edges: u64,
+    /// Root layout computations requested for the draw.
+    pub compute_layout_calls: u64,
+    /// Measured layout callbacks invoked by Taffy.
+    pub measured_layout_calls: u64,
+    /// Wall time spent computing root layouts.
+    pub compute_layout_duration: Duration,
+    /// Wall time spent inside measured layout callbacks.
+    pub measured_layout_duration: Duration,
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
@@ -38,6 +61,7 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    layout_work: LayoutWorkSample,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -52,14 +76,27 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            layout_work: LayoutWorkSample::default(),
         }
     }
 
-    pub fn clear(&mut self) {
+    pub fn finish_frame(&mut self) -> LayoutWorkSample {
+        let layout_work = self.layout_work;
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.layout_work = LayoutWorkSample::default();
+        layout_work
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.layout_work = LayoutWorkSample::default();
+    }
+
+    #[cfg(test)]
+    fn layout_work_sample(&self) -> LayoutWorkSample {
+        self.layout_work
     }
 
     pub fn request_layout(
@@ -70,6 +107,8 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        self.layout_work.layout_node_requests += 1;
+        self.layout_work.child_edges += children.len() as u64;
 
         if children.is_empty() {
             self.taffy
@@ -99,6 +138,7 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        self.layout_work.measured_layout_node_requests += 1;
 
         self.taffy
             .new_leaf_with_context(
@@ -207,6 +247,11 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        self.layout_work.compute_layout_calls += 1;
+        let compute_start = std::time::Instant::now();
+        let mut measured_layout_calls = 0;
+        let mut measured_layout_duration = Duration::default();
+
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
@@ -234,12 +279,19 @@ impl TaffyLayoutEngine {
                         untransform(available_space.height),
                     );
 
+                    measured_layout_calls += 1;
+                    let measure_start = std::time::Instant::now();
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
+                    measured_layout_duration += measure_start.elapsed();
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
             )
             .expect(EXPECT_MESSAGE);
+
+        self.layout_work.compute_layout_duration += compute_start.elapsed();
+        self.layout_work.measured_layout_calls += measured_layout_calls;
+        self.layout_work.measured_layout_duration += measured_layout_duration;
     }
 
     // Pixel snapping
@@ -720,6 +772,8 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AppContext as _;
+    use std::{cell::Cell, ops::Deref as _, rc::Rc, time::Duration};
 
     #[test]
     fn border_widths_to_taffy_use_stroke_snapping() {
@@ -747,5 +801,85 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+
+    #[test]
+    fn layout_work_sample_counts_requests_and_finish_frame_resets() {
+        let mut engine = TaffyLayoutEngine::new();
+        let first_child = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+        let second_child = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+        engine.request_layout(
+            Style::default(),
+            Pixels(16.0),
+            1.0,
+            &[first_child, second_child],
+        );
+
+        let expected_sample = LayoutWorkSample {
+            draw_index: 0,
+            layout_node_requests: 3,
+            measured_layout_node_requests: 0,
+            child_edges: 2,
+            compute_layout_calls: 0,
+            measured_layout_calls: 0,
+            compute_layout_duration: Duration::default(),
+            measured_layout_duration: Duration::default(),
+        };
+        assert_eq!(engine.layout_work_sample(), expected_sample);
+        assert_eq!(engine.finish_frame(), expected_sample);
+        assert_eq!(engine.layout_work_sample(), LayoutWorkSample::default());
+    }
+
+    #[test]
+    fn layout_work_sample_counts_compute_and_measure() {
+        let measure_invocations = Rc::new(Cell::new(0));
+        let measure_invocations_for_closure = measure_invocations.clone();
+        let mut test_app = crate::TestAppContext::single();
+        let window = test_app.add_window(|_, _| crate::Empty);
+
+        let sample = test_app
+            .update_window(*window.deref(), |_, window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let measured_layout = engine.request_measured_layout(
+                    Style::default(),
+                    Pixels(16.0),
+                    1.0,
+                    move |_, _, _, _| {
+                        measure_invocations_for_closure
+                            .set(measure_invocations_for_closure.get() + 1);
+                        std::thread::sleep(Duration::from_micros(1));
+                        size(Pixels(10.0), Pixels(20.0))
+                    },
+                );
+
+                engine.compute_layout(
+                    measured_layout,
+                    size(
+                        AvailableSpace::Definite(Pixels(100.0)),
+                        AvailableSpace::Definite(Pixels(100.0)),
+                    ),
+                    window,
+                    cx,
+                );
+                engine.finish_frame()
+            })
+            .unwrap();
+
+        assert_eq!(
+            sample,
+            LayoutWorkSample {
+                draw_index: 0,
+                layout_node_requests: 0,
+                measured_layout_node_requests: 1,
+                child_edges: 0,
+                compute_layout_calls: 1,
+                measured_layout_calls: 1,
+                compute_layout_duration: sample.compute_layout_duration,
+                measured_layout_duration: sample.measured_layout_duration,
+            }
+        );
+        assert_eq!(measure_invocations.get(), 1);
+        assert!(sample.compute_layout_duration >= sample.measured_layout_duration);
+        assert!(sample.measured_layout_duration > Duration::default());
     }
 }

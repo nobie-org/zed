@@ -810,6 +810,36 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CachedViewSite {
+    owner: EntityId,
+    global_id: GlobalElementId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CachedViewMissReason {
+    NoPreviousState,
+    CacheKeyChanged,
+    DirtyView,
+    DirtyDependency,
+    DependencyRegistrationMissing,
+    DuplicateSite,
+    Refreshing,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CachedViewCounters {
+    pub(crate) hits: usize,
+    pub(crate) no_previous_state_misses: usize,
+    pub(crate) cache_key_changed_misses: usize,
+    pub(crate) dirty_view_misses: usize,
+    pub(crate) dirty_dependency_misses: usize,
+    pub(crate) dependency_registration_missing_misses: usize,
+    pub(crate) duplicate_site_misses: usize,
+    pub(crate) refreshing_misses: usize,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -1010,6 +1040,14 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    cached_view_dependencies_by_site: FxHashMap<CachedViewSite, FxHashSet<EntityId>>,
+    cached_view_sites_by_dependency: FxHashMap<EntityId, FxHashSet<CachedViewSite>>,
+    cached_view_site_by_element_state: FxHashMap<(GlobalElementId, TypeId), CachedViewSite>,
+    dirty_cached_view_sites: FxHashSet<CachedViewSite>,
+    seen_cached_view_sites: FxHashSet<CachedViewSite>,
+    duplicate_cached_view_sites: FxHashSet<CachedViewSite>,
+    #[cfg(any(test, feature = "test-support"))]
+    cached_view_counters: CachedViewCounters,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -1660,6 +1698,14 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            cached_view_dependencies_by_site: FxHashMap::default(),
+            cached_view_sites_by_dependency: FxHashMap::default(),
+            cached_view_site_by_element_state: FxHashMap::default(),
+            dirty_cached_view_sites: FxHashSet::default(),
+            seen_cached_view_sites: FxHashSet::default(),
+            duplicate_cached_view_sites: FxHashSet::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            cached_view_counters: CachedViewCounters::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -1753,6 +1799,192 @@ impl Window {
                 break;
             }
         }
+    }
+
+    fn cached_view_site(owner: EntityId, global_id: &GlobalElementId) -> CachedViewSite {
+        CachedViewSite {
+            owner,
+            global_id: global_id.clone(),
+        }
+    }
+
+    pub(crate) fn cached_view_site_is_dirty(
+        &self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> bool {
+        let site = Self::cached_view_site(owner, global_id);
+        self.dirty_cached_view_sites.contains(&site)
+            || self.duplicate_cached_view_sites.contains(&site)
+    }
+
+    pub(crate) fn cached_view_site_is_duplicate(
+        &self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> bool {
+        self.duplicate_cached_view_sites
+            .contains(&Self::cached_view_site(owner, global_id))
+    }
+
+    pub(crate) fn cached_view_site_dependencies_are_registered(
+        &self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> bool {
+        self.cached_view_dependencies_by_site
+            .contains_key(&Self::cached_view_site(owner, global_id))
+    }
+
+    pub(crate) fn mark_cached_view_site_seen<S: 'static>(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) {
+        let site = Self::cached_view_site(owner, global_id);
+        self.cached_view_site_by_element_state
+            .insert((global_id.clone(), TypeId::of::<S>()), site.clone());
+        if !self.seen_cached_view_sites.insert(site.clone()) {
+            self.duplicate_cached_view_sites.insert(site.clone());
+            self.remove_cached_view_site_dependencies(&site);
+        }
+    }
+
+    pub(crate) fn replace_cached_view_site_dependencies<S: 'static>(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+        accessed_entities: &FxHashSet<EntityId>,
+    ) {
+        let site = Self::cached_view_site(owner, global_id);
+        self.remove_cached_view_site_dependencies(&site);
+        self.cached_view_site_by_element_state
+            .insert((global_id.clone(), TypeId::of::<S>()), site.clone());
+        if self.duplicate_cached_view_sites.contains(&site) {
+            return;
+        }
+
+        self.cached_view_dependencies_by_site
+            .insert(site.clone(), accessed_entities.clone());
+        for dependency in accessed_entities {
+            self.cached_view_sites_by_dependency
+                .entry(*dependency)
+                .or_default()
+                .insert(site.clone());
+        }
+        self.dirty_cached_view_sites.remove(&site);
+    }
+
+    fn remove_cached_view_site_dependencies(&mut self, site: &CachedViewSite) {
+        self.cached_view_site_by_element_state
+            .retain(|_, cached_site| cached_site != site);
+        if let Some(dependencies) = self.cached_view_dependencies_by_site.remove(site) {
+            for dependency in dependencies {
+                let remove_dependency_entry = if let Some(sites) =
+                    self.cached_view_sites_by_dependency.get_mut(&dependency)
+                {
+                    sites.remove(site);
+                    sites.is_empty()
+                } else {
+                    false
+                };
+
+                if remove_dependency_entry {
+                    self.cached_view_sites_by_dependency.remove(&dependency);
+                }
+            }
+        }
+        self.dirty_cached_view_sites.remove(site);
+    }
+
+    fn mark_cached_view_sites_seen_for_element_state_keys(
+        &mut self,
+        keys: &[(GlobalElementId, TypeId)],
+    ) {
+        for key in keys {
+            if let Some(site) = self.cached_view_site_by_element_state.get(key) {
+                self.seen_cached_view_sites.insert(site.clone());
+            }
+        }
+    }
+
+    fn mark_cached_view_sites_dirty_for_dependency(&mut self, dependency: EntityId) {
+        let Some(sites) = self
+            .cached_view_sites_by_dependency
+            .get(&dependency)
+            .cloned()
+        else {
+            return;
+        };
+
+        for site in sites {
+            self.dirty_cached_view_sites.insert(site.clone());
+            self.mark_view_dirty(site.owner);
+        }
+    }
+
+    fn sweep_unseen_cached_view_sites(&mut self) {
+        let seen = mem::take(&mut self.seen_cached_view_sites);
+        let unseen_sites = self
+            .cached_view_dependencies_by_site
+            .keys()
+            .filter(|site| !seen.contains(*site))
+            .cloned()
+            .collect::<SmallVec<[_; 8]>>();
+
+        for site in unseen_sites {
+            self.remove_cached_view_site_dependencies(&site);
+        }
+        self.duplicate_cached_view_sites
+            .retain(|site| seen.contains(site));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_cached_view_dependency_site_count(&self) -> usize {
+        self.cached_view_dependencies_by_site.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_cached_view_duplicate_site_count(&self) -> usize {
+        self.duplicate_cached_view_sites.len()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_cached_view_hit(&mut self) {
+        self.cached_view_counters.hits += 1;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_cached_view_miss(&mut self, reason: CachedViewMissReason) {
+        match reason {
+            CachedViewMissReason::NoPreviousState => {
+                self.cached_view_counters.no_previous_state_misses += 1;
+            }
+            CachedViewMissReason::CacheKeyChanged => {
+                self.cached_view_counters.cache_key_changed_misses += 1;
+            }
+            CachedViewMissReason::DirtyView => {
+                self.cached_view_counters.dirty_view_misses += 1;
+            }
+            CachedViewMissReason::DirtyDependency => {
+                self.cached_view_counters.dirty_dependency_misses += 1;
+            }
+            CachedViewMissReason::DependencyRegistrationMissing => {
+                self.cached_view_counters
+                    .dependency_registration_missing_misses += 1;
+            }
+            CachedViewMissReason::DuplicateSite => {
+                self.cached_view_counters.duplicate_site_misses += 1;
+            }
+            CachedViewMissReason::Refreshing => {
+                self.cached_view_counters.refreshing_misses += 1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_cached_view_counters(&self) -> CachedViewCounters {
+        self.cached_view_counters.clone()
     }
 
     /// Registers a callback to be invoked when the window appearance changes.
@@ -2730,6 +2962,7 @@ impl Window {
         if !cx.mode.skip_drawing() {
             profiling::scope!("gpui::window::draw_roots");
             self.draw_roots(cx);
+            self.sweep_unseen_cached_view_sites();
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
@@ -2841,6 +3074,9 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
+        for entity in &views {
+            self.mark_cached_view_sites_dirty_for_dependency(*entity);
+        }
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -3162,12 +3398,15 @@ impl Window {
                 .iter_mut()
                 .map(|request| request.take()),
         );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
+        let accessed_element_states = self.rendered_frame.accessed_element_states
+            [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
+            .iter()
+            .map(|(id, type_id)| (id.clone(), *type_id))
+            .collect::<SmallVec<[_; 8]>>();
+        self.mark_cached_view_sites_seen_for_element_state_keys(&accessed_element_states);
+        self.next_frame
+            .accessed_element_states
+            .extend(accessed_element_states);
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
 
@@ -3232,12 +3471,15 @@ impl Window {
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
+        let accessed_element_states = self.rendered_frame.accessed_element_states
+            [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
+            .iter()
+            .map(|(id, type_id)| (id.clone(), *type_id))
+            .collect::<SmallVec<[_; 8]>>();
+        self.mark_cached_view_sites_seen_for_element_state_keys(&accessed_element_states);
+        self.next_frame
+            .accessed_element_states
+            .extend(accessed_element_states);
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],

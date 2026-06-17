@@ -62,6 +62,7 @@ use uuid::Uuid;
 
 mod prompts;
 
+use crate::taffy::RetainedLayoutScopeId;
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -816,6 +817,11 @@ struct CachedViewSite {
     global_id: GlobalElementId,
 }
 
+enum RequestedLayoutContract {
+    Style(Style),
+    Measured,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CachedViewMissReason {
     NoPreviousState,
@@ -824,6 +830,7 @@ pub(crate) enum CachedViewMissReason {
     DirtyDependency,
     DependencyRegistrationMissing,
     DuplicateSite,
+    OuterLayoutUnknown,
     Refreshing,
 }
 
@@ -837,7 +844,10 @@ pub(crate) struct CachedViewCounters {
     pub(crate) dirty_dependency_misses: usize,
     pub(crate) dependency_registration_missing_misses: usize,
     pub(crate) duplicate_site_misses: usize,
+    pub(crate) outer_layout_unknown_misses: usize,
     pub(crate) refreshing_misses: usize,
+    pub(crate) automatic_hits: usize,
+    pub(crate) automatic_misses: usize,
 }
 
 pub(crate) struct Frame {
@@ -1024,6 +1034,7 @@ pub struct Window {
     layout_engine: Option<TaffyLayoutEngine>,
     last_layout_work_sample: Option<LayoutWorkSample>,
     next_layout_work_draw_index: u64,
+    requested_layout_contracts: FxHashMap<LayoutId, RequestedLayoutContract>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -1046,6 +1057,10 @@ pub struct Window {
     dirty_cached_view_sites: FxHashSet<CachedViewSite>,
     seen_cached_view_sites: FxHashSet<CachedViewSite>,
     duplicate_cached_view_sites: FxHashSet<CachedViewSite>,
+    retained_layout_claimed_cached_view_sites: FxHashSet<CachedViewSite>,
+    retained_layout_removal_pending_cached_view_sites: FxHashSet<CachedViewSite>,
+    retained_layout_scopes_by_cached_view_site: FxHashMap<CachedViewSite, RetainedLayoutScopeId>,
+    next_retained_layout_scope_id: u64,
     #[cfg(any(test, feature = "test-support"))]
     cached_view_counters: CachedViewCounters,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -1683,6 +1698,7 @@ impl Window {
             layout_engine: Some(TaffyLayoutEngine::new()),
             last_layout_work_sample: None,
             next_layout_work_draw_index: 0,
+            requested_layout_contracts: FxHashMap::default(),
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
@@ -1704,6 +1720,10 @@ impl Window {
             dirty_cached_view_sites: FxHashSet::default(),
             seen_cached_view_sites: FxHashSet::default(),
             duplicate_cached_view_sites: FxHashSet::default(),
+            retained_layout_claimed_cached_view_sites: FxHashSet::default(),
+            retained_layout_removal_pending_cached_view_sites: FxHashSet::default(),
+            retained_layout_scopes_by_cached_view_site: FxHashMap::default(),
+            next_retained_layout_scope_id: 0,
             #[cfg(any(test, feature = "test-support"))]
             cached_view_counters: CachedViewCounters::default(),
             focus_listeners: SubscriberSet::new(),
@@ -1808,6 +1828,155 @@ impl Window {
         }
     }
 
+    fn cached_view_retained_layout_scope(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> RetainedLayoutScopeId {
+        let site = Self::cached_view_site(owner, global_id);
+        if let Some(scope) = self.retained_layout_scopes_by_cached_view_site.get(&site) {
+            return *scope;
+        }
+
+        let scope = RetainedLayoutScopeId::new(self.next_retained_layout_scope_id);
+        self.next_retained_layout_scope_id += 1;
+        self.retained_layout_scopes_by_cached_view_site
+            .insert(site, scope);
+        scope
+    }
+
+    pub(crate) fn begin_cached_view_retained_layout_scope(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) {
+        let scope = self.cached_view_retained_layout_scope(owner, global_id);
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .begin_retained_layout_scope(scope);
+    }
+
+    pub(crate) fn finish_cached_view_retained_layout_scope(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+        root: LayoutId,
+    ) {
+        let scope = self.cached_view_retained_layout_scope(owner, global_id);
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .finish_retained_layout_scope(scope, root);
+    }
+
+    pub(crate) fn discard_cached_view_retained_layout_scope(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) {
+        let site = Self::cached_view_site(owner, global_id);
+        if let Some(scope) = self
+            .retained_layout_scopes_by_cached_view_site
+            .remove(&site)
+        {
+            self.layout_engine
+                .as_mut()
+                .unwrap()
+                .discard_retained_layout_scope(scope);
+        }
+    }
+
+    pub(crate) fn cached_view_retained_layout_root(
+        &self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> Option<LayoutId> {
+        let site = Self::cached_view_site(owner, global_id);
+        let scope = self.retained_layout_scopes_by_cached_view_site.get(&site)?;
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .retained_layout_root(*scope)
+    }
+
+    pub(crate) fn claim_cached_view_retained_layout_root(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> Result<LayoutId, CachedViewMissReason> {
+        let layout_id = self
+            .cached_view_retained_layout_root(owner, global_id)
+            .ok_or(CachedViewMissReason::OuterLayoutUnknown)?;
+
+        if !self.claim_cached_view_retained_layout_site(owner, global_id) {
+            return Err(CachedViewMissReason::DuplicateSite);
+        }
+
+        Ok(layout_id)
+    }
+
+    pub(crate) fn claim_cached_view_retained_layout_site(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) -> bool {
+        let site = Self::cached_view_site(owner, global_id);
+        if self.duplicate_cached_view_sites.contains(&site) {
+            return false;
+        }
+
+        if !self
+            .retained_layout_claimed_cached_view_sites
+            .insert(site.clone())
+        {
+            self.duplicate_cached_view_sites.insert(site.clone());
+            self.remove_cached_view_site_dependencies(&site);
+            self.retained_layout_removal_pending_cached_view_sites
+                .insert(site);
+            return false;
+        }
+
+        true
+    }
+
+    pub(crate) fn remove_cached_view_retained_layout(
+        &mut self,
+        owner: EntityId,
+        global_id: &GlobalElementId,
+    ) {
+        let site = Self::cached_view_site(owner, global_id);
+        self.schedule_cached_view_site_retained_layout_removal(site);
+    }
+
+    fn schedule_cached_view_site_retained_layout_removal(&mut self, site: CachedViewSite) {
+        if self
+            .retained_layout_claimed_cached_view_sites
+            .contains(&site)
+        {
+            self.retained_layout_removal_pending_cached_view_sites
+                .insert(site);
+        } else {
+            self.remove_cached_view_site_retained_layout_now(&site);
+        }
+    }
+
+    fn remove_cached_view_site_retained_layout_now(&mut self, site: &CachedViewSite) {
+        if let Some(scope) = self.retained_layout_scopes_by_cached_view_site.remove(site) {
+            self.layout_engine
+                .as_mut()
+                .unwrap()
+                .remove_retained_layout_scope(scope);
+        }
+    }
+
+    fn remove_pending_cached_view_retained_layouts(&mut self) {
+        let pending = mem::take(&mut self.retained_layout_removal_pending_cached_view_sites);
+        for site in pending {
+            self.remove_cached_view_site_retained_layout_now(&site);
+        }
+    }
+
     pub(crate) fn cached_view_site_is_dirty(
         &self,
         owner: EntityId,
@@ -1847,6 +2016,8 @@ impl Window {
         if !self.seen_cached_view_sites.insert(site.clone()) {
             self.duplicate_cached_view_sites.insert(site.clone());
             self.remove_cached_view_site_dependencies(&site);
+            self.retained_layout_removal_pending_cached_view_sites
+                .insert(site);
         }
     }
 
@@ -1925,18 +2096,25 @@ impl Window {
 
     fn sweep_unseen_cached_view_sites(&mut self) {
         let seen = mem::take(&mut self.seen_cached_view_sites);
-        let unseen_sites = self
+        let mut unseen_sites = self
             .cached_view_dependencies_by_site
             .keys()
             .filter(|site| !seen.contains(*site))
             .cloned()
             .collect::<SmallVec<[_; 8]>>();
+        for site in self.retained_layout_scopes_by_cached_view_site.keys() {
+            if !seen.contains(site) && !unseen_sites.contains(site) {
+                unseen_sites.push(site.clone());
+            }
+        }
 
         for site in unseen_sites {
             self.remove_cached_view_site_dependencies(&site);
+            self.schedule_cached_view_site_retained_layout_removal(site);
         }
         self.duplicate_cached_view_sites
             .retain(|site| seen.contains(site));
+        self.retained_layout_claimed_cached_view_sites.clear();
     }
 
     #[cfg(test)]
@@ -1949,9 +2127,30 @@ impl Window {
         self.duplicate_cached_view_sites.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_retained_layout_node_creates(&self) -> usize {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .retained_layout_node_creates()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_retained_layout_node_count(&self) -> usize {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .retained_layout_node_count()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cached_view_hit(&mut self) {
         self.cached_view_counters.hits += 1;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_automatic_cached_view_hit(&mut self) {
+        self.cached_view_counters.automatic_hits += 1;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1976,10 +2175,18 @@ impl Window {
             CachedViewMissReason::DuplicateSite => {
                 self.cached_view_counters.duplicate_site_misses += 1;
             }
+            CachedViewMissReason::OuterLayoutUnknown => {
+                self.cached_view_counters.outer_layout_unknown_misses += 1;
+            }
             CachedViewMissReason::Refreshing => {
                 self.cached_view_counters.refreshing_misses += 1;
             }
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_automatic_cached_view_miss(&mut self) {
+        self.cached_view_counters.automatic_misses += 1;
     }
 
     #[cfg(test)]
@@ -2984,10 +3191,27 @@ impl Window {
 
         {
             profiling::scope!("gpui::window::finish_next_frame");
+            #[cfg(debug_assertions)]
+            self.layout_engine
+                .as_ref()
+                .unwrap()
+                .debug_assert_retained_layout_invariants();
             let mut layout_work_sample = self.layout_engine.as_mut().unwrap().finish_frame();
             layout_work_sample.draw_index = self.next_layout_work_draw_index;
             self.next_layout_work_draw_index = self.next_layout_work_draw_index.saturating_add(1);
             self.last_layout_work_sample = Some(layout_work_sample);
+            #[cfg(debug_assertions)]
+            self.layout_engine
+                .as_ref()
+                .unwrap()
+                .debug_assert_retained_layout_invariants();
+            self.remove_pending_cached_view_retained_layouts();
+            #[cfg(debug_assertions)]
+            self.layout_engine
+                .as_ref()
+                .unwrap()
+                .debug_assert_retained_layout_invariants();
+            self.requested_layout_contracts.clear();
             self.text_system().finish_frame();
             self.next_frame.finish(&mut self.rendered_frame);
         }
@@ -3919,6 +4143,32 @@ impl Window {
         }
     }
 
+    pub(crate) fn element_state<S: 'static>(&self, global_id: &GlobalElementId) -> Option<&S> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.next_frame
+            .element_states
+            .get(&key)
+            .or_else(|| self.rendered_frame.element_states.get(&key))
+            .and_then(|any| any.inner.downcast_ref::<Option<S>>())
+            .and_then(Option::as_ref)
+    }
+
+    pub(crate) fn next_frame_element_state<S: 'static>(
+        &self,
+        global_id: &GlobalElementId,
+    ) -> Option<&S> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.next_frame
+            .element_states
+            .get(&key)
+            .and_then(|any| any.inner.downcast_ref::<Option<S>>())
+            .and_then(Option::as_ref)
+    }
+
     /// A variant of `with_element_state` that allows the element's id to be optional. This is a convenience
     /// method for elements where the element id may or may not be assigned. Prefer using `with_element_state`
     /// when the element is guaranteed to have an id.
@@ -4540,13 +4790,17 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
+        let requested_style = style.clone();
 
-        self.layout_engine.as_mut().unwrap().request_layout(
+        let layout_id = self.layout_engine.as_mut().unwrap().request_layout(
             style,
             rem_size,
             scale_factor,
             &cx.layout_id_buffer,
-        )
+        );
+        self.requested_layout_contracts
+            .insert(layout_id, RequestedLayoutContract::Style(requested_style));
+        layout_id
     }
 
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,
@@ -4566,10 +4820,21 @@ impl Window {
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
-        self.layout_engine
+        let layout_id = self
+            .layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(style, rem_size, scale_factor, measure);
+        self.requested_layout_contracts
+            .insert(layout_id, RequestedLayoutContract::Measured);
+        layout_id
+    }
+
+    pub(crate) fn take_requested_layout_style(&mut self, layout_id: LayoutId) -> Option<Style> {
+        match self.requested_layout_contracts.remove(&layout_id) {
+            Some(RequestedLayoutContract::Style(style)) => Some(style),
+            Some(RequestedLayoutContract::Measured) | None => None,
+        }
     }
 
     /// Compute the layout for the given id within the given available space.

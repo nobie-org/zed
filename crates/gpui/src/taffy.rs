@@ -54,6 +54,18 @@ pub struct LayoutWorkSample {
     pub measured_layout_duration: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedLayoutNodeKind {
+    Unmeasured,
+    Measured,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveRetainedLayoutScope {
+    id: RetainedLayoutScopeId,
+    next_node_index: usize,
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
@@ -63,8 +75,9 @@ pub struct TaffyLayoutEngine {
     layout_bounds_scratch_space: Vec<LayoutId>,
     layout_work: LayoutWorkSample,
     scratch_nodes: Vec<LayoutId>,
-    retained_layout_scope_stack: Vec<RetainedLayoutScopeId>,
+    retained_layout_scope_stack: Vec<ActiveRetainedLayoutScope>,
     retained_layout_nodes_by_scope: FxHashMap<RetainedLayoutScopeId, Vec<LayoutId>>,
+    retained_layout_node_kinds: FxHashMap<LayoutId, RetainedLayoutNodeKind>,
     retained_layout_root_by_scope: FxHashMap<RetainedLayoutScopeId, LayoutId>,
     #[cfg(any(test, feature = "test-support"))]
     retained_layout_node_creates: usize,
@@ -86,6 +99,7 @@ impl TaffyLayoutEngine {
             scratch_nodes: Vec::new(),
             retained_layout_scope_stack: Vec::new(),
             retained_layout_nodes_by_scope: FxHashMap::default(),
+            retained_layout_node_kinds: FxHashMap::default(),
             retained_layout_root_by_scope: FxHashMap::default(),
             #[cfg(any(test, feature = "test-support"))]
             retained_layout_node_creates: 0,
@@ -114,10 +128,14 @@ impl TaffyLayoutEngine {
     }
 
     pub(crate) fn begin_retained_layout_scope(&mut self, scope: RetainedLayoutScopeId) {
-        self.remove_retained_layout_scope(scope);
-        self.retained_layout_scope_stack.push(scope);
         self.retained_layout_nodes_by_scope
-            .insert(scope, Vec::new());
+            .entry(scope)
+            .or_default();
+        self.retained_layout_scope_stack
+            .push(ActiveRetainedLayoutScope {
+                id: scope,
+                next_node_index: 0,
+            });
     }
 
     pub(crate) fn finish_retained_layout_scope(
@@ -125,18 +143,31 @@ impl TaffyLayoutEngine {
         scope: RetainedLayoutScopeId,
         root: LayoutId,
     ) {
+        let Some(active_scope) = self.retained_layout_scope_stack.pop() else {
+            panic!("retained layout scopes must be finished in stack order");
+        };
         assert_eq!(
-            self.retained_layout_scope_stack.pop(),
-            Some(scope),
+            active_scope.id, scope,
             "retained layout scopes must be finished in stack order"
         );
+        if let Some(nodes) = self.retained_layout_nodes_by_scope.get_mut(&scope) {
+            for node in nodes
+                .split_off(active_scope.next_node_index)
+                .into_iter()
+                .rev()
+            {
+                self.remove_node(node);
+            }
+        }
         self.retained_layout_root_by_scope.insert(scope, root);
     }
 
     pub(crate) fn discard_retained_layout_scope(&mut self, scope: RetainedLayoutScopeId) {
+        let Some(active_scope) = self.retained_layout_scope_stack.pop() else {
+            panic!("retained layout scopes must be discarded in stack order");
+        };
         assert_eq!(
-            self.retained_layout_scope_stack.pop(),
-            Some(scope),
+            active_scope.id, scope,
             "retained layout scopes must be discarded in stack order"
         );
         if let Some(nodes) = self.retained_layout_nodes_by_scope.remove(&scope) {
@@ -190,6 +221,14 @@ impl TaffyLayoutEngine {
                 "retained layout root must be tracked in its retained scope"
             );
         }
+        for nodes in self.retained_layout_nodes_by_scope.values() {
+            for node in nodes {
+                debug_assert!(
+                    self.retained_layout_node_kinds.contains_key(node),
+                    "retained layout node must have a recorded node kind"
+                );
+            }
+        }
         debug_assert_eq!(
             self.taffy.total_node_count(),
             tracked_nodes.len(),
@@ -210,12 +249,26 @@ impl TaffyLayoutEngine {
             .sum()
     }
 
-    fn track_new_layout_node(&mut self, layout_id: LayoutId) {
-        if let Some(scope) = self.retained_layout_scope_stack.last().copied() {
+    fn next_retained_layout_node(&mut self) -> Option<Option<LayoutId>> {
+        let active_scope = self.retained_layout_scope_stack.last_mut()?;
+        let scope = active_scope.id;
+        let node_index = active_scope.next_node_index;
+        active_scope.next_node_index += 1;
+
+        let nodes = self
+            .retained_layout_nodes_by_scope
+            .entry(scope)
+            .or_default();
+        Some(nodes.get(node_index).copied())
+    }
+
+    fn track_new_layout_node(&mut self, layout_id: LayoutId, kind: RetainedLayoutNodeKind) {
+        if let Some(active_scope) = self.retained_layout_scope_stack.last() {
             self.retained_layout_nodes_by_scope
-                .entry(scope)
+                .entry(active_scope.id)
                 .or_default()
                 .push(layout_id);
+            self.retained_layout_node_kinds.insert(layout_id, kind);
             #[cfg(any(test, feature = "test-support"))]
             {
                 self.retained_layout_node_creates += 1;
@@ -226,10 +279,82 @@ impl TaffyLayoutEngine {
     }
 
     fn remove_node(&mut self, node: LayoutId) {
+        self.retained_layout_node_kinds.remove(&node);
         self.taffy
             .set_node_context(node.into(), None)
             .expect(EXPECT_MESSAGE);
         self.taffy.remove(node.into()).expect(EXPECT_MESSAGE);
+    }
+
+    fn node_children_match(&self, node: LayoutId, children: &[LayoutId]) -> bool {
+        self.taffy.child_count(node.into()) == children.len()
+            && children.iter().enumerate().all(|(ix, child)| {
+                self.taffy
+                    .child_at_index(node.into(), ix)
+                    .expect(EXPECT_MESSAGE)
+                    == (*child).into()
+            })
+    }
+
+    fn update_retained_layout_node(
+        &mut self,
+        layout_id: LayoutId,
+        style: taffy::style::Style,
+        children: &[LayoutId],
+    ) {
+        if self.taffy.style(layout_id.into()).expect(EXPECT_MESSAGE) != &style {
+            self.taffy
+                .set_style(layout_id.into(), style)
+                .expect(EXPECT_MESSAGE);
+        }
+        if self
+            .retained_layout_node_kinds
+            .insert(layout_id, RetainedLayoutNodeKind::Unmeasured)
+            == Some(RetainedLayoutNodeKind::Measured)
+        {
+            self.taffy
+                .set_node_context(layout_id.into(), None)
+                .expect(EXPECT_MESSAGE);
+        }
+        if !self.node_children_match(layout_id, children) {
+            self.taffy
+                .set_children(layout_id.into(), LayoutId::to_taffy_slice(children))
+                .expect(EXPECT_MESSAGE);
+        }
+    }
+
+    fn update_retained_measured_layout_node(
+        &mut self,
+        layout_id: LayoutId,
+        style: taffy::style::Style,
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+            &mut App,
+        ) -> Size<Pixels>
+        + 'static,
+    ) {
+        if self.taffy.style(layout_id.into()).expect(EXPECT_MESSAGE) != &style {
+            self.taffy
+                .set_style(layout_id.into(), style)
+                .expect(EXPECT_MESSAGE);
+        }
+        self.taffy
+            .set_node_context(
+                layout_id.into(),
+                Some(NodeContext {
+                    measure: StackSafe::new(Box::new(measure)),
+                }),
+            )
+            .expect(EXPECT_MESSAGE);
+        self.retained_layout_node_kinds
+            .insert(layout_id, RetainedLayoutNodeKind::Measured);
+        if !self.node_children_match(layout_id, &[]) {
+            self.taffy
+                .set_children(layout_id.into(), &[])
+                .expect(EXPECT_MESSAGE);
+        }
     }
 
     pub fn request_layout(
@@ -243,20 +368,28 @@ impl TaffyLayoutEngine {
         self.layout_work.layout_node_requests += 1;
         self.layout_work.child_edges += children.len() as u64;
 
-        let layout_id = if children.is_empty() {
-            self.taffy
-                .new_leaf(taffy_style)
-                .expect(EXPECT_MESSAGE)
-                .into()
-        } else {
-            self.taffy
-                // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
-                .expect(EXPECT_MESSAGE)
-                .into()
-        };
-        self.track_new_layout_node(layout_id);
-        layout_id
+        match self.next_retained_layout_node() {
+            Some(Some(layout_id)) => {
+                self.update_retained_layout_node(layout_id, taffy_style, children);
+                layout_id
+            }
+            Some(None) | None => {
+                let layout_id = if children.is_empty() {
+                    self.taffy
+                        .new_leaf(taffy_style)
+                        .expect(EXPECT_MESSAGE)
+                        .into()
+                } else {
+                    self.taffy
+                        // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
+                        .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
+                        .expect(EXPECT_MESSAGE)
+                        .into()
+                };
+                self.track_new_layout_node(layout_id, RetainedLayoutNodeKind::Unmeasured);
+                layout_id
+            }
+        }
     }
 
     pub fn request_measured_layout(
@@ -275,18 +408,26 @@ impl TaffyLayoutEngine {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         self.layout_work.measured_layout_node_requests += 1;
 
-        let layout_id = self
-            .taffy
-            .new_leaf_with_context(
-                taffy_style,
-                NodeContext {
-                    measure: StackSafe::new(Box::new(measure)),
-                },
-            )
-            .expect(EXPECT_MESSAGE)
-            .into();
-        self.track_new_layout_node(layout_id);
-        layout_id
+        match self.next_retained_layout_node() {
+            Some(Some(layout_id)) => {
+                self.update_retained_measured_layout_node(layout_id, taffy_style, measure);
+                layout_id
+            }
+            Some(None) | None => {
+                let layout_id = self
+                    .taffy
+                    .new_leaf_with_context(
+                        taffy_style,
+                        NodeContext {
+                            measure: StackSafe::new(Box::new(measure)),
+                        },
+                    )
+                    .expect(EXPECT_MESSAGE)
+                    .into();
+                self.track_new_layout_node(layout_id, RetainedLayoutNodeKind::Measured);
+                layout_id
+            }
+        }
     }
 
     // Used to understand performance

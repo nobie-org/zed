@@ -817,11 +817,6 @@ struct CachedViewSite {
     global_id: GlobalElementId,
 }
 
-enum RequestedLayoutContract {
-    Style(Style),
-    Measured,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CachedViewMissReason {
     NoPreviousState,
@@ -830,7 +825,7 @@ pub(crate) enum CachedViewMissReason {
     DirtyDependency,
     DependencyRegistrationMissing,
     DuplicateSite,
-    OuterLayoutUnknown,
+    RetainedLayoutUnavailable,
     Refreshing,
 }
 
@@ -844,7 +839,7 @@ pub(crate) struct CachedViewCounters {
     pub(crate) dirty_dependency_misses: usize,
     pub(crate) dependency_registration_missing_misses: usize,
     pub(crate) duplicate_site_misses: usize,
-    pub(crate) outer_layout_unknown_misses: usize,
+    pub(crate) retained_layout_unavailable_misses: usize,
     pub(crate) refreshing_misses: usize,
     pub(crate) automatic_hits: usize,
     pub(crate) automatic_misses: usize,
@@ -889,6 +884,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1034,7 +1030,6 @@ pub struct Window {
     layout_engine: Option<TaffyLayoutEngine>,
     last_layout_work_sample: Option<LayoutWorkSample>,
     next_layout_work_draw_index: u64,
-    requested_layout_contracts: FxHashMap<LayoutId, RequestedLayoutContract>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -1698,7 +1693,6 @@ impl Window {
             layout_engine: Some(TaffyLayoutEngine::new()),
             last_layout_work_sample: None,
             next_layout_work_draw_index: 0,
-            requested_layout_contracts: FxHashMap::default(),
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
@@ -1907,7 +1901,7 @@ impl Window {
     ) -> Result<LayoutId, CachedViewMissReason> {
         let layout_id = self
             .cached_view_retained_layout_root(owner, global_id)
-            .ok_or(CachedViewMissReason::OuterLayoutUnknown)?;
+            .ok_or(CachedViewMissReason::RetainedLayoutUnavailable)?;
 
         if !self.claim_cached_view_retained_layout_site(owner, global_id) {
             return Err(CachedViewMissReason::DuplicateSite);
@@ -1931,7 +1925,7 @@ impl Window {
             .insert(site.clone())
         {
             self.duplicate_cached_view_sites.insert(site.clone());
-            self.remove_cached_view_site_dependencies(&site);
+            self.remove_cached_view_site_dependencies_for_site(&site);
             self.retained_layout_removal_pending_cached_view_sites
                 .insert(site);
             return false;
@@ -2015,7 +2009,7 @@ impl Window {
             .insert((global_id.clone(), TypeId::of::<S>()), site.clone());
         if !self.seen_cached_view_sites.insert(site.clone()) {
             self.duplicate_cached_view_sites.insert(site.clone());
-            self.remove_cached_view_site_dependencies(&site);
+            self.remove_cached_view_site_dependencies_for_site(&site);
             self.retained_layout_removal_pending_cached_view_sites
                 .insert(site);
         }
@@ -2028,7 +2022,7 @@ impl Window {
         accessed_entities: &FxHashSet<EntityId>,
     ) {
         let site = Self::cached_view_site(owner, global_id);
-        self.remove_cached_view_site_dependencies(&site);
+        self.remove_cached_view_site_dependencies_for_site(&site);
         self.cached_view_site_by_element_state
             .insert((global_id.clone(), TypeId::of::<S>()), site.clone());
         if self.duplicate_cached_view_sites.contains(&site) {
@@ -2046,7 +2040,7 @@ impl Window {
         self.dirty_cached_view_sites.remove(&site);
     }
 
-    fn remove_cached_view_site_dependencies(&mut self, site: &CachedViewSite) {
+    fn remove_cached_view_site_dependencies_for_site(&mut self, site: &CachedViewSite) {
         self.cached_view_site_by_element_state
             .retain(|_, cached_site| cached_site != site);
         if let Some(dependencies) = self.cached_view_dependencies_by_site.remove(site) {
@@ -2109,11 +2103,10 @@ impl Window {
         }
 
         for site in unseen_sites {
-            self.remove_cached_view_site_dependencies(&site);
+            self.remove_cached_view_site_dependencies_for_site(&site);
             self.schedule_cached_view_site_retained_layout_removal(site);
         }
-        self.duplicate_cached_view_sites
-            .retain(|site| seen.contains(site));
+        self.duplicate_cached_view_sites.clear();
         self.retained_layout_claimed_cached_view_sites.clear();
     }
 
@@ -2175,8 +2168,8 @@ impl Window {
             CachedViewMissReason::DuplicateSite => {
                 self.cached_view_counters.duplicate_site_misses += 1;
             }
-            CachedViewMissReason::OuterLayoutUnknown => {
-                self.cached_view_counters.outer_layout_unknown_misses += 1;
+            CachedViewMissReason::RetainedLayoutUnavailable => {
+                self.cached_view_counters.retained_layout_unavailable_misses += 1;
             }
             CachedViewMissReason::Refreshing => {
                 self.cached_view_counters.refreshing_misses += 1;
@@ -3211,7 +3204,6 @@ impl Window {
                 .as_ref()
                 .unwrap()
                 .debug_assert_retained_layout_invariants();
-            self.requested_layout_contracts.clear();
             self.text_system().finish_frame();
             self.next_frame.finish(&mut self.rendered_frame);
         }
@@ -3622,15 +3614,7 @@ impl Window {
                 .iter_mut()
                 .map(|request| request.take()),
         );
-        let accessed_element_states = self.rendered_frame.accessed_element_states
-            [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
-            .iter()
-            .map(|(id, type_id)| (id.clone(), *type_id))
-            .collect::<SmallVec<[_; 8]>>();
-        self.mark_cached_view_sites_seen_for_element_state_keys(&accessed_element_states);
-        self.next_frame
-            .accessed_element_states
-            .extend(accessed_element_states);
+        self.reuse_prepaint_element_state_accesses(range.clone());
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
 
@@ -3664,12 +3648,28 @@ impl Window {
         );
     }
 
+    pub(crate) fn reuse_prepaint_element_state_accesses(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+    ) {
+        let accessed_element_states = self.rendered_frame.accessed_element_states
+            [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
+            .iter()
+            .map(|(id, type_id)| (id.clone(), *type_id))
+            .collect::<SmallVec<[_; 8]>>();
+        self.mark_cached_view_sites_seen_for_element_state_keys(&accessed_element_states);
+        self.next_frame
+            .accessed_element_states
+            .extend(accessed_element_states);
+    }
+
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -3680,6 +3680,12 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
@@ -4790,17 +4796,13 @@ impl Window {
         cx.layout_id_buffer.extend(children);
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
-        let requested_style = style.clone();
 
-        let layout_id = self.layout_engine.as_mut().unwrap().request_layout(
+        self.layout_engine.as_mut().unwrap().request_layout(
             style,
             rem_size,
             scale_factor,
             &cx.layout_id_buffer,
-        );
-        self.requested_layout_contracts
-            .insert(layout_id, RequestedLayoutContract::Style(requested_style));
-        layout_id
+        )
     }
 
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,
@@ -4820,21 +4822,10 @@ impl Window {
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
-        let layout_id = self
-            .layout_engine
+        self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure);
-        self.requested_layout_contracts
-            .insert(layout_id, RequestedLayoutContract::Measured);
-        layout_id
-    }
-
-    pub(crate) fn take_requested_layout_style(&mut self, layout_id: LayoutId) -> Option<Style> {
-        match self.requested_layout_contracts.remove(&layout_id) {
-            Some(RequestedLayoutContract::Style(style)) => Some(style),
-            Some(RequestedLayoutContract::Measured) | None => None,
-        }
+            .request_measured_layout(style, rem_size, scale_factor, measure)
     }
 
     /// Compute the layout for the given id within the given available space.

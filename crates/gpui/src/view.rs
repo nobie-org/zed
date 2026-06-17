@@ -1,8 +1,7 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Length,
-    PaintIndex, Pixels, PrepaintStateIndex, Render, Size, Style, StyleRefinement, TextStyle,
-    WeakEntity,
+    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
+    Pixels, PrepaintStateIndex, Render, Size, Style, StyleRefinement, TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -16,11 +15,11 @@ use std::{any::TypeId, fmt, ops::Range};
 use crate::window::CachedViewMissReason;
 
 struct AnyViewState {
+    request_layout_range: Range<PrepaintStateIndex>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewCacheKey,
     accessed_entities: FxHashSet<EntityId>,
-    automatic_root_style: Option<Style>,
     cache_kind: AnyViewCacheKind,
 }
 
@@ -32,18 +31,19 @@ struct ViewCacheKey {
     rem_size: Pixels,
     scale_factor: f32,
     viewport_size: Size<Pixels>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AnyViewCacheKind {
-    Automatic,
-    Manual,
+    element_opacity: u32,
 }
 
 #[derive(Clone, Debug)]
 enum AnyViewCacheMode {
     Automatic,
     Manual(Rc<StyleRefinement>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnyViewCacheKind {
+    Automatic,
+    Manual,
 }
 
 /// Opaque request-layout state used by [`AnyView`].
@@ -53,7 +53,8 @@ enum AnyViewRequestLayoutStateInner {
     Rendered {
         element: AnyElement,
         accessed_entities: FxHashSet<EntityId>,
-        automatic_root_style: Option<Style>,
+        retained_layout_site: Option<GlobalElementId>,
+        request_layout_range: Range<PrepaintStateIndex>,
     },
     CachedCandidate,
 }
@@ -131,6 +132,7 @@ impl AnyView {
             rem_size: window.rem_size(),
             scale_factor: window.scale_factor(),
             viewport_size: window.viewport_size(),
+            element_opacity: window.element_opacity().to_bits(),
         }
     }
 
@@ -153,6 +155,7 @@ impl AnyView {
             || element_state.cache_key.rem_size != cache_key.rem_size
             || element_state.cache_key.scale_factor != cache_key.scale_factor
             || element_state.cache_key.viewport_size != cache_key.viewport_size
+            || element_state.cache_key.element_opacity != cache_key.element_opacity
         {
             return Err(CachedViewMissReason::CacheKeyChanged);
         }
@@ -179,15 +182,11 @@ impl AnyView {
             return Err(CachedViewMissReason::Refreshing);
         }
 
-        let Some(root_style) = element_state.automatic_root_style.clone() else {
-            return Err(CachedViewMissReason::OuterLayoutUnknown);
-        };
-
-        if !automatic_root_style_is_admissible(&root_style) {
-            return Err(CachedViewMissReason::OuterLayoutUnknown);
-        }
-
-        window.claim_cached_view_retained_layout_root(self.entity_id(), global_id)
+        let request_layout_range = element_state.request_layout_range.clone();
+        let layout_id =
+            window.claim_cached_view_retained_layout_root(self.entity_id(), global_id)?;
+        window.reuse_prepaint_element_state_accesses(request_layout_range);
+        Ok(layout_id)
     }
 
     fn render_for_uncached_request_layout(
@@ -202,7 +201,8 @@ impl AnyView {
             AnyViewRequestLayoutState(AnyViewRequestLayoutStateInner::Rendered {
                 element,
                 accessed_entities: FxHashSet::default(),
-                automatic_root_style: None,
+                retained_layout_site: None,
+                request_layout_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             }),
         )
     }
@@ -233,6 +233,7 @@ impl AnyView {
             window.begin_cached_view_retained_layout_scope(self.entity_id(), global_id);
         }
 
+        let request_layout_start = window.prepaint_index();
         let render_result = panic::catch_unwind(AssertUnwindSafe(|| {
             cx.detect_accessed_entities(|cx| {
                 let mut element = (self.render)(self, window, cx);
@@ -249,29 +250,14 @@ impl AnyView {
                 panic::resume_unwind(payload);
             }
         };
-        let automatic_root_style = retained_global_id
-            .and_then(|_| window.take_requested_layout_style(layout_id))
-            .filter(automatic_root_style_is_admissible);
+        let request_layout_end = window.prepaint_index();
 
         if let Some(global_id) = retained_global_id {
-            if automatic_root_style.is_some() {
-                window.finish_cached_view_retained_layout_scope(
-                    self.entity_id(),
-                    global_id,
-                    layout_id,
-                );
-            } else {
-                window.discard_cached_view_retained_layout_scope(self.entity_id(), global_id);
-            }
+            window.finish_cached_view_retained_layout_scope(self.entity_id(), global_id, layout_id);
         }
 
         #[cfg(any(test, feature = "test-support"))]
         {
-            let effective_miss_reason = if retain_layout && automatic_root_style.is_none() {
-                CachedViewMissReason::OuterLayoutUnknown
-            } else {
-                effective_miss_reason
-            };
             window.record_cached_view_miss(effective_miss_reason);
             window.record_automatic_cached_view_miss();
         }
@@ -281,15 +267,11 @@ impl AnyView {
             AnyViewRequestLayoutState(AnyViewRequestLayoutStateInner::Rendered {
                 element,
                 accessed_entities,
-                automatic_root_style,
+                retained_layout_site: retained_global_id.cloned(),
+                request_layout_range: request_layout_start..request_layout_end,
             }),
         )
     }
-}
-
-fn automatic_root_style_is_admissible(style: &Style) -> bool {
-    matches!(style.size.width, Length::Definite(_))
-        && matches!(style.size.height, Length::Definite(_))
 }
 
 fn automatic_global_id_is_admissible(global_id: &GlobalElementId) -> bool {
@@ -348,6 +330,11 @@ impl Element for AnyView {
 
                     let miss_reason = match self.automatic_cached_root_layout(global_id, window) {
                         Ok(layout_id) => {
+                            #[cfg(any(test, feature = "test-support"))]
+                            {
+                                window.record_cached_view_hit();
+                                window.record_automatic_cached_view_hit();
+                            }
                             return (
                                 layout_id,
                                 AnyViewRequestLayoutState(
@@ -389,25 +376,24 @@ impl Element for AnyView {
         window.with_rendered_view(self.entity_id(), |window| {
             if let AnyViewRequestLayoutStateInner::Rendered {
                 element,
-                accessed_entities,
-                automatic_root_style,
+                mut accessed_entities,
+                retained_layout_site,
+                request_layout_range,
             } = mem::replace(
                 &mut request_layout_state.0,
                 AnyViewRequestLayoutStateInner::CachedCandidate,
             ) {
                 let prepaint_start = window.prepaint_index();
                 let mut element = element;
-                element.prepaint(window, cx);
+                let ((), prepaint_accessed_entities) = cx.detect_accessed_entities(|cx| {
+                    element.prepaint(window, cx);
+                });
+                accessed_entities.extend(prepaint_accessed_entities);
                 let prepaint_end = window.prepaint_index();
 
                 if let Some(global_id) = global_id {
-                    let cache_key = self.current_cache_key(bounds, window);
-                    if window.cached_view_site_is_duplicate(self.entity_id(), global_id) {
-                        window.mark_cached_view_site_seen::<AnyViewState>(
-                            self.entity_id(),
-                            global_id,
-                        );
-                    } else if let Some(automatic_root_style) = automatic_root_style {
+                    if retained_layout_site.as_ref() == Some(global_id) {
+                        let cache_key = self.current_cache_key(bounds, window);
                         window.with_element_state::<AnyViewState, _>(global_id, |_, window| {
                             window.mark_cached_view_site_seen::<AnyViewState>(
                                 self.entity_id(),
@@ -421,8 +407,8 @@ impl Element for AnyView {
                             (
                                 (),
                                 AnyViewState {
+                                    request_layout_range,
                                     accessed_entities,
-                                    automatic_root_style: Some(automatic_root_style),
                                     cache_kind: AnyViewCacheKind::Automatic,
                                     prepaint_range: prepaint_start..prepaint_end,
                                     paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -480,9 +466,6 @@ impl Element for AnyView {
                     #[cfg(any(test, feature = "test-support"))]
                     {
                         window.record_cached_view_hit();
-                        if element_state.automatic_root_style.is_some() {
-                            window.record_automatic_cached_view_hit();
-                        }
                     }
 
                     let prepaint_start = window.prepaint_index();
@@ -505,12 +488,15 @@ impl Element for AnyView {
 
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
-                let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    let mut element = (self.render)(self, window, cx);
-                    element.layout_as_root(bounds.size.into(), window, cx);
-                    element.prepaint_at(bounds.origin, window, cx);
-                    element
-                });
+                let request_layout_start = window.prepaint_index();
+                let ((mut element, request_layout_end), accessed_entities) = cx
+                    .detect_accessed_entities(|cx| {
+                        let mut element = (self.render)(self, window, cx);
+                        element.layout_as_root(bounds.size.into(), window, cx);
+                        let request_layout_end = window.prepaint_index();
+                        element.prepaint_at(bounds.origin, window, cx);
+                        (element, request_layout_end)
+                    });
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
@@ -523,8 +509,8 @@ impl Element for AnyView {
                 (
                     Some(element),
                     AnyViewState {
+                        request_layout_range: request_layout_start..request_layout_end,
                         accessed_entities,
-                        automatic_root_style: None,
                         cache_kind,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -567,8 +553,18 @@ impl Element for AnyView {
 
                         if let Some(element) = element {
                             let refreshing = mem::replace(&mut window.refreshing, true);
-                            element.paint(window, cx);
+                            let ((), paint_accessed_entities) = cx.detect_accessed_entities(|cx| {
+                                element.paint(window, cx);
+                            });
                             window.refreshing = refreshing;
+                            element_state
+                                .accessed_entities
+                                .extend(paint_accessed_entities);
+                            window.replace_cached_view_site_dependencies::<AnyViewState>(
+                                self.entity_id(),
+                                global_id.expect("cached view state requires an element id"),
+                                &element_state.accessed_entities,
+                            );
                         } else {
                             window.reuse_paint(element_state.paint_range.clone());
                         }
@@ -668,7 +664,9 @@ impl Render for EmptyView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AnyWindowHandle, AppContext as _, TestAppContext, div, prelude::*};
+    use crate::{
+        AnyWindowHandle, AppContext as _, TestAppContext, WindowControlArea, div, prelude::*,
+    };
     use gpui::proptest::prelude::{ProptestConfig, prop_assert_eq};
     use std::cell::{Cell, RefCell};
 
@@ -870,6 +868,202 @@ mod tests {
             div()
                 .size_full()
                 .child(self.label.to_string())
+                .child(self.child.clone())
+        }
+    }
+
+    struct PaintDependencyChild {
+        model: Entity<CachedDependencyModel>,
+        render_count: Rc<Cell<usize>>,
+        painted_values: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl Render for PaintDependencyChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            PaintDependencyElement {
+                model: self.model.clone(),
+                painted_values: self.painted_values.clone(),
+            }
+        }
+    }
+
+    struct PaintDependencyElement {
+        model: Entity<CachedDependencyModel>,
+        painted_values: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl Element for PaintDependencyElement {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            (window.request_layout(Style::default(), None, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+
+        fn paint(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            _window: &mut Window,
+            cx: &mut App,
+        ) {
+            let value = self.model.read(cx).value;
+            self.painted_values.borrow_mut().push(value);
+        }
+    }
+
+    impl IntoElement for PaintDependencyElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    struct RequestLayoutStateChild {
+        state_values: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl Render for RequestLayoutStateChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            RequestLayoutStateElement {
+                state_values: self.state_values.clone(),
+            }
+        }
+    }
+
+    struct RequestLayoutStateElement {
+        state_values: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl Element for RequestLayoutStateElement {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            Some(ElementId::Name("request-layout-state".into()))
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            if let Some(global_id) = global_id {
+                window.with_element_state::<usize, _>(global_id, |state, _window| {
+                    let state = state.unwrap_or(0) + 1;
+                    self.state_values.borrow_mut().push(state);
+                    ((), state)
+                });
+            }
+            (window.request_layout(Style::default(), None, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+
+        fn paint(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+    }
+
+    impl IntoElement for RequestLayoutStateElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    struct WindowControlChild {
+        render_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for WindowControlChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            div()
+                .id("window-control-child")
+                .size_full()
+                .window_control_area(WindowControlArea::Drag)
+        }
+    }
+
+    struct SingleChildRoot<C> {
+        child: Entity<C>,
+        label: usize,
+    }
+
+    impl<C: Render> Render for SingleChildRoot<C> {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.label.to_string())
+                .child(self.child.clone())
+        }
+    }
+
+    struct OpacityRoot {
+        child: Entity<IntrinsicDependencyChild>,
+        opacity: f32,
+    }
+
+    impl Render for OpacityRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .opacity(self.opacity)
                 .child(self.child.clone())
         }
     }
@@ -1288,7 +1482,7 @@ mod tests {
                 counters.automatic_misses,
                 counters_after_first_draw.automatic_misses
             );
-            assert_eq!(counters.outer_layout_unknown_misses, 0);
+            assert_eq!(counters.retained_layout_unavailable_misses, 0);
             assert_eq!(
                 window.debug_retained_layout_node_creates(),
                 retained_layout_node_creates_after_first_draw
@@ -1367,6 +1561,163 @@ mod tests {
     }
 
     #[test]
+    fn cached_view_automatic_paint_dependency_invalidates_replay() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let model = Rc::new(RefCell::new(None));
+        let render_count = Rc::new(Cell::new(0));
+        let painted_values = Rc::new(RefCell::new(Vec::new()));
+
+        let window = cx.add_window({
+            let model_slot = model.clone();
+            let render_count = render_count.clone();
+            let painted_values = painted_values.clone();
+
+            move |_, cx| {
+                let model = cx.new(|_| CachedDependencyModel { value: 0 });
+                let child = cx.new(|_| PaintDependencyChild {
+                    model: model.clone(),
+                    render_count,
+                    painted_values,
+                });
+                *model_slot.borrow_mut() = Some(model);
+
+                SingleChildRoot { child, label: 0 }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        assert_eq!(&*painted_values.borrow(), &[0]);
+        let render_count_after_first_draw = render_count.get();
+
+        draw_root(&mut cx, any_window);
+        assert_eq!(render_count.get(), render_count_after_first_draw);
+        assert_eq!(&*painted_values.borrow(), &[0]);
+
+        let model = model.borrow().clone().unwrap();
+        model.update(&mut cx, |model, cx| {
+            model.value = 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        assert_eq!(render_count.get(), render_count_after_first_draw + 1);
+        assert_eq!(&*painted_values.borrow(), &[0, 1]);
+    }
+
+    #[test]
+    fn cached_view_automatic_replays_request_layout_element_state_accesses() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let child_slot = Rc::new(RefCell::new(None));
+        let state_values = Rc::new(RefCell::new(Vec::new()));
+
+        let window = cx.add_window({
+            let child_slot = child_slot.clone();
+            let state_values = state_values.clone();
+
+            move |_, cx| {
+                let child = cx.new(|_| RequestLayoutStateChild { state_values });
+                *child_slot.borrow_mut() = Some(child.clone());
+
+                SingleChildRoot { child, label: 0 }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        assert_eq!(&*state_values.borrow(), &[1]);
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.label = 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+        assert_eq!(&*state_values.borrow(), &[1]);
+
+        let child = child_slot.borrow().clone().unwrap();
+        child.update(&mut cx, |_child, cx| cx.notify());
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        assert_eq!(&*state_values.borrow(), &[1, 2]);
+    }
+
+    #[test]
+    fn cached_view_automatic_replays_window_control_hitboxes() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let render_count = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let render_count = render_count.clone();
+
+            move |_, cx| {
+                let child = cx.new(|_| WindowControlChild { render_count });
+                SingleChildRoot { child, label: 0 }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        let render_count_after_first_draw = render_count.get();
+        cx.update_window(any_window, |_, window, _| {
+            assert_eq!(window.rendered_frame.window_control_hitboxes.len(), 1);
+        })
+        .unwrap();
+
+        draw_root(&mut cx, any_window);
+        assert_eq!(render_count.get(), render_count_after_first_draw);
+        cx.update_window(any_window, |_, window, _| {
+            assert_eq!(window.rendered_frame.window_control_hitboxes.len(), 1);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cached_view_automatic_parent_opacity_change_invalidates_paint_replay() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let render_count = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let render_count = render_count.clone();
+
+            move |_, cx| {
+                let child = cx.new(|_| IntrinsicDependencyChild { render_count });
+                OpacityRoot {
+                    child,
+                    opacity: 1.0,
+                }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        let render_count_after_first_draw = render_count.get();
+        draw_root(&mut cx, any_window);
+        assert_eq!(render_count.get(), render_count_after_first_draw);
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.opacity = 0.5;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        assert_eq!(render_count.get(), render_count_after_first_draw + 1);
+    }
+
+    #[test]
     fn cached_view_automatic_duplicate_after_retained_hit_is_not_reused_twice() {
         let mut cx = TestAppContext::single();
         cx.set_auto_draw_test_windows(false);
@@ -1426,7 +1777,7 @@ mod tests {
             let counters = window.debug_cached_view_counters();
             assert!(counters.duplicate_site_misses >= 1);
             assert_eq!(window.debug_cached_view_dependency_site_count(), 0);
-            assert_eq!(window.debug_cached_view_duplicate_site_count(), 1);
+            assert_eq!(window.debug_cached_view_duplicate_site_count(), 0);
             assert_eq!(window.debug_retained_layout_node_count(), 0);
         })
         .unwrap();
@@ -1438,8 +1789,33 @@ mod tests {
         );
         cx.update_window(any_window, |_, window, _| {
             assert_eq!(window.debug_cached_view_dependency_site_count(), 0);
-            assert_eq!(window.debug_cached_view_duplicate_site_count(), 1);
+            assert_eq!(window.debug_cached_view_duplicate_site_count(), 0);
             assert_eq!(window.debug_retained_layout_node_count(), 0);
+        })
+        .unwrap();
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.duplicate = false;
+                root.label = 2;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+        assert_eq!(
+            child_render_count.get(),
+            child_render_count_after_first_draw + 5
+        );
+        draw_root(&mut cx, any_window);
+        assert_eq!(
+            child_render_count.get(),
+            child_render_count_after_first_draw + 5
+        );
+        cx.update_window(any_window, |_, window, _| {
+            assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+            assert_eq!(window.debug_cached_view_duplicate_site_count(), 0);
+            assert!(window.debug_retained_layout_node_count() > 0);
         })
         .unwrap();
         assert!(observed_values.borrow().iter().all(|value| *value == 0));
@@ -1525,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_view_automatic_child_without_outer_layout_contract_is_not_retained() {
+    fn cached_view_automatic_intrinsic_child_replays_retained_layout() {
         let mut cx = TestAppContext::single();
         cx.set_auto_draw_test_windows(false);
 
@@ -1562,29 +1938,30 @@ mod tests {
 
         assert_eq!(
             child_render_count.get(),
-            child_render_count_after_first_draw + 1
+            child_render_count_after_first_draw
         );
         cx.update_window(any_window, |_, window, _| {
             let counters = window.debug_cached_view_counters();
             assert_eq!(
                 counters.automatic_hits,
-                counters_after_first_draw.automatic_hits
+                counters_after_first_draw.automatic_hits + 1
             );
             assert_eq!(
                 counters.automatic_misses,
-                counters_after_first_draw.automatic_misses + 1
+                counters_after_first_draw.automatic_misses
             );
             assert_eq!(
-                counters.outer_layout_unknown_misses,
-                counters_after_first_draw.outer_layout_unknown_misses + 1
+                counters.retained_layout_unavailable_misses,
+                counters_after_first_draw.retained_layout_unavailable_misses
             );
-            assert_eq!(window.debug_cached_view_dependency_site_count(), 0);
+            assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+            assert!(window.debug_retained_layout_node_count() > 0);
         })
         .unwrap();
     }
 
     #[test]
-    fn cached_view_automatic_child_drops_previous_state_when_outer_layout_becomes_unknown() {
+    fn cached_view_automatic_child_reconciles_when_root_shape_changes() {
         let mut cx = TestAppContext::single();
         cx.set_auto_draw_test_windows(false);
 
@@ -1644,7 +2021,8 @@ mod tests {
             child_render_count_after_first_draw + 1
         );
         cx.update_window(any_window, |_, window, _| {
-            assert_eq!(window.debug_cached_view_dependency_site_count(), 0);
+            assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+            assert!(window.debug_retained_layout_node_count() > 0);
         })
         .unwrap();
 
@@ -1658,15 +2036,16 @@ mod tests {
         draw_root(&mut cx, any_window);
         assert_eq!(
             child_render_count.get(),
-            child_render_count_after_first_draw + 2
+            child_render_count_after_first_draw + 1
         );
         let mut expected_observed_values = observed_values_after_first_draw;
-        expected_observed_values.extend([0, 0]);
+        expected_observed_values.push(0);
         assert_eq!(&*observed_values.borrow(), &expected_observed_values);
         cx.update_window(any_window, |_, window, _| {
             let counters = window.debug_cached_view_counters();
-            assert!(counters.outer_layout_unknown_misses >= 1);
-            assert_eq!(window.debug_cached_view_dependency_site_count(), 0);
+            assert_eq!(counters.retained_layout_unavailable_misses, 0);
+            assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+            assert!(window.debug_retained_layout_node_count() > 0);
         })
         .unwrap();
     }
@@ -1891,7 +2270,7 @@ mod tests {
         assert_eq!(render_count.get(), initial_render_count + 2);
         cx.update_window(any_window, |_, window, _| {
             assert_eq!(window.debug_cached_view_dependency_site_count(), 0);
-            assert_eq!(window.debug_cached_view_duplicate_site_count(), 1);
+            assert_eq!(window.debug_cached_view_duplicate_site_count(), 0);
         })
         .unwrap();
 

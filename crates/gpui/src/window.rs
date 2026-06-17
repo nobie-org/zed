@@ -2145,6 +2145,14 @@ impl Window {
             .retained_layout_node_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_scratch_layout_node_creates(&self) -> usize {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .scratch_layout_node_creates()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_cached_view_hit(&mut self) {
         self.cached_view_counters.hits += 1;

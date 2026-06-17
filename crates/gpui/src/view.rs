@@ -575,14 +575,56 @@ impl Element for AnyView {
                     miss_reason,
                     replayed_request_layout_range.is_some()
                 );
-                let ((mut element, request_layout_end), accessed_entities) = cx
-                    .detect_accessed_entities(|cx| {
+                let revalidate_retained_layout =
+                    cache_kind == AnyViewCacheKind::Automatic && replayed_request_layout_range.is_some();
+                let expected_retained_layout_root = revalidate_retained_layout
+                    .then(|| window.cached_view_retained_layout_root(self.entity_id(), global_id))
+                    .flatten();
+                let mut retained_layout_scope_open = false;
+                let render_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    cx.detect_accessed_entities(|cx| {
                         let mut element = (self.render)(self, window, cx);
-                        element.layout_as_root(bounds.size.into(), window, cx);
+                        if revalidate_retained_layout {
+                            window.begin_cached_view_retained_layout_scope(self.entity_id(), global_id);
+                            retained_layout_scope_open = true;
+                        }
+                        let layout_id = element.request_layout(window, cx);
+                        if revalidate_retained_layout {
+                            let retained = window.finish_cached_view_retained_layout_scope(
+                                self.entity_id(),
+                                global_id,
+                                layout_id,
+                            );
+                            retained_layout_scope_open = false;
+                            assert!(
+                                retained,
+                                "retained request-layout replay must revalidate into its retained scope"
+                            );
+                            assert_eq!(
+                                Some(layout_id),
+                                expected_retained_layout_root,
+                                "retained request-layout replay must revalidate the same retained root"
+                            );
+                        }
                         let request_layout_end = window.prepaint_index();
+                        window.compute_layout(layout_id, bounds.size.into(), cx);
                         element.prepaint_at(bounds.origin, window, cx);
                         (element, request_layout_end)
-                    });
+                    })
+                }));
+                let ((mut element, request_layout_end), accessed_entities) = match render_result {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        if retained_layout_scope_open {
+                            window.discard_cached_view_retained_layout_scope(
+                                self.entity_id(),
+                                global_id,
+                            );
+                        }
+                        window.refreshing = refreshing;
+                        panic::resume_unwind(payload);
+                    }
+                };
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
@@ -2032,6 +2074,11 @@ mod tests {
             }]
         );
         let child_render_count_after_first_draw = child_render_count.get();
+        let scratch_layout_node_creates_after_first_draw = cx
+            .update_window(any_window, |_, window, _| {
+                window.debug_scratch_layout_node_creates()
+            })
+            .unwrap();
 
         window
             .update(&mut cx, |root, _window, cx| {
@@ -2060,6 +2107,13 @@ mod tests {
                 },
             ]
         );
+        cx.update_window(any_window, |_, window, _| {
+            assert_eq!(
+                window.debug_scratch_layout_node_creates(),
+                scratch_layout_node_creates_after_first_draw + 2
+            );
+        })
+        .unwrap();
     }
 
     #[test]

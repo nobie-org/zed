@@ -93,6 +93,8 @@ pub struct TaffyLayoutEngine {
     retained_layout_root_by_scope: FxHashMap<RetainedLayoutScopeId, LayoutId>,
     #[cfg(any(test, feature = "test-support"))]
     retained_layout_node_creates: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    scratch_layout_node_creates: usize,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -115,6 +117,8 @@ impl TaffyLayoutEngine {
             retained_layout_root_by_scope: FxHashMap::default(),
             #[cfg(any(test, feature = "test-support"))]
             retained_layout_node_creates: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            scratch_layout_node_creates: 0,
         }
     }
 
@@ -296,6 +300,11 @@ impl TaffyLayoutEngine {
             .sum()
     }
 
+    #[cfg(test)]
+    pub(crate) fn scratch_layout_node_creates(&self) -> usize {
+        self.scratch_layout_node_creates
+    }
+
     fn next_retained_layout_node(&mut self) -> Option<Option<LayoutId>> {
         let active_scope = self.retained_layout_scope_stack.last_mut()?;
         let scope = active_scope.id;
@@ -322,6 +331,10 @@ impl TaffyLayoutEngine {
             }
         } else {
             self.scratch_nodes.push(layout_id);
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                self.scratch_layout_node_creates += 1;
+            }
         }
     }
 

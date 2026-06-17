@@ -255,6 +255,20 @@ impl TaffyLayoutEngine {
             tracked_nodes.len(),
             "every live taffy node must be owned by scratch or retained layout tracking"
         );
+        for parent in &tracked_nodes {
+            for child in self.taffy.children((*parent).into()).expect(EXPECT_MESSAGE) {
+                let child = LayoutId::from(child);
+                debug_assert!(
+                    tracked_nodes.contains(&child),
+                    "every taffy child edge must point to a tracked live layout node"
+                );
+                debug_assert_eq!(
+                    self.taffy.parent(child.into()),
+                    Some((*parent).into()),
+                    "every taffy child edge must agree with the child's parent edge"
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -395,18 +409,16 @@ impl TaffyLayoutEngine {
                 layout_id
             }
             Some(None) | None => {
-                let layout_id = if children.is_empty() {
+                let layout_id: LayoutId = self
+                    .taffy
+                    .new_leaf(taffy_style)
+                    .expect(EXPECT_MESSAGE)
+                    .into();
+                if !children.is_empty() {
                     self.taffy
-                        .new_leaf(taffy_style)
-                        .expect(EXPECT_MESSAGE)
-                        .into()
-                } else {
-                    self.taffy
-                        // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
-                        .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
-                        .expect(EXPECT_MESSAGE)
-                        .into()
-                };
+                        .set_children(layout_id.into(), LayoutId::to_taffy_slice(children))
+                        .expect(EXPECT_MESSAGE);
+                }
                 self.track_new_layout_node(layout_id, RetainedLayoutNodeKind::Unmeasured);
                 layout_id
             }
@@ -1137,6 +1149,52 @@ mod tests {
         assert_eq!(engine.layout_work_sample(), expected_sample);
         assert_eq!(engine.finish_frame(), expected_sample);
         assert_eq!(engine.layout_work_sample(), LayoutWorkSample::default());
+    }
+
+    #[test]
+    fn retained_child_reparented_by_scratch_parent_detaches_from_old_retained_parent() {
+        let mut engine = TaffyLayoutEngine::new();
+        let child_scope = RetainedLayoutScopeId::new(0);
+        let parent_scope = RetainedLayoutScopeId::new(1);
+
+        engine.begin_retained_layout_scope(child_scope);
+        let child = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+        assert!(engine.finish_retained_layout_scope(child_scope, child));
+
+        engine.begin_retained_layout_scope(parent_scope);
+        let retained_parent = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[child]);
+        assert!(engine.finish_retained_layout_scope(parent_scope, retained_parent));
+        assert_eq!(
+            engine.taffy.parent(child.into()),
+            Some(retained_parent.into())
+        );
+
+        let scratch_parent = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[child]);
+        assert_eq!(
+            engine.taffy.parent(child.into()),
+            Some(scratch_parent.into())
+        );
+        assert_eq!(
+            engine
+                .taffy
+                .children(retained_parent.into())
+                .expect(EXPECT_MESSAGE),
+            Vec::<taffy::NodeId>::new()
+        );
+
+        engine.finish_frame();
+        engine.remove_retained_layout_scope(child_scope);
+
+        engine.begin_retained_layout_scope(parent_scope);
+        let retained_parent = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+        assert!(engine.finish_retained_layout_scope(parent_scope, retained_parent));
+        assert_eq!(
+            engine
+                .taffy
+                .children(retained_parent.into())
+                .expect(EXPECT_MESSAGE),
+            Vec::<taffy::NodeId>::new()
+        );
     }
 
     #[test]

@@ -48,24 +48,6 @@ pub struct LayoutWorkSample {
     pub compute_layout_calls: u64,
     /// Measured layout callbacks invoked by Taffy.
     pub measured_layout_calls: u64,
-    /// Retained Taffy nodes created while committing descriptors.
-    pub taffy_node_creates: u64,
-    /// Retained Taffy nodes reused while committing descriptors.
-    pub taffy_node_reuses: u64,
-    /// Retained Taffy node styles updated while committing descriptors.
-    pub taffy_style_updates: u64,
-    /// Retained Taffy child lists updated while committing descriptors.
-    pub taffy_children_updates: u64,
-    /// Retained Taffy measured contexts updated while committing descriptors.
-    pub taffy_measure_context_updates: u64,
-    /// Retained Taffy nodes removed while sweeping replaced descriptors.
-    pub taffy_node_removes: u64,
-    /// Wall time spent constructing non-measured layout descriptors.
-    pub request_layout_duration: Duration,
-    /// Wall time spent constructing measured layout descriptors.
-    pub request_measured_layout_duration: Duration,
-    /// Wall time spent committing descriptors onto retained Taffy nodes.
-    pub descriptor_commit_duration: Duration,
     /// Wall time spent computing root layouts.
     pub compute_layout_duration: Duration,
     /// Wall time spent inside measured layout callbacks.
@@ -160,11 +142,11 @@ impl TaffyLayoutEngine {
     }
 
     pub fn finish_frame(&mut self) -> LayoutWorkSample {
+        let layout_work = self.layout_work;
         for retained_root in mem::take(&mut self.retained_roots).into_iter().flatten() {
             self.remove_retained_subtree(retained_root);
         }
 
-        let layout_work = self.layout_work;
         self.retained_roots = self.current_roots.drain(..).map(Some).collect();
         self.layout_descriptors.clear();
         self.layout_measure_contexts.clear();
@@ -195,7 +177,6 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
-        let request_start = std::time::Instant::now();
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         self.layout_work.layout_node_requests += 1;
         self.layout_work.child_edges += children.len() as u64;
@@ -204,12 +185,10 @@ impl TaffyLayoutEngine {
             children: children.to_vec(),
         };
 
-        let id = self.push_descriptor(LayoutDescriptor {
+        self.push_descriptor(LayoutDescriptor {
             style: taffy_style,
             kind,
-        });
-        self.layout_work.request_layout_duration += request_start.elapsed();
-        id
+        })
     }
 
     pub fn request_measured_layout(
@@ -225,21 +204,18 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
-        let request_start = std::time::Instant::now();
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         self.layout_work.measured_layout_node_requests += 1;
         let measure_id = self.layout_measure_contexts.len();
         self.layout_measure_contexts
             .push(Some(StackSafe::new(Box::new(measure))));
 
-        let id = self.push_descriptor(LayoutDescriptor {
+        self.push_descriptor(LayoutDescriptor {
             style: taffy_style,
             kind: LayoutDescriptorKind::Measured {
                 measure: measure_id,
             },
-        });
-        self.layout_work.request_measured_layout_duration += request_start.elapsed();
-        id
+        })
     }
 
     fn push_descriptor(&mut self, descriptor: LayoutDescriptor) -> LayoutId {
@@ -300,7 +276,6 @@ impl TaffyLayoutEngine {
             return *node_id;
         }
 
-        let commit_start = std::time::Instant::now();
         let retained_root = self
             .retained_roots
             .get_mut(self.root_commit_index)
@@ -317,7 +292,6 @@ impl TaffyLayoutEngine {
 
         let node_id = retained_node.node_id;
         self.current_roots.push(retained_node);
-        self.layout_work.descriptor_commit_duration += commit_start.elapsed();
         #[cfg(any(test, debug_assertions))]
         self.debug_assert_committed_descriptor_matches(id, node_id);
         node_id
@@ -419,7 +393,6 @@ impl TaffyLayoutEngine {
                 self.taffy
                     .set_node_context(candidate.node_id, Some(NodeContext { measure }))
                     .expect(EXPECT_MESSAGE);
-                self.layout_work.taffy_measure_context_updates += 1;
                 self.committed_layout_nodes.insert(id, candidate.node_id);
                 CommitResult {
                     retained_node: RetainedLayoutNode {
@@ -511,18 +484,14 @@ impl TaffyLayoutEngine {
         style: &taffy::style::Style,
     ) -> RetainedCandidate {
         match previous {
-            Some(previous) if previous.descriptor.kind == kind => {
-                self.layout_work.taffy_node_reuses += 1;
-                RetainedCandidate {
-                    node_id: previous.node_id,
-                    previous_descriptor: Some(previous.descriptor),
-                    previous_children: previous.children,
-                    replaced_previous: None,
-                }
-            }
+            Some(previous) if previous.descriptor.kind == kind => RetainedCandidate {
+                node_id: previous.node_id,
+                previous_descriptor: Some(previous.descriptor),
+                previous_children: previous.children,
+                replaced_previous: None,
+            },
             Some(previous) => {
                 let node_id = self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE);
-                self.layout_work.taffy_node_creates += 1;
                 RetainedCandidate {
                     node_id,
                     previous_descriptor: None,
@@ -530,16 +499,12 @@ impl TaffyLayoutEngine {
                     replaced_previous: Some(previous),
                 }
             }
-            None => {
-                let node_id = self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE);
-                self.layout_work.taffy_node_creates += 1;
-                RetainedCandidate {
-                    node_id,
-                    previous_descriptor: None,
-                    previous_children: Vec::new(),
-                    replaced_previous: None,
-                }
-            }
+            None => RetainedCandidate {
+                node_id: self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE),
+                previous_descriptor: None,
+                previous_children: Vec::new(),
+                replaced_previous: None,
+            },
         }
     }
 
@@ -554,7 +519,6 @@ impl TaffyLayoutEngine {
                 self.taffy
                     .set_style(node_id, style.clone())
                     .expect(EXPECT_MESSAGE);
-                self.layout_work.taffy_style_updates += 1;
             }
         }
     }
@@ -569,7 +533,6 @@ impl TaffyLayoutEngine {
             self.taffy
                 .set_children(node_id, children)
                 .expect(EXPECT_MESSAGE);
-            self.layout_work.taffy_children_updates += 1;
         }
     }
 
@@ -581,12 +544,10 @@ impl TaffyLayoutEngine {
             self.taffy
                 .set_node_context(retained_node.node_id, None)
                 .expect(EXPECT_MESSAGE);
-            self.layout_work.taffy_measure_context_updates += 1;
         }
         self.taffy
             .remove(retained_node.node_id)
             .expect(EXPECT_MESSAGE);
-        self.layout_work.taffy_node_removes += 1;
     }
 
     fn invalidate_cached_bounds_for_subtree(&mut self, node_id: NodeId) {
@@ -1260,57 +1221,6 @@ mod retained_layout_tests {
     }
 
     #[test]
-    fn layout_work_sample_counts_retained_taffy_mutations() {
-        let mut engine = TaffyLayoutEngine::new();
-
-        let root = request_leaf(&mut engine, 10.0);
-        compute_layout_without_measure(&mut engine, root, 100.0, 100.0);
-        let initial = engine.finish_frame();
-        assert_eq!(initial.taffy_node_creates, 1);
-        assert_eq!(initial.taffy_node_reuses, 0);
-        assert_eq!(initial.taffy_style_updates, 0);
-        assert_eq!(initial.taffy_children_updates, 0);
-        assert_eq!(initial.taffy_node_removes, 0);
-
-        let root = request_leaf(&mut engine, 10.0);
-        compute_layout_without_measure(&mut engine, root, 100.0, 100.0);
-        let reused = engine.finish_frame();
-        assert_eq!(reused.taffy_node_creates, 0);
-        assert_eq!(reused.taffy_node_reuses, 1);
-        assert_eq!(reused.taffy_style_updates, 0);
-        assert_eq!(reused.taffy_children_updates, 0);
-        assert_eq!(reused.taffy_node_removes, 0);
-
-        let root = request_leaf(&mut engine, 20.0);
-        compute_layout_without_measure(&mut engine, root, 100.0, 100.0);
-        let style_changed = engine.finish_frame();
-        assert_eq!(style_changed.taffy_node_creates, 0);
-        assert_eq!(style_changed.taffy_node_reuses, 1);
-        assert_eq!(style_changed.taffy_style_updates, 1);
-        assert_eq!(style_changed.taffy_children_updates, 0);
-        assert_eq!(style_changed.taffy_node_removes, 0);
-
-        let child = request_leaf(&mut engine, 10.0);
-        let root = request_container(&mut engine, &[child]);
-        compute_layout_without_measure(&mut engine, root, 100.0, 100.0);
-        let child_inserted = engine.finish_frame();
-        assert_eq!(child_inserted.taffy_node_creates, 1);
-        assert_eq!(child_inserted.taffy_node_reuses, 1);
-        assert_eq!(child_inserted.taffy_style_updates, 1);
-        assert_eq!(child_inserted.taffy_children_updates, 1);
-        assert_eq!(child_inserted.taffy_node_removes, 0);
-
-        let root = request_container(&mut engine, &[]);
-        compute_layout_without_measure(&mut engine, root, 100.0, 100.0);
-        let child_removed = engine.finish_frame();
-        assert_eq!(child_removed.taffy_node_creates, 0);
-        assert_eq!(child_removed.taffy_node_reuses, 1);
-        assert_eq!(child_removed.taffy_style_updates, 0);
-        assert_eq!(child_removed.taffy_children_updates, 1);
-        assert_eq!(child_removed.taffy_node_removes, 1);
-    }
-
-    #[test]
     fn repeated_root_layout_recompute_is_allowed() {
         let mut engine = TaffyLayoutEngine::new();
         let child = request_full_leaf(&mut engine);
@@ -1724,24 +1634,18 @@ mod tests {
             &[first_child, second_child],
         );
 
-        let sample = engine.layout_work_sample();
-        assert_eq!(
-            sample,
-            LayoutWorkSample {
-                draw_index: 0,
-                layout_node_requests: 3,
-                measured_layout_node_requests: 0,
-                child_edges: 2,
-                compute_layout_calls: 0,
-                measured_layout_calls: 0,
-                request_layout_duration: sample.request_layout_duration,
-                compute_layout_duration: Duration::default(),
-                measured_layout_duration: Duration::default(),
-                ..Default::default()
-            }
-        );
-        assert!(sample.request_layout_duration > Duration::default());
-        assert_eq!(engine.finish_frame(), sample);
+        let expected_sample = LayoutWorkSample {
+            draw_index: 0,
+            layout_node_requests: 3,
+            measured_layout_node_requests: 0,
+            child_edges: 2,
+            compute_layout_calls: 0,
+            measured_layout_calls: 0,
+            compute_layout_duration: Duration::default(),
+            measured_layout_duration: Duration::default(),
+        };
+        assert_eq!(engine.layout_work_sample(), expected_sample);
+        assert_eq!(engine.finish_frame(), expected_sample);
         assert_eq!(engine.layout_work_sample(), LayoutWorkSample::default());
     }
 
@@ -1789,18 +1693,11 @@ mod tests {
                 child_edges: 0,
                 compute_layout_calls: 1,
                 measured_layout_calls: 1,
-                taffy_node_creates: 1,
-                taffy_measure_context_updates: 1,
-                request_measured_layout_duration: sample.request_measured_layout_duration,
-                descriptor_commit_duration: sample.descriptor_commit_duration,
                 compute_layout_duration: sample.compute_layout_duration,
                 measured_layout_duration: sample.measured_layout_duration,
-                ..Default::default()
             }
         );
         assert_eq!(measure_invocations.get(), 1);
-        assert!(sample.request_measured_layout_duration > Duration::default());
-        assert!(sample.descriptor_commit_duration > Duration::default());
         assert!(sample.compute_layout_duration >= sample.measured_layout_duration);
         assert!(sample.measured_layout_duration > Duration::default());
     }

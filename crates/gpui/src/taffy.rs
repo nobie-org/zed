@@ -142,7 +142,7 @@ impl TaffyLayoutEngine {
         &mut self,
         scope: RetainedLayoutScopeId,
         root: LayoutId,
-    ) {
+    ) -> bool {
         let Some(active_scope) = self.retained_layout_scope_stack.pop() else {
             panic!("retained layout scopes must be finished in stack order");
         };
@@ -150,16 +150,37 @@ impl TaffyLayoutEngine {
             active_scope.id, scope,
             "retained layout scopes must be finished in stack order"
         );
-        if let Some(nodes) = self.retained_layout_nodes_by_scope.get_mut(&scope) {
-            for node in nodes
-                .split_off(active_scope.next_node_index)
-                .into_iter()
-                .rev()
-            {
-                self.remove_node(node);
+
+        let root_is_owned = self
+            .retained_layout_nodes_by_scope
+            .get(&scope)
+            .is_some_and(|nodes| {
+                nodes
+                    .get(..active_scope.next_node_index)
+                    .is_some_and(|active_nodes| active_nodes.contains(&root))
+            });
+
+        if root_is_owned {
+            if let Some(nodes) = self.retained_layout_nodes_by_scope.get_mut(&scope) {
+                for node in nodes
+                    .split_off(active_scope.next_node_index)
+                    .into_iter()
+                    .rev()
+                {
+                    self.remove_node(node);
+                }
             }
+            self.retained_layout_root_by_scope.insert(scope, root);
+            true
+        } else {
+            if let Some(nodes) = self.retained_layout_nodes_by_scope.remove(&scope) {
+                for node in nodes.into_iter().rev() {
+                    self.remove_node(node);
+                }
+            }
+            self.retained_layout_root_by_scope.remove(&scope);
+            false
         }
-        self.retained_layout_root_by_scope.insert(scope, root);
     }
 
     pub(crate) fn discard_retained_layout_scope(&mut self, scope: RetainedLayoutScopeId) {

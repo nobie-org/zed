@@ -1856,12 +1856,19 @@ impl Window {
         owner: EntityId,
         global_id: &GlobalElementId,
         root: LayoutId,
-    ) {
+    ) -> bool {
+        let site = Self::cached_view_site(owner, global_id);
         let scope = self.cached_view_retained_layout_scope(owner, global_id);
-        self.layout_engine
+        let retained = self
+            .layout_engine
             .as_mut()
             .unwrap()
             .finish_retained_layout_scope(scope, root);
+        if !retained {
+            self.retained_layout_scopes_by_cached_view_site
+                .remove(&site);
+        }
+        retained
     }
 
     pub(crate) fn discard_cached_view_retained_layout_scope(

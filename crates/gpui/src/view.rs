@@ -228,7 +228,7 @@ impl AnyView {
         } else {
             false
         };
-        let retained_global_id = global_id.filter(|_| retain_layout);
+        let mut retained_global_id = global_id.filter(|_| retain_layout);
         if let Some(global_id) = retained_global_id {
             window.begin_cached_view_retained_layout_scope(self.entity_id(), global_id);
         }
@@ -253,7 +253,13 @@ impl AnyView {
         let request_layout_end = window.prepaint_index();
 
         if let Some(global_id) = retained_global_id {
-            window.finish_cached_view_retained_layout_scope(self.entity_id(), global_id, layout_id);
+            if !window.finish_cached_view_retained_layout_scope(
+                self.entity_id(),
+                global_id,
+                layout_id,
+            ) {
+                retained_global_id = None;
+            }
         }
 
         #[cfg(any(test, feature = "test-support"))]
@@ -771,6 +777,32 @@ mod tests {
                 .size_full()
                 .child(self.label.to_string())
                 .when(self.show_child, |parent| parent.child(self.child.clone()))
+        }
+    }
+
+    struct ForwardingAutomaticDependencyParent {
+        child: Entity<CachedDependencyChild>,
+        render_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for ForwardingAutomaticDependencyParent {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            self.child.clone()
+        }
+    }
+
+    struct ForwardingAutomaticDependencyRoot {
+        parent: Entity<ForwardingAutomaticDependencyParent>,
+        label: usize,
+    }
+
+    impl Render for ForwardingAutomaticDependencyRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.label.to_string())
+                .child(self.parent.clone())
         }
     }
 
@@ -1492,6 +1524,72 @@ mod tests {
                 retained_layout_node_count_after_first_draw
             );
             assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cached_view_automatic_forwarding_parent_does_not_alias_child_retained_root() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let parent_render_count = Rc::new(Cell::new(0));
+        let child_render_count = Rc::new(Cell::new(0));
+        let observed_values = Rc::new(RefCell::new(Vec::new()));
+
+        let window = cx.add_window({
+            let parent_render_count = parent_render_count.clone();
+            let child_render_count = child_render_count.clone();
+            let observed_values = observed_values.clone();
+
+            move |_, cx| {
+                let model = cx.new(|_| CachedDependencyModel { value: 0 });
+                let child = cx.new(|_| CachedDependencyChild {
+                    models: vec![model],
+                    active_model: 0,
+                    render_count: child_render_count,
+                    observed_values,
+                });
+                let parent = cx.new(|_| ForwardingAutomaticDependencyParent {
+                    child,
+                    render_count: parent_render_count,
+                });
+
+                ForwardingAutomaticDependencyRoot { parent, label: 0 }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        let parent_render_count_after_first_draw = parent_render_count.get();
+        let child_render_count_after_first_draw = child_render_count.get();
+        cx.update_window(any_window, |_, window, _| {
+            assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+            assert!(window.debug_retained_layout_node_count() > 0);
+        })
+        .unwrap();
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.label = 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        assert_eq!(
+            parent_render_count.get(),
+            parent_render_count_after_first_draw + 1
+        );
+        assert_eq!(
+            child_render_count.get(),
+            child_render_count_after_first_draw
+        );
+        assert_eq!(&*observed_values.borrow(), &[0]);
+        cx.update_window(any_window, |_, window, _| {
+            assert_eq!(window.debug_cached_view_dependency_site_count(), 1);
+            assert!(window.debug_retained_layout_node_count() > 0);
         })
         .unwrap();
     }

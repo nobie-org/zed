@@ -8,14 +8,7 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
-use std::{
-    any::Any,
-    fmt::{self, Debug},
-    mem,
-    ops::Range,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt::Debug, mem, ops::Range, time::Duration};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -35,61 +28,9 @@ type NodeMeasureFn = StackSafe<
     >,
 >;
 
-struct NodeContext;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LayoutMeasureKey {
-    Opaque(u64),
-    Stable(MeasureKey),
+struct NodeContext {
+    measure: NodeMeasureFn,
 }
-
-trait MeasureKeyData: Debug {
-    fn as_any(&self) -> &dyn Any;
-    fn equals(&self, other: &dyn MeasureKeyData) -> bool;
-}
-
-impl<T> MeasureKeyData for T
-where
-    T: Debug + Eq + 'static,
-{
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn equals(&self, other: &dyn MeasureKeyData) -> bool {
-        other.as_any().downcast_ref::<T>() == Some(self)
-    }
-}
-
-/// A semantic key for a measured layout node.
-///
-/// The key must change whenever the measurement's layout-visible meaning can
-/// change for the same style, known dimensions, and available space.
-#[derive(Clone)]
-pub(crate) struct MeasureKey(Arc<dyn MeasureKeyData>);
-
-impl MeasureKey {
-    pub(crate) fn new<T>(key: T) -> Self
-    where
-        T: Debug + Eq + 'static,
-    {
-        Self(Arc::new(key))
-    }
-}
-
-impl Debug for MeasureKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl PartialEq for MeasureKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.equals(&*other.0)
-    }
-}
-
-impl Eq for MeasureKey {}
 
 /// Layout work performed by GPUI for one completed window draw.
 #[non_exhaustive]
@@ -117,8 +58,6 @@ pub struct LayoutWorkSample {
     pub taffy_children_updates: u64,
     /// Retained Taffy measured contexts updated while committing descriptors.
     pub taffy_measure_context_updates: u64,
-    /// Retained Taffy measured nodes explicitly dirtied by changed measure keys.
-    pub taffy_measure_dirty_marks: u64,
     /// Retained Taffy nodes removed while sweeping replaced descriptors.
     pub taffy_node_removes: u64,
     /// Wall time spent constructing non-measured layout descriptors.
@@ -140,23 +79,13 @@ struct LayoutDescriptor {
 
 #[derive(Clone)]
 enum LayoutDescriptorKind {
-    Unmeasured {
-        children: Vec<LayoutId>,
-    },
-    Measured {
-        measure: usize,
-        measure_key: LayoutMeasureKey,
-    },
+    Unmeasured { children: Vec<LayoutId> },
+    Measured { measure: usize },
 }
 
 enum LayoutCommitKind {
-    Unmeasured {
-        children: Vec<LayoutId>,
-    },
-    Measured {
-        measure: NodeMeasureFn,
-        measure_key: LayoutMeasureKey,
-    },
+    Unmeasured { children: Vec<LayoutId> },
+    Measured { measure: NodeMeasureFn },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,7 +97,6 @@ enum RetainedLayoutKind {
 struct RetainedLayoutDescriptor {
     style: taffy::style::Style,
     kind: RetainedLayoutKind,
-    measure_key: Option<LayoutMeasureKey>,
 }
 
 struct RetainedLayoutNode {
@@ -193,8 +121,6 @@ pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
     layout_descriptors: Vec<LayoutDescriptor>,
     layout_measure_contexts: Vec<Option<NodeMeasureFn>>,
-    current_measure_contexts: FxHashMap<NodeId, NodeMeasureFn>,
-    next_opaque_measure_key: u64,
     committed_layout_nodes: FxHashMap<LayoutId, NodeId>,
     #[cfg(any(test, debug_assertions))]
     committed_taffy_nodes: FxHashSet<NodeId>,
@@ -219,8 +145,6 @@ impl TaffyLayoutEngine {
             taffy,
             layout_descriptors: Vec::new(),
             layout_measure_contexts: Vec::new(),
-            current_measure_contexts: FxHashMap::default(),
-            next_opaque_measure_key: 0,
             committed_layout_nodes: FxHashMap::default(),
             #[cfg(any(test, debug_assertions))]
             committed_taffy_nodes: FxHashSet::default(),
@@ -244,7 +168,6 @@ impl TaffyLayoutEngine {
         self.retained_roots = self.current_roots.drain(..).map(Some).collect();
         self.layout_descriptors.clear();
         self.layout_measure_contexts.clear();
-        self.current_measure_contexts.clear();
         self.committed_layout_nodes.clear();
         #[cfg(any(test, debug_assertions))]
         self.committed_taffy_nodes.clear();
@@ -302,48 +225,6 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
-        let measure_key = LayoutMeasureKey::Opaque(self.next_opaque_measure_key);
-        self.next_opaque_measure_key = self.next_opaque_measure_key.wrapping_add(1);
-        self.request_measured_layout_with_key(style, rem_size, scale_factor, measure_key, measure)
-    }
-
-    pub(crate) fn request_keyed_measured_layout(
-        &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        measure_key: MeasureKey,
-        measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>
-        + 'static,
-    ) -> LayoutId {
-        self.request_measured_layout_with_key(
-            style,
-            rem_size,
-            scale_factor,
-            LayoutMeasureKey::Stable(measure_key),
-            measure,
-        )
-    }
-
-    fn request_measured_layout_with_key(
-        &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        measure_key: LayoutMeasureKey,
-        measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
-        ) -> Size<Pixels>
-        + 'static,
-    ) -> LayoutId {
         let request_start = std::time::Instant::now();
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         self.layout_work.measured_layout_node_requests += 1;
@@ -355,7 +236,6 @@ impl TaffyLayoutEngine {
             style: taffy_style,
             kind: LayoutDescriptorKind::Measured {
                 measure: measure_id,
-                measure_key,
             },
         });
         self.layout_work.request_measured_layout_duration += request_start.elapsed();
@@ -468,14 +348,10 @@ impl TaffyLayoutEngine {
             LayoutDescriptorKind::Unmeasured { children } => {
                 LayoutCommitKind::Unmeasured { children }
             }
-            LayoutDescriptorKind::Measured {
-                measure,
-                measure_key,
-            } => LayoutCommitKind::Measured {
+            LayoutDescriptorKind::Measured { measure } => LayoutCommitKind::Measured {
                 measure: self.layout_measure_contexts[measure]
                     .take()
                     .expect("measured layout descriptor should be committed only once"),
-                measure_key,
             },
         };
 
@@ -526,17 +402,13 @@ impl TaffyLayoutEngine {
                         descriptor: RetainedLayoutDescriptor {
                             style,
                             kind: RetainedLayoutKind::Unmeasured,
-                            measure_key: None,
                         },
                         children: retained_children,
                     },
                     replaced_previous: candidate.replaced_previous,
                 }
             }
-            LayoutCommitKind::Measured {
-                measure,
-                measure_key,
-            } => {
+            LayoutCommitKind::Measured { measure } => {
                 let candidate =
                     self.node_for_descriptor(previous, RetainedLayoutKind::Measured, &style);
                 self.apply_style_diff(
@@ -544,23 +416,10 @@ impl TaffyLayoutEngine {
                     candidate.previous_descriptor.as_ref(),
                     &style,
                 );
-                self.apply_measure_diff(
-                    candidate.node_id,
-                    candidate.previous_descriptor.as_ref(),
-                    &measure_key,
-                );
-                if candidate.previous_descriptor.is_none() {
-                    self.taffy
-                        .set_node_context(candidate.node_id, Some(NodeContext))
-                        .expect(EXPECT_MESSAGE);
-                    self.layout_work.taffy_measure_context_updates += 1;
-                }
-                assert!(
-                    self.current_measure_contexts
-                        .insert(candidate.node_id, measure)
-                        .is_none(),
-                    "measured Taffy node should receive one current-frame callback"
-                );
+                self.taffy
+                    .set_node_context(candidate.node_id, Some(NodeContext { measure }))
+                    .expect(EXPECT_MESSAGE);
+                self.layout_work.taffy_measure_context_updates += 1;
                 self.committed_layout_nodes.insert(id, candidate.node_id);
                 CommitResult {
                     retained_node: RetainedLayoutNode {
@@ -568,7 +427,6 @@ impl TaffyLayoutEngine {
                         descriptor: RetainedLayoutDescriptor {
                             style,
                             kind: RetainedLayoutKind::Measured,
-                            measure_key: Some(measure_key),
                         },
                         children: Vec::new(),
                     },
@@ -715,20 +573,6 @@ impl TaffyLayoutEngine {
         }
     }
 
-    fn apply_measure_diff(
-        &mut self,
-        node_id: NodeId,
-        previous: Option<&RetainedLayoutDescriptor>,
-        measure_key: &LayoutMeasureKey,
-    ) {
-        if let Some(previous) = previous
-            && previous.measure_key.as_ref() != Some(measure_key)
-        {
-            self.taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
-            self.layout_work.taffy_measure_dirty_marks += 1;
-        }
-    }
-
     fn remove_retained_subtree(&mut self, retained_node: RetainedLayoutNode) {
         for child in retained_node.children {
             self.remove_retained_subtree(child);
@@ -803,17 +647,14 @@ impl TaffyLayoutEngine {
         let mut measured_layout_calls = 0;
         let mut measured_layout_duration = Duration::default();
 
-        let current_measure_contexts = &mut self.current_measure_contexts;
-
         self.taffy
             .compute_layout_with_measure(
                 node_id,
                 available_space.into(),
-                |known_dimensions, available_space, id, node_context, _style| {
+                |known_dimensions, available_space, _id, node_context, _style| {
                     let Some(node_context) = node_context else {
                         return taffy::geometry::Size::default();
                     };
-                    let _node_context = node_context;
 
                     let known_dimensions = Size {
                         width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
@@ -835,11 +676,8 @@ impl TaffyLayoutEngine {
 
                     measured_layout_calls += 1;
                     let measure_start = std::time::Instant::now();
-                    let measure = current_measure_contexts
-                        .get_mut(&id)
-                        .expect("measured Taffy node should have a current-frame callback");
                     let measured_size: Size<Pixels> =
-                        measure(known_dimensions, available_space, window, cx);
+                        (node_context.measure)(known_dimensions, available_space, window, cx);
                     measured_layout_duration += measure_start.elapsed();
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
@@ -1037,24 +875,6 @@ mod retained_layout_tests {
         engine.request_measured_layout(Style::default(), px(16.0), 1.0, move |_, _, _, _| {
             size(px(width), px(10.0))
         })
-    }
-
-    fn request_keyed_auto_measured(
-        engine: &mut TaffyLayoutEngine,
-        key: u64,
-        width: f32,
-        invocations: Rc<Cell<usize>>,
-    ) -> LayoutId {
-        engine.request_keyed_measured_layout(
-            Style::default(),
-            px(16.0),
-            1.0,
-            MeasureKey::new(key),
-            move |_, _, _, _| {
-                invocations.set(invocations.get() + 1);
-                size(px(width), px(10.0))
-            },
-        )
     }
 
     struct DropCounter(Rc<Cell<usize>>);
@@ -1338,7 +1158,7 @@ mod retained_layout_tests {
         assert_eq!(drops.get(), 0);
 
         engine.finish_frame();
-        assert_eq!(drops.get(), 1);
+        assert_eq!(drops.get(), 0);
 
         let leaf = request_leaf(&mut engine, 10.0);
         engine.commit_layout(leaf);
@@ -1393,85 +1213,6 @@ mod retained_layout_tests {
                 taffy_node_size(&fresh, fresh_root),
             ),
             (expected_size, expected_size)
-        );
-    }
-
-    #[gpui::test]
-    fn keyed_measured_node_reuse_does_not_replace_taffy_context(cx: &mut TestAppContext) {
-        let cx = cx.add_empty_window();
-        let invocations = Rc::new(Cell::new(0));
-        let mut engine = TaffyLayoutEngine::new();
-
-        let root = request_keyed_auto_measured(&mut engine, 1, 100.0, invocations.clone());
-        cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-                window,
-                app,
-            );
-        });
-        let initial = engine.finish_frame();
-        assert_eq!(initial.taffy_measure_context_updates, 1);
-        assert_eq!(initial.taffy_measure_dirty_marks, 0);
-        assert_eq!(initial.measured_layout_calls, 1);
-
-        let root = request_keyed_auto_measured(&mut engine, 1, 100.0, invocations.clone());
-        cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-                window,
-                app,
-            );
-        });
-        let reused = engine.finish_frame();
-
-        assert_eq!(reused.taffy_node_reuses, 1);
-        assert_eq!(reused.taffy_measure_context_updates, 0);
-        assert_eq!(reused.taffy_measure_dirty_marks, 0);
-        assert_eq!(reused.measured_layout_calls, 0);
-        assert_eq!(invocations.get(), 1);
-    }
-
-    #[gpui::test]
-    fn keyed_measured_node_recomputes_when_key_changes(cx: &mut TestAppContext) {
-        let cx = cx.add_empty_window();
-        let scale_factor = cx.update(|window, _| window.scale_factor());
-        let invocations = Rc::new(Cell::new(0));
-        let mut engine = TaffyLayoutEngine::new();
-
-        let root = request_keyed_auto_measured(&mut engine, 1, 0.0, invocations.clone());
-        cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-                window,
-                app,
-            );
-        });
-        engine.finish_frame();
-
-        let root = request_keyed_auto_measured(&mut engine, 2, 100.0, invocations.clone());
-        let retained_root = cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-                window,
-                app,
-            );
-            engine.committed_layout_nodes[&root]
-        });
-        let changed = engine.finish_frame();
-
-        assert_eq!(changed.taffy_node_reuses, 1);
-        assert_eq!(changed.taffy_measure_context_updates, 0);
-        assert_eq!(changed.taffy_measure_dirty_marks, 1);
-        assert_eq!(changed.measured_layout_calls, 1);
-        assert_eq!(invocations.get(), 2);
-        assert_eq!(
-            taffy_node_size(&engine, retained_root),
-            size(100.0 * scale_factor, 10.0 * scale_factor)
         );
     }
 

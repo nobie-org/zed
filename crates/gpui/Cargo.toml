@@ -106,6 +106,7 @@ thiserror.workspace = true
 gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
+wgpu.workspace = true
 lyon = "1.0"
 pin-project = "1.1.10"
 spin = "0.10.0"

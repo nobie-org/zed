@@ -7,17 +7,18 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformInputSimulator, PlatformWindow,
-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SceneCapture, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    KeystrokeEvent, LayoutId, LayoutWorkSample, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point,
     prelude::*,
     px, rems,
     scene::{LogicalVisualPlan, RenderGroupInput},
@@ -991,6 +992,8 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    last_layout_work_sample: Option<LayoutWorkSample>,
+    next_layout_work_draw_index: u64,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -1640,6 +1643,8 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            last_layout_work_sample: None,
+            next_layout_work_draw_index: 0,
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
@@ -2694,6 +2699,7 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        self.layout_engine.as_mut().unwrap().begin_frame();
 
         {
             profiling::scope!("gpui::window::draw_invalidate_entities");
@@ -2745,7 +2751,10 @@ impl Window {
 
         {
             profiling::scope!("gpui::window::finish_next_frame");
-            self.layout_engine.as_mut().unwrap().clear();
+            let mut layout_work_sample = self.layout_engine.as_mut().unwrap().finish_frame();
+            layout_work_sample.draw_index = self.next_layout_work_draw_index;
+            self.next_layout_work_draw_index = self.next_layout_work_draw_index.saturating_add(1);
+            self.last_layout_work_sample = Some(layout_work_sample);
             self.text_system().finish_frame();
             self.next_frame.finish(&mut self.rendered_frame);
         }
@@ -4303,6 +4312,11 @@ impl Window {
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
+    }
+
+    /// Returns the layout work sample for the most recently completed draw.
+    pub fn last_layout_work_sample(&self) -> Option<LayoutWorkSample> {
+        self.last_layout_work_sample
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
@@ -6342,6 +6356,20 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        AppContext as _, Context, IntoElement, ParentElement as _, Render, TestAppContext, Window,
+        div, px, size,
+    };
+    use std::ops::Deref as _;
+
+    struct LayoutTelemetryTestView;
+
+    impl Render for LayoutTelemetryTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(div()).child(div())
+        }
+    }
+
     #[test]
     fn input_boundary_cannot_present_outside_request_frame_callback() {
         let source = include_str!("window.rs");
@@ -6371,5 +6399,43 @@ mod tests {
             .and_then(|tail| tail.split("let node_id").next())
             .expect("dispatch_key_event should still exist");
         assert!(!key_dispatch_prefix.contains(&["self", "draw(cx)", "clear();"].join(".")));
+    }
+
+    #[test]
+    fn draw_publishes_layout_work_sample_for_that_draw() {
+        let mut test_app = TestAppContext::single();
+        let window =
+            test_app.open_window(size(px(800.0), px(600.0)), |_, _| LayoutTelemetryTestView);
+        test_app.run_until_parked();
+
+        let first_sample = test_app
+            .update_window(*window.deref(), |_, window, _| {
+                window.last_layout_work_sample()
+            })
+            .unwrap()
+            .expect("opening the window should draw once");
+
+        assert_eq!(first_sample.layout_node_requests, 3);
+        assert_eq!(first_sample.measured_layout_node_requests, 0);
+        assert_eq!(first_sample.child_edges, 2);
+        assert_eq!(first_sample.compute_layout_calls, 1);
+
+        test_app
+            .update_window(*window.deref(), |_, window, _| window.refresh())
+            .unwrap();
+        test_app.run_until_parked();
+
+        let second_sample = test_app
+            .update_window(*window.deref(), |_, window, _| {
+                window.last_layout_work_sample()
+            })
+            .unwrap()
+            .expect("refreshing the window should draw again");
+
+        assert!(second_sample.draw_index > first_sample.draw_index);
+        assert_eq!(second_sample.layout_node_requests, 3);
+        assert_eq!(second_sample.measured_layout_node_requests, 0);
+        assert_eq!(second_sample.child_edges, 2);
+        assert_eq!(second_sample.compute_layout_calls, 1);
     }
 }

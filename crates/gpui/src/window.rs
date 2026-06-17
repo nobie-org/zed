@@ -827,6 +827,7 @@ pub(crate) enum CachedViewMissReason {
     DuplicateSite,
     RetainedLayoutUnavailable,
     Refreshing,
+    PreviousFrameArtifactsUnavailable,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -841,6 +842,7 @@ pub(crate) struct CachedViewCounters {
     pub(crate) duplicate_site_misses: usize,
     pub(crate) retained_layout_unavailable_misses: usize,
     pub(crate) refreshing_misses: usize,
+    pub(crate) previous_frame_artifacts_unavailable_misses: usize,
     pub(crate) automatic_hits: usize,
     pub(crate) automatic_misses: usize,
 }
@@ -2180,6 +2182,10 @@ impl Window {
             }
             CachedViewMissReason::Refreshing => {
                 self.cached_view_counters.refreshing_misses += 1;
+            }
+            CachedViewMissReason::PreviousFrameArtifactsUnavailable => {
+                self.cached_view_counters
+                    .previous_frame_artifacts_unavailable_misses += 1;
             }
         }
     }
@@ -3655,6 +3661,18 @@ impl Window {
         );
     }
 
+    pub(crate) fn can_reuse_prepaint(&self, range: &Range<PrepaintStateIndex>) -> bool {
+        range.end.hitboxes_index <= self.rendered_frame.hitboxes.len()
+            && range.end.tooltips_index <= self.rendered_frame.tooltip_requests.len()
+            && range.end.deferred_draws_index <= self.rendered_frame.deferred_draws.len()
+            && range.end.dispatch_tree_index <= self.rendered_frame.dispatch_tree.len()
+            && range.end.accessed_element_states_index
+                <= self.rendered_frame.accessed_element_states.len()
+            && self.text_system.can_reuse_layouts(
+                range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+            )
+    }
+
     pub(crate) fn reuse_prepaint_element_state_accesses(
         &mut self,
         range: Range<PrepaintStateIndex>,
@@ -3668,6 +3686,23 @@ impl Window {
         self.next_frame
             .accessed_element_states
             .extend(accessed_element_states);
+    }
+
+    pub(crate) fn can_reuse_request_layout(&self, range: &Range<PrepaintStateIndex>) -> bool {
+        debug_assert_eq!(range.start.hitboxes_index, range.end.hitboxes_index);
+        debug_assert_eq!(range.start.tooltips_index, range.end.tooltips_index);
+        debug_assert_eq!(
+            range.start.deferred_draws_index,
+            range.end.deferred_draws_index
+        );
+        debug_assert_eq!(
+            range.start.dispatch_tree_index,
+            range.end.dispatch_tree_index
+        );
+        range.end.accessed_element_states_index <= self.rendered_frame.accessed_element_states.len()
+            && self.text_system.can_reuse_layouts(
+                range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+            )
     }
 
     pub(crate) fn reuse_request_layout(
@@ -3703,6 +3738,21 @@ impl Window {
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
         }
+    }
+
+    pub(crate) fn can_reuse_paint(&self, range: &Range<PaintIndex>) -> bool {
+        range.end.scene_index <= self.rendered_frame.scene.len()
+            && range.end.mouse_listeners_index <= self.rendered_frame.mouse_listeners.len()
+            && range.end.input_handlers_index <= self.rendered_frame.input_handlers.len()
+            && range.end.cursor_styles_index <= self.rendered_frame.cursor_styles.len()
+            && range.end.window_control_hitboxes_index
+                <= self.rendered_frame.window_control_hitboxes.len()
+            && range.end.accessed_element_states_index
+                <= self.rendered_frame.accessed_element_states.len()
+            && range.end.tab_handle_index <= self.rendered_frame.tab_stops.paint_index()
+            && self.text_system.can_reuse_layouts(
+                range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+            )
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {

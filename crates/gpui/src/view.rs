@@ -184,6 +184,13 @@ impl AnyView {
             return Err(CachedViewMissReason::Refreshing);
         }
 
+        if !window.can_reuse_request_layout(&element_state.request_layout_range)
+            || !window.can_reuse_prepaint(&element_state.prepaint_range)
+            || !window.can_reuse_paint(&element_state.paint_range)
+        {
+            return Err(CachedViewMissReason::PreviousFrameArtifactsUnavailable);
+        }
+
         let request_layout_range = element_state.request_layout_range.clone();
         let layout_id =
             window.claim_cached_view_retained_layout_root(self.entity_id(), global_id)?;
@@ -480,6 +487,12 @@ impl Element for AnyView {
                         Some(CachedViewMissReason::DependencyRegistrationMissing)
                     }
                     Some(_) if window.refreshing => Some(CachedViewMissReason::Refreshing),
+                    Some(element_state)
+                        if !window.can_reuse_prepaint(&element_state.prepaint_range)
+                            || !window.can_reuse_paint(&element_state.paint_range) =>
+                    {
+                        Some(CachedViewMissReason::PreviousFrameArtifactsUnavailable)
+                    }
                     Some(_) => None,
                 };
 

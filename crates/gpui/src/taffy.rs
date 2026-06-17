@@ -54,6 +54,16 @@ pub struct LayoutWorkSample {
     pub measured_layout_duration: Duration,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TaffyMutationCountsForTests {
+    creates: u64,
+    style_updates: u64,
+    children_updates: u64,
+    context_updates: u64,
+    removes: u64,
+}
+
 struct LayoutDescriptor {
     style: taffy::style::Style,
     kind: LayoutDescriptorKind,
@@ -115,6 +125,8 @@ pub struct TaffyLayoutEngine {
     computed_layouts: FxHashSet<NodeId>,
     layout_bounds_scratch_space: Vec<NodeId>,
     layout_work: LayoutWorkSample,
+    #[cfg(test)]
+    taffy_mutation_counts_for_tests: TaffyMutationCountsForTests,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -138,6 +150,8 @@ impl TaffyLayoutEngine {
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             layout_work: LayoutWorkSample::default(),
+            #[cfg(test)]
+            taffy_mutation_counts_for_tests: TaffyMutationCountsForTests::default(),
         }
     }
 
@@ -168,6 +182,16 @@ impl TaffyLayoutEngine {
     #[cfg(test)]
     fn layout_work_sample(&self) -> LayoutWorkSample {
         self.layout_work
+    }
+
+    #[cfg(test)]
+    fn reset_taffy_mutation_counts_for_tests(&mut self) {
+        self.taffy_mutation_counts_for_tests = TaffyMutationCountsForTests::default();
+    }
+
+    #[cfg(test)]
+    fn taffy_mutation_counts_for_tests(&self) -> TaffyMutationCountsForTests {
+        self.taffy_mutation_counts_for_tests
     }
 
     pub fn request_layout(
@@ -393,6 +417,10 @@ impl TaffyLayoutEngine {
                 self.taffy
                     .set_node_context(candidate.node_id, Some(NodeContext { measure }))
                     .expect(EXPECT_MESSAGE);
+                #[cfg(test)]
+                {
+                    self.taffy_mutation_counts_for_tests.context_updates += 1;
+                }
                 self.committed_layout_nodes.insert(id, candidate.node_id);
                 CommitResult {
                     retained_node: RetainedLayoutNode {
@@ -492,6 +520,10 @@ impl TaffyLayoutEngine {
             },
             Some(previous) => {
                 let node_id = self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE);
+                #[cfg(test)]
+                {
+                    self.taffy_mutation_counts_for_tests.creates += 1;
+                }
                 RetainedCandidate {
                     node_id,
                     previous_descriptor: None,
@@ -499,12 +531,19 @@ impl TaffyLayoutEngine {
                     replaced_previous: Some(previous),
                 }
             }
-            None => RetainedCandidate {
-                node_id: self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE),
-                previous_descriptor: None,
-                previous_children: Vec::new(),
-                replaced_previous: None,
-            },
+            None => {
+                let node_id = self.taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE);
+                #[cfg(test)]
+                {
+                    self.taffy_mutation_counts_for_tests.creates += 1;
+                }
+                RetainedCandidate {
+                    node_id,
+                    previous_descriptor: None,
+                    previous_children: Vec::new(),
+                    replaced_previous: None,
+                }
+            }
         }
     }
 
@@ -519,6 +558,10 @@ impl TaffyLayoutEngine {
                 self.taffy
                     .set_style(node_id, style.clone())
                     .expect(EXPECT_MESSAGE);
+                #[cfg(test)]
+                {
+                    self.taffy_mutation_counts_for_tests.style_updates += 1;
+                }
             }
         }
     }
@@ -533,6 +576,10 @@ impl TaffyLayoutEngine {
             self.taffy
                 .set_children(node_id, children)
                 .expect(EXPECT_MESSAGE);
+            #[cfg(test)]
+            {
+                self.taffy_mutation_counts_for_tests.children_updates += 1;
+            }
         }
     }
 
@@ -544,10 +591,18 @@ impl TaffyLayoutEngine {
             self.taffy
                 .set_node_context(retained_node.node_id, None)
                 .expect(EXPECT_MESSAGE);
+            #[cfg(test)]
+            {
+                self.taffy_mutation_counts_for_tests.context_updates += 1;
+            }
         }
         self.taffy
             .remove(retained_node.node_id)
             .expect(EXPECT_MESSAGE);
+        #[cfg(test)]
+        {
+            self.taffy_mutation_counts_for_tests.removes += 1;
+        }
     }
 
     fn invalidate_cached_bounds_for_subtree(&mut self, node_id: NodeId) {
@@ -984,6 +1039,24 @@ mod retained_layout_tests {
         assert_eq!(
             taffy_shape(&retained, retained_root_node),
             taffy_shape(&fresh, fresh_root_node)
+        );
+    }
+
+    #[test]
+    fn unchanged_unmeasured_tree_emits_no_taffy_mutations_on_second_frame() {
+        let mut engine = TaffyLayoutEngine::new();
+        let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);
+        engine.commit_layout(root);
+        engine.finish_frame();
+
+        engine.reset_taffy_mutation_counts_for_tests();
+        let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);
+        engine.commit_layout(root);
+        engine.finish_frame();
+
+        assert_eq!(
+            engine.taffy_mutation_counts_for_tests(),
+            TaffyMutationCountsForTests::default()
         );
     }
 

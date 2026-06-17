@@ -7,7 +7,8 @@ use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
     LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer, RenderGroupShadowMode,
-    RenderImageParams, RenderSvgParams, ScaledPixels, point, px, rgba,
+    RenderImageParams, RenderSvgParams, ScaledPixels, SurfacePrimitive, SurfaceSilhouette, point,
+    px, rgba,
     scene_protocol::{
         LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
         RenderGroupBackendCounters, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
@@ -33,6 +34,10 @@ fn sp(value: f32) -> ScaledPixels {
 
 fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
     Bounds::new(point(sp(x), sp(y)), size(sp(width), sp(height)))
+}
+
+fn pixel_rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+    Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
 }
 
 fn viewport() -> Bounds<ScaledPixels> {
@@ -1014,6 +1019,99 @@ fn render_group_explicit_surface_shadow_mode_uses_material_shape_without_source_
         pixel(&image, 19, 12),
         [128, 128, 128, 255],
         "explicit exact surface shadow mode should render from the material shape"
+    );
+}
+
+#[test]
+fn render_group_surface_shadow_unions_declared_primitives() {
+    let silhouette = SurfaceSilhouette::union([
+        SurfacePrimitive::new(pixel_rect(6., 8., 6., 6.), GroupShape::rectangle()),
+        SurfacePrimitive::new(pixel_rect(16., 8., 6., 6.), GroupShape::rectangle()),
+    ])
+    .expect("union silhouette fits shader ABI");
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(paint_group_with_effects(
+        1,
+        rect(4., 4., 24., 20.),
+        vec![CompositeEffect::surface_shadow(
+            silhouette,
+            point(px(0.), px(6.)),
+            px(0.),
+            half_white(),
+        )],
+        Scene::default(),
+    ));
+    scene.finish();
+
+    let image = render(&scene);
+
+    assert_eq!(
+        pixel(&image, 8, 10),
+        [0, 0, 0, 255],
+        "offset surface shadow should not fill the original primitive location"
+    );
+    assert_eq!(
+        pixel(&image, 8, 16),
+        [128, 128, 128, 255],
+        "first declared primitive should cast a surface shadow"
+    );
+    assert_eq!(
+        pixel(&image, 14, 16),
+        [0, 0, 0, 255],
+        "gap between declared primitives must stay outside the union"
+    );
+    assert_eq!(
+        pixel(&image, 18, 16),
+        [128, 128, 128, 255],
+        "second declared primitive should cast a surface shadow"
+    );
+}
+
+#[test]
+fn render_group_surface_shadow_unions_group_bounds_with_declared_primitive() {
+    let silhouette = SurfaceSilhouette::union_with_group_shape(
+        GroupShape::rectangle(),
+        [SurfacePrimitive::new(
+            pixel_rect(12., 20., 8., 6.),
+            GroupShape::rectangle(),
+        )],
+    )
+    .expect("group-bounds union silhouette fits shader ABI");
+
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(0, viewport(), black()));
+    scene.insert_primitive(paint_group_with_bounds(
+        1,
+        rect(4., 4., 24., 18.),
+        rect(4., 4., 24., 28.),
+        vec![CompositeEffect::surface_shadow(
+            silhouette,
+            point(px(0.), px(6.)),
+            px(0.),
+            half_white(),
+        )],
+        Scene::default(),
+    ));
+    scene.finish();
+
+    let image = render(&scene);
+
+    assert_eq!(
+        pixel(&image, 8, 16),
+        [128, 128, 128, 255],
+        "group bounds should cast the slab portion of the surface shadow"
+    );
+    assert_eq!(
+        pixel(&image, 14, 30),
+        [128, 128, 128, 255],
+        "declared primitive should cast the hanging-tab portion of the same surface shadow"
+    );
+    assert_eq!(
+        pixel(&image, 22, 30),
+        [0, 0, 0, 255],
+        "pixels below the slab but outside the tab primitive must stay outside the union"
     );
 }
 

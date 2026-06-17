@@ -102,6 +102,7 @@ struct GammaParams {
 
 const M_PI_F: f32 = 3.1415926;
 const GRAYSCALE_FACTORS: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+const MAX_SURFACE_SILHOUETTE_PRIMITIVES: u32 = 4u;
 
 struct Bounds {
     origin: vec2<f32>,
@@ -1140,8 +1141,11 @@ struct GroupSprite {
     shadow_color: vec4<f32>,
     source_mask_bounds: Bounds,
     source_mask_corner_radii: Corners,
-    material_shape_bounds: Bounds,
-    material_shape_corner_radii: Corners,
+    material_shape_count: u32,
+    pad2: array<u32, 3>,
+    material_shape_bounds: array<Bounds, 4>,
+    material_shape_corner_radii: array<Corners, 4>,
+    material_shape_params: array<vec4<f32>, 4>,
     group_shape_params: vec4<f32>,
     source_directional_blur: vec4<f32>,
     color_matrix: array<vec4<f32>, 4>,
@@ -1224,8 +1228,28 @@ fn group_material_alpha(point: vec2<f32>, sprite: GroupSprite) -> f32 {
 }
 
 fn group_material_sdf(point: vec2<f32>, sprite: GroupSprite) -> f32 {
-    let exponent = select(2.0, sprite.group_shape_params.w, sprite.group_shape_params.z == 1.0);
-    return group_shape_sdf(point, sprite.material_shape_bounds, sprite.material_shape_corner_radii, exponent);
+    var distance = 1000000.0;
+    var index = 0u;
+    loop {
+        if (index >= MAX_SURFACE_SILHOUETTE_PRIMITIVES) {
+            break;
+        }
+        if (index < sprite.material_shape_count) {
+            let params = sprite.material_shape_params[index];
+            let exponent = select(2.0, params.y, params.x == 1.0);
+            distance = min(
+                distance,
+                group_shape_sdf(
+                    point,
+                    sprite.material_shape_bounds[index],
+                    sprite.material_shape_corner_radii[index],
+                    exponent,
+                ),
+            );
+        }
+        index = index + 1u;
+    }
+    return distance;
 }
 
 fn group_material_normal(point: vec2<f32>, sprite: GroupSprite) -> vec2<f32> {

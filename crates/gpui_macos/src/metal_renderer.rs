@@ -7,12 +7,13 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, Point,
-    RenderGroupShadowMode, ScaledPixels, Size, Surface, point,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, Size, Surface,
+    point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintMetalTexture, Path,
         PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters, Scene, Shadow,
-        Underline,
+        SurfaceSilhouetteSpriteData, Underline,
     },
     size,
 };
@@ -1574,6 +1575,11 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
+        command_encoder.set_fragment_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
 
         let buffer_contents =
             unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
@@ -1906,12 +1912,9 @@ impl MetalRenderer {
             None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
-        let material_shape_corner_radii = effect_plan
-            .material_shape()
-            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let material_shape = Self::group_material_shape(effect_plan, group.bounds());
         let (smk, sme) = effect_plan.source_mask_shape().shader_params();
-        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
-        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let group_shape_params = [smk as f32, sme, 0., 0.];
         let db = effect_plan.source_directional_blur();
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
@@ -1931,8 +1934,11 @@ impl MetalRenderer {
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds(),
             source_mask_corner_radii,
-            material_shape_bounds: group.bounds(),
-            material_shape_corner_radii,
+            material_shape_count: material_shape.count,
+            _pad2: [0; 3],
+            material_shape_bounds: material_shape.bounds,
+            material_shape_corner_radii: material_shape.corner_radii,
+            material_shape_params: material_shape.shape_params(),
             group_shape_params,
             source_directional_blur,
             color_matrix: [[0., 0., 0., 0.]; 4],
@@ -2027,12 +2033,9 @@ impl MetalRenderer {
             None if source_mask_mode == 1 => (1., Corners::all(ScaledPixels(0.))),
             None => (0., Corners::all(ScaledPixels(0.))),
         };
-        let material_shape_corner_radii = effect_plan
-            .material_shape()
-            .unwrap_or_else(|| Corners::all(ScaledPixels(0.)));
+        let material_shape = Self::group_material_shape(&effect_plan, group.bounds());
         let (smk, sme) = effect_plan.source_mask_shape().shader_params();
-        let (mmk, mme) = effect_plan.material_shape_shape().shader_params();
-        let group_shape_params = [smk as f32, sme, mmk as f32, mme];
+        let group_shape_params = [smk as f32, sme, 0., 0.];
         let db = effect_plan.source_directional_blur();
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
@@ -2068,8 +2071,11 @@ impl MetalRenderer {
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds(),
-                material_shape_corner_radii,
+                material_shape_count: material_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: material_shape.bounds,
+                material_shape_corner_radii: material_shape.corner_radii,
+                material_shape_params: material_shape.shape_params(),
                 group_shape_params,
                 source_directional_blur,
                 color_matrix,
@@ -2111,10 +2117,8 @@ impl MetalRenderer {
             }
             let color = shadow.shadow.color.to_rgb();
             // The surface-shadow SDF reads the material slot; drive it from the
-            // shadow's own shape so a superellipse shadow gets squircle corners.
-            let (shadow_shape_kind, shadow_shape_exponent) = shadow.shape_kind.shader_params();
-            let shadow_group_shape_params =
-                [0., 0., shadow_shape_kind as f32, shadow_shape_exponent];
+            // shadow's own declared silhouette rather than captured content.
+            let shadow_shape = shadow.silhouette.sprite_data(group.bounds());
             sprites.push(GroupSprite {
                 bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
@@ -2131,9 +2135,12 @@ impl MetalRenderer {
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds(),
                 source_mask_corner_radii: Corners::all(ScaledPixels(0.)),
-                material_shape_bounds: group.bounds(),
-                material_shape_corner_radii: shadow.shape,
-                group_shape_params: shadow_group_shape_params,
+                material_shape_count: shadow_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: shadow_shape.bounds,
+                material_shape_corner_radii: shadow_shape.corner_radii,
+                material_shape_params: shadow_shape.shape_params(),
+                group_shape_params,
                 source_directional_blur,
                 color_matrix,
                 color_offset,
@@ -2169,8 +2176,11 @@ impl MetalRenderer {
                 shadow_color: [color.r, color.g, color.b, color.a],
                 source_mask_bounds: group.bounds(),
                 source_mask_corner_radii,
-                material_shape_bounds: group.bounds(),
-                material_shape_corner_radii,
+                material_shape_count: material_shape.count,
+                _pad2: [0; 3],
+                material_shape_bounds: material_shape.bounds,
+                material_shape_corner_radii: material_shape.corner_radii,
+                material_shape_params: material_shape.shape_params(),
                 group_shape_params,
                 source_directional_blur,
                 color_matrix,
@@ -2205,8 +2215,11 @@ impl MetalRenderer {
             shadow_color: [0., 0., 0., 0.],
             source_mask_bounds: group.bounds(),
             source_mask_corner_radii,
-            material_shape_bounds: group.bounds(),
-            material_shape_corner_radii,
+            material_shape_count: material_shape.count,
+            _pad2: [0; 3],
+            material_shape_bounds: material_shape.bounds,
+            material_shape_corner_radii: material_shape.corner_radii,
+            material_shape_params: material_shape.shape_params(),
             group_shape_params,
             source_directional_blur,
             color_matrix,
@@ -2298,6 +2311,11 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
+        command_encoder.set_fragment_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
 
         let buffer_contents =
             unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
@@ -2330,6 +2348,22 @@ impl MetalRenderer {
                 [0., 0., 0., 1.],
             ],
             [offset[0], offset[1], offset[2], 0.],
+        )
+    }
+
+    fn group_material_shape(
+        effect_plan: &CompositeEffectPlan,
+        group_bounds: Bounds<ScaledPixels>,
+    ) -> SurfaceSilhouetteSpriteData<ScaledPixels> {
+        effect_plan.material_shape().map_or_else(
+            || {
+                let mut shape = SurfaceSilhouetteSpriteData::default();
+                shape.count = 1;
+                shape.bounds[0] = group_bounds;
+                shape.corner_radii[0] = Corners::all(ScaledPixels(0.));
+                shape
+            },
+            |silhouette| silhouette.sprite_data(group_bounds),
         )
     }
 
@@ -3307,8 +3341,11 @@ pub struct GroupSprite {
     pub shadow_color: [f32; 4],
     pub source_mask_bounds: Bounds<ScaledPixels>,
     pub source_mask_corner_radii: Corners<ScaledPixels>,
-    pub material_shape_bounds: Bounds<ScaledPixels>,
-    pub material_shape_corner_radii: Corners<ScaledPixels>,
+    pub material_shape_count: u32,
+    pub _pad2: [u32; 3],
+    pub material_shape_bounds: [Bounds<ScaledPixels>; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+    pub material_shape_corner_radii: [Corners<ScaledPixels>; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
+    pub material_shape_params: [[f32; 4]; MAX_SURFACE_SILHOUETTE_PRIMITIVES],
     pub group_shape_params: [f32; 4],
     pub source_directional_blur: [f32; 4],
     pub color_matrix: [[f32; 4]; 4],
@@ -3337,7 +3374,8 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::{
-        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, px, rgba,
+        BorderStyle, CompositeBlendMode, CompositeEffect, Edges, GroupShape, Hsla, Pixels,
+        SurfacePrimitive, SurfaceSilhouette, px, rgba,
         scene_protocol::{
             LogicalVisualPlan, PaintGroup, RenderGroupBackendCounters,
             RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
@@ -3355,6 +3393,10 @@ mod tests {
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
         Bounds::new(point(sp(x), sp(y)), size(sp(width), sp(height)))
+    }
+
+    fn pixel_rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
     }
 
     fn viewport() -> Bounds<ScaledPixels> {
@@ -3394,6 +3436,23 @@ mod tests {
         )
     }
 
+    fn paint_group_with_bounds(
+        order: u32,
+        bounds: Bounds<ScaledPixels>,
+        capture_bounds: Bounds<ScaledPixels>,
+        effects: Vec<CompositeEffect>,
+        scene: Scene,
+    ) -> PaintGroup {
+        PaintGroup::new_for_backend_test(
+            order,
+            bounds,
+            capture_bounds,
+            mask(),
+            LogicalVisualPlan::from_effects(1., 1., effects),
+            scene,
+        )
+    }
+
     fn black() -> Hsla {
         rgba(0x000000ff).into()
     }
@@ -3412,6 +3471,10 @@ mod tests {
 
     fn white() -> Hsla {
         rgba(0xffffffff).into()
+    }
+
+    fn half_white() -> Hsla {
+        rgba(0xffffff80).into()
     }
 
     #[test]
@@ -3837,6 +3900,99 @@ mod tests {
         scene.finish();
 
         assert_eq!(backend_counters(&scene), predicted);
+    }
+
+    #[test]
+    fn render_group_surface_shadow_unions_declared_primitives_metal() {
+        let silhouette = SurfaceSilhouette::union([
+            SurfacePrimitive::new(pixel_rect(6., 8., 6., 6.), GroupShape::rectangle()),
+            SurfacePrimitive::new(pixel_rect(16., 8., 6., 6.), GroupShape::rectangle()),
+        ])
+        .expect("union silhouette fits shader ABI");
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_effects(
+            1,
+            rect(4., 4., 24., 20.),
+            vec![CompositeEffect::surface_shadow(
+                silhouette,
+                point(px(0.), px(6.)),
+                px(0.),
+                half_white(),
+            )],
+            Scene::default(),
+        ));
+        scene.finish();
+
+        let image = render(&scene);
+
+        assert_eq!(
+            pixel(&image, 8, 10),
+            [0, 0, 0, 255],
+            "offset surface shadow should not fill the original primitive location"
+        );
+        assert_eq!(
+            pixel(&image, 8, 16),
+            [128, 128, 128, 255],
+            "first declared primitive should cast a surface shadow"
+        );
+        assert_eq!(
+            pixel(&image, 14, 16),
+            [0, 0, 0, 255],
+            "gap between declared primitives must stay outside the union"
+        );
+        assert_eq!(
+            pixel(&image, 18, 16),
+            [128, 128, 128, 255],
+            "second declared primitive should cast a surface shadow"
+        );
+    }
+
+    #[test]
+    fn render_group_surface_shadow_unions_group_bounds_with_declared_primitive_metal() {
+        let silhouette = SurfaceSilhouette::union_with_group_shape(
+            GroupShape::rectangle(),
+            [SurfacePrimitive::new(
+                pixel_rect(12., 20., 8., 6.),
+                GroupShape::rectangle(),
+            )],
+        )
+        .expect("group-bounds union silhouette fits shader ABI");
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0, viewport(), black()));
+        scene.insert_primitive(paint_group_with_bounds(
+            1,
+            rect(4., 4., 24., 18.),
+            rect(4., 4., 24., 28.),
+            vec![CompositeEffect::surface_shadow(
+                silhouette,
+                point(px(0.), px(6.)),
+                px(0.),
+                half_white(),
+            )],
+            Scene::default(),
+        ));
+        scene.finish();
+
+        let image = render(&scene);
+
+        assert_eq!(
+            pixel(&image, 8, 16),
+            [128, 128, 128, 255],
+            "group bounds should cast the slab portion of the surface shadow"
+        );
+        assert_eq!(
+            pixel(&image, 14, 30),
+            [128, 128, 128, 255],
+            "declared primitive should cast the hanging-tab portion of the same surface shadow"
+        );
+        assert_eq!(
+            pixel(&image, 22, 30),
+            [0, 0, 0, 255],
+            "pixels below the slab but outside the tab primitive must stay outside the union"
+        );
     }
 
     #[test]

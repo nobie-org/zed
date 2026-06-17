@@ -1264,6 +1264,31 @@ mod tests {
         }
     }
 
+    struct NestedConstraintChangingRoot {
+        child: Entity<BoundsProbeChild>,
+        dock_width: Pixels,
+        label: usize,
+    }
+
+    impl Render for NestedConstraintChangingRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(1000.))
+                .h(px(100.))
+                .flex()
+                .child(
+                    div()
+                        .id("workbook-card")
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(self.child.clone()),
+                )
+                .child(div().w(self.dock_width).h_full().flex_none())
+        }
+    }
+
     struct SingleChildRoot<C> {
         child: Entity<C>,
         label: usize,
@@ -2031,6 +2056,79 @@ mod tests {
                 },
                 ObservedSize {
                     width: px(680.),
+                    height: px(100.),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cached_view_automatic_nested_child_bounds_follow_parent_constraints() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let child_render_count = Rc::new(Cell::new(0));
+        let observed_sizes = Rc::new(RefCell::new(Vec::new()));
+
+        let window = cx.add_window({
+            let child_render_count = child_render_count.clone();
+            let observed_sizes = observed_sizes.clone();
+
+            move |_, cx| {
+                let child = cx.new(|_| BoundsProbeChild {
+                    render_count: child_render_count,
+                    observed_sizes,
+                });
+
+                NestedConstraintChangingRoot {
+                    child,
+                    dock_width: px(1000.),
+                    label: 0,
+                }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        let child_render_count_after_first_draw = child_render_count.get();
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.dock_width = px(320.);
+                root.label = 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.dock_width = px(900.);
+                root.label = 2;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        assert_eq!(
+            child_render_count.get(),
+            child_render_count_after_first_draw + 2
+        );
+        assert_eq!(
+            &*observed_sizes.borrow(),
+            &[
+                ObservedSize {
+                    width: px(0.),
+                    height: px(100.),
+                },
+                ObservedSize {
+                    width: px(680.),
+                    height: px(100.),
+                },
+                ObservedSize {
+                    width: px(100.),
                     height: px(100.),
                 },
             ]

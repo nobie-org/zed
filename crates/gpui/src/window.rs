@@ -3670,6 +3670,28 @@ impl Window {
             .extend(accessed_element_states);
     }
 
+    pub(crate) fn reuse_request_layout(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+    ) -> Range<PrepaintStateIndex> {
+        debug_assert_eq!(range.start.hitboxes_index, range.end.hitboxes_index);
+        debug_assert_eq!(range.start.tooltips_index, range.end.tooltips_index);
+        debug_assert_eq!(
+            range.start.deferred_draws_index,
+            range.end.deferred_draws_index
+        );
+        debug_assert_eq!(
+            range.start.dispatch_tree_index,
+            range.end.dispatch_tree_index
+        );
+        let replay_start = self.prepaint_index();
+        self.reuse_prepaint_element_state_accesses(range.clone());
+        self.text_system
+            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        let replay_end = self.prepaint_index();
+        replay_start..replay_end
+    }
+
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),

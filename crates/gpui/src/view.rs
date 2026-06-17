@@ -56,7 +56,9 @@ enum AnyViewRequestLayoutStateInner {
         retained_layout_site: Option<GlobalElementId>,
         request_layout_range: Range<PrepaintStateIndex>,
     },
-    CachedCandidate,
+    CachedCandidate {
+        replayed_request_layout_range: Option<Range<PrepaintStateIndex>>,
+    },
 }
 
 /// A dynamically-typed handle to a view, which can be downcast to a [Entity] for a specific type.
@@ -140,7 +142,7 @@ impl AnyView {
         &self,
         global_id: &GlobalElementId,
         window: &mut Window,
-    ) -> Result<LayoutId, CachedViewMissReason> {
+    ) -> Result<(LayoutId, Range<PrepaintStateIndex>), CachedViewMissReason> {
         let Some(element_state) = window.element_state::<AnyViewState>(global_id) else {
             return Err(CachedViewMissReason::NoPreviousState);
         };
@@ -185,8 +187,8 @@ impl AnyView {
         let request_layout_range = element_state.request_layout_range.clone();
         let layout_id =
             window.claim_cached_view_retained_layout_root(self.entity_id(), global_id)?;
-        window.reuse_prepaint_element_state_accesses(request_layout_range);
-        Ok(layout_id)
+        let replayed_request_layout_range = window.reuse_request_layout(request_layout_range);
+        Ok((layout_id, replayed_request_layout_range))
     }
 
     fn render_for_uncached_request_layout(
@@ -324,7 +326,11 @@ impl Element for AnyView {
                     let layout_id = window.request_layout(root_style, None, cx);
                     (
                         layout_id,
-                        AnyViewRequestLayoutState(AnyViewRequestLayoutStateInner::CachedCandidate),
+                        AnyViewRequestLayoutState(
+                            AnyViewRequestLayoutStateInner::CachedCandidate {
+                                replayed_request_layout_range: None,
+                            },
+                        ),
                     )
                 }
                 AnyViewCacheMode::Automatic if !caching_disabled => {
@@ -335,7 +341,7 @@ impl Element for AnyView {
                     };
 
                     let miss_reason = match self.automatic_cached_root_layout(global_id, window) {
-                        Ok(layout_id) => {
+                        Ok((layout_id, replayed_request_layout_range)) => {
                             #[cfg(any(test, feature = "test-support"))]
                             {
                                 window.record_cached_view_hit();
@@ -344,7 +350,11 @@ impl Element for AnyView {
                             return (
                                 layout_id,
                                 AnyViewRequestLayoutState(
-                                    AnyViewRequestLayoutStateInner::CachedCandidate,
+                                    AnyViewRequestLayoutStateInner::CachedCandidate {
+                                        replayed_request_layout_range: Some(
+                                            replayed_request_layout_range,
+                                        ),
+                                    },
                                 ),
                             );
                         }
@@ -380,53 +390,60 @@ impl Element for AnyView {
     ) -> Option<AnyElement> {
         window.set_view_id(self.entity_id());
         window.with_rendered_view(self.entity_id(), |window| {
-            if let AnyViewRequestLayoutStateInner::Rendered {
-                element,
-                mut accessed_entities,
-                retained_layout_site,
-                request_layout_range,
-            } = mem::replace(
+            let replayed_request_layout_range = match mem::replace(
                 &mut request_layout_state.0,
-                AnyViewRequestLayoutStateInner::CachedCandidate,
+                AnyViewRequestLayoutStateInner::CachedCandidate {
+                    replayed_request_layout_range: None,
+                },
             ) {
-                let prepaint_start = window.prepaint_index();
-                let mut element = element;
-                let ((), prepaint_accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    element.prepaint(window, cx);
-                });
-                accessed_entities.extend(prepaint_accessed_entities);
-                let prepaint_end = window.prepaint_index();
+                AnyViewRequestLayoutStateInner::Rendered {
+                    element,
+                    mut accessed_entities,
+                    retained_layout_site,
+                    request_layout_range,
+                } => {
+                    let prepaint_start = window.prepaint_index();
+                    let mut element = element;
+                    let ((), prepaint_accessed_entities) = cx.detect_accessed_entities(|cx| {
+                        element.prepaint(window, cx);
+                    });
+                    accessed_entities.extend(prepaint_accessed_entities);
+                    let prepaint_end = window.prepaint_index();
 
-                if let Some(global_id) = global_id {
-                    if retained_layout_site.as_ref() == Some(global_id) {
-                        let cache_key = self.current_cache_key(bounds, window);
-                        window.with_element_state::<AnyViewState, _>(global_id, |_, window| {
-                            window.mark_cached_view_site_seen::<AnyViewState>(
-                                self.entity_id(),
-                                global_id,
-                            );
-                            window.replace_cached_view_site_dependencies::<AnyViewState>(
-                                self.entity_id(),
-                                global_id,
-                                &accessed_entities,
-                            );
-                            (
-                                (),
-                                AnyViewState {
-                                    request_layout_range,
-                                    accessed_entities,
-                                    cache_kind: AnyViewCacheKind::Automatic,
-                                    prepaint_range: prepaint_start..prepaint_end,
-                                    paint_range: PaintIndex::default()..PaintIndex::default(),
-                                    cache_key,
-                                },
-                            )
-                        });
+                    if let Some(global_id) = global_id {
+                        if retained_layout_site.as_ref() == Some(global_id) {
+                            let cache_key = self.current_cache_key(bounds, window);
+                            window.with_element_state::<AnyViewState, _>(global_id, |_, window| {
+                                window.mark_cached_view_site_seen::<AnyViewState>(
+                                    self.entity_id(),
+                                    global_id,
+                                );
+                                window.replace_cached_view_site_dependencies::<AnyViewState>(
+                                    self.entity_id(),
+                                    global_id,
+                                    &accessed_entities,
+                                );
+                                (
+                                    (),
+                                    AnyViewState {
+                                        request_layout_range,
+                                        accessed_entities,
+                                        cache_kind: AnyViewCacheKind::Automatic,
+                                        prepaint_range: prepaint_start..prepaint_end,
+                                        paint_range: PaintIndex::default()..PaintIndex::default(),
+                                        cache_key,
+                                    },
+                                )
+                            });
+                        }
                     }
-                }
 
-                return Some(element);
-            }
+                    return Some(element);
+                }
+                AnyViewRequestLayoutStateInner::CachedCandidate {
+                    replayed_request_layout_range,
+                } => replayed_request_layout_range,
+            };
 
             let global_id = global_id.unwrap();
             window.with_element_state::<AnyViewState, _>(global_id, |element_state, window| {
@@ -479,6 +496,9 @@ impl Element for AnyView {
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();
+                    if let Some(replayed_request_layout_range) = replayed_request_layout_range {
+                        element_state.request_layout_range = replayed_request_layout_range;
+                    }
                     element_state.prepaint_range = prepaint_start..prepaint_end;
 
                     return (None, element_state);

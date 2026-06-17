@@ -14,6 +14,18 @@ use std::{any::TypeId, fmt, ops::Range};
 
 use crate::window::CachedViewMissReason;
 
+fn retained_layout_trace_enabled() -> bool {
+    std::env::var_os("GPUI_RETAINED_LAYOUT_TRACE").is_some()
+}
+
+macro_rules! trace_retained_layout {
+    ($($arg:tt)*) => {
+        if retained_layout_trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 struct AnyViewState {
     request_layout_range: Range<PrepaintStateIndex>,
     prepaint_range: Range<PrepaintStateIndex>,
@@ -195,6 +207,12 @@ impl AnyView {
         let layout_id =
             window.claim_cached_view_retained_layout_root(self.entity_id(), global_id)?;
         let replayed_request_layout_range = window.reuse_request_layout(request_layout_range);
+        trace_retained_layout!(
+            "gpui retained request hit entity={:?} global_id={} layout_id={:?}",
+            self.entity_id(),
+            global_id,
+            layout_id
+        );
         Ok((layout_id, replayed_request_layout_range))
     }
 
@@ -365,7 +383,15 @@ impl Element for AnyView {
                                 ),
                             );
                         }
-                        Err(reason) => reason,
+                        Err(reason) => {
+                            trace_retained_layout!(
+                                "gpui retained request miss entity={:?} global_id={} reason={:?}",
+                                self.entity_id(),
+                                global_id,
+                                reason
+                            );
+                            reason
+                        }
                     };
 
                     self.render_for_automatic_request_layout(
@@ -420,6 +446,12 @@ impl Element for AnyView {
                     if let Some(global_id) = global_id {
                         if retained_layout_site.as_ref() == Some(global_id) {
                             let cache_key = self.current_cache_key(bounds, window);
+                            trace_retained_layout!(
+                                "gpui retained prepaint rendered-store entity={:?} global_id={} bounds={:?} retained_layout_site=true",
+                                self.entity_id(),
+                                global_id,
+                                bounds
+                            );
                             window.with_element_state::<AnyViewState, _>(global_id, |_, window| {
                                 window.mark_cached_view_site_seen::<AnyViewState>(
                                     self.entity_id(),
@@ -499,6 +531,13 @@ impl Element for AnyView {
                 if let Some(mut element_state) = element_state
                     && miss_reason.is_none()
                 {
+                    trace_retained_layout!(
+                        "gpui retained prepaint hit entity={:?} global_id={} bounds={:?} replayed_request_layout_range={}",
+                        self.entity_id(),
+                        global_id,
+                        bounds,
+                        replayed_request_layout_range.is_some()
+                    );
                     #[cfg(any(test, feature = "test-support"))]
                     {
                         window.record_cached_view_hit();
@@ -528,6 +567,14 @@ impl Element for AnyView {
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
                 let request_layout_start = window.prepaint_index();
+                trace_retained_layout!(
+                    "gpui retained prepaint miss entity={:?} global_id={} bounds={:?} reason={:?} replayed_request_layout_range={}",
+                    self.entity_id(),
+                    global_id,
+                    bounds,
+                    miss_reason,
+                    replayed_request_layout_range.is_some()
+                );
                 let ((mut element, request_layout_end), accessed_entities) = cx
                     .detect_accessed_entities(|cx| {
                         let mut element = (self.render)(self, window, cx);
@@ -704,7 +751,7 @@ impl Render for EmptyView {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, TestAppContext, WindowControlArea, div, prelude::*,
+        AnyWindowHandle, AppContext as _, TestAppContext, WindowControlArea, div, prelude::*, px,
     };
     use gpui::proptest::prelude::{ProptestConfig, prop_assert_eq};
     use std::cell::{Cell, RefCell};
@@ -1102,6 +1149,118 @@ mod tests {
                 .id("window-control-child")
                 .size_full()
                 .window_control_area(WindowControlArea::Drag)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct ObservedSize {
+        width: Pixels,
+        height: Pixels,
+    }
+
+    impl From<Bounds<Pixels>> for ObservedSize {
+        fn from(bounds: Bounds<Pixels>) -> Self {
+            Self {
+                width: bounds.size.width,
+                height: bounds.size.height,
+            }
+        }
+    }
+
+    struct BoundsProbeChild {
+        render_count: Rc<Cell<usize>>,
+        observed_sizes: Rc<RefCell<Vec<ObservedSize>>>,
+    }
+
+    impl Render for BoundsProbeChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            div()
+                .id("bounds-probe-child")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(BoundsProbeElement {
+                    observed_sizes: self.observed_sizes.clone(),
+                })
+        }
+    }
+
+    struct BoundsProbeElement {
+        observed_sizes: Rc<RefCell<Vec<ObservedSize>>>,
+    }
+
+    impl Element for BoundsProbeElement {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            Some(ElementId::Name("bounds-probe".into()))
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            let mut style = Style::default();
+            style.size = Size::full();
+            (window.request_layout(style, None, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+            self.observed_sizes.borrow_mut().push(bounds.into());
+        }
+
+        fn paint(
+            &mut self,
+            _global_id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+    }
+
+    impl IntoElement for BoundsProbeElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    struct ConstraintChangingRoot {
+        child: Entity<BoundsProbeChild>,
+        dock_width: Pixels,
+        label: usize,
+    }
+
+    impl Render for ConstraintChangingRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(1000.))
+                .h(px(100.))
+                .flex()
+                .child(self.child.clone())
+                .child(div().w(self.dock_width).h_full().flex_none())
         }
     }
 
@@ -1810,6 +1969,72 @@ mod tests {
             assert_eq!(window.rendered_frame.window_control_hitboxes.len(), 1);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn cached_view_automatic_child_bounds_update_when_parent_constraints_change() {
+        let mut cx = TestAppContext::single();
+        cx.set_auto_draw_test_windows(false);
+
+        let child_render_count = Rc::new(Cell::new(0));
+        let observed_sizes = Rc::new(RefCell::new(Vec::new()));
+
+        let window = cx.add_window({
+            let child_render_count = child_render_count.clone();
+            let observed_sizes = observed_sizes.clone();
+
+            move |_, cx| {
+                let child = cx.new(|_| BoundsProbeChild {
+                    render_count: child_render_count,
+                    observed_sizes,
+                });
+
+                ConstraintChangingRoot {
+                    child,
+                    dock_width: px(1000.),
+                    label: 0,
+                }
+            }
+        });
+        let any_window = window.into();
+
+        draw_root(&mut cx, any_window);
+        assert_eq!(
+            &*observed_sizes.borrow(),
+            &[ObservedSize {
+                width: px(0.),
+                height: px(100.),
+            }]
+        );
+        let child_render_count_after_first_draw = child_render_count.get();
+
+        window
+            .update(&mut cx, |root, _window, cx| {
+                root.dock_width = px(320.);
+                root.label = 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw_root(&mut cx, any_window);
+
+        assert_eq!(
+            child_render_count.get(),
+            child_render_count_after_first_draw + 1
+        );
+        assert_eq!(
+            &*observed_sizes.borrow(),
+            &[
+                ObservedSize {
+                    width: px(0.),
+                    height: px(100.),
+                },
+                ObservedSize {
+                    width: px(680.),
+                    height: px(100.),
+                },
+            ]
+        );
     }
 
     #[test]

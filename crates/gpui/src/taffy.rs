@@ -17,6 +17,18 @@ use taffy::{
     tree::NodeId,
 };
 
+fn retained_layout_trace_enabled() -> bool {
+    std::env::var_os("GPUI_RETAINED_LAYOUT_TRACE").is_some()
+}
+
+macro_rules! trace_retained_layout {
+    ($($arg:tt)*) => {
+        if retained_layout_trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 type NodeMeasureFn = StackSafe<
     Box<
         dyn FnMut(
@@ -71,7 +83,7 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
-    computed_layouts: FxHashSet<LayoutId>,
+    computed_layout_roots: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
     layout_work: LayoutWorkSample,
     scratch_nodes: Vec<LayoutId>,
@@ -93,7 +105,7 @@ impl TaffyLayoutEngine {
             taffy,
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
-            computed_layouts: FxHashSet::default(),
+            computed_layout_roots: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             layout_work: LayoutWorkSample::default(),
             scratch_nodes: Vec::new(),
@@ -113,7 +125,7 @@ impl TaffyLayoutEngine {
         }
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
-        self.computed_layouts.clear();
+        self.computed_layout_roots.clear();
         self.layout_work = LayoutWorkSample::default();
         layout_work
     }
@@ -337,7 +349,17 @@ impl TaffyLayoutEngine {
         style: taffy::style::Style,
         children: &[LayoutId],
     ) {
-        if self.taffy.style(layout_id.into()).expect(EXPECT_MESSAGE) != &style {
+        let style_changed = self.taffy.style(layout_id.into()).expect(EXPECT_MESSAGE) != &style;
+        let children_changed = !self.node_children_match(layout_id, children);
+        trace_retained_layout!(
+            "gpui retained taffy reuse-unmeasured node={:?} old_kind={:?} style_changed={} children_changed={} children={:?}",
+            layout_id,
+            self.retained_layout_node_kinds.get(&layout_id),
+            style_changed,
+            children_changed,
+            children,
+        );
+        if style_changed {
             self.taffy
                 .set_style(layout_id.into(), style)
                 .expect(EXPECT_MESSAGE);
@@ -351,11 +373,14 @@ impl TaffyLayoutEngine {
                 .set_node_context(layout_id.into(), None)
                 .expect(EXPECT_MESSAGE);
         }
-        if !self.node_children_match(layout_id, children) {
+        if children_changed {
             self.taffy
                 .set_children(layout_id.into(), LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE);
         }
+        self.taffy
+            .mark_dirty(layout_id.into())
+            .expect(EXPECT_MESSAGE);
     }
 
     fn update_retained_measured_layout_node(
@@ -370,7 +395,14 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) {
-        if self.taffy.style(layout_id.into()).expect(EXPECT_MESSAGE) != &style {
+        let style_changed = self.taffy.style(layout_id.into()).expect(EXPECT_MESSAGE) != &style;
+        trace_retained_layout!(
+            "gpui retained taffy reuse-measured node={:?} old_kind={:?} style_changed={}",
+            layout_id,
+            self.retained_layout_node_kinds.get(&layout_id),
+            style_changed,
+        );
+        if style_changed {
             self.taffy
                 .set_style(layout_id.into(), style)
                 .expect(EXPECT_MESSAGE);
@@ -390,6 +422,9 @@ impl TaffyLayoutEngine {
                 .set_children(layout_id.into(), &[])
                 .expect(EXPECT_MESSAGE);
         }
+        self.taffy
+            .mark_dirty(layout_id.into())
+            .expect(EXPECT_MESSAGE);
     }
 
     pub fn request_layout(
@@ -419,6 +454,12 @@ impl TaffyLayoutEngine {
                         .set_children(layout_id.into(), LayoutId::to_taffy_slice(children))
                         .expect(EXPECT_MESSAGE);
                 }
+                trace_retained_layout!(
+                    "gpui retained taffy create-unmeasured node={:?} children={:?} retained_scope_active={}",
+                    layout_id,
+                    children,
+                    self.retained_layout_scope_stack.last().is_some(),
+                );
                 self.track_new_layout_node(layout_id, RetainedLayoutNodeKind::Unmeasured);
                 layout_id
             }
@@ -457,6 +498,11 @@ impl TaffyLayoutEngine {
                     )
                     .expect(EXPECT_MESSAGE)
                     .into();
+                trace_retained_layout!(
+                    "gpui retained taffy create-measured node={:?} retained_scope_active={}",
+                    layout_id,
+                    self.retained_layout_scope_stack.last().is_some(),
+                );
                 self.track_new_layout_node(layout_id, RetainedLayoutNodeKind::Measured);
                 layout_id
             }
@@ -510,6 +556,23 @@ impl TaffyLayoutEngine {
         Ok(edges)
     }
 
+    fn clear_absolute_layout_bounds_for_subtree(&mut self, root: LayoutId) {
+        let stack = &mut self.layout_bounds_scratch_space;
+        stack.push(root);
+        while let Some(id) = stack.pop() {
+            self.absolute_layout_bounds.remove(&id);
+            self.absolute_outer_origins.remove(&id);
+            self.computed_layout_roots.remove(&id);
+            stack.extend(
+                self.taffy
+                    .children(id.into())
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter()
+                    .map(LayoutId::from),
+            );
+        }
+    }
+
     #[stacksafe]
     pub fn compute_layout(
         &mut self,
@@ -518,6 +581,18 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        trace_retained_layout!(
+            "gpui retained taffy compute root={:?} available={:?}",
+            id,
+            available_space,
+        );
+        // A retained node can be computed as a temporary root and later as a
+        // descendant of another root in the same frame. Absolute bounds depend
+        // on that root/available-space context, so clear the reachable subtree
+        // before every compute.
+        self.clear_absolute_layout_bounds_for_subtree(id);
+        self.computed_layout_roots.insert(id);
+
         // Leaving this here until we have a better instrumentation approach.
         // println!("Laying out {} children", self.count_all_children(id)?);
         // println!("Max layout depth: {}", self.max_depth(0, id)?);
@@ -528,22 +603,6 @@ impl TaffyLayoutEngine {
         //     println!("N{} --> N{}", u64::from(a), u64::from(b));
         // }
         //
-
-        if !self.computed_layouts.insert(id) {
-            let stack = &mut self.layout_bounds_scratch_space;
-            stack.push(id);
-            while let Some(id) = stack.pop() {
-                self.absolute_layout_bounds.remove(&id);
-                self.absolute_outer_origins.remove(&id);
-                stack.extend(
-                    self.taffy
-                        .children(id.into())
-                        .expect(EXPECT_MESSAGE)
-                        .into_iter()
-                        .map(LayoutId::from),
-                );
-            }
-        }
 
         let scale_factor = window.scale_factor();
 
@@ -689,7 +748,11 @@ impl TaffyLayoutEngine {
         let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
         let layout_location = layout.location;
         let layout_size = layout.size;
-        let parent = self.taffy.parent(id.0);
+        let parent = if self.computed_layout_roots.contains(&id) {
+            None
+        } else {
+            self.taffy.parent(id.0)
+        };
 
         let absolute_outer_origin = match parent {
             Some(parent_id) => {
@@ -713,6 +776,22 @@ impl TaffyLayoutEngine {
         );
 
         let bounds = (snapped_bounds / scale_factor).map(Pixels);
+        if bounds.size.width == Pixels::ZERO || bounds.size.height == Pixels::ZERO {
+            trace_retained_layout!(
+                "gpui retained taffy zero-bounds node={:?} parent={:?} raw_location={:?} raw_size={:?} bounds={:?} children={:?}",
+                id,
+                parent.map(LayoutId::from),
+                layout_location,
+                layout_size,
+                bounds,
+                self.taffy
+                    .children(id.into())
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter()
+                    .map(LayoutId::from)
+                    .collect::<Vec<_>>(),
+            );
+        }
         self.absolute_layout_bounds.insert(id, bounds);
         bounds
     }
@@ -1195,6 +1274,147 @@ mod tests {
                 .expect(EXPECT_MESSAGE),
             Vec::<taffy::NodeId>::new()
         );
+    }
+
+    #[test]
+    fn retained_scope_revalidation_dirties_reused_nodes_even_when_descriptor_is_unchanged() {
+        let mut test_app = crate::TestAppContext::single();
+        let window = test_app.add_window(|_, _| crate::Empty);
+
+        test_app
+            .update_window(*window.deref(), |_, window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let scope = RetainedLayoutScopeId::new(0);
+                let scale_factor = window.scale_factor();
+
+                engine.begin_retained_layout_scope(scope);
+                let child =
+                    engine.request_layout(Style::default(), Pixels(16.0), scale_factor, &[]);
+                let root =
+                    engine.request_layout(Style::default(), Pixels(16.0), scale_factor, &[child]);
+                assert!(engine.finish_retained_layout_scope(scope, root));
+
+                engine.compute_layout(
+                    root,
+                    size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    (
+                        engine.taffy.dirty(child.into()).expect(EXPECT_MESSAGE),
+                        engine.taffy.dirty(root.into()).expect(EXPECT_MESSAGE),
+                    ),
+                    (false, false),
+                );
+
+                engine.begin_retained_layout_scope(scope);
+                let reused_child =
+                    engine.request_layout(Style::default(), Pixels(16.0), scale_factor, &[]);
+                let reused_root = engine.request_layout(
+                    Style::default(),
+                    Pixels(16.0),
+                    scale_factor,
+                    &[reused_child],
+                );
+                assert_eq!((reused_child, reused_root), (child, root));
+                assert!(engine.finish_retained_layout_scope(scope, reused_root));
+
+                assert_eq!(
+                    (
+                        engine
+                            .taffy
+                            .dirty(reused_child.into())
+                            .expect(EXPECT_MESSAGE),
+                        engine
+                            .taffy
+                            .dirty(reused_root.into())
+                            .expect(EXPECT_MESSAGE),
+                    ),
+                    (true, true),
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn compute_layout_clears_cached_descendant_bounds_from_previous_root_compute() {
+        let mut test_app = crate::TestAppContext::single();
+        let window = test_app.add_window(|_, _| crate::Empty);
+
+        test_app
+            .update_window(*window.deref(), |_, window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let scale_factor = window.scale_factor();
+
+                let mut child_style = Style::default();
+                child_style.size = size(
+                    Length::Definite(DefiniteLength::Fraction(1.0)),
+                    Length::Definite(DefiniteLength::Fraction(1.0)),
+                );
+                let child = engine.request_layout(child_style, Pixels(16.0), scale_factor, &[]);
+
+                let mut previous_parent_style = Style::default();
+                previous_parent_style.size = size(Pixels(100.0).into(), Pixels(100.0).into());
+                let previous_parent = engine.request_layout(
+                    previous_parent_style,
+                    Pixels(16.0),
+                    scale_factor,
+                    &[child],
+                );
+                assert_eq!(
+                    engine.taffy.parent(child.into()),
+                    Some(previous_parent.into())
+                );
+
+                engine.compute_layout(
+                    child,
+                    size(
+                        AvailableSpace::Definite(Pixels(0.0)),
+                        AvailableSpace::Definite(Pixels(571.5)),
+                    ),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    engine.layout_bounds(child, scale_factor),
+                    Bounds {
+                        origin: Point::default(),
+                        size: size(Pixels(0.0), Pixels(571.5)),
+                    }
+                );
+
+                let mut parent_style = Style::default();
+                parent_style.size = size(Pixels(1077.0).into(), Pixels(0.0).into());
+                let parent =
+                    engine.request_layout(parent_style, Pixels(16.0), scale_factor, &[child]);
+
+                engine.compute_layout(
+                    parent,
+                    size(
+                        AvailableSpace::Definite(Pixels(1077.0)),
+                        AvailableSpace::Definite(Pixels(0.0)),
+                    ),
+                    window,
+                    cx,
+                );
+
+                assert_eq!(
+                    engine.layout_bounds(parent, scale_factor),
+                    Bounds {
+                        origin: Point::default(),
+                        size: size(Pixels(1077.0), Pixels(0.0)),
+                    }
+                );
+                assert_eq!(
+                    engine.layout_bounds(child, scale_factor),
+                    Bounds {
+                        origin: Point::default(),
+                        size: size(Pixels(1077.0), Pixels(0.0)),
+                    }
+                );
+            })
+            .unwrap();
     }
 
     #[test]

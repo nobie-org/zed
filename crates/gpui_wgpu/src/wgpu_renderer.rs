@@ -1,8 +1,8 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentAlphaShadowMode, Corners, DevicePixels, GpuSpecs,
-    Point, ScaledPixels, Size, get_gamma_correction_ratios, point,
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point,
+    RenderGroupShadowMode, ScaledPixels, Size, get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, PrimitiveBatch,
         Quad, RenderGroupBackendCounters, Scene, Shadow, SubpixelSprite, Underline,
@@ -2227,14 +2227,13 @@ impl WgpuRenderer {
             };
 
             let support_counters = group.plan().support_counters(group.capture_bounds());
-            group_counters.shadow_modes.content_alpha_separable +=
-                support_counters.shadow_modes.content_alpha_separable;
-            group_counters.shadow_modes.content_alpha_exact +=
-                support_counters.shadow_modes.content_alpha_exact;
-            group_counters.shadow_modes.content_alpha_downsampled +=
-                support_counters.shadow_modes.content_alpha_downsampled;
-            group_counters.shadow_modes.surface_geometry +=
-                support_counters.shadow_modes.surface_geometry;
+            group_counters.shadow_sources.content_alpha +=
+                support_counters.shadow_sources.content_alpha;
+            group_counters.shadow_sources.surface_geometry +=
+                support_counters.shadow_sources.surface_geometry;
+            group_counters.shadow_modes.separable += support_counters.shadow_modes.separable;
+            group_counters.shadow_modes.exact += support_counters.shadow_modes.exact;
+            group_counters.shadow_modes.downsampled += support_counters.shadow_modes.downsampled;
             group_counters.content_alpha_shadow_max_kernel_radius = group_counters
                 .content_alpha_shadow_max_kernel_radius
                 .max(support_counters.content_alpha_shadow_max_kernel_radius);
@@ -2243,13 +2242,13 @@ impl WgpuRenderer {
 
             let mut separable_shadow_views = HashMap::new();
             for shadow in effect_plan.drop_shadows() {
-                if shadow.mode != ContentAlphaShadowMode::Separable
-                    || shadow.blur_radius.0 <= f32::EPSILON
+                if shadow.shadow.mode != RenderGroupShadowMode::Separable
+                    || shadow.shadow.blur_radius.0 <= f32::EPSILON
                 {
                     continue;
                 }
 
-                let key = shadow.blur_radius.0.to_bits();
+                let key = shadow.shadow.blur_radius.0.to_bits();
                 if separable_shadow_views.contains_key(&key) {
                     continue;
                 }
@@ -2274,7 +2273,7 @@ impl WgpuRenderer {
                 if !self.draw_group_alpha_horizontal_blur_to_view(
                     group,
                     &effect_plan,
-                    shadow.blur_radius,
+                    shadow.shadow.blur_radius,
                     &group_view,
                     source_mask_view,
                     instance_offset,
@@ -2462,28 +2461,27 @@ impl WgpuRenderer {
         let source_directional_blur = [db.x.0, db.y.0, 0., 0.];
 
         for shadow in effect_plan.drop_shadows() {
-            let (effect_kind, shadow_view) = match shadow.mode {
-                ContentAlphaShadowMode::Separable if shadow.blur_radius.0 > f32::EPSILON => {
-                    let Some(view) = separable_shadow_views.get(&shadow.blur_radius.0.to_bits())
+            let (effect_kind, shadow_view) = match shadow.shadow.mode {
+                RenderGroupShadowMode::Separable if shadow.shadow.blur_radius.0 > f32::EPSILON => {
+                    let Some(view) =
+                        separable_shadow_views.get(&shadow.shadow.blur_radius.0.to_bits())
                     else {
                         return false;
                     };
                     (4, view)
                 }
-                ContentAlphaShadowMode::Separable | ContentAlphaShadowMode::Exact => {
-                    (1, group_view)
-                }
-                ContentAlphaShadowMode::Downsampled | _ => return false,
+                RenderGroupShadowMode::Separable | RenderGroupShadowMode::Exact => (1, group_view),
+                RenderGroupShadowMode::Downsampled | _ => return false,
             };
-            let color = shadow.color.to_rgb();
+            let color = shadow.shadow.color.to_rgb();
             let sprite = GroupSprite {
                 bounds: group.capture_bounds(),
                 opacity: effect_plan.opacity(),
                 effect_kind,
                 source_blur_radius: 0.,
                 source_mask_enabled,
-                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
-                shadow_blur_radius: shadow.blur_radius.0,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,
@@ -2529,7 +2527,10 @@ impl WgpuRenderer {
         );
 
         for shadow in effect_plan.surface_shadows() {
-            let color = shadow.color.to_rgb();
+            if shadow.shadow.mode != RenderGroupShadowMode::Exact {
+                return false;
+            }
+            let color = shadow.shadow.color.to_rgb();
             // The surface-shadow SDF reads the material slot; drive it from the
             // shadow's own shape so a superellipse shadow gets squircle corners.
             let (shadow_shape_kind, shadow_shape_exponent) = shadow.shape_kind.shader_params();
@@ -2541,8 +2542,8 @@ impl WgpuRenderer {
                 effect_kind: 2,
                 source_blur_radius: 0.,
                 source_mask_enabled: 0.,
-                shadow_offset: [shadow.offset.x.0, shadow.offset.y.0],
-                shadow_blur_radius: shadow.blur_radius.0,
+                shadow_offset: [shadow.shadow.offset.x.0, shadow.shadow.offset.y.0],
+                shadow_blur_radius: shadow.shadow.blur_radius.0,
                 backdrop_blur_radius: 0.,
                 source_mask_blur_order: effect_plan.source_mask_blur_order().shader_code(),
                 derived_luma_threshold: 0.,

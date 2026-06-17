@@ -6,11 +6,12 @@ use std::sync::Arc;
 use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
-    LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer, RenderImageParams,
-    RenderSvgParams, ScaledPixels, point, px, rgba,
+    LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer, RenderGroupShadowMode,
+    RenderImageParams, RenderSvgParams, ScaledPixels, point, px, rgba,
     scene_protocol::{
         LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
-        RenderGroupBackendCounters, RenderGroupShadowModeCounters, Scene, TransformationMatrix,
+        RenderGroupBackendCounters, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
+        Scene, TransformationMatrix,
     },
     size, transparent_black,
 };
@@ -178,6 +179,7 @@ fn predicted_counters(group: &PaintGroup) -> RenderGroupBackendCounters {
     RenderGroupBackendCounters {
         intermediate_textures: counters.intermediate_textures,
         backdrop_copies: counters.backdrop_copies,
+        shadow_sources: counters.shadow_sources,
         shadow_modes: counters.shadow_modes,
         content_alpha_shadow_max_kernel_radius: counters.content_alpha_shadow_max_kernel_radius,
         content_alpha_shadow_sample_count_estimate: counters
@@ -295,13 +297,16 @@ fn backend_counters_match_planner_for_separable_content_alpha_shadow() {
         finished_scene([quad(0, rect(20., 10., 40., 12.), white())]),
     );
     let predicted = predicted_counters(&group);
+    let mut shadow_sources = RenderGroupShadowSourceCounters::default();
+    shadow_sources.content_alpha = 1;
     let mut shadow_modes = RenderGroupShadowModeCounters::default();
-    shadow_modes.content_alpha_separable = 1;
+    shadow_modes.separable = 1;
     assert_eq!(
         predicted,
         RenderGroupBackendCounters {
             intermediate_textures: 2,
             backdrop_copies: 0,
+            shadow_sources,
             shadow_modes,
             content_alpha_shadow_max_kernel_radius: 9,
             content_alpha_shadow_sample_count_estimate: 152_000,
@@ -977,6 +982,38 @@ fn render_group_surface_shadow_uses_material_shape_without_source_alpha() {
         pixel(&surface_image, 19, 12),
         [128, 128, 128, 255],
         "surface shadow should be generated from the material shape even with no source alpha"
+    );
+}
+
+#[test]
+fn render_group_explicit_surface_shadow_mode_uses_material_shape_without_source_alpha() {
+    let mut surface_shadow = Scene::default();
+    surface_shadow.insert_primitive(quad(0, viewport(), black()));
+    surface_shadow.insert_primitive(paint_group_with_effects(
+        1,
+        rect(8., 8., 14., 8.),
+        vec![CompositeEffect::surface_shadow_with_mode(
+            GroupShape::rectangle(),
+            point(px(6.), px(0.)),
+            px(0.),
+            half_white(),
+            RenderGroupShadowMode::Exact,
+        )],
+        Scene::default(),
+    ));
+    surface_shadow.finish();
+
+    let image = render(&surface_shadow);
+
+    assert_eq!(
+        pixel(&image, 12, 12),
+        [0, 0, 0, 255],
+        "offset surface shadow should not fill the original material body"
+    );
+    assert_eq!(
+        pixel(&image, 19, 12),
+        [128, 128, 128, 255],
+        "explicit exact surface shadow mode should render from the material shape"
     );
 }
 

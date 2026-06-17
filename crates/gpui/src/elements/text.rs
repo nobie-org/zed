@@ -1,6 +1,6 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, Font, GlobalElementId,
+    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MeasureKey,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
@@ -17,6 +17,40 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextLayoutMeasureKey {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    white_space: WhiteSpace,
+    text_overflow: Option<TextOverflow>,
+    line_clamp: Option<usize>,
+    scale_factor_bits: u32,
+}
+
+fn text_layout_measure_key(
+    text: &SharedString,
+    runs: &[TextRun],
+    text_style: &TextStyle,
+    font_size: Pixels,
+    line_height: Pixels,
+    scale_factor: f32,
+) -> MeasureKey {
+    MeasureKey::new(TextLayoutMeasureKey {
+        text: text.clone(),
+        runs: runs.to_vec(),
+        font: text_style.font(),
+        font_size,
+        line_height,
+        white_space: text_style.white_space,
+        text_overflow: text_style.text_overflow.clone(),
+        line_clamp: text_style.line_clamp,
+        scale_factor_bits: scale_factor.to_bits(),
+    })
+}
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -410,7 +444,15 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        let measure_key = text_layout_measure_key(
+            &text,
+            &runs,
+            &text_style,
+            font_size,
+            line_height,
+            window.scale_factor(),
+        );
+        window.request_keyed_measured_layout(Default::default(), measure_key, {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {

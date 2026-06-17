@@ -162,6 +162,7 @@ pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
+pub(crate) use taffy::MeasureKey;
 use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId, LayoutWorkSample};
 #[cfg(any(test, feature = "test-support"))]

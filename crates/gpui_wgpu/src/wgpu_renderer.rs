@@ -449,23 +449,8 @@ impl WgpuRenderer {
         }
 
         let queue = Arc::clone(&context.queue);
-        let dual_source_blending = if surface.is_some() {
-            context.supports_dual_source_blending()
-        } else {
-            // Headless capture paints grayscale monochrome glyphs only
-            // (TestWindow reports subpixel rendering unsupported), so the
-            // subpixel pipeline and its adapter-dependence are dropped.
-            false
-        };
-
-        let rendering_params = if surface.is_some() {
-            RenderingParameters::new(&context.adapter, surface_format)
-        } else {
-            // Fixed sample count (no MSAA): MSAA sample positions are
-            // backend-defined, and the render-parity contract forbids relying on
-            // backend-defined behavior for cross-platform byte-identity.
-            RenderingParameters::headless()
-        };
+        let dual_source_blending = context.supports_dual_source_blending();
+        let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
         let pipelines = Self::create_pipelines(
             &device,
@@ -3333,16 +3318,6 @@ impl RenderingParameters {
             .unwrap_or(1);
 
         Self::from_env(path_sample_count)
-    }
-
-    /// Deterministic parameters for headless offscreen capture. Forces
-    /// `path_sample_count = 1`: MSAA sample positions are backend-defined, and
-    /// the render-parity contract forbids relying on backend-defined behavior,
-    /// so cross-platform byte-identity (macOS Metal vs Linux Vulkan/lavapipe)
-    /// requires single-sampled path rasterization. Gamma/contrast use the same
-    /// env-driven defaults as the windowed path.
-    fn headless() -> Self {
-        Self::from_env(1)
     }
 
     fn from_env(path_sample_count: u32) -> Self {

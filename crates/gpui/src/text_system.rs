@@ -29,7 +29,10 @@ use std::{
     fmt::{Debug, Display, Formatter},
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut, Range},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// An opaque identifier for a specific font.
@@ -56,6 +59,7 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    shaping_epoch: AtomicU64,
 }
 
 impl TextSystem {
@@ -81,6 +85,7 @@ impl TextSystem {
                 font("DejaVu Sans"),
                 font("Arial"), // macOS, Windows
             ],
+            shaping_epoch: AtomicU64::new(0),
         }
     }
 
@@ -105,7 +110,12 @@ impl TextSystem {
         self.font_metrics.write().clear();
         self.raster_bounds.write().clear();
         self.wrapper_pool.lock().clear();
+        self.shaping_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub(crate) fn shaping_epoch(&self) -> u64 {
+        self.shaping_epoch.load(Ordering::Relaxed)
     }
 
     /// Get the FontId for the configure font family and style.
@@ -972,7 +982,7 @@ impl Display for FontStyle {
 }
 
 /// A styled run of text, for use in [`crate::TextLayout`].
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TextRun {
     /// A number of utf8 bytes
     pub len: usize,

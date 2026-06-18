@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, Pixels, Point, PureSizeMeasure, ScrollDelta, ScrollWheelEvent, Size, Style,
+    StyleRefinement, Styled, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -1323,26 +1323,13 @@ impl Element for List {
                     let summary = state.items.summary();
                     let total_height = summary.height;
 
-                    window.request_measured_layout(
+                    window.request_pure_measured_layout(
                         style,
-                        move |known_dimensions, available_space, _window, _cx| {
-                            let width =
-                                known_dimensions
-                                    .width
-                                    .unwrap_or(match available_space.width {
-                                        AvailableSpace::Definite(x) => x,
-                                        AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                            max_element_width
-                                        }
-                                    });
-                            let height = match available_space.height {
-                                AvailableSpace::Definite(height) => total_height.min(height),
-                                AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                    total_height
-                                }
-                            };
-                            size(width, height)
-                        },
+                        PureSizeMeasure::list(
+                            max_element_width,
+                            total_height,
+                            window.scale_factor(),
+                        ),
                     )
                 })
             }

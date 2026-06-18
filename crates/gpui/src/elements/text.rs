@@ -1,5 +1,5 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
+    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, Font, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
@@ -380,13 +380,170 @@ impl IntoElement for StyledText {
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
+#[derive(Clone)]
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
-    wrap_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct TextMeasureKey {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    white_space: WhiteSpace,
+    text_overflow: Option<TextOverflow>,
+    line_clamp: Option<usize>,
+    scale_factor_bits: u32,
+    shaping_epoch: u64,
+}
+
+impl TextMeasureKey {
+    pub(crate) fn new(
+        text: SharedString,
+        runs: Vec<TextRun>,
+        text_style: &TextStyle,
+        font_size: Pixels,
+        line_height: Pixels,
+        scale_factor: f32,
+        shaping_epoch: u64,
+    ) -> Self {
+        Self {
+            text,
+            runs,
+            font: text_style.font(),
+            font_size,
+            line_height,
+            white_space: text_style.white_space,
+            text_overflow: text_style.text_overflow.clone(),
+            line_clamp: text_style.line_clamp,
+            scale_factor_bits: scale_factor.to_bits(),
+            shaping_epoch,
+        }
+    }
+
+    fn measure(
+        &self,
+        known_dimensions: Size<Option<Pixels>>,
+        available_space: Size<crate::AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> TextLayoutArtifact {
+        let wrap_width = if self.white_space == WhiteSpace::Normal {
+            known_dimensions.width.or(match available_space.width {
+                crate::AvailableSpace::Definite(width) => Some(width),
+                _ => None,
+            })
+        } else {
+            None
+        };
+
+        let (truncate_width, truncation_affix, truncate_from) =
+            if let Some(text_overflow) = self.text_overflow.clone() {
+                let width = known_dimensions.width.or(match available_space.width {
+                    crate::AvailableSpace::Definite(width) => match self.line_clamp {
+                        Some(max_lines) => Some(width * max_lines),
+                        None => Some(width),
+                    },
+                    _ => None,
+                });
+
+                match text_overflow {
+                    TextOverflow::Truncate(affix) => (width, affix, TruncateFrom::End),
+                    TextOverflow::TruncateStart(affix) => (width, affix, TruncateFrom::Start),
+                }
+            } else {
+                (None, "".into(), TruncateFrom::End)
+            };
+
+        let mut line_wrapper = cx
+            .text_system()
+            .line_wrapper(self.font.clone(), self.font_size);
+        let (text, runs) = if let Some(truncate_width) = truncate_width {
+            line_wrapper.truncate_line(
+                self.text.clone(),
+                truncate_width,
+                &truncation_affix,
+                &self.runs,
+                truncate_from,
+            )
+        } else {
+            (self.text.clone(), Cow::Borrowed(&*self.runs))
+        };
+        let len = text.len();
+
+        let Some(lines) = window
+            .text_system()
+            .shape_text(text, self.font_size, &runs, wrap_width, self.line_clamp)
+            .log_err()
+        else {
+            return TextLayoutArtifact {
+                key: self.clone(),
+                inner: TextLayoutInner {
+                    lines: Default::default(),
+                    len: 0,
+                    line_height: self.line_height,
+                    size: Some(Size::default()),
+                    bounds: None,
+                },
+            };
+        };
+
+        let mut size: Size<Pixels> = Size::default();
+        for line in &lines {
+            let line_size = line.size(self.line_height);
+            size.height += line_size.height;
+            size.width = size.width.max(line_size.width).ceil();
+        }
+
+        TextLayoutArtifact {
+            key: self.clone(),
+            inner: TextLayoutInner {
+                lines,
+                len,
+                line_height: self.line_height,
+                size: Some(size),
+                bounds: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TextLayoutArtifact {
+    key: TextMeasureKey,
+    inner: TextLayoutInner,
+}
+
+impl TextLayoutArtifact {
+    pub(crate) fn key(&self) -> &TextMeasureKey {
+        &self.key
+    }
+
+    pub(crate) fn size(&self) -> Size<Pixels> {
+        self.inner
+            .size
+            .expect("text layout artifact should always carry a measured size")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(key: TextMeasureKey, size: Size<Pixels>) -> Self {
+        Self {
+            key,
+            inner: TextLayoutInner {
+                lines: Default::default(),
+                len: 0,
+                line_height: Pixels::ZERO,
+                size: Some(size),
+                bounds: None,
+            },
+        }
+    }
 }
 
 impl TextLayout {
@@ -395,7 +552,7 @@ impl TextLayout {
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         window: &mut Window,
-        _: &mut App,
+        _cx: &mut App,
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -410,105 +567,30 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
-            let element_state = self.clone();
+        let measure_key = TextMeasureKey::new(
+            text,
+            runs,
+            &text_style,
+            font_size,
+            line_height,
+            window.scale_factor(),
+            window.text_system().shaping_epoch(),
+        );
+        let measure_key_for_measure = measure_key.clone();
+        let layout = self.clone();
 
+        window.request_text_measured_layout(
+            Default::default(),
+            measure_key,
+            move |artifact| layout.hydrate(artifact),
             move |known_dimensions, available_space, window, cx| {
-                let wrap_width = if text_style.white_space == WhiteSpace::Normal {
-                    known_dimensions.width.or(match available_space.width {
-                        crate::AvailableSpace::Definite(x) => Some(x),
-                        _ => None,
-                    })
-                } else {
-                    None
-                };
+                measure_key_for_measure.measure(known_dimensions, available_space, window, cx)
+            },
+        )
+    }
 
-                let (truncate_width, truncation_affix, truncate_from) =
-                    if let Some(text_overflow) = text_style.text_overflow.clone() {
-                        let width = known_dimensions.width.or(match available_space.width {
-                            crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                                Some(max_lines) => Some(x * max_lines),
-                                None => Some(x),
-                            },
-                            _ => None,
-                        });
-
-                        match text_overflow {
-                            TextOverflow::Truncate(s) => (width, s, TruncateFrom::End),
-                            TextOverflow::TruncateStart(s) => (width, s, TruncateFrom::Start),
-                        }
-                    } else {
-                        (None, "".into(), TruncateFrom::End)
-                    };
-
-                // Only use cached layout if:
-                // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                //    because the previous layout may have been computed without truncation)
-                if let Some(text_layout) = element_state.0.borrow().as_ref()
-                    && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
-                    && truncate_width.is_none()
-                {
-                    return size;
-                }
-
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let (text, runs) = if let Some(truncate_width) = truncate_width {
-                    line_wrapper.truncate_line(
-                        text.clone(),
-                        truncate_width,
-                        &truncation_affix,
-                        &runs,
-                        truncate_from,
-                    )
-                } else {
-                    (text.clone(), Cow::Borrowed(&*runs))
-                };
-                let len = text.len();
-
-                let Some(lines) = window
-                    .text_system()
-                    .shape_text(
-                        text,
-                        font_size,
-                        &runs,
-                        wrap_width,            // Wrap if we know the width.
-                        text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                    )
-                    .log_err()
-                else {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines: Default::default(),
-                        len: 0,
-                        line_height,
-                        wrap_width,
-                        size: Some(Size::default()),
-                        bounds: None,
-                    });
-                    return Size::default();
-                };
-
-                let mut size: Size<Pixels> = Size::default();
-                for line in &lines {
-                    let line_size = line.size(line_height);
-                    size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
-                }
-
-                element_state.0.borrow_mut().replace(TextLayoutInner {
-                    lines,
-                    len,
-                    line_height,
-                    wrap_width,
-                    size: Some(size),
-                    bounds: None,
-                });
-
-                size
-            }
-        })
+    fn hydrate(&self, artifact: &TextLayoutArtifact) {
+        self.0.borrow_mut().replace(artifact.inner.clone());
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {

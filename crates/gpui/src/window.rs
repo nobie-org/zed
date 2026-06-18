@@ -11,14 +11,15 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
-    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point,
+    PromptLevel, PureSizeMeasure, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SceneCapture, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextLayoutArtifact,
+    TextMeasureKey, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point,
     prelude::*,
     px, rems,
     scene::{LogicalVisualPlan, RenderGroupInput},
@@ -3438,6 +3439,14 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let layout_checkpoint = self
+            .layout_engine
+            .as_ref()
+            .expect(
+                "retryable prepaint transactions require an installed layout engine; \
+                 nested transactions during layout measurement cannot be rolled back",
+            )
+            .checkpoint();
         let result = f(self);
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
@@ -3454,6 +3463,13 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            self.layout_engine
+                .as_mut()
+                .expect(
+                    "retryable prepaint transactions require an installed layout engine; \
+                     nested transactions during layout measurement cannot be rolled back",
+                )
+                .rollback_to_checkpoint(layout_checkpoint);
         }
         result
     }
@@ -4328,6 +4344,55 @@ impl Window {
             .as_mut()
             .unwrap()
             .request_measured_layout(style, rem_size, scale_factor, measure)
+    }
+
+    pub(crate) fn request_pure_measured_layout(
+        &mut self,
+        style: Style,
+        measure: PureSizeMeasure,
+    ) -> LayoutId {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_pure_measured_layout(style, rem_size, scale_factor, measure)
+    }
+
+    pub(crate) fn request_text_measured_layout<F, H>(
+        &mut self,
+        style: Style,
+        measure_key: TextMeasureKey,
+        hydrate: H,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: FnMut(
+                Size<Option<Pixels>>,
+                Size<AvailableSpace>,
+                &mut Window,
+                &mut App,
+            ) -> TextLayoutArtifact
+            + 'static,
+        H: Fn(&TextLayoutArtifact) + 'static,
+    {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_text_measured_layout(
+                style,
+                rem_size,
+                scale_factor,
+                measure_key,
+                hydrate,
+                measure,
+            )
     }
 
     /// Compute the layout for the given id within the given available space.

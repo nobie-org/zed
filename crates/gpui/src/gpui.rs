@@ -122,6 +122,7 @@ pub use color::*;
 pub use ctor::ctor;
 pub use element::*;
 pub use elements::*;
+pub(crate) use elements::{TextLayoutArtifact, TextMeasureKey};
 pub use executor::*;
 pub use geometry::*;
 pub use global::*;
@@ -162,6 +163,7 @@ pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
+pub(crate) use taffy::PureSizeMeasure;
 use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId, LayoutWorkSample};
 #[cfg(any(test, feature = "test-support"))]

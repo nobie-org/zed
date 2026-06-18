@@ -190,11 +190,10 @@ impl WgpuContext {
         })
     }
 
-    /// Create a surfaceless context for headless offscreen rendering (visual
-    /// regression capture). Selects an adapter with no compatible surface — the
-    /// native analog of [`new_web`](Self::new_web) — so it works without a window
-    /// on CI Linux (lavapipe/Vulkan) and on macOS (Metal). `Backends::PRIMARY | GL`
-    /// lets adapter selection resolve Metal on macOS and Vulkan (lavapipe) on Linux.
+    /// Create a context for headless presentation capture. Selects an adapter
+    /// with no compatible surface so it works without a window on CI Linux
+    /// (lavapipe/Vulkan) and on macOS (Metal). `Backends::PRIMARY | GL` lets
+    /// adapter selection resolve Metal on macOS and Vulkan (lavapipe) on Linux.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
     pub fn new_headless() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {

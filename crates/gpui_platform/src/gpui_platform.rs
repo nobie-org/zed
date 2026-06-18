@@ -60,11 +60,10 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
-/// Returns the canonical headless offscreen renderer for visual-regression
-/// capture. This is a single cross-platform wgpu renderer (Metal on macOS,
-/// Vulkan/lavapipe on Linux) so baselines are byte-identical across platforms
-/// and assertable on Linux CI. There is no per-platform fallback: a missing
-/// headless GPU adapter is an environment misconfiguration and fails loudly.
+/// Returns the current test-window renderer for screenshots. macOS uses the
+/// macOS Metal renderer; non-macOS native platforms use the wgpu renderer with
+/// a surfaceless presentation texture. There is no silent fallback: a missing
+/// native test renderer is an environment misconfiguration and fails loudly.
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
     #[cfg(target_os = "macos")]

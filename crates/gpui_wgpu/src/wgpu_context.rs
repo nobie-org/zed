@@ -155,18 +155,6 @@ impl WgpuContext {
                 Subpixel text antialiasing will be disabled."
             );
         }
-        // Enable 32-bit float blending when the adapter supports it. The headless
-        // capture path renders into an `Rgba32Float` target and requires this so
-        // alpha compositing happens at full f32 precision — the cross-platform
-        // byte-identity contract forbids the backend-defined rounding of lower-
-        // precision blend targets.
-        if adapter
-            .features()
-            .contains(wgpu::Features::FLOAT32_BLENDABLE)
-        {
-            required_features |= wgpu::Features::FLOAT32_BLENDABLE;
-        }
-
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
 
         let (device, queue) = adapter
@@ -229,24 +217,6 @@ impl WgpuContext {
             adapter.get_info().name,
             adapter.get_info().backend
         );
-
-        // The headless capture target is `Rgba32Float`; blending into it requires
-        // `FLOAT32_BLENDABLE`. Requiring it here keeps every platform on the same
-        // float capture path (Metal on macOS, Vulkan/lavapipe on Linux) so the
-        // readback is byte-identical. A missing feature is an environment
-        // misconfiguration, not something to silently degrade to a lower-precision
-        // target (which would reintroduce backend-defined blend rounding).
-        if !adapter
-            .features()
-            .contains(wgpu::Features::FLOAT32_BLENDABLE)
-        {
-            anyhow::bail!(
-                "headless GPU adapter {:?} ({:?}) does not support FLOAT32_BLENDABLE, \
-                 required for deterministic float-target capture",
-                adapter.get_info().name,
-                adapter.get_info().backend,
-            );
-        }
 
         let device_lost = Arc::new(AtomicBool::new(false));
         let (device, queue, dual_source_blending, color_texture_format) =

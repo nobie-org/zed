@@ -340,11 +340,10 @@ impl WgpuRenderer {
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        // A headless renderer (visual-regression capture) has no surface: it
-        // renders into its own offscreen texture and never presents. To keep
-        // capture byte-identical across backends (macOS Metal vs Linux
-        // Vulkan/lavapipe) it pins a fixed format and opaque alpha instead of
-        // negotiating capabilities with a surface.
+        // A surfaceless test renderer has no platform surface: it renders into
+        // its own presentation texture and reads that texture back. It uses the
+        // same preferred 8-bit format as windowed wgpu surfaces instead of a
+        // separate high-precision capture oracle.
         let (surface_format, transparent_alpha_mode, opaque_alpha_mode, present_mode) =
             if let Some(surface) = surface.as_ref() {
                 let surface_caps = surface.get_capabilities(&context.adapter);
@@ -398,21 +397,13 @@ impl WgpuRenderer {
                     present_mode,
                 )
             } else {
-                // Headless capture renders into an `Rgba32Float` target so all
-                // alpha compositing accumulates at full f32 precision. An 8-bit
-                // `Unorm` target re-quantizes after *every* blend, and that
-                // per-blend rounding is backend-defined: Metal and Vulkan/lavapipe
-                // round it differently, producing ±1 LSB cross-platform drift at
-                // every anti-aliased/blended edge. A 16-bit float target removes
-                // most of that but the blend itself is only specified to "at
-                // least f16" precision, so a backend that blends in a wider
-                // intermediate still differs by ±1 LSB. f32 is the widest blend
-                // precision, so both backends round identically. Quantization to
-                // 8-bit happens once, deterministically on the CPU, in
-                // `render_scene_to_image`. Requires `FLOAT32_BLENDABLE` (asserted
-                // in `WgpuContext::new_headless`).
+                // Surfaceless test windows render into the same 8-bit
+                // presentation format preferred by windowed wgpu surfaces. The
+                // readback is a tap on the renderer's presentation target, not a
+                // separate high-precision oracle with different blend and
+                // quantization semantics.
                 (
-                    wgpu::TextureFormat::Rgba32Float,
+                    wgpu::TextureFormat::Bgra8Unorm,
                     wgpu::CompositeAlphaMode::Opaque,
                     wgpu::CompositeAlphaMode::Opaque,
                     wgpu::PresentMode::Fifo,
@@ -642,8 +633,8 @@ impl WgpuRenderer {
         })
     }
 
-    /// Build a surfaceless renderer for headless offscreen capture (visual
-    /// regression). `initial_size` only sizes the first allocation;
+    /// Build a surfaceless renderer for test-window presentation capture.
+    /// `initial_size` only sizes the first allocation;
     /// [`render_scene_to_image`](Self::render_scene_to_image) resizes per capture.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
     pub fn new_headless(
@@ -665,9 +656,8 @@ impl WgpuRenderer {
         )
     }
 
-    /// Render `scene` to an offscreen texture at `size` and read it back as an
-    /// RGBA image. The single canonical headless capture path: deterministic and
-    /// byte-identical across backends (macOS Metal, Linux Vulkan/lavapipe).
+    /// Render `scene` to the surfaceless presentation target at `size` and read
+    /// it back as an RGBA image.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
     pub fn render_scene_to_image(
         &mut self,
@@ -701,7 +691,7 @@ impl WgpuRenderer {
             .resources()
             .device
             .create_texture(&wgpu::TextureDescriptor {
-                label: Some("headless_capture_target"),
+                label: Some("presentation_capture_target"),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -717,20 +707,18 @@ impl WgpuRenderer {
         let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         if !self.encode_scene_to_view(scene, Some(&target_texture), true, &target_view) {
-            anyhow::bail!("headless scene encode failed");
+            anyhow::bail!("presentation scene encode failed");
         }
 
         // Copy the rendered texture into a CPU-readable buffer with rows padded
-        // to COPY_BYTES_PER_ROW_ALIGNMENT, then read back, un-pad, and quantize
-        // to 8-bit RGBA.
+        // to COPY_BYTES_PER_ROW_ALIGNMENT, then read back, un-pad, and convert
+        // to RGBA.
         let bytes_per_pixel: u32 = match format {
-            wgpu::TextureFormat::Rgba32Float => 16,
-            wgpu::TextureFormat::Rgba16Float => 8,
             wgpu::TextureFormat::Rgba8Unorm
             | wgpu::TextureFormat::Rgba8UnormSrgb
             | wgpu::TextureFormat::Bgra8Unorm
             | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
-            other => anyhow::bail!("unsupported headless capture format {other:?}"),
+            other => anyhow::bail!("unsupported presentation capture format {other:?}"),
         };
         let unpadded_bytes_per_row = width * bytes_per_pixel;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -741,7 +729,7 @@ impl WgpuRenderer {
             .resources()
             .device
             .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("headless_capture_readback"),
+                label: Some("presentation_capture_readback"),
                 size: buffer_size,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -751,7 +739,7 @@ impl WgpuRenderer {
             self.resources()
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("headless_capture_copy"),
+                    label: Some("presentation_capture_copy"),
                 });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -790,11 +778,11 @@ impl WgpuRenderer {
                 submission_index: None,
                 timeout: None,
             })
-            .map_err(|e| anyhow::anyhow!("headless capture device poll failed: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("presentation capture device poll failed: {e:?}"))?;
         receiver
             .recv()
-            .map_err(|_| anyhow::anyhow!("headless capture map channel disconnected"))?
-            .map_err(|e| anyhow::anyhow!("headless capture buffer map failed: {e:?}"))?;
+            .map_err(|_| anyhow::anyhow!("presentation capture map channel disconnected"))?
+            .map_err(|e| anyhow::anyhow!("presentation capture buffer map failed: {e:?}"))?;
 
         if let Some(error) = self.last_error.lock().unwrap().take() {
             anyhow::bail!("GPU error during headless scene encode: {error}");
@@ -813,13 +801,9 @@ impl WgpuRenderer {
         }
         read_buffer.unmap();
 
-        // Quantize the captured texels to 8-bit RGBA with a single deterministic
-        // CPU rounding step. For the float capture target this is the *only*
-        // quantization, so the result never depends on backend-defined 8-bit
-        // blend rounding (Metal vs Vulkan/lavapipe).
-        let rgba = quantize_headless_capture_to_rgba8(&raw, format)?;
+        let rgba = presentation_capture_to_rgba8(&raw, format)?;
         image::RgbaImage::from_raw(width, height, rgba)
-            .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from headless capture"))
+            .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presentation capture"))
     }
 
     fn create_bind_group_layouts(device: &wgpu::Device) -> WgpuBindGroupLayouts {
@@ -3392,43 +3376,15 @@ impl RenderingParameters {
     }
 }
 
-/// Convert tightly packed captured texels (no row padding) to 8-bit RGBA,
-/// quantizing the float capture target with a single deterministic round so the
-/// readback is byte-identical across GPU backends. 8-bit `Unorm` inputs are
-/// already quantized and pass through (with a BGRA→RGBA swizzle when needed).
+/// Convert tightly packed captured presentation texels (no row padding) to
+/// RGBA. 8-bit `Unorm` inputs are already quantized and pass through, with a
+/// BGRA→RGBA swizzle when needed.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-fn quantize_headless_capture_to_rgba8(
+fn presentation_capture_to_rgba8(
     raw: &[u8],
     format: wgpu::TextureFormat,
 ) -> anyhow::Result<Vec<u8>> {
     match format {
-        wgpu::TextureFormat::Rgba32Float => {
-            let mut out = Vec::with_capacity(raw.len() / 4);
-            for texel in raw.chunks_exact(16) {
-                for channel in 0..4 {
-                    let base = channel * 4;
-                    let value = f32::from_le_bytes([
-                        texel[base],
-                        texel[base + 1],
-                        texel[base + 2],
-                        texel[base + 3],
-                    ]);
-                    out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
-                }
-            }
-            Ok(out)
-        }
-        wgpu::TextureFormat::Rgba16Float => {
-            let mut out = Vec::with_capacity(raw.len() / 2);
-            for texel in raw.chunks_exact(8) {
-                for channel in 0..4 {
-                    let bits = u16::from_le_bytes([texel[channel * 2], texel[channel * 2 + 1]]);
-                    let value = half_bits_to_f32(bits);
-                    out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
-                }
-            }
-            Ok(out)
-        }
         wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(raw.to_vec()),
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
             let mut out = raw.to_vec();
@@ -3437,48 +3393,12 @@ fn quantize_headless_capture_to_rgba8(
             }
             Ok(out)
         }
-        other => anyhow::bail!("unsupported headless capture format {other:?}"),
+        other => anyhow::bail!("unsupported presentation capture format {other:?}"),
     }
 }
 
-/// Decode an IEEE 754 binary16 (half) bit pattern to `f32` using only integer
-/// arithmetic and `f32::from_bits`. Deterministic and identical across
-/// platforms — no transcendental or `powi` dependence.
-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-fn half_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits as u32) & 0x8000) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x3ff) as u32;
-    if exponent == 0 {
-        if mantissa == 0 {
-            // Signed zero.
-            return f32::from_bits(sign);
-        }
-        // Subnormal half: normalize into a normal f32.
-        let mut exp = -1i32;
-        let mut mant = mantissa;
-        loop {
-            exp += 1;
-            mant <<= 1;
-            if mant & 0x400 != 0 {
-                break;
-            }
-        }
-        let f32_exponent = (127 - 15 - exp) as u32;
-        f32::from_bits(sign | (f32_exponent << 23) | ((mant & 0x3ff) << 13))
-    } else if exponent == 0x1f {
-        // Inf / NaN.
-        f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13))
-    } else {
-        let f32_exponent = exponent + (127 - 15);
-        f32::from_bits(sign | (f32_exponent << 23) | (mantissa << 13))
-    }
-}
-
-/// Headless renderer for visual-regression capture: renders a GPUI scene to an
-/// offscreen wgpu texture and reads it back as RGBA. This is the single canonical
-/// cross-platform headless capture backend (macOS Metal, Linux Vulkan/lavapipe),
-/// wired into `gpui_platform::current_headless_renderer`.
+/// Renderer for test-window presentation capture. It renders a GPUI scene to a
+/// surfaceless wgpu presentation texture and reads that texture back as RGBA.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 pub struct WgpuHeadlessRenderer {
     renderer: WgpuRenderer,

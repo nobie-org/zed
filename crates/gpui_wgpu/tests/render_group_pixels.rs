@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
-    LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer, RenderGroupShadowMode,
+    LumaThreshold, Pixels, PlatformAtlas, PlatformTestWindowRenderer, RenderGroupShadowMode,
     RenderImageParams, RenderSvgParams, ScaledPixels, SurfacePrimitive, SurfaceSilhouette, point,
     px, rgba,
     scene_protocol::{
@@ -16,7 +16,7 @@ use gpui::{
     },
     size, transparent_black,
 };
-use gpui_wgpu::WgpuHeadlessRenderer;
+use gpui_wgpu::WgpuTestWindowRenderer;
 use image::RgbaImage;
 
 const IMAGE_SIZE: i32 = 32;
@@ -155,10 +155,10 @@ fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
 }
 
 fn render(scene: &Scene) -> RgbaImage {
-    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    let mut renderer = WgpuTestWindowRenderer::new().expect("create test-window renderer");
     capture_to_image(
         renderer
-            .draw_scene(
+            .draw_presented_frame(
                 scene,
                 size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
             )
@@ -166,11 +166,11 @@ fn render(scene: &Scene) -> RgbaImage {
     )
 }
 
-/// Render `scene` headlessly and return the backend's measured render-group counters.
+/// Render `scene` through the test-window path and return the backend's measured render-group counters.
 fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
-    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    let mut renderer = WgpuTestWindowRenderer::new().expect("create test-window renderer");
     renderer
-        .draw_scene(
+        .draw_presented_frame(
             scene,
             size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
         )
@@ -1975,15 +1975,15 @@ fn render_group_hard_light_blend_mode_applies_at_group_boundary() {
 
 /// Render a scene that needs atlas-backed sprites: the build closure receives the
 /// renderer's sprite atlas so it can insert tiles before the scene is rendered.
-/// `draw_scene` calls `atlas.before_frame()`, which flushes the staged
+/// `draw_presented_frame` calls `atlas.before_frame()`, which flushes the staged
 /// tile uploads before the draw, so the injected pixels are on the GPU.
 fn render_with_atlas(build: impl FnOnce(&Arc<dyn PlatformAtlas>) -> Scene) -> RgbaImage {
-    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    let mut renderer = WgpuTestWindowRenderer::new().expect("create test-window renderer");
     let atlas = renderer.sprite_atlas().clone();
     let scene = build(&atlas);
     capture_to_image(
         renderer
-            .draw_scene(
+            .draw_presented_frame(
                 &scene,
                 size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
             )

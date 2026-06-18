@@ -14,8 +14,8 @@ path = "src/gpui_platform.rs"
 [features]
 default = []
 font-kit = ["gpui_macos/font-kit"]
-# Headless capture (visual regression) uses the cross-platform wgpu renderer +
-# swash text system, so `gpui_wgpu` is compiled only under `test-support`.
+# Test-window capture uses the native wgpu renderer plus swash text system, so
+# `gpui_wgpu` is compiled only under `test-support`.
 test-support = [
     "gpui/test-support",
     "gpui_macos/test-support",

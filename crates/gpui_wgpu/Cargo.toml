@@ -14,19 +14,18 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
-# Enables the headless offscreen capture renderer (`WgpuHeadlessRenderer`) used
-# by GPUI visual-regression tests. Pulls in `gpui/test-support` so the
-# `PlatformHeadlessRenderer` trait is available, plus `image` for RGBA output.
+# Enables the test-window capture renderer (`WgpuTestWindowRenderer`) used by
+# GPUI visual-regression tests. Pulls in `gpui/test-support` so the
+# `PlatformTestWindowRenderer` trait is available, plus `image` for RGBA output.
 test-support = ["dep:image", "gpui/test-support"]
-# Linux windowing backend. `wgpu` is built surfaceless by default (Metal +
-# Vulkan only); `gpui_linux` opts into the GLES backend, which pulls the
+# Linux windowing backend. `wgpu` is built with native Metal + Vulkan by default;
+# `gpui_linux` opts into the GLES backend, which pulls the
 # EGL/wayland/x11 system bindings needed for on-screen GL surfaces.
 gles = ["wgpu/gles"]
 # Web/wasm rendering support (`new_web`, `new_from_canvas`). The web bindings are
-# opt-in so non-web consumers (e.g. the macOS/Linux headless capture renderer,
-# which is wasm-free) don't drag `wasm-bindgen` into their dependency
+# opt-in so non-web consumers don't drag `wasm-bindgen` into their dependency
 # resolution. Also enables the WebGPU/WebGL `wgpu` backends, which are excluded
-# from the surfaceless default set. `gpui_web` enables this.
+# from the native default set. `gpui_web` enables this.
 web = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",

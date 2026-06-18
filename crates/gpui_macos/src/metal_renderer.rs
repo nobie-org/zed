@@ -1820,6 +1820,11 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
+        command_encoder.set_fragment_buffer(
+            SpriteInputIndex::Sprites as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
 
         let buffer_contents =
             unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };

@@ -92,6 +92,28 @@ impl TestWindow {
         })))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_capture(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
+        let mut state = self.0.lock();
+        let size = state.bounds.size;
+        if let Some(renderer) = &mut state.renderer {
+            let scale_factor = 2.0;
+            let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
+            let backend = renderer.capture_backend();
+            let image = renderer.render_scene_to_image(scene, device_size)?;
+            let width_px = image.width();
+            let height_px = image.height();
+            Ok(SceneCapture {
+                rgba: image.into_raw(),
+                width_px,
+                height_px,
+                backend,
+            })
+        } else {
+            anyhow::bail!("test-window draw not available: no HeadlessRenderer configured")
+        }
+    }
+
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
         let scale_factor = self.scale_factor();
         let mut lock = self.0.lock();
@@ -332,28 +354,6 @@ impl PlatformWindow for TestWindow {
             image::RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
                 .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
         })
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_to_capture(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
-        let mut state = self.0.lock();
-        let size = state.bounds.size;
-        if let Some(renderer) = &mut state.renderer {
-            let scale_factor = 2.0;
-            let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
-            let backend = renderer.capture_backend();
-            let image = renderer.render_scene_to_image(scene, device_size)?;
-            let width_px = image.width();
-            let height_px = image.height();
-            Ok(SceneCapture {
-                rgba: image.into_raw(),
-                width_px,
-                height_px,
-                backend,
-            })
-        } else {
-            anyhow::bail!("test-window draw not available: no HeadlessRenderer configured")
-        }
     }
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {

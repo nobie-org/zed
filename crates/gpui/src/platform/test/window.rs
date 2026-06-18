@@ -35,6 +35,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    presented_capture: Option<Result<SceneCapture, String>>,
 }
 
 #[derive(Clone)]
@@ -87,6 +88,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            presented_capture: None,
         })))
     }
 
@@ -307,25 +309,17 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, _scene: &Scene) {}
+    fn draw(&self, scene: &Scene) {
+        let capture = self.render_to_capture(scene).map_err(|err| err.to_string());
+        self.0.lock().presented_capture = Some(capture);
+    }
 
-    fn capture_scene(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
-        let image = self.render_to_image(scene)?;
-        let width_px = image.width();
-        let height_px = image.height();
-        let backend = {
-            let state = self.0.lock();
-            let renderer = state.renderer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("capture_scene not available: no HeadlessRenderer configured")
-            })?;
-            renderer.capture_backend()
-        };
-        Ok(SceneCapture {
-            rgba: image.into_raw(),
-            width_px,
-            height_px,
-            backend,
-        })
+    fn capture_scene(&self, _scene: &Scene) -> anyhow::Result<SceneCapture> {
+        match self.0.lock().presented_capture.clone() {
+            Some(Ok(capture)) => Ok(capture),
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None => anyhow::bail!("capture_scene called before draw presented a frame"),
+        }
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
@@ -334,14 +328,31 @@ impl PlatformWindow for TestWindow {
 
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
+        self.render_to_capture(scene).and_then(|capture| {
+            image::RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
+                .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_capture(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
         let mut state = self.0.lock();
         let size = state.bounds.size;
         if let Some(renderer) = &mut state.renderer {
             let scale_factor = 2.0;
             let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
-            renderer.render_scene_to_image(scene, device_size)
+            let backend = renderer.capture_backend();
+            let image = renderer.render_scene_to_image(scene, device_size)?;
+            let width_px = image.width();
+            let height_px = image.height();
+            Ok(SceneCapture {
+                rgba: image.into_raw(),
+                width_px,
+                height_px,
+                backend,
+            })
         } else {
-            anyhow::bail!("render_to_image not available: no HeadlessRenderer configured")
+            anyhow::bail!("test-window draw not available: no HeadlessRenderer configured")
         }
     }
 

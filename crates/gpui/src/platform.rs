@@ -793,6 +793,7 @@ pub enum SceneCaptureBackend {
 }
 
 /// CPU-readable capture of a rendered GPUI scene.
+#[derive(Clone)]
 pub struct SceneCapture {
     /// Pixels encoded as RGBA8 in row-major order.
     pub rgba: Vec<u8>,

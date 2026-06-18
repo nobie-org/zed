@@ -805,21 +805,14 @@ pub struct SceneCapture {
     pub backend: SceneCaptureBackend,
 }
 
-/// A renderer for headless windows that can produce real rendered output.
+/// A renderer for test windows that can draw and capture the presented output.
 #[cfg(any(test, feature = "test-support"))]
 pub trait PlatformHeadlessRenderer {
-    /// Render a scene and return the result as an RGBA image.
-    fn render_scene_to_image(
-        &mut self,
-        scene: &Scene,
-        size: Size<DevicePixels>,
-    ) -> Result<RgbaImage>;
+    /// Draw a scene at `size` and return the captured presented pixels.
+    fn draw_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<SceneCapture>;
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
-
-    /// The GPU backend this renderer captures through.
-    fn capture_backend(&self) -> SceneCaptureBackend;
 }
 
 /// Type alias for runnables with metadata.

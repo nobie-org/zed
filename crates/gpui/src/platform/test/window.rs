@@ -99,16 +99,7 @@ impl TestWindow {
         if let Some(renderer) = &mut state.renderer {
             let scale_factor = 2.0;
             let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
-            let backend = renderer.capture_backend();
-            let image = renderer.render_scene_to_image(scene, device_size)?;
-            let width_px = image.width();
-            let height_px = image.height();
-            Ok(SceneCapture {
-                rgba: image.into_raw(),
-                width_px,
-                height_px,
-                backend,
-            })
+            renderer.draw_scene(scene, device_size)
         } else {
             anyhow::bail!("test-window draw not available: no HeadlessRenderer configured")
         }

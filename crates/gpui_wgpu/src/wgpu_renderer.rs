@@ -2,8 +2,8 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, Size,
-    get_gamma_correction_ratios, point,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, SceneCapture,
+    SceneCaptureBackend, Size, get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
         PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
@@ -231,6 +231,10 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    capture_next_frame: bool,
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    presentation_capture: Option<Result<SceneCapture, String>>,
     /// Measured render-group resource counts from the most recent scene encode.
     last_render_group_counters: Option<RenderGroupBackendCounters>,
 }
@@ -344,27 +348,32 @@ impl WgpuRenderer {
         // its own presentation texture and reads that texture back. It uses the
         // same preferred 8-bit format as windowed wgpu surfaces instead of a
         // separate high-precision capture oracle.
-        let (surface_format, transparent_alpha_mode, opaque_alpha_mode, present_mode) =
-            if let Some(surface) = surface.as_ref() {
-                let surface_caps = surface.get_capabilities(&context.adapter);
-                let preferred_formats = [
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                ];
-                let surface_format = preferred_formats
-                    .iter()
-                    .find(|f| surface_caps.formats.contains(f))
-                    .copied()
-                    .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-                    .or_else(|| surface_caps.formats.first().copied())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Surface reports no supported texture formats for adapter {:?}",
-                            context.adapter.get_info().name
-                        )
-                    })?;
+        let (
+            surface_format,
+            transparent_alpha_mode,
+            opaque_alpha_mode,
+            present_mode,
+            surface_usage,
+        ) = if let Some(surface) = surface.as_ref() {
+            let surface_caps = surface.get_capabilities(&context.adapter);
+            let preferred_formats = [
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba8Unorm,
+            ];
+            let surface_format = preferred_formats
+                .iter()
+                .find(|f| surface_caps.formats.contains(f))
+                .copied()
+                .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+                .or_else(|| surface_caps.formats.first().copied())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Surface reports no supported texture formats for adapter {:?}",
+                        context.adapter.get_info().name
+                    )
+                })?;
 
-                let pick_alpha_mode = |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
+            let pick_alpha_mode = |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
                     preferences
                         .iter()
                         .find(|p| surface_caps.alpha_modes.contains(p))
@@ -378,37 +387,43 @@ impl WgpuRenderer {
                         })
                 };
 
-                let transparent_alpha_mode = pick_alpha_mode(&[
-                    wgpu::CompositeAlphaMode::PreMultiplied,
-                    wgpu::CompositeAlphaMode::Inherit,
-                ])?;
-                let opaque_alpha_mode = pick_alpha_mode(&[
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::CompositeAlphaMode::Inherit,
-                ])?;
-                let present_mode = config
-                    .preferred_present_mode
-                    .filter(|mode| surface_caps.present_modes.contains(mode))
-                    .unwrap_or(wgpu::PresentMode::Fifo);
-                (
-                    surface_format,
-                    transparent_alpha_mode,
-                    opaque_alpha_mode,
-                    present_mode,
-                )
-            } else {
-                // Surfaceless test windows render into the same 8-bit
-                // presentation format preferred by windowed wgpu surfaces. The
-                // readback is a tap on the renderer's presentation target, not a
-                // separate high-precision oracle with different blend and
-                // quantization semantics.
-                (
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::PresentMode::Fifo,
-                )
-            };
+            let transparent_alpha_mode = pick_alpha_mode(&[
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::Inherit,
+            ])?;
+            let opaque_alpha_mode = pick_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Inherit,
+            ])?;
+            let present_mode = config
+                .preferred_present_mode
+                .filter(|mode| surface_caps.present_modes.contains(mode))
+                .unwrap_or(wgpu::PresentMode::Fifo);
+            let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+            if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                surface_usage |= wgpu::TextureUsages::COPY_SRC;
+            }
+            (
+                surface_format,
+                transparent_alpha_mode,
+                opaque_alpha_mode,
+                present_mode,
+                surface_usage,
+            )
+        } else {
+            // Surfaceless test windows render into the same 8-bit
+            // presentation format preferred by windowed wgpu surfaces. The
+            // readback is a tap on the renderer's presentation target, not a
+            // separate high-precision oracle with different blend and
+            // quantization semantics.
+            (
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::PresentMode::Fifo,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            )
+        };
 
         let alpha_mode = if config.transparent {
             transparent_alpha_mode
@@ -433,7 +448,7 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -568,7 +583,7 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
-        let surface_configured = surface.is_some();
+        let surface_configured = true;
         let resources = WgpuResources {
             device,
             queue,
@@ -614,6 +629,10 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured,
             needs_redraw: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+            capture_next_frame: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+            presentation_capture: None,
             last_render_group_counters: None,
         })
     }
@@ -641,14 +660,14 @@ impl WgpuRenderer {
         )
     }
 
-    /// Render `scene` to the surfaceless presentation target at `size` and read
-    /// it back as an RGBA image.
+    /// Draw `scene` through the surfaceless presentation path at `size` and
+    /// return the captured presented pixels.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn render_scene_to_image(
+    pub fn draw_scene_to_capture(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
-    ) -> anyhow::Result<image::RgbaImage> {
+    ) -> anyhow::Result<SceneCapture> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("invalid headless capture size: {size:?}");
         }
@@ -668,126 +687,34 @@ impl WgpuRenderer {
             }
         }
 
-        self.atlas.before_frame();
-        self.ensure_intermediate_textures();
-
-        let format = self.surface_config.format;
-        let target_texture = self
-            .resources()
-            .device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("presentation_capture_target"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-        let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        if !self.encode_scene_to_view(scene, Some(&target_texture), true, &target_view) {
-            anyhow::bail!("presentation scene encode failed");
+        self.presentation_capture = None;
+        self.capture_next_frame = true;
+        if !self.draw(scene) {
+            self.capture_next_frame = false;
+            anyhow::bail!("presentation scene draw failed");
         }
 
-        // Copy the rendered texture into a CPU-readable buffer with rows padded
-        // to COPY_BYTES_PER_ROW_ALIGNMENT, then read back, un-pad, and convert
-        // to RGBA.
-        let bytes_per_pixel: u32 = match format {
-            wgpu::TextureFormat::Rgba8Unorm
-            | wgpu::TextureFormat::Rgba8UnormSrgb
-            | wgpu::TextureFormat::Bgra8Unorm
-            | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
-            other => anyhow::bail!("unsupported presentation capture format {other:?}"),
+        let capture = match self.presentation_capture.take() {
+            Some(Ok(capture)) => capture,
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None => anyhow::bail!("draw completed without a presentation capture"),
         };
-        let unpadded_bytes_per_row = width * bytes_per_pixel;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
-        let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+        Ok(capture)
+    }
 
-        let read_buffer = self
-            .resources()
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("presentation_capture_readback"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-        let mut encoder =
-            self.resources()
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("presentation_capture_copy"),
-                });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &read_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        read_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-        self.resources()
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| anyhow::anyhow!("presentation capture device poll failed: {e:?}"))?;
-        receiver
-            .recv()
-            .map_err(|_| anyhow::anyhow!("presentation capture map channel disconnected"))?
-            .map_err(|e| anyhow::anyhow!("presentation capture buffer map failed: {e:?}"))?;
-
-        if let Some(error) = self.last_error.lock().unwrap().take() {
-            anyhow::bail!("GPU error during headless scene encode: {error}");
-        }
-
-        let row = unpadded_bytes_per_row as usize;
-        let padded = padded_bytes_per_row as usize;
-        let mut raw = vec![0u8; row * height as usize];
-        {
-            let mapped = read_buffer.slice(..).get_mapped_range();
-            for y in 0..height as usize {
-                let src = y * padded;
-                let dst = y * row;
-                raw[dst..dst + row].copy_from_slice(&mapped[src..src + row]);
-            }
-        }
-        read_buffer.unmap();
-
-        let rgba = presentation_capture_to_rgba8(&raw, format)?;
-        image::RgbaImage::from_raw(width, height, rgba)
+    /// Draw `scene` through the surfaceless presentation path at `size` and read
+    /// the presented target back as an RGBA image.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        let capture = self.draw_scene_to_capture(scene, size)?;
+        let width_px = capture.width_px;
+        let height_px = capture.height_px;
+        let rgba = capture.rgba;
+        image::RgbaImage::from_raw(width_px, height_px, rgba)
             .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presentation capture"))
     }
 
@@ -1475,11 +1402,25 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
+        if self.resources().surface.is_none() {
+            self.ensure_intermediate_textures();
+            let capture = self.draw_surfaceless_scene(scene);
+            let ok = capture.is_ok();
+            #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+            {
+                if self.capture_next_frame {
+                    self.presentation_capture = Some(capture.map_err(|err| err.to_string()));
+                    self.capture_next_frame = false;
+                }
+            }
+            #[cfg(not(all(not(target_family = "wasm"), feature = "test-support")))]
+            let _ = capture;
+            return ok;
+        }
+
         let current = match self.resources().surface.as_ref() {
             Some(surface) => surface.get_current_texture(),
-            // A headless renderer has no surface; it captures via
-            // `render_scene_to_image` and `draw()` is never called on it.
-            None => return false,
+            None => unreachable!("surfaceless renderers returned above"),
         };
         let frame = match current {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -1526,8 +1467,176 @@ impl WgpuRenderer {
                 .contains(wgpu::TextureUsages::COPY_SRC),
             &frame_view,
         );
+        #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+        if self.capture_next_frame {
+            self.presentation_capture = Some(if !encoded {
+                Err("surface presentation encode failed".to_string())
+            } else if self
+                .surface_config
+                .usage
+                .contains(wgpu::TextureUsages::COPY_SRC)
+            {
+                self.read_presentation_texture(
+                    &frame.texture,
+                    self.surface_config.width,
+                    self.surface_config.height,
+                    self.surface_config.format,
+                )
+                .map(|rgba| SceneCapture {
+                    rgba,
+                    width_px: self.surface_config.width,
+                    height_px: self.surface_config.height,
+                    backend: scene_capture_backend(self.adapter_info.backend),
+                })
+                .map_err(|err| err.to_string())
+            } else {
+                Err("surface presentation target does not support COPY_SRC readback".to_string())
+            });
+            self.capture_next_frame = false;
+        }
         frame.present();
         encoded
+    }
+
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    fn draw_surfaceless_scene(&mut self, scene: &Scene) -> anyhow::Result<SceneCapture> {
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let format = self.surface_config.format;
+        let target_texture = self
+            .resources()
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("surfaceless_presentation_target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        if !self.encode_scene_to_view(scene, Some(&target_texture), true, &target_view) {
+            anyhow::bail!("surfaceless presentation encode failed");
+        }
+
+        let rgba = self.read_presentation_texture(&target_texture, width, height, format)?;
+        Ok(SceneCapture {
+            rgba,
+            width_px: width,
+            height_px: height,
+            backend: scene_capture_backend(self.adapter_info.backend),
+        })
+    }
+
+    #[cfg(not(all(not(target_family = "wasm"), feature = "test-support")))]
+    fn draw_surfaceless_scene(&mut self, _scene: &Scene) -> anyhow::Result<SceneCapture> {
+        anyhow::bail!("surfaceless draw requires test-support")
+    }
+
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    fn read_presentation_texture(
+        &self,
+        target_texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> anyhow::Result<Vec<u8>> {
+        let bytes_per_pixel: u32 = match format {
+            wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
+            other => anyhow::bail!("unsupported presentation capture format {other:?}"),
+        };
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+
+        let read_buffer = self
+            .resources()
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("surfaceless_presentation_readback"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("surfaceless_presentation_copy"),
+                });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: target_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        read_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.resources()
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| anyhow::anyhow!("surfaceless presentation device poll failed: {e:?}"))?;
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("surfaceless presentation map channel disconnected"))?
+            .map_err(|e| anyhow::anyhow!("surfaceless presentation buffer map failed: {e:?}"))?;
+
+        if let Some(error) = self.last_error.lock().unwrap().take() {
+            anyhow::bail!("GPU error during surfaceless presentation encode: {error}");
+        }
+
+        let row = unpadded_bytes_per_row as usize;
+        let padded = padded_bytes_per_row as usize;
+        let mut raw = vec![0u8; row * height as usize];
+        {
+            let mapped = read_buffer.slice(..).get_mapped_range();
+            for y in 0..height as usize {
+                let src = y * padded;
+                let dst = y * row;
+                raw[dst..dst + row].copy_from_slice(&mapped[src..src + row]);
+            }
+        }
+        read_buffer.unmap();
+
+        presentation_capture_to_rgba8(&raw, format)
     }
 
     /// Returns the measured render-group resource counts from the most recent
@@ -3372,6 +3481,17 @@ fn presentation_capture_to_rgba8(
     }
 }
 
+#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+fn scene_capture_backend(backend: wgpu::Backend) -> SceneCaptureBackend {
+    match backend {
+        wgpu::Backend::Metal => SceneCaptureBackend::Metal,
+        wgpu::Backend::Vulkan => SceneCaptureBackend::Vulkan,
+        wgpu::Backend::Dx12 => SceneCaptureBackend::Dx12,
+        wgpu::Backend::Gl => SceneCaptureBackend::Gl,
+        _ => SceneCaptureBackend::Other,
+    }
+}
+
 /// Renderer for test-window presentation capture. It renders a GPUI scene to a
 /// surfaceless wgpu presentation texture and reads that texture back as RGBA.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
@@ -3402,25 +3522,15 @@ impl WgpuHeadlessRenderer {
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
-    fn render_scene_to_image(
+    fn draw_scene(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
-    ) -> anyhow::Result<image::RgbaImage> {
-        self.renderer.render_scene_to_image(scene, size)
+    ) -> anyhow::Result<gpui::SceneCapture> {
+        self.renderer.draw_scene_to_capture(scene, size)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
-    }
-
-    fn capture_backend(&self) -> gpui::SceneCaptureBackend {
-        match self.renderer.adapter_backend() {
-            wgpu::Backend::Metal => gpui::SceneCaptureBackend::Metal,
-            wgpu::Backend::Vulkan => gpui::SceneCaptureBackend::Vulkan,
-            wgpu::Backend::Dx12 => gpui::SceneCaptureBackend::Dx12,
-            wgpu::Backend::Gl => gpui::SceneCaptureBackend::Gl,
-            _ => gpui::SceneCaptureBackend::Other,
-        }
     }
 }

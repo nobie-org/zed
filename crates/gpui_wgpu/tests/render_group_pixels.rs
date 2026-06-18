@@ -156,19 +156,21 @@ fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
 
 fn render(scene: &Scene) -> RgbaImage {
     let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
-    renderer
-        .render_scene_to_image(
-            scene,
-            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-        )
-        .expect("render scene")
+    capture_to_image(
+        renderer
+            .draw_scene(
+                scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render scene"),
+    )
 }
 
 /// Render `scene` headlessly and return the backend's measured render-group counters.
 fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
     let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
     renderer
-        .render_scene_to_image(
+        .draw_scene(
             scene,
             size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
         )
@@ -1973,18 +1975,25 @@ fn render_group_hard_light_blend_mode_applies_at_group_boundary() {
 
 /// Render a scene that needs atlas-backed sprites: the build closure receives the
 /// renderer's sprite atlas so it can insert tiles before the scene is rendered.
-/// `render_scene_to_image` calls `atlas.before_frame()`, which flushes the staged
+/// `draw_scene` calls `atlas.before_frame()`, which flushes the staged
 /// tile uploads before the draw, so the injected pixels are on the GPU.
 fn render_with_atlas(build: impl FnOnce(&Arc<dyn PlatformAtlas>) -> Scene) -> RgbaImage {
     let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
     let atlas = renderer.sprite_atlas().clone();
     let scene = build(&atlas);
-    renderer
-        .render_scene_to_image(
-            &scene,
-            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-        )
-        .expect("render scene")
+    capture_to_image(
+        renderer
+            .draw_scene(
+                &scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render scene"),
+    )
+}
+
+fn capture_to_image(capture: gpui::SceneCapture) -> RgbaImage {
+    RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
+        .expect("captured RGBA dimensions match buffer")
 }
 
 /// Allocate and upload a `side`x`side` monochrome tile whose every texel has the

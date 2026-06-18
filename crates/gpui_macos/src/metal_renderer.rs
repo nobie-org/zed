@@ -3045,20 +3045,20 @@ fn first_and_last_path(
 
 #[cfg(any(test, feature = "test-support"))]
 impl gpui::PlatformHeadlessRenderer for MetalRenderer {
-    fn render_scene_to_image(
-        &mut self,
-        scene: &Scene,
-        size: Size<DevicePixels>,
-    ) -> Result<RgbaImage> {
-        MetalRenderer::render_scene_to_image(self, scene, size)
+    fn draw_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<SceneCapture> {
+        let image = MetalRenderer::render_scene_to_image(self, scene, size)?;
+        let width_px = image.width();
+        let height_px = image.height();
+        Ok(SceneCapture {
+            rgba: image.into_raw(),
+            width_px,
+            height_px,
+            backend: SceneCaptureBackend::Metal,
+        })
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.sprite_atlas.clone()
-    }
-
-    fn capture_backend(&self) -> SceneCaptureBackend {
-        SceneCaptureBackend::Metal
     }
 }
 

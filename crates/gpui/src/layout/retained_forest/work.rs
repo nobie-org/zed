@@ -11,8 +11,6 @@ pub(in crate::layout) struct RetainedLayoutWork {
     pub(in crate::layout) reuses: u64,
     pub(in crate::layout) style_updates: u64,
     pub(in crate::layout) child_list_updates: u64,
-    pub(in crate::layout) cache_invalidations: u64,
-    pub(in crate::layout) measured_context_updates: u64,
     pub(in crate::layout) measured_context_clears: u64,
     pub(in crate::layout) removes: u64,
 }
@@ -36,8 +34,6 @@ pub(in crate::layout) struct RetainedForestMutationSample {
     pub(in crate::layout) reuses: u64,
     pub(in crate::layout) style_updates: u64,
     pub(in crate::layout) child_list_updates: u64,
-    pub(in crate::layout) cache_invalidations: u64,
-    pub(in crate::layout) context_updates: u64,
     pub(in crate::layout) context_clears: u64,
     pub(in crate::layout) removes: u64,
 }
@@ -139,10 +135,6 @@ impl RetainedWorkState {
                 reuses: self.work.reuses - snapshot.work.reuses,
                 style_updates: self.work.style_updates - snapshot.work.style_updates,
                 child_list_updates: self.work.child_list_updates - snapshot.work.child_list_updates,
-                cache_invalidations: self.work.cache_invalidations
-                    - snapshot.work.cache_invalidations,
-                measured_context_updates: self.work.measured_context_updates
-                    - snapshot.work.measured_context_updates,
                 measured_context_clears: self.work.measured_context_clears
                     - snapshot.work.measured_context_clears,
                 removes: self.work.removes - snapshot.work.removes,

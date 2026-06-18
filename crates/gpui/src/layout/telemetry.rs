@@ -36,14 +36,6 @@ pub struct LayoutWorkSample {
     pub retained_layout_style_updates: u64,
     /// Retained layout child-list updates emitted while committing current intent.
     pub retained_layout_child_list_updates: u64,
-    /// Retained layout mirror caches explicitly invalidated by GPUI.
-    ///
-    /// This should normally stay zero: the private mirror owns layout-cache
-    /// validity once GPUI projects style, child-list, and measured-context
-    /// mutations through the retained forest.
-    pub retained_layout_cache_invalidations: u64,
-    /// Retained measured-context updates emitted while committing current intent.
-    pub retained_layout_measured_context_updates: u64,
     /// Retained measured-context clears emitted while removing retained occurrences.
     pub retained_layout_measured_context_clears: u64,
     /// Retained layout occurrences removed while sweeping old subtrees.
@@ -84,8 +76,6 @@ impl LayoutWorkSample {
         self.retained_layout_reuses = work.reuses;
         self.retained_layout_style_updates = work.style_updates;
         self.retained_layout_child_list_updates = work.child_list_updates;
-        self.retained_layout_cache_invalidations = work.cache_invalidations;
-        self.retained_layout_measured_context_updates = work.measured_context_updates;
         self.retained_layout_measured_context_clears = work.measured_context_clears;
         self.retained_layout_removes = work.removes;
         self.retained_layout_miss_no_previous = misses.no_previous;

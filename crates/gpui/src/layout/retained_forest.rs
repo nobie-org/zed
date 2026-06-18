@@ -53,7 +53,7 @@ use taffy::{
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
     prelude::{TaffyGridLine, TaffyGridSpan, max_content, min_content},
     style::AvailableSpace as TaffyAvailableSpace,
-    tree::{Layout, LayoutCacheEntry, LayoutCacheEvent, NodeId},
+    tree::{Layout, NodeId},
 };
 #[cfg(test)]
 pub(super) use work::RetainedForestMutationSample;
@@ -659,80 +659,6 @@ fn trace_layout_id_is_targeted(layout_id: Option<usize>) -> bool {
         .unwrap_or(true)
 }
 
-fn trace_layout_cache_event(node_layout_ids: &[(NodeId, LayoutId)], event: LayoutCacheEvent) {
-    if retained_layout_trace_layout_ids().is_none() {
-        return;
-    }
-
-    match event {
-        LayoutCacheEvent::Hit(entry) => trace_layout_cache_entry("hit", node_layout_ids, entry),
-        LayoutCacheEvent::Stored(entry) => {
-            trace_layout_cache_entry("stored", node_layout_ids, entry)
-        }
-        LayoutCacheEvent::Cleared(clear) => {
-            let node_id = clear.node_id();
-            let layout_id = node_layout_ids
-                .iter()
-                .find_map(|(candidate_node_id, layout_id)| {
-                    (*candidate_node_id == node_id).then_some(layout_id.0)
-                });
-            if trace_layout_id_is_targeted(layout_id) {
-                eprintln!(
-                    "gpui retained_layout cache_event kind=cleared layout_id={:?} node_id={:?}",
-                    layout_id, node_id
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-fn trace_layout_cache_entry(
-    kind: &'static str,
-    node_layout_ids: &[(NodeId, LayoutId)],
-    entry: LayoutCacheEntry,
-) {
-    let input = entry.requested_input();
-    let output = entry.returned_output();
-    let node_id = entry.node_id();
-    let layout_id = node_layout_ids
-        .iter()
-        .find_map(|(candidate_node_id, layout_id)| {
-            (*candidate_node_id == node_id).then_some(layout_id.0)
-        });
-
-    if !trace_layout_id_is_targeted(layout_id) {
-        return;
-    }
-
-    let zero_output = output.size.width <= 0.0 || output.size.height <= 0.0;
-    let zero_known_dimension =
-        input.known_dimensions.width == Some(0.0) || input.known_dimensions.height == Some(0.0);
-    let zero_parent_dimension =
-        input.parent_size.width == Some(0.0) || input.parent_size.height == Some(0.0);
-    let zero_available_space = matches!(input.available_space.width, TaffyAvailableSpace::Definite(width) if width <= 0.0)
-        || matches!(input.available_space.height, TaffyAvailableSpace::Definite(height) if height <= 0.0);
-
-    if !(zero_output || zero_known_dimension || zero_parent_dimension || zero_available_space) {
-        return;
-    }
-
-    eprintln!(
-        "gpui retained_layout cache_event kind={} layout_id={:?} node_id={:?} entry_id={:?} run_mode={:?} sizing_mode={:?} axis={:?} known_dimensions={:?} parent_size={:?} available_space={:?} output_size={:?}",
-        kind,
-        layout_id,
-        node_id,
-        entry.entry_id(),
-        input.run_mode,
-        input.sizing_mode,
-        input.axis,
-        input.known_dimensions,
-        input.parent_size,
-        input.available_space,
-        output.size
-    );
-}
-
 impl RetainedLayoutForest {
     /// Create an empty retained forest and configure the mirror for GPUI snapping.
     pub(super) fn new() -> Self {
@@ -1002,10 +928,6 @@ impl RetainedLayoutForest {
         self.committed.layout_id_for_node(node_id)
     }
 
-    fn committed_node_layout_ids_for_trace(&self) -> Vec<(NodeId, LayoutId)> {
-        self.committed.node_layout_ids_for_trace()
-    }
-
     fn children(&self, node_id: NodeId) -> Vec<NodeId> {
         self.taffy.children(node_id).expect(EXPECT_MESSAGE)
     }
@@ -1052,29 +974,17 @@ impl RetainedLayoutForest {
             );
         }
 
-        let trace_cache_node_layout_ids = if retained_layout_detail_trace_enabled() {
-            self.committed_node_layout_ids_for_trace()
-        } else {
-            Vec::new()
-        };
-        let trace_cache_events = retained_layout_detail_trace_enabled();
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
 
         let compute_start = std::time::Instant::now();
-        let (measured_layout_calls, measured_layout_duration) = self
-            .compute_layout_with_measure_and_cache_events(
-                node_id,
-                taffy_available_space,
-                scale_factor,
-                window,
-                cx,
-                &mut subtree_compute_recorder,
-                |event| {
-                    if trace_cache_events {
-                        trace_layout_cache_event(&trace_cache_node_layout_ids, event);
-                    }
-                },
-            );
+        let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
+            node_id,
+            taffy_available_space,
+            scale_factor,
+            window,
+            cx,
+            &mut subtree_compute_recorder,
+        );
         let compute_layout_duration = compute_start.elapsed();
         self.subtree_probe.record_compute(subtree_compute_recorder);
 
@@ -1174,7 +1084,7 @@ impl RetainedLayoutForest {
         )
     }
 
-    fn compute_layout_with_measure_and_cache_events(
+    fn compute_layout_with_measure(
         &mut self,
         node_id: NodeId,
         available_space: TaffySize<TaffyAvailableSpace>,
@@ -1182,7 +1092,6 @@ impl RetainedLayoutForest {
         window: &mut Window,
         cx: &mut App,
         subtree_compute_recorder: &mut SubtreeProbeComputeRecorder,
-        mut handle_cache_event: impl FnMut(LayoutCacheEvent),
     ) -> (u64, std::time::Duration) {
         let mut measured_layout_calls = 0;
         let mut measured_layout_duration = std::time::Duration::default();
@@ -1197,7 +1106,7 @@ impl RetainedLayoutForest {
         let subtree_compute_recorder = std::cell::RefCell::new(subtree_compute_recorder);
 
         taffy
-            .compute_layout_with_measure_and_cache_events(
+            .compute_layout_with_measure(
                 node_id,
                 available_space,
                 |known_dimensions, available_space, node_id, node_context, _style| {
@@ -1244,16 +1153,9 @@ impl RetainedLayoutForest {
                     measured_layout_duration += measure_start.elapsed();
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
-                |event| {
-                    subtree_compute_recorder
-                        .borrow_mut()
-                        .record_cache_event(event);
-                    handle_cache_event(event);
-                    compute_measurements.borrow_mut().handle_cache_event(event);
-                },
             )
             .expect(EXPECT_MESSAGE);
-        compute_measurements.into_inner().finish_compute();
+        compute_measurements.into_inner().finish_compute(node_id);
 
         (measured_layout_calls, measured_layout_duration)
     }

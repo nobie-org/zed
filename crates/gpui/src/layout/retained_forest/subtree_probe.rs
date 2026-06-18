@@ -1,15 +1,15 @@
 //! Subtree-scoped retained-layout proof instrumentation.
 //!
 //! This module is private to the retained forest because it needs to name
-//! Taffy mirror nodes and cache events. Its samples expose only GPUI-facing
-//! identity strings, layout ids, node counts, and typed work counters.
+//! Taffy mirror nodes. Its samples expose only GPUI-facing identity strings,
+//! layout ids, node counts, and typed retained-forest work counters.
 
 use super::super::LayoutId;
 use super::work::RetainedWorkDelta;
 use crate::GlobalElementId;
 use collections::FxHashSet;
 use std::sync::OnceLock;
-use taffy::tree::{LayoutCacheEvent, NodeId};
+use taffy::tree::NodeId;
 
 /// Work observed for one explicitly identified retained subtree in one frame.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -24,12 +24,7 @@ pub(in crate::layout) struct RetainedSubtreeWorkSample {
     pub(in crate::layout) mirror_set_style: u64,
     pub(in crate::layout) mirror_set_children: u64,
     pub(in crate::layout) mirror_measured_context_clears: u64,
-    pub(in crate::layout) mirror_cache_invalidations: u64,
-    pub(in crate::layout) layout_cache_hits: u64,
-    pub(in crate::layout) layout_cache_stores: u64,
-    pub(in crate::layout) layout_cache_clears: u64,
     pub(in crate::layout) measured_callbacks: u64,
-    pub(in crate::layout) event_details: Vec<String>,
 }
 
 impl RetainedSubtreeWorkSample {
@@ -41,9 +36,6 @@ impl RetainedSubtreeWorkSample {
             + self.mirror_set_style
             + self.mirror_set_children
             + self.mirror_measured_context_clears
-            + self.mirror_cache_invalidations
-            + self.layout_cache_stores
-            + self.layout_cache_clears
             + self.measured_callbacks
     }
 }
@@ -72,20 +64,15 @@ pub(super) struct SubtreeProbeCheckpoint {
     targets_for_tests: Option<Vec<String>>,
 }
 
-/// Per-compute recorder that keeps Taffy event attribution out of callers.
+/// Per-compute recorder that keeps mirror-node attribution out of callers.
 pub(super) struct SubtreeProbeComputeRecorder {
     active_subtrees: Vec<ActiveSubtree>,
     sample_deltas: Vec<SubtreeProbeComputeDelta>,
-    event_detail_limit: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SubtreeProbeComputeDelta {
-    layout_cache_hits: u64,
-    layout_cache_stores: u64,
-    layout_cache_clears: u64,
     measured_callbacks: u64,
-    event_details: Vec<String>,
 }
 
 impl SubtreeProbe {
@@ -154,7 +141,6 @@ impl SubtreeProbe {
             mirror_set_style: work_delta.work.style_updates,
             mirror_set_children: work_delta.work.child_list_updates,
             mirror_measured_context_clears: work_delta.work.measured_context_clears,
-            mirror_cache_invalidations: work_delta.work.cache_invalidations,
             ..RetainedSubtreeWorkSample::default()
         });
         self.active_subtrees.push(ActiveSubtree {
@@ -164,21 +150,13 @@ impl SubtreeProbe {
     }
 
     pub(super) fn compute_recorder(&self) -> SubtreeProbeComputeRecorder {
-        SubtreeProbeComputeRecorder::new(
-            self.active_subtrees.clone(),
-            self.frame_samples.len(),
-            env_subtree_event_detail_limit(),
-        )
+        SubtreeProbeComputeRecorder::new(self.active_subtrees.clone(), self.frame_samples.len())
     }
 
     pub(super) fn record_compute(&mut self, recorder: SubtreeProbeComputeRecorder) {
         for (sample_index, delta) in recorder.into_deltas() {
             if let Some(sample) = self.frame_samples.get_mut(sample_index) {
-                sample.layout_cache_hits += delta.layout_cache_hits;
-                sample.layout_cache_stores += delta.layout_cache_stores;
-                sample.layout_cache_clears += delta.layout_cache_clears;
                 sample.measured_callbacks += delta.measured_callbacks;
-                sample.event_details.extend(delta.event_details);
             }
         }
     }
@@ -203,7 +181,7 @@ impl SubtreeProbe {
             }
             self.emitted_samples += 1;
             eprintln!(
-                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} context_clears={} cache_invalidations={} cache_hits={} cache_stores={} cache_clears={} measured_callbacks={}",
+                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} context_clears={} measured_callbacks={}",
                 sample.global_id,
                 sample.layout_id,
                 sample.node_count,
@@ -215,18 +193,8 @@ impl SubtreeProbe {
                 sample.mirror_set_style,
                 sample.mirror_set_children,
                 sample.mirror_measured_context_clears,
-                sample.mirror_cache_invalidations,
-                sample.layout_cache_hits,
-                sample.layout_cache_stores,
-                sample.layout_cache_clears,
                 sample.measured_callbacks,
             );
-            for detail in &sample.event_details {
-                eprintln!(
-                    "gpui retained_layout subtree_event global_id=\"{}\" layout_id={} {}",
-                    sample.global_id, sample.layout_id, detail,
-                );
-            }
         }
     }
 
@@ -242,46 +210,15 @@ impl SubtreeProbe {
 }
 
 impl SubtreeProbeComputeRecorder {
-    fn new(
-        active_subtrees: Vec<ActiveSubtree>,
-        sample_count: usize,
-        event_detail_limit: usize,
-    ) -> Self {
+    fn new(active_subtrees: Vec<ActiveSubtree>, sample_count: usize) -> Self {
         Self {
             active_subtrees,
             sample_deltas: vec![SubtreeProbeComputeDelta::default(); sample_count],
-            event_detail_limit,
         }
     }
 
     pub(super) fn record_measured_callback(&mut self, node_id: NodeId) {
         self.record_node(node_id, |delta| delta.measured_callbacks += 1);
-    }
-
-    pub(super) fn record_cache_event(&mut self, event: LayoutCacheEvent) {
-        match event {
-            LayoutCacheEvent::Hit(entry) => {
-                self.record_node(entry.node_id(), |delta| delta.layout_cache_hits += 1);
-            }
-            LayoutCacheEvent::Stored(entry) => {
-                let node_id = entry.node_id();
-                let detail =
-                    (self.event_detail_limit > 0).then(|| cache_entry_detail("stored", entry));
-                let event_detail_limit = self.event_detail_limit;
-                self.record_node(node_id, |delta| {
-                    delta.layout_cache_stores += 1;
-                    if let Some(detail) = detail.as_ref()
-                        && delta.event_details.len() < event_detail_limit
-                    {
-                        delta.event_details.push(detail.clone());
-                    }
-                });
-            }
-            LayoutCacheEvent::Cleared(clear) => {
-                self.record_node(clear.node_id(), |delta| delta.layout_cache_clears += 1);
-            }
-            _ => {}
-        }
     }
 
     fn record_node(
@@ -304,24 +241,6 @@ impl SubtreeProbeComputeRecorder {
             .enumerate()
             .filter(|(_, delta)| *delta != SubtreeProbeComputeDelta::default())
     }
-}
-
-fn cache_entry_detail(kind: &'static str, entry: taffy::tree::LayoutCacheEntry) -> String {
-    let input = entry.requested_input();
-    let output = entry.returned_output();
-    format!(
-        "kind={} node_id={:?} entry_id={:?} run_mode={:?} sizing_mode={:?} axis={:?} known_dimensions={:?} parent_size={:?} available_space={:?} output_size={:?}",
-        kind,
-        entry.node_id(),
-        entry.entry_id(),
-        input.run_mode,
-        input.sizing_mode,
-        input.axis,
-        input.known_dimensions,
-        input.parent_size,
-        input.available_space,
-        output.size,
-    )
 }
 
 fn global_id_matches_target(global_id: &str, target: &str) -> bool {
@@ -360,15 +279,5 @@ fn env_subtree_sample_limit() -> usize {
             .ok()
             .and_then(|limit| limit.parse().ok())
             .unwrap_or(120)
-    })
-}
-
-fn env_subtree_event_detail_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::env::var("GPUI_TRACE_RETAINED_LAYOUT_SUBTREE_EVENT_LIMIT")
-            .ok()
-            .and_then(|limit| limit.parse().ok())
-            .unwrap_or(0)
     })
 }

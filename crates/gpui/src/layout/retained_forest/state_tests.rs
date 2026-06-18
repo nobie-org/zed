@@ -416,8 +416,6 @@ fn work_state_checkpoint_and_finish_return_complete_frame_counts(_cx: &mut TestA
                     reuses: reuses as u64,
                     style_updates: 0,
                     child_list_updates: 0,
-                    cache_invalidations: 0,
-                    measured_context_updates: 0,
                     measured_context_clears: 0,
                     removes: removes as u64,
                 },

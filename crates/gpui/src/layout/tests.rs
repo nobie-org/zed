@@ -180,7 +180,6 @@ fn stable_subtree_probe_reports_zero_write_work_after_admission() {
             layout_id: 0,
             node_count: 1,
             retained_reuses: 1,
-            layout_cache_hits: samples[0].layout_cache_hits,
             ..RetainedSubtreeWorkSample::default()
         }
     );

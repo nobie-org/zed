@@ -68,13 +68,6 @@ impl CommittedLayoutState {
             })
     }
 
-    pub(super) fn node_layout_ids_for_trace(&self) -> Vec<(NodeId, LayoutId)> {
-        self.layout_nodes
-            .iter()
-            .map(|(layout_id, node_id)| (*node_id, *layout_id))
-            .collect()
-    }
-
     pub(super) fn insert(&mut self, id: LayoutId, node_id: NodeId) {
         let previous = self.layout_nodes.insert(id, node_id);
         assert!(

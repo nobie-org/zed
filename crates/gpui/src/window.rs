@@ -1023,6 +1023,7 @@ pub struct Window {
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
+    titlebar_traffic_light_position: Option<Point<Pixels>>,
     throttle_inactive_frame_rate: Rc<Cell<bool>>,
     throttle_under_thermal_pressure: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
@@ -1304,6 +1305,10 @@ impl Window {
         } = options;
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let titlebar_traffic_light_position = titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.traffic_light_position);
+
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -1673,6 +1678,7 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
+            titlebar_traffic_light_position,
             throttle_inactive_frame_rate,
             throttle_under_thermal_pressure,
             hovered,
@@ -2301,6 +2307,12 @@ impl Window {
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// Returns the configured traffic-light position for this window's
+    /// transparent titlebar, when the window was opened with one.
+    pub fn titlebar_traffic_light_position(&self) -> Option<Point<Pixels>> {
+        self.titlebar_traffic_light_position
     }
 
     /// Returns whether this window's request-frame closure throttles to

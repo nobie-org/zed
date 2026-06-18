@@ -16,7 +16,7 @@ pub(crate) use retained_forest::PureSizeMeasure;
 #[cfg(test)]
 use retained_forest::{
     FreshLayoutComparisonSummary, RetainedForestMutationSample, RetainedLayoutProjectionForTests,
-    RetainedLayoutShapeForTests, RetainedNodeToken,
+    RetainedLayoutShapeForTests, RetainedNodeToken, RetainedSubtreeWorkSample,
 };
 use retained_forest::{RetainedLayoutForest, RetainedLayoutForestCheckpoint};
 pub use telemetry::LayoutWorkSample;
@@ -124,13 +124,36 @@ impl LayoutEngine {
         self.forest.retained_mutation_sample_for_tests()
     }
 
-    /// Record an unmeasured current-frame layout intent.
-    ///
-    /// This is pure GPUI input: style plus ordered child `LayoutId`s. The forest
-    /// decides later whether an existing retained occurrence can own the mirror
-    /// node for this intent.
+    #[cfg(test)]
+    fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
+        self.forest
+            .set_retained_subtree_probe_targets_for_tests(targets);
+    }
+
+    #[cfg(test)]
+    fn retained_subtree_work_samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
+        self.forest.retained_subtree_work_samples_for_tests()
+    }
+
+    /// Test-only helper for recording an anonymous unmeasured layout intent.
+    #[cfg(test)]
     pub fn request_layout(
         &mut self,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+    ) -> LayoutId {
+        self.request_layout_with_global_id(None, style, rem_size, scale_factor, children)
+    }
+
+    /// Record an unmeasured current-frame layout intent with observation identity.
+    ///
+    /// `global_id` is used only for retained-layout diagnostics. It is not a
+    /// retention key and cannot change which occurrence owns a Taffy node.
+    pub(crate) fn request_layout_with_global_id(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
@@ -140,7 +163,7 @@ impl LayoutEngine {
         self.layout_work.child_edges += children.len() as u64;
 
         self.forest
-            .request_layout(style, rem_size, scale_factor, children)
+            .request_layout(global_id, style, rem_size, scale_factor, children)
     }
 
     /// Record an opaque measured layout intent.

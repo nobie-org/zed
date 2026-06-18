@@ -57,6 +57,7 @@ fn global_id(id: u8) -> GlobalElementId {
 
 fn unmeasured_intent(children: Vec<LayoutId>) -> LayoutIntent {
     LayoutIntent {
+        global_id: None,
         style: TaffyStyle::default(),
         kind: LayoutIntentKind::Unmeasured { children },
     }
@@ -64,6 +65,7 @@ fn unmeasured_intent(children: Vec<LayoutId>) -> LayoutIntent {
 
 fn measured_intent(measured_kind: MeasuredLayoutKind) -> LayoutIntent {
     LayoutIntent {
+        global_id: None,
         style: TaffyStyle::default(),
         kind: LayoutIntentKind::Measured {
             measure: None,

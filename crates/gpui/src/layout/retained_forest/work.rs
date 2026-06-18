@@ -60,6 +60,31 @@ pub(super) struct RetainedWorkCheckpoint {
     mutation_sample_for_tests: RetainedForestMutationSample,
 }
 
+/// Delta of retained work performed by one forest operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct RetainedWorkDelta {
+    pub(super) work: RetainedLayoutWork,
+    pub(super) miss_work: RetainedLayoutMissWork,
+}
+
+impl RetainedWorkDelta {
+    pub(super) fn miss_count(&self) -> u64 {
+        self.miss_work.no_previous
+            + self.miss_work.style
+            + self.miss_work.kind
+            + self.miss_work.measured_kind
+            + self.miss_work.child_count
+            + self.miss_work.child_subtree
+            + self.miss_work.no_exact_child
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct RetainedWorkSnapshot {
+    work: RetainedLayoutWork,
+    miss_work: RetainedLayoutMissWork,
+}
+
 impl RetainedWorkState {
     pub(super) fn new() -> Self {
         Self {
@@ -98,6 +123,40 @@ impl RetainedWorkState {
 
     pub(super) fn miss_work(&self) -> RetainedLayoutMissWork {
         self.miss_work
+    }
+
+    pub(super) fn snapshot(&self) -> RetainedWorkSnapshot {
+        RetainedWorkSnapshot {
+            work: self.work,
+            miss_work: self.miss_work,
+        }
+    }
+
+    pub(super) fn delta_since(&self, snapshot: RetainedWorkSnapshot) -> RetainedWorkDelta {
+        RetainedWorkDelta {
+            work: RetainedLayoutWork {
+                creates: self.work.creates - snapshot.work.creates,
+                reuses: self.work.reuses - snapshot.work.reuses,
+                style_updates: self.work.style_updates - snapshot.work.style_updates,
+                child_list_updates: self.work.child_list_updates - snapshot.work.child_list_updates,
+                cache_invalidations: self.work.cache_invalidations
+                    - snapshot.work.cache_invalidations,
+                measured_context_updates: self.work.measured_context_updates
+                    - snapshot.work.measured_context_updates,
+                measured_context_clears: self.work.measured_context_clears
+                    - snapshot.work.measured_context_clears,
+                removes: self.work.removes - snapshot.work.removes,
+            },
+            miss_work: RetainedLayoutMissWork {
+                no_previous: self.miss_work.no_previous - snapshot.miss_work.no_previous,
+                style: self.miss_work.style - snapshot.miss_work.style,
+                kind: self.miss_work.kind - snapshot.miss_work.kind,
+                measured_kind: self.miss_work.measured_kind - snapshot.miss_work.measured_kind,
+                child_count: self.miss_work.child_count - snapshot.miss_work.child_count,
+                child_subtree: self.miss_work.child_subtree - snapshot.miss_work.child_subtree,
+                no_exact_child: self.miss_work.no_exact_child - snapshot.miss_work.no_exact_child,
+            },
+        }
     }
 
     pub(super) fn finish_frame(&mut self) -> (RetainedLayoutWork, RetainedLayoutMissWork) {

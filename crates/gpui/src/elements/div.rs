@@ -1501,7 +1501,12 @@ impl Element for Div {
                             .iter_mut()
                             .map(|child| child.request_layout(window, cx))
                             .collect::<SmallVec<_>>();
-                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                        window.request_layout_with_global_id(
+                            global_id,
+                            style,
+                            child_layout_ids.iter().copied(),
+                            cx,
+                        )
                     })
                 },
             )

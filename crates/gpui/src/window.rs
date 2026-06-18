@@ -4317,6 +4317,16 @@ impl Window {
         children: impl IntoIterator<Item = LayoutId>,
         cx: &mut App,
     ) -> LayoutId {
+        self.request_layout_with_global_id(None, style, children, cx)
+    }
+
+    pub(crate) fn request_layout_with_global_id(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
         cx.layout_id_buffer.clear();
@@ -4324,12 +4334,16 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
 
-        self.layout_engine.as_mut().unwrap().request_layout(
-            style,
-            rem_size,
-            scale_factor,
-            &cx.layout_id_buffer,
-        )
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_layout_with_global_id(
+                global_id,
+                style,
+                rem_size,
+                scale_factor,
+                &cx.layout_id_buffer,
+            )
     }
 
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,

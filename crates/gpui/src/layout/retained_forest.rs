@@ -14,6 +14,7 @@ mod root_slots;
 mod roots;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod state_tests;
+mod subtree_probe;
 mod work;
 use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, ElementId, GlobalElementId, GridTemplate,
@@ -44,6 +45,9 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
+#[cfg(test)]
+pub(super) use subtree_probe::RetainedSubtreeWorkSample;
+use subtree_probe::{SubtreeProbe, SubtreeProbeCheckpoint, SubtreeProbeComputeRecorder};
 use taffy::{
     TaffyTree,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -63,6 +67,7 @@ use work::{RetainedWorkCheckpoint, RetainedWorkState};
 /// intent ids or an explicit measured-node kind.
 #[derive(Clone, Debug, PartialEq)]
 struct LayoutIntent {
+    global_id: Option<GlobalElementId>,
     style: taffy::style::Style,
     kind: LayoutIntentKind,
 }
@@ -210,6 +215,7 @@ pub(super) struct RetainedLayoutForest {
     committed: CommittedLayoutState,
     bounds: BoundsCache,
     root_slots: RootSlots,
+    subtree_probe: SubtreeProbe,
     work: RetainedWorkState,
 }
 
@@ -225,6 +231,7 @@ pub(super) struct RetainedLayoutForestCheckpoint {
     committed: CommittedLayoutCheckpoint,
     bounds: BoundsCacheCheckpoint,
     root_slots: RootSlotsCheckpoint,
+    subtree_probe: SubtreeProbeCheckpoint,
     work: RetainedWorkCheckpoint,
 }
 
@@ -739,6 +746,7 @@ impl RetainedLayoutForest {
             committed: CommittedLayoutState::new(),
             bounds: BoundsCache::new(),
             root_slots: RootSlots::new(),
+            subtree_probe: SubtreeProbe::new(),
             work: RetainedWorkState::new(),
         }
     }
@@ -747,6 +755,7 @@ impl RetainedLayoutForest {
     pub(super) fn begin_frame(&mut self) {
         self.roots.begin_frame();
         self.measurements.begin_frame();
+        self.subtree_probe.begin_frame();
         self.work.begin_frame();
     }
 
@@ -760,6 +769,7 @@ impl RetainedLayoutForest {
             committed: self.committed.checkpoint(),
             bounds: self.bounds.checkpoint(),
             root_slots: self.root_slots.checkpoint(),
+            subtree_probe: self.subtree_probe.checkpoint(),
             work: self.work.checkpoint(),
         }
     }
@@ -775,6 +785,8 @@ impl RetainedLayoutForest {
         self.bounds.rollback_to_checkpoint(checkpoint.bounds);
         self.root_slots
             .rollback_to_checkpoint(checkpoint.root_slots);
+        self.subtree_probe
+            .rollback_to_checkpoint(checkpoint.subtree_probe);
         self.work.rollback_to_checkpoint(checkpoint.work);
     }
 
@@ -807,6 +819,7 @@ impl RetainedLayoutForest {
         self.measurements.finish_frame();
         self.committed.clear();
         self.bounds.clear();
+        self.subtree_probe.finish_frame();
         let misses = self.work.miss_work();
         if retained_layout_trace_enabled() {
             if misses != RetainedLayoutMissWork::default() {
@@ -828,12 +841,14 @@ impl RetainedLayoutForest {
     /// Store an unmeasured current-frame intent.
     pub(super) fn request_layout(
         &mut self,
+        global_id: Option<&GlobalElementId>,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
         self.push_intent(LayoutIntent {
+            global_id: global_id.cloned(),
             style: style.to_taffy(rem_size, scale_factor),
             kind: LayoutIntentKind::Unmeasured {
                 children: children.to_vec(),
@@ -955,6 +970,7 @@ impl RetainedLayoutForest {
             .map(|measure_context| self.measurements.push_producer_context(measure_context));
 
         self.push_intent(LayoutIntent {
+            global_id: None,
             style: style.to_taffy(rem_size, scale_factor),
             kind: LayoutIntentKind::Measured {
                 measure,
@@ -966,6 +982,16 @@ impl RetainedLayoutForest {
     /// Allocate the next current-frame `LayoutId`.
     fn push_intent(&mut self, intent: LayoutIntent) -> LayoutId {
         self.frame.push_intent(intent)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
+        self.subtree_probe.set_targets_for_tests(targets);
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_subtree_work_samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
+        self.subtree_probe.samples_for_tests()
     }
 
     fn committed_node(&self, id: LayoutId) -> NodeId {
@@ -1032,6 +1058,7 @@ impl RetainedLayoutForest {
             Vec::new()
         };
         let trace_cache_events = retained_layout_detail_trace_enabled();
+        let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
 
         let compute_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self
@@ -1041,6 +1068,7 @@ impl RetainedLayoutForest {
                 scale_factor,
                 window,
                 cx,
+                &mut subtree_compute_recorder,
                 |event| {
                     if trace_cache_events {
                         trace_layout_cache_event(&trace_cache_node_layout_ids, event);
@@ -1048,6 +1076,7 @@ impl RetainedLayoutForest {
                 },
             );
         let compute_layout_duration = compute_start.elapsed();
+        self.subtree_probe.record_compute(subtree_compute_recorder);
 
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             let layout = self.layout(node_id);
@@ -1152,6 +1181,7 @@ impl RetainedLayoutForest {
         scale_factor: f32,
         window: &mut Window,
         cx: &mut App,
+        subtree_compute_recorder: &mut SubtreeProbeComputeRecorder,
         mut handle_cache_event: impl FnMut(LayoutCacheEvent),
     ) -> (u64, std::time::Duration) {
         let mut measured_layout_calls = 0;
@@ -1164,6 +1194,7 @@ impl RetainedLayoutForest {
         } = self;
 
         let compute_measurements = std::cell::RefCell::new(measurements.compute_state());
+        let subtree_compute_recorder = std::cell::RefCell::new(subtree_compute_recorder);
 
         taffy
             .compute_layout_with_measure_and_cache_events(
@@ -1199,6 +1230,9 @@ impl RetainedLayoutForest {
                     );
 
                     measured_layout_calls += 1;
+                    subtree_compute_recorder
+                        .borrow_mut()
+                        .record_measured_callback(node_id);
                     let measure_start = std::time::Instant::now();
                     let measured_size = compute_measurements.borrow_mut().measure(
                         node_id,
@@ -1211,6 +1245,9 @@ impl RetainedLayoutForest {
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
                 |event| {
+                    subtree_compute_recorder
+                        .borrow_mut()
+                        .record_cache_event(event);
                     handle_cache_event(event);
                     compute_measurements.borrow_mut().handle_cache_event(event);
                 },
@@ -1869,8 +1906,12 @@ impl RetainedLayoutForest {
             "layout intent should appear only once in a committed layout tree"
         );
 
+        let probe_global_id = self
+            .subtree_probe
+            .matched_global_id(self.intent(id).global_id.as_ref());
+        let work_snapshot = probe_global_id.as_ref().map(|_| self.work.snapshot());
         let intent = self.intent(id);
-        match intent.kind.clone() {
+        let retained_node = match intent.kind.clone() {
             LayoutIntentKind::Unmeasured { children } => {
                 self.commit_unmeasured_intent(id, intent.style.clone(), children, previous)
             }
@@ -1884,7 +1925,16 @@ impl RetainedLayoutForest {
                 measured_kind,
                 previous,
             ),
+        };
+
+        if let (Some(global_id), Some(work_snapshot)) = (probe_global_id, work_snapshot) {
+            let work_delta = self.work.delta_since(work_snapshot);
+            let node_ids = Self::retained_occurrence_node_ids(&retained_node);
+            self.subtree_probe
+                .record_committed_subtree(global_id, id, node_ids, work_delta);
         }
+
+        retained_node
     }
 
     /// Build a retained occurrence with fresh mirror nodes only.
@@ -2277,6 +2327,14 @@ impl RetainedLayoutForest {
     /// Mark a mirror node as used at one current-frame position.
     fn mark_taffy_node_committed(&mut self, node_id: NodeId) {
         self.committed.mark_taffy_node_committed(node_id);
+    }
+
+    fn retained_occurrence_node_ids(retained_node: &RetainedLayoutOccurrence) -> Vec<NodeId> {
+        let mut node_ids = vec![retained_node.node_id];
+        for child in &retained_node.children {
+            node_ids.extend(Self::retained_occurrence_node_ids(child));
+        }
+        node_ids
     }
 
     #[cfg(any(test, debug_assertions))]

@@ -11,7 +11,7 @@ use gpui::{
         Underline,
     },
 };
-use log::warn;
+use log::{info, warn};
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
@@ -469,6 +469,18 @@ impl WgpuRenderer {
         let queue = Arc::clone(&context.queue);
         let dual_source_blending = context.supports_dual_source_blending();
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
+        info!(
+            "Initialized wgpu renderer: backend={:?}, surface_present={}, surface_format={:?}, \
+             alpha_mode={:?}, path_sample_count={}, dual_source_blending={}, \
+             color_texture_format={:?}",
+            context.adapter.get_info().backend,
+            surface.is_some(),
+            surface_format,
+            alpha_mode,
+            rendering_params.path_sample_count,
+            dual_source_blending,
+            context.color_texture_format(),
+        );
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
         let pipelines = Self::create_pipelines(
             &device,

@@ -11,5 +11,5 @@ pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 pub use wgpu_renderer::{
-    WgpuHeadlessContextParts, WgpuHeadlessRenderer, clone_active_headless_wgpu_context,
+    WgpuTestWindowContextParts, WgpuTestWindowRenderer, clone_active_test_window_wgpu_context,
 };

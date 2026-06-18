@@ -190,12 +190,12 @@ impl WgpuContext {
         })
     }
 
-    /// Create a context for headless presentation capture. Selects an adapter
+    /// Create a context for test-window presentation capture. Selects an adapter
     /// with no compatible surface so it works without a window on CI Linux
     /// (lavapipe/Vulkan) and on macOS (Metal). `Backends::PRIMARY | GL` lets
     /// adapter selection resolve Metal on macOS and Vulkan (lavapipe) on Linux.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn new_headless() -> anyhow::Result<Self> {
+    pub fn new_for_test_window() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
             flags: wgpu::InstanceFlags::default(),
@@ -209,10 +209,10 @@ impl WgpuContext {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
-        .map_err(|e| anyhow::anyhow!("Failed to request headless GPU adapter: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to request test-window GPU adapter: {e}"))?;
 
         log::info!(
-            "Selected headless GPU adapter: {:?} ({:?})",
+            "Selected test-window GPU adapter: {:?} ({:?})",
             adapter.get_info().name,
             adapter.get_info().backend
         );

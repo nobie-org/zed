@@ -2,7 +2,7 @@ use crate::EmbeddedTestTextSystem;
 use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, Platform, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTestWindowRenderer, PlatformTextSystem,
     PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SourceMetadata,
     Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
 };
@@ -35,7 +35,8 @@ pub(crate) struct TestPlatform {
     pub opened_url: RefCell<Option<String>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
-    headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
+    test_window_renderer_factory:
+        Option<Box<dyn Fn() -> Option<Box<dyn PlatformTestWindowRenderer>>>>,
     weak: Weak<Self>,
 }
 
@@ -110,8 +111,8 @@ impl TestPlatform {
         executor: BackgroundExecutor,
         foreground_executor: ForegroundExecutor,
         text_system: Arc<dyn PlatformTextSystem>,
-        headless_renderer_factory: Option<
-            Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>,
+        test_window_renderer_factory: Option<
+            Box<dyn Fn() -> Option<Box<dyn PlatformTestWindowRenderer>>>,
         >,
     ) -> Rc<Self> {
         Rc::new_cyclic(|weak| TestPlatform {
@@ -131,7 +132,7 @@ impl TestPlatform {
             weak: weak.clone(),
             opened_url: Default::default(),
             text_system,
-            headless_renderer_factory,
+            test_window_renderer_factory,
         })
     }
 
@@ -328,7 +329,7 @@ impl Platform for TestPlatform {
         handle: AnyWindowHandle,
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
-        let renderer = self.headless_renderer_factory.as_ref().and_then(|f| f());
+        let renderer = self.test_window_renderer_factory.as_ref().and_then(|f| f());
         let window = TestWindow::new(
             handle,
             params,

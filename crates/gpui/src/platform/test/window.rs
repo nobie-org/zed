@@ -1,10 +1,9 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformInputSimulator,
-    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, SceneCapture, Size,
-    TestPlatform, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams,
+    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformInputSimulator, PlatformTestWindowRenderer, PlatformWindow,
+    Point, PromptButton, RequestFrameOptions, Scene, SceneCapture, Size, TestPlatform, TileId,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;
@@ -24,7 +23,7 @@ pub(crate) struct TestWindowState {
     platform: Weak<TestPlatform>,
     // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
-    renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
+    renderer: Option<Box<dyn PlatformTestWindowRenderer>>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -62,7 +61,7 @@ impl TestWindow {
         params: WindowParams,
         platform: Weak<TestPlatform>,
         display: Rc<dyn PlatformDisplay>,
-        renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
+        renderer: Option<Box<dyn PlatformTestWindowRenderer>>,
     ) -> Self {
         let sprite_atlas: Arc<dyn PlatformAtlas> = match &renderer {
             Some(r) => r.sprite_atlas(),
@@ -92,15 +91,15 @@ impl TestWindow {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn render_to_capture(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
+    fn draw_presented_frame_to_capture(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
         let mut state = self.0.lock();
         let size = state.bounds.size;
         if let Some(renderer) = &mut state.renderer {
             let scale_factor = 2.0;
             let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
-            renderer.draw_scene(scene, device_size)
+            renderer.draw_presented_frame(scene, device_size)
         } else {
-            anyhow::bail!("test-window draw not available: no HeadlessRenderer configured")
+            anyhow::bail!("test-window draw not available: no test-window renderer configured")
         }
     }
 
@@ -322,7 +321,9 @@ impl PlatformWindow for TestWindow {
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn draw(&self, scene: &Scene) {
-        let capture = self.render_to_capture(scene).map_err(|err| err.to_string());
+        let capture = self
+            .draw_presented_frame_to_capture(scene)
+            .map_err(|err| err.to_string());
         self.0.lock().presented_capture = Some(capture);
     }
 

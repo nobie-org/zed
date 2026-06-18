@@ -518,12 +518,12 @@ impl Renderer {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
+pub fn current_test_window_renderer() -> Option<Box<dyn gpui::PlatformTestWindowRenderer>> {
     let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
     match MetalRenderer::try_new_internal(None, true, pool) {
         Ok(renderer) => Some(Box::new(renderer)),
         Err(error) => {
-            log::error!("failed to initialize headless Metal renderer: {error}");
+            log::error!("failed to initialize test-window Metal renderer: {error}");
             None
         }
     }
@@ -595,7 +595,7 @@ pub(crate) struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
-    /// For headless rendering, tracks whether output should be opaque
+    /// For test-window rendering, tracks whether output should be opaque.
     opaque: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
@@ -1062,12 +1062,12 @@ impl MetalRenderer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
-                    "draw() called on headless renderer - use render_scene_to_image() instead"
+                    "draw() called without a platform layer - use test-window presented-frame capture instead"
                 );
                 #[cfg(any(test, feature = "test-support"))]
                 if self.capture_next_frame {
                     self.presented_capture =
-                        Some(Err("draw() called on headless renderer".to_string()));
+                        Some(Err("draw() called without a platform layer".to_string()));
                     self.capture_next_frame = false;
                 }
                 return;
@@ -1338,24 +1338,22 @@ impl MetalRenderer {
         }
     }
 
-    /// Renders a scene to an image without requiring a window or CAMetalLayer.
-    ///
-    /// This is the primary method for headless rendering. It creates an offscreen
-    /// texture, renders the scene to it, and returns the pixel data as an RGBA image.
+    /// Draws the test-window presented frame into a renderer-owned BGRA8 target
+    /// and returns the captured pixels as an RGBA image.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn render_scene_to_image(
+    pub fn draw_presented_frame_to_image(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> Result<RgbaImage> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
+            anyhow::bail!("Invalid size for draw_presented_frame_to_image: {:?}", size);
         }
 
         // Update path intermediate textures for this size
         self.update_path_intermediate_textures(size);
 
-        // Create an offscreen texture as render target
+        // Create the test-window presentation texture.
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
@@ -3000,9 +2998,13 @@ fn first_and_last_path(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl gpui::PlatformHeadlessRenderer for MetalRenderer {
-    fn draw_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<SceneCapture> {
-        let image = MetalRenderer::render_scene_to_image(self, scene, size)?;
+impl gpui::PlatformTestWindowRenderer for MetalRenderer {
+    fn draw_presented_frame(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<SceneCapture> {
+        let image = MetalRenderer::draw_presented_frame_to_image(self, scene, size)?;
         let width_px = image.width();
         let height_px = image.height();
         Ok(SceneCapture {
@@ -3619,7 +3621,7 @@ mod tests {
     fn render(scene: &Scene) -> Result<RgbaImage> {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
         let mut renderer = MetalRenderer::try_new_internal(None, true, pool)?;
-        renderer.render_scene_to_image(
+        renderer.draw_presented_frame_to_image(
             scene,
             size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
         )
@@ -3634,11 +3636,11 @@ mod tests {
         scene
     }
 
-    /// Render `scene` headlessly and return the metal backend's measured counters.
+    /// Draw a test-window frame and return the Metal backend's measured counters.
     fn backend_counters(scene: &Scene) -> Result<RenderGroupBackendCounters> {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
         let mut renderer = MetalRenderer::try_new_internal(None, true, pool)?;
-        renderer.render_scene_to_image(
+        renderer.draw_presented_frame_to_image(
             scene,
             size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
         )?;

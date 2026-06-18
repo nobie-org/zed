@@ -798,9 +798,13 @@ pub struct SceneCapture {
 
 /// A renderer for test windows that can draw and capture the presented output.
 #[cfg(any(test, feature = "test-support"))]
-pub trait PlatformHeadlessRenderer {
+pub trait PlatformTestWindowRenderer {
     /// Draw a scene at `size` and return the captured presented pixels.
-    fn draw_scene(&mut self, scene: &Scene, size: Size<DevicePixels>) -> Result<SceneCapture>;
+    fn draw_presented_frame(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<SceneCapture>;
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;

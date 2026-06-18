@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 #[derive(Clone)]
-pub struct WgpuHeadlessContextParts {
+pub struct WgpuTestWindowContextParts {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
@@ -31,13 +31,13 @@ pub struct WgpuHeadlessContextParts {
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 thread_local! {
-    static ACTIVE_HEADLESS_WGPU_CONTEXT: RefCell<Option<WgpuHeadlessContextParts>> =
+    static ACTIVE_TEST_WINDOW_WGPU_CONTEXT: RefCell<Option<WgpuTestWindowContextParts>> =
         const { RefCell::new(None) };
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-pub fn clone_active_headless_wgpu_context() -> Option<WgpuHeadlessContextParts> {
-    ACTIVE_HEADLESS_WGPU_CONTEXT.with(|context| context.borrow().clone())
+pub fn clone_active_test_window_wgpu_context() -> Option<WgpuTestWindowContextParts> {
+    ACTIVE_TEST_WINDOW_WGPU_CONTEXT.with(|context| context.borrow().clone())
 }
 
 #[repr(C)]
@@ -177,7 +177,7 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    /// `None` for a headless renderer, which still uses the same presentation
+    /// `None` for a test-window renderer, which still uses the same presentation
     /// texture path but has no platform surface to transfer into.
     surface: Option<wgpu::Surface<'static>>,
     pipelines: WgpuPipelines,
@@ -345,7 +345,7 @@ impl WgpuRenderer {
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        // A headless test renderer has no platform surface, but it still uses
+        // A test-window renderer has no platform surface, but it still uses
         // the same presentation texture path as windowed wgpu rendering.
         let (
             surface_format,
@@ -635,9 +635,9 @@ impl WgpuRenderer {
 
     /// Build a renderer for test-window presentation capture.
     /// `initial_size` only sizes the first allocation;
-    /// [`render_scene_to_image`](Self::render_scene_to_image) resizes per capture.
+    /// [`draw_presented_frame_to_image`](Self::draw_presented_frame_to_image) resizes per capture.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn new_headless(
+    pub fn new_for_test_window(
         context: &WgpuContext,
         initial_size: Size<DevicePixels>,
     ) -> anyhow::Result<Self> {
@@ -659,19 +659,21 @@ impl WgpuRenderer {
     /// Draw `scene` through the shared presentation texture path at `size` and
     /// return the captured presented pixels.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn draw_scene_to_capture(
+    pub fn draw_presented_frame_to_capture(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> anyhow::Result<SceneCapture> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            anyhow::bail!("invalid headless capture size: {size:?}");
+            anyhow::bail!("invalid test-window capture size: {size:?}");
         }
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
         let max = self.max_texture_size;
         if width > max || height > max {
-            anyhow::bail!("headless capture size {width}x{height} exceeds max texture dim {max}");
+            anyhow::bail!(
+                "test-window capture size {width}x{height} exceeds max texture dim {max}"
+            );
         }
 
         // Size the globals viewport and intermediate path textures to this capture.
@@ -715,12 +717,12 @@ impl WgpuRenderer {
     /// Draw `scene` through the shared presentation texture path at `size` and read
     /// the presented target back as an RGBA image.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn render_scene_to_image(
+    pub fn draw_presented_frame_to_image(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> anyhow::Result<image::RgbaImage> {
-        let capture = self.draw_scene_to_capture(scene, size)?;
+        let capture = self.draw_presented_frame_to_capture(scene, size)?;
         let width_px = capture.width_px;
         let height_px = capture.height_px;
         let rgba = capture.rgba;
@@ -1371,8 +1373,8 @@ impl WgpuRenderer {
         &self.atlas
     }
 
-    /// The wgpu backend of the adapter this renderer drives. Used by the
-    /// headless capture path to report which backend produced a screenshot.
+    /// The wgpu backend of the adapter this renderer drives. Used by presented
+    /// frame capture to report which backend produced a screenshot.
     pub fn adapter_backend(&self) -> wgpu::Backend {
         self.adapter_info.backend
     }
@@ -2108,9 +2110,9 @@ impl WgpuRenderer {
     }
 
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    fn register_active_headless_wgpu_context(context: &WgpuContext) {
-        ACTIVE_HEADLESS_WGPU_CONTEXT.with(|active| {
-            *active.borrow_mut() = Some(WgpuHeadlessContextParts {
+    fn register_active_test_window_wgpu_context(context: &WgpuContext) {
+        ACTIVE_TEST_WINDOW_WGPU_CONTEXT.with(|active| {
+            *active.borrow_mut() = Some(WgpuTestWindowContextParts {
                 instance: context.instance.clone(),
                 adapter: context.adapter.clone(),
                 device: (*context.device).clone(),
@@ -3571,22 +3573,22 @@ fn scene_capture_backend(backend: wgpu::Backend) -> SceneCaptureBackend {
 /// through the same wgpu presentation texture path used by surfaced windows and
 /// reads that texture back as RGBA.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-pub struct WgpuHeadlessRenderer {
+pub struct WgpuTestWindowRenderer {
     renderer: WgpuRenderer,
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-impl WgpuHeadlessRenderer {
+impl WgpuTestWindowRenderer {
     pub fn new() -> anyhow::Result<Self> {
-        let context = WgpuContext::new_headless()?;
-        let renderer = WgpuRenderer::new_headless(
+        let context = WgpuContext::new_for_test_window()?;
+        let renderer = WgpuRenderer::new_for_test_window(
             &context,
             Size {
                 width: DevicePixels(1),
                 height: DevicePixels(1),
             },
         )?;
-        WgpuRenderer::register_active_headless_wgpu_context(&context);
+        WgpuRenderer::register_active_test_window_wgpu_context(&context);
         Ok(Self { renderer })
     }
 
@@ -3597,13 +3599,13 @@ impl WgpuHeadlessRenderer {
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
-    fn draw_scene(
+impl gpui::PlatformTestWindowRenderer for WgpuTestWindowRenderer {
+    fn draw_presented_frame(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> anyhow::Result<gpui::SceneCapture> {
-        self.renderer.draw_scene_to_capture(scene, size)
+        self.renderer.draw_presented_frame_to_capture(scene, size)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {

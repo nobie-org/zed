@@ -4,8 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
-use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
@@ -33,8 +31,6 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, nobie_platform_trace, point, px, scene_protocol::Scene, size,
 };
-#[cfg(any(test, feature = "test-support"))]
-use image::RgbaImage;
 
 use core_foundation::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::base::CFEqual;
@@ -1694,16 +1690,23 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
-    fn capture_scene(&self, scene: &Scene) -> gpui::Result<gpui::SceneCapture> {
+    fn request_frame_capture(&self) {
         #[cfg(any(test, feature = "test-support"))]
         {
             let mut this = self.0.lock();
-            this.renderer.capture_scene(scene)
+            this.renderer.request_frame_capture();
+        }
+    }
+
+    fn capture_presented_frame(&self) -> gpui::Result<gpui::SceneCapture> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut this = self.0.lock();
+            this.renderer.take_presented_capture()
         }
         #[cfg(not(any(test, feature = "test-support")))]
         {
-            let _ = scene;
-            anyhow::bail!("scene capture is not available without test-support")
+            anyhow::bail!("presented-frame capture is not available without test-support")
         }
     }
 
@@ -1795,12 +1798,6 @@ impl PlatformWindow for MacWindow {
         // SAFETY: `NSBeep` is a parameterless AppKit C function with no
         // preconditions; it is marked `unsafe` only because it is an extern fn.
         unsafe { NSBeep() }
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, scene: &Scene) -> Result<RgbaImage> {
-        let mut this = self.0.lock();
-        this.renderer.render_to_image(scene)
     }
 }
 

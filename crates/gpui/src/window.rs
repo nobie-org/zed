@@ -1854,10 +1854,9 @@ impl Window {
     /// capture state.
     pub fn draw_present_and_capture_immediately(&mut self, cx: &mut App) -> Result<SceneCapture> {
         let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
+        self.platform_window.request_frame_capture();
         self.present();
-        let capture = self
-            .platform_window
-            .capture_scene(&self.rendered_frame.scene);
+        let capture = self.platform_window.capture_presented_frame();
         arena_clear_needed.clear();
         self.complete_frame();
         capture
@@ -2259,15 +2258,6 @@ impl Window {
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.platform_window.bounds()
-    }
-
-    /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing where we want
-    /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
-        self.platform_window
-            .render_to_image(&self.rendered_frame.scene)
     }
 
     /// Set the content size of the window.

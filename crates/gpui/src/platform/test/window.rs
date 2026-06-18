@@ -7,7 +7,6 @@ use crate::{
     WindowControlArea, WindowParams,
 };
 use collections::HashMap;
-use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
@@ -327,24 +326,17 @@ impl PlatformWindow for TestWindow {
         self.0.lock().presented_capture = Some(capture);
     }
 
-    fn capture_scene(&self, _scene: &Scene) -> anyhow::Result<SceneCapture> {
-        match self.0.lock().presented_capture.clone() {
+    fn capture_presented_frame(&self) -> anyhow::Result<SceneCapture> {
+        let mut state = self.0.lock();
+        match state.presented_capture.take() {
             Some(Ok(capture)) => Ok(capture),
             Some(Err(error)) => anyhow::bail!("{error}"),
-            None => anyhow::bail!("capture_scene called before draw presented a frame"),
+            None => anyhow::bail!("capture_presented_frame called before draw presented a frame"),
         }
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
-        self.render_to_capture(scene).and_then(|capture| {
-            image::RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
-                .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
-        })
     }
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {

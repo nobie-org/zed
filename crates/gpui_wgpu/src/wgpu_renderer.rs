@@ -683,19 +683,33 @@ impl WgpuRenderer {
             }
         }
 
-        self.presentation_capture = None;
-        self.capture_next_frame = true;
+        self.request_frame_capture();
         if !self.draw(scene) {
             self.capture_next_frame = false;
             anyhow::bail!("presentation scene draw failed");
         }
 
-        let capture = match self.presentation_capture.take() {
-            Some(Ok(capture)) => capture,
+        self.take_presented_capture()
+    }
+
+    /// Capture the next frame produced by [`draw`](Self::draw).
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn request_frame_capture(&mut self) {
+        self.presentation_capture = None;
+        self.capture_next_frame = true;
+    }
+
+    /// Return the capture produced by the most recent requested draw.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn take_presented_capture(&mut self) -> anyhow::Result<SceneCapture> {
+        match self.presentation_capture.take() {
+            Some(Ok(capture)) => Ok(capture),
             Some(Err(error)) => anyhow::bail!("{error}"),
-            None => anyhow::bail!("draw completed without a presentation capture"),
-        };
-        Ok(capture)
+            None => {
+                self.capture_next_frame = false;
+                anyhow::bail!("draw completed without a presentation capture")
+            }
+        }
     }
 
     /// Draw `scene` through the shared presentation texture path at `size` and read

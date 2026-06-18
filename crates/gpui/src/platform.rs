@@ -48,8 +48,6 @@ use font_kit::{
     properties::{Properties as FontKitProperties, Style as FontKitStyle, Weight as FontKitWeight},
 };
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
-use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
 #[cfg(all(target_os = "macos", feature = "font-kit"))]
@@ -696,8 +694,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
-    fn capture_scene(&self, _scene: &Scene) -> Result<SceneCapture> {
-        anyhow::bail!("scene capture is not implemented for this platform window")
+    fn request_frame_capture(&self) {}
+    fn capture_presented_frame(&self) -> Result<SceneCapture> {
+        anyhow::bail!("presented-frame capture is not implemented for this platform window")
     }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
@@ -758,14 +757,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
-    }
-
-    /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing where we want
-    /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
-        anyhow::bail!("render_to_image not implemented for this platform")
     }
 }
 

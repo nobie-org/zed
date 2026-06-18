@@ -167,7 +167,11 @@ impl HeadlessAppContext {
     /// returns `Some` via [`HeadlessAppContext::with_platform`].
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         let mut app = self.app.borrow_mut();
-        app.update_window(window, |_, window, _| window.render_to_image())?
+        app.update_window(window, |_, window, cx| {
+            let capture = window.draw_present_and_capture_immediately(cx)?;
+            RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
+                .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
+        })?
     }
 
     /// Returns the text system.

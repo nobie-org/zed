@@ -501,43 +501,19 @@ impl Renderer {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
+    pub fn request_frame_capture(&mut self) {
         match self {
-            Self::Metal(renderer) => renderer.render_to_image(scene),
-            Self::Wgpu { renderer, .. } => {
-                let size = renderer.viewport_size();
-                renderer.render_scene_to_image(scene, size)
-            }
+            Self::Metal(renderer) => renderer.request_frame_capture(),
+            Self::Wgpu { renderer, .. } => renderer.request_frame_capture(),
         }
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn capture_scene(&mut self, scene: &Scene) -> Result<SceneCapture> {
+    pub fn take_presented_capture(&mut self) -> Result<SceneCapture> {
         match self {
-            Self::Metal(renderer) => renderer.capture_scene(scene),
-            Self::Wgpu { renderer, .. } => {
-                let image = renderer.render_scene_to_image(scene, renderer.viewport_size())?;
-                let width_px = image.width();
-                let height_px = image.height();
-                Ok(SceneCapture {
-                    rgba: image.into_raw(),
-                    width_px,
-                    height_px,
-                    backend: wgpu_capture_backend(renderer.adapter_backend()),
-                })
-            }
+            Self::Metal(renderer) => renderer.take_presented_capture(),
+            Self::Wgpu { renderer, .. } => renderer.take_presented_capture(),
         }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn wgpu_capture_backend(backend: gpui_wgpu::wgpu::Backend) -> SceneCaptureBackend {
-    match backend {
-        gpui_wgpu::wgpu::Backend::Metal => SceneCaptureBackend::Metal,
-        gpui_wgpu::wgpu::Backend::Vulkan => SceneCaptureBackend::Vulkan,
-        gpui_wgpu::wgpu::Backend::Dx12 => SceneCaptureBackend::Dx12,
-        gpui_wgpu::wgpu::Backend::Gl => SceneCaptureBackend::Gl,
-        _ => SceneCaptureBackend::Other,
     }
 }
 
@@ -640,6 +616,10 @@ pub(crate) struct MetalRenderer {
     path_sample_count: u32,
     /// Measured render-group resource counts from the most recent scene render.
     last_render_group_counters: Option<RenderGroupBackendCounters>,
+    #[cfg(any(test, feature = "test-support"))]
+    capture_next_frame: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    presented_capture: Option<Result<SceneCapture, String>>,
 }
 
 #[repr(C)]
@@ -901,6 +881,10 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            #[cfg(any(test, feature = "test-support"))]
+            capture_next_frame: false,
+            #[cfg(any(test, feature = "test-support"))]
+            presented_capture: None,
         })
     }
 
@@ -917,6 +901,59 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn scene_capture_from_texture(texture: &metal::TextureRef) -> Result<SceneCapture> {
+        let width = texture.width() as u32;
+        let height = texture.height() as u32;
+        let bytes_per_row = width as usize * 4;
+        let buffer_size = height as usize * bytes_per_row;
+        let mut pixels = vec![0u8; buffer_size];
+        let region = metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+        };
+
+        texture.get_bytes(
+            pixels.as_mut_ptr() as *mut c_void,
+            bytes_per_row as u64,
+            region,
+            0,
+        );
+
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
+
+        Ok(SceneCapture {
+            rgba: pixels,
+            width_px: width,
+            height_px: height,
+            backend: SceneCaptureBackend::Metal,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn request_frame_capture(&mut self) {
+        self.presented_capture = None;
+        self.capture_next_frame = true;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_presented_capture(&mut self) -> Result<SceneCapture> {
+        match self.presented_capture.take() {
+            Some(Ok(capture)) => Ok(capture),
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None => {
+                self.capture_next_frame = false;
+                anyhow::bail!("draw completed without a presented-frame capture")
+            }
+        }
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -1027,6 +1064,12 @@ impl MetalRenderer {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
+                #[cfg(any(test, feature = "test-support"))]
+                if self.capture_next_frame {
+                    self.presented_capture =
+                        Some(Err("draw() called on headless renderer".to_string()));
+                    self.capture_next_frame = false;
+                }
                 return;
             }
         };
@@ -1066,6 +1109,11 @@ impl MetalRenderer {
                         viewport_size.height.0
                     ),
                 );
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            if self.capture_next_frame {
+                self.presented_capture = Some(Err("failed to retrieve next drawable".to_string()));
+                self.capture_next_frame = false;
             }
             return;
         };
@@ -1133,6 +1181,9 @@ impl MetalRenderer {
                         drawable.add_presented_handler(&presented_block);
                     }
 
+                    #[cfg(any(test, feature = "test-support"))]
+                    let capture_next_frame = self.capture_next_frame;
+
                     if self.presents_with_transaction {
                         if trace_enabled {
                             nobie_platform_trace::trace(
@@ -1148,6 +1199,18 @@ impl MetalRenderer {
                             );
                         }
                         command_buffer.commit();
+                        #[cfg(any(test, feature = "test-support"))]
+                        if capture_next_frame {
+                            command_buffer.wait_until_completed();
+                            self.presented_capture = Some(
+                                Self::scene_capture_from_texture(drawable.texture())
+                                    .map_err(|err| err.to_string()),
+                            );
+                            self.capture_next_frame = false;
+                        } else {
+                            command_buffer.wait_until_scheduled();
+                        }
+                        #[cfg(not(any(test, feature = "test-support")))]
                         command_buffer.wait_until_scheduled();
                         if trace_enabled {
                             nobie_platform_trace::trace(
@@ -1192,6 +1255,15 @@ impl MetalRenderer {
                             );
                         }
                         command_buffer.commit();
+                        #[cfg(any(test, feature = "test-support"))]
+                        if capture_next_frame {
+                            command_buffer.wait_until_completed();
+                            self.presented_capture = Some(
+                                Self::scene_capture_from_texture(drawable.texture())
+                                    .map_err(|err| err.to_string()),
+                            );
+                            self.capture_next_frame = false;
+                        }
                     }
                     if trace_enabled {
                         nobie_platform_trace::trace(
@@ -1229,6 +1301,13 @@ impl MetalRenderer {
                     let buffer_size = instance_buffer_pool.buffer_size;
                     if buffer_size >= 256 * 1024 * 1024 {
                         log::error!("instance buffer size grew too large: {}", buffer_size);
+                        #[cfg(any(test, feature = "test-support"))]
+                        if self.capture_next_frame {
+                            self.presented_capture = Some(Err(format!(
+                                "instance buffer size grew too large: {buffer_size}"
+                            )));
+                            self.capture_next_frame = false;
+                        }
                         break;
                     }
                     instance_buffer_pool.reset(buffer_size * 2);
@@ -1239,6 +1318,11 @@ impl MetalRenderer {
                 }
                 Err(err) => {
                     log::error!("failed to encode Metal draw: {err}");
+                    #[cfg(any(test, feature = "test-support"))]
+                    if self.capture_next_frame {
+                        self.presented_capture = Some(Err(format!("{err}")));
+                        self.capture_next_frame = false;
+                    }
                     if trace_enabled {
                         nobie_platform_trace::trace(
                             "metal_draw_failed",
@@ -1252,134 +1336,6 @@ impl MetalRenderer {
                 }
             }
         }
-    }
-
-    /// Renders the scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing
-    /// where we want to capture what would be rendered without displaying it.
-    ///
-    /// Note: This requires a layer-backed renderer. For headless rendering,
-    /// use `render_scene_to_image()` instead.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
-        let layer = self
-            .layer
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("render_to_image requires a layer-backed renderer"))?;
-        let viewport_size = layer.drawable_size();
-        let viewport_size: Size<DevicePixels> = size(
-            (viewport_size.width.ceil() as i32).into(),
-            (viewport_size.height.ceil() as i32).into(),
-        );
-        let drawable = layer
-            .next_drawable()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
-
-        loop {
-            let mut instance_buffer = self
-                .instance_buffer_pool
-                .lock()
-                .acquire(&self.device, self.is_unified_memory);
-
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
-
-            match command_buffer {
-                Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
-
-                    // Commit and wait for completion without presenting
-                    command_buffer.commit();
-                    command_buffer.wait_until_completed();
-
-                    // Read pixels from the texture
-                    let texture = drawable.texture();
-                    let width = texture.width() as u32;
-                    let height = texture.height() as u32;
-                    let bytes_per_row = width as usize * 4;
-                    let buffer_size = height as usize * bytes_per_row;
-
-                    let mut pixels = vec![0u8; buffer_size];
-
-                    let region = metal::MTLRegion {
-                        origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                        size: metal::MTLSize {
-                            width: width as u64,
-                            height: height as u64,
-                            depth: 1,
-                        },
-                    };
-
-                    texture.get_bytes(
-                        pixels.as_mut_ptr() as *mut std::ffi::c_void,
-                        bytes_per_row as u64,
-                        region,
-                        0,
-                    );
-
-                    // Convert BGRA to RGBA (swap B and R channels)
-                    for chunk in pixels.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
-
-                    return RgbaImage::from_raw(width, height, pixels).ok_or_else(|| {
-                        anyhow::anyhow!("Failed to create RgbaImage from pixel data")
-                    });
-                }
-                Err(err @ MetalRenderError::InstanceBufferExceeded { .. }) => {
-                    // Designed growth path, not a failure: the frame is
-                    // re-encoded after the pool doubles, so report it at the
-                    // same level as the matching "increased instance buffer
-                    // size" message. Pool exhaustion below stays an error.
-                    log::info!(
-                        "scene exceeded instance buffer: {}. retrying with larger instance buffer size",
-                        err
-                    );
-                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
-                    let buffer_size = instance_buffer_pool.buffer_size;
-                    if buffer_size >= 256 * 1024 * 1024 {
-                        anyhow::bail!("instance buffer size grew too large: {}", buffer_size);
-                    }
-                    instance_buffer_pool.reset(buffer_size * 2);
-                    log::info!(
-                        "increased instance buffer size to {}",
-                        instance_buffer_pool.buffer_size
-                    );
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-    }
-
-    /// Renders the full scene to CPU-readable RGBA bytes for deterministic automation.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn capture_scene(&mut self, scene: &Scene) -> Result<SceneCapture> {
-        let layer = self
-            .layer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("capture_scene requires a layer-backed renderer"))?;
-        let drawable_size = layer.drawable_size();
-        let size: Size<DevicePixels> = size(
-            (drawable_size.width.ceil() as i32).into(),
-            (drawable_size.height.ceil() as i32).into(),
-        );
-        let image = self.render_scene_to_image(scene, size)?;
-        let width_px = image.width();
-        let height_px = image.height();
-        Ok(SceneCapture {
-            rgba: image.into_raw(),
-            width_px,
-            height_px,
-            backend: SceneCaptureBackend::Metal,
-        })
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.

@@ -158,7 +158,6 @@ struct WgpuPipelines {
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
     surfaces: wgpu::RenderPipeline,
-    presentation_transfer: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -397,7 +396,16 @@ impl WgpuRenderer {
                 .preferred_present_mode
                 .filter(|mode| surface_caps.present_modes.contains(mode))
                 .unwrap_or(wgpu::PresentMode::Fifo);
-            let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+            if !surface_caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
+                anyhow::bail!(
+                    "Surface for adapter {:?} does not support COPY_DST, which is required so \
+                     headed wgpu presentation is a byte copy from the same renderer-owned \
+                     presentation texture captured by test windows.",
+                    context.adapter.get_info().name
+                );
+            }
+            let mut surface_usage =
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST;
             if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
                 surface_usage |= wgpu::TextureUsages::COPY_SRC;
             }
@@ -1168,22 +1176,6 @@ impl WgpuRenderer {
             &shader_module,
         );
 
-        let presentation_transfer = create_pipeline(
-            "presentation_transfer",
-            "vs_surface",
-            "fs_surface",
-            &layouts.globals,
-            &layouts.surfaces,
-            wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            1,
-            &shader_module,
-        );
-
         WgpuPipelines {
             quads,
             shadows,
@@ -1196,7 +1188,6 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
-            presentation_transfer,
         }
     }
 
@@ -1498,11 +1489,8 @@ impl WgpuRenderer {
         }
 
         if let Some(frame) = frame {
-            let frame_view = frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
             let presented = encoded
-                && self.transfer_presentation_texture_to_view(&presentation_view, &frame_view);
+                && self.copy_presentation_texture_to_surface(&presentation_texture, &frame.texture);
             if presented {
                 frame.present();
             }
@@ -1534,84 +1522,37 @@ impl WgpuRenderer {
         (texture, view)
     }
 
-    fn transfer_presentation_texture_to_view(
+    fn copy_presentation_texture_to_surface(
         &self,
-        texture_view: &wgpu::TextureView,
-        target_view: &wgpu::TextureView,
+        presentation_texture: &wgpu::Texture,
+        surface_texture: &wgpu::Texture,
     ) -> bool {
-        let bounds = Bounds::new(
-            point(ScaledPixels(0.), ScaledPixels(0.)),
-            Size {
-                width: ScaledPixels(self.surface_config.width as f32),
-                height: ScaledPixels(self.surface_config.height as f32),
-            },
-        );
-        let bounds = PodBounds::from(bounds);
-        let params = SurfaceParams {
-            bounds,
-            content_mask: bounds,
-        };
-        let params_size = std::mem::size_of::<SurfaceParams>() as u64;
         let resources = self.resources();
-        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("presentation_transfer_params"),
-            size: params_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        resources
-            .queue
-            .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
-        let bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("presentation_transfer_bind_group"),
-                layout: &resources.bind_group_layouts.surfaces,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &buffer,
-                            offset: 0,
-                            size: Some(NonZeroU64::new(params_size).unwrap()),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
-                    },
-                ],
-            });
         let mut encoder =
             resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("presentation_transfer_encoder"),
+                    label: Some("presentation_copy_encoder"),
                 });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("presentation_transfer_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            pass.set_pipeline(&resources.pipelines.presentation_transfer);
-            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &bind_group, &[]);
-            pass.draw(0..4, 0..1);
-        }
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: presentation_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: surface_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.surface_config.width.max(1),
+                height: self.surface_config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
         resources.queue.submit(std::iter::once(encoder.finish()));
         true
     }

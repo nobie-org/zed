@@ -74,7 +74,6 @@ impl RetainedWorkState {
     pub(super) fn begin_frame(&mut self) {
         self.work = RetainedLayoutWork::default();
         self.miss_work = RetainedLayoutMissWork::default();
-        self.miss_trace_samples = 0;
     }
 
     pub(super) fn checkpoint(&self) -> RetainedWorkCheckpoint {

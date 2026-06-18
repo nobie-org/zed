@@ -422,6 +422,8 @@ fn work_state_checkpoint_and_finish_return_complete_frame_counts(_cx: &mut TestA
                 RetainedLayoutMissWork::default(),
             )
         );
+        work.begin_frame();
+        assert_eq!(work.should_trace_miss(traced_misses), false);
         assert_eq!(
             work.finish_frame(),
             (

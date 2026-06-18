@@ -49,7 +49,7 @@ use taffy::{
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
     prelude::{TaffyGridLine, TaffyGridSpan, max_content, min_content},
     style::AvailableSpace as TaffyAvailableSpace,
-    tree::{Layout, LayoutCacheEntry, LayoutCacheEvent, NodeId, RunMode},
+    tree::{Layout, LayoutCacheEntry, LayoutCacheEvent, NodeId},
 };
 #[cfg(test)]
 pub(super) use work::RetainedForestMutationSample;
@@ -638,6 +638,10 @@ fn retained_layout_trace_layout_ids() -> Option<&'static Vec<usize>> {
         .as_ref()
 }
 
+fn retained_layout_detail_trace_enabled() -> bool {
+    retained_layout_trace_enabled() && retained_layout_trace_layout_ids().is_some()
+}
+
 fn trace_layout_id_is_targeted(layout_id: Option<usize>) -> bool {
     retained_layout_trace_layout_ids()
         .map(|target_layout_ids| {
@@ -649,6 +653,10 @@ fn trace_layout_id_is_targeted(layout_id: Option<usize>) -> bool {
 }
 
 fn trace_layout_cache_event(node_layout_ids: &[(NodeId, LayoutId)], event: LayoutCacheEvent) {
+    if retained_layout_trace_layout_ids().is_none() {
+        return;
+    }
+
     match event {
         LayoutCacheEvent::Hit(entry) => trace_layout_cache_entry("hit", node_layout_ids, entry),
         LayoutCacheEvent::Stored(entry) => {
@@ -661,9 +669,7 @@ fn trace_layout_cache_event(node_layout_ids: &[(NodeId, LayoutId)], event: Layou
                 .find_map(|(candidate_node_id, layout_id)| {
                     (*candidate_node_id == node_id).then_some(layout_id.0)
                 });
-            if retained_layout_trace_layout_ids().is_some()
-                && trace_layout_id_is_targeted(layout_id)
-            {
+            if trace_layout_id_is_targeted(layout_id) {
                 eprintln!(
                     "gpui retained_layout cache_event kind=cleared layout_id={:?} node_id={:?}",
                     layout_id, node_id
@@ -689,12 +695,6 @@ fn trace_layout_cache_entry(
         });
 
     if !trace_layout_id_is_targeted(layout_id) {
-        return;
-    }
-
-    if retained_layout_trace_layout_ids().is_none()
-        && (layout_id.is_none() || input.run_mode != RunMode::PerformLayout)
-    {
         return;
     }
 
@@ -1019,18 +1019,19 @@ impl RetainedLayoutForest {
 
         let taffy_available_space = scale_available_space_for_taffy(available_space, scale_factor);
 
-        if retained_layout_trace_enabled() {
+        if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             eprintln!(
                 "gpui retained_layout compute_start layout_id={} node_id={:?} repeated_root={} available_space={:?}",
                 id.0, node_id, repeated_root, available_space
             );
         }
 
-        let trace_cache_node_layout_ids = if retained_layout_trace_enabled() {
+        let trace_cache_node_layout_ids = if retained_layout_detail_trace_enabled() {
             self.committed_node_layout_ids_for_trace()
         } else {
             Vec::new()
         };
+        let trace_cache_events = retained_layout_detail_trace_enabled();
 
         let compute_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self
@@ -1041,14 +1042,14 @@ impl RetainedLayoutForest {
                 window,
                 cx,
                 |event| {
-                    if retained_layout_trace_enabled() {
+                    if trace_cache_events {
                         trace_layout_cache_event(&trace_cache_node_layout_ids, event);
                     }
                 },
             );
         let compute_layout_duration = compute_start.elapsed();
 
-        if retained_layout_trace_enabled() {
+        if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             let layout = self.layout(node_id);
             eprintln!(
                 "gpui retained_layout compute_finish layout_id={} node_id={:?} repeated_root={} root_layout={:?}",
@@ -1083,7 +1084,7 @@ impl RetainedLayoutForest {
     pub(super) fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         let node_id = self.committed_node(id);
         let bounds = self.layout_bounds_for_node(node_id, scale_factor);
-        if retained_layout_trace_enabled()
+        if retained_layout_detail_trace_enabled()
             && trace_layout_id_is_targeted(Some(id.0))
             && (bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0)
         {
@@ -1799,7 +1800,7 @@ impl RetainedLayoutForest {
             "retained layout root should be committed at most once per frame"
         );
         let retained_root = self.root_slots.take_retained_root(root_id);
-        if retained_layout_trace_enabled() {
+        if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             eprintln!(
                 "gpui retained_layout commit_root_candidate root_id={:?} layout_id={} retained_root={}",
                 root_id,
@@ -1813,7 +1814,7 @@ impl RetainedLayoutForest {
         self.flush_detached_subtree_removals();
         self.record_current_text_descendants(&retained_node);
         self.root_slots.insert_current_root(root_id, retained_node);
-        if retained_layout_trace_enabled() {
+        if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             eprintln!(
                 "gpui retained_layout commit_root_done root_id={:?} layout_id={} node_id={:?} current_roots={}",
                 root_id,

@@ -354,7 +354,7 @@ pub struct BoxShadow {
 }
 
 /// How to handle whitespace in text
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WhiteSpace {
     /// Normal line wrapping when text overflows the width of the element
     #[default]
@@ -364,7 +364,7 @@ pub enum WhiteSpace {
 }
 
 /// How to truncate text that overflows the width of the element
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum TextOverflow {
     /// Truncate the text at the end when it doesn't fit, and represent this truncation by
     /// displaying the provided string (e.g., "very long te…").
@@ -1201,88 +1201,6 @@ pub enum Position {
     Absolute,
 }
 
-impl From<AlignItems> for taffy::style::AlignItems {
-    fn from(value: AlignItems) -> Self {
-        match value {
-            AlignItems::Start => Self::START,
-            AlignItems::End => Self::END,
-            AlignItems::FlexStart => Self::FLEX_START,
-            AlignItems::FlexEnd => Self::FLEX_END,
-            AlignItems::Center => Self::CENTER,
-            AlignItems::Baseline => Self::BASELINE,
-            AlignItems::Stretch => Self::STRETCH,
-        }
-    }
-}
-
-impl From<AlignContent> for taffy::style::AlignContent {
-    fn from(value: AlignContent) -> Self {
-        match value {
-            AlignContent::Start => Self::START,
-            AlignContent::End => Self::END,
-            AlignContent::FlexStart => Self::FLEX_START,
-            AlignContent::FlexEnd => Self::FLEX_END,
-            AlignContent::Center => Self::CENTER,
-            AlignContent::Stretch => Self::STRETCH,
-            AlignContent::SpaceBetween => Self::SPACE_BETWEEN,
-            AlignContent::SpaceEvenly => Self::SPACE_EVENLY,
-            AlignContent::SpaceAround => Self::SPACE_AROUND,
-        }
-    }
-}
-
-impl From<Display> for taffy::style::Display {
-    fn from(value: Display) -> Self {
-        match value {
-            Display::Block => Self::Block,
-            Display::Flex => Self::Flex,
-            Display::Grid => Self::Grid,
-            Display::None => Self::None,
-        }
-    }
-}
-
-impl From<FlexWrap> for taffy::style::FlexWrap {
-    fn from(value: FlexWrap) -> Self {
-        match value {
-            FlexWrap::NoWrap => Self::NoWrap,
-            FlexWrap::Wrap => Self::Wrap,
-            FlexWrap::WrapReverse => Self::WrapReverse,
-        }
-    }
-}
-
-impl From<FlexDirection> for taffy::style::FlexDirection {
-    fn from(value: FlexDirection) -> Self {
-        match value {
-            FlexDirection::Row => Self::Row,
-            FlexDirection::Column => Self::Column,
-            FlexDirection::RowReverse => Self::RowReverse,
-            FlexDirection::ColumnReverse => Self::ColumnReverse,
-        }
-    }
-}
-
-impl From<Overflow> for taffy::style::Overflow {
-    fn from(value: Overflow) -> Self {
-        match value {
-            Overflow::Visible => Self::Visible,
-            Overflow::Clip => Self::Clip,
-            Overflow::Hidden => Self::Hidden,
-            Overflow::Scroll => Self::Scroll,
-        }
-    }
-}
-
-impl From<Position> for taffy::style::Position {
-    fn from(value: Position) -> Self {
-        match value {
-            Position::Relative => Self::Relative,
-            Position::Absolute => Self::Absolute,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{blue, green, px, red, yellow};
@@ -1290,78 +1208,6 @@ mod tests {
     use super::*;
 
     use util_macros::perf;
-
-    #[test]
-    fn align_items_to_taffy_preserves_keywords() {
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::Start),
-            taffy::style::AlignItems::START
-        );
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::End),
-            taffy::style::AlignItems::END
-        );
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::FlexStart),
-            taffy::style::AlignItems::FLEX_START
-        );
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::FlexEnd),
-            taffy::style::AlignItems::FLEX_END
-        );
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::Center),
-            taffy::style::AlignItems::CENTER
-        );
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::Baseline),
-            taffy::style::AlignItems::BASELINE
-        );
-        assert_eq!(
-            taffy::style::AlignItems::from(AlignItems::Stretch),
-            taffy::style::AlignItems::STRETCH
-        );
-    }
-
-    #[test]
-    fn align_content_to_taffy_preserves_keywords() {
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::Start),
-            taffy::style::AlignContent::START
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::End),
-            taffy::style::AlignContent::END
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::FlexStart),
-            taffy::style::AlignContent::FLEX_START
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::FlexEnd),
-            taffy::style::AlignContent::FLEX_END
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::Center),
-            taffy::style::AlignContent::CENTER
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::Stretch),
-            taffy::style::AlignContent::STRETCH
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::SpaceBetween),
-            taffy::style::AlignContent::SPACE_BETWEEN
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::SpaceEvenly),
-            taffy::style::AlignContent::SPACE_EVENLY
-        );
-        assert_eq!(
-            taffy::style::AlignContent::from(AlignContent::SpaceAround),
-            taffy::style::AlignContent::SPACE_AROUND
-        );
-    }
 
     #[perf]
     fn test_basic_highlight_style_combination() {

@@ -1,6 +1,6 @@
 //! Elements are the workhorses of GPUI. They are responsible for laying out and painting all of
 //! the contents of a window. Elements form a tree and are laid out according to the web layout
-//! standards as implemented by [taffy](https://github.com/DioxusLabs/taffy). Most of the time,
+//! standards through GPUI's retained layout engine. Most of the time,
 //! you won't need to interact with this module or these APIs directly. Elements provide their
 //! own APIs and GPUI, or other element implementation, uses the APIs in this module to convert
 //! that element tree into the pixels you see on the screen.
@@ -9,7 +9,7 @@
 //!
 //! Elements are constructed by calling [`Render::render()`] on the root view of the window,
 //! which recursively constructs the element tree from the current state of the application,.
-//! These elements are then laid out by Taffy, and painted to the screen according to their own
+//! These elements are then laid out by GPUI, and painted to the screen according to their own
 //! implementation of [`Element::paint()`]. Before the start of the next frame, the entire element
 //! tree and any callbacks they have registered with GPUI are dropped and the process repeats.
 //!
@@ -34,7 +34,7 @@
 use crate::{
     App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
     InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    util::FluentBuilder, window::with_element_arena,
+    layout::RetainedLayoutRootId, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -45,7 +45,7 @@ use std::{
 };
 
 /// Implemented by types that participate in laying out and painting the contents of a window.
-/// Elements form a tree and are laid out according to web-based layout rules, as implemented by Taffy.
+/// Elements form a tree and are laid out according to web-based layout rules.
 /// You can create custom elements by implementing this trait, see the module-level documentation
 /// for more details.
 pub trait Element: 'static + IntoElement {
@@ -69,7 +69,7 @@ pub trait Element: 'static + IntoElement {
     fn source_location(&self) -> Option<&'static panic::Location<'static>>;
 
     /// Before an element can be painted, we need to know where it's going to be and how big it is.
-    /// Use this method to request a layout from Taffy and initialize the element's state.
+    /// Use this method to request a layout from GPUI and initialize the element's state.
     fn request_layout(
         &mut self,
         id: Option<&GlobalElementId>,
@@ -338,6 +338,7 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     },
     LayoutComputed {
         layout_id: LayoutId,
+        retained_root_id: RetainedLayoutRootId,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         available_space: Size<AvailableSpace>,
@@ -518,9 +519,15 @@ impl<E: Element> Drawable<E> {
                 inspector_id,
                 request_layout,
             } => {
-                window.compute_layout(layout_id, available_space, cx);
+                let retained_root_id = window.compute_layout_as_root(
+                    layout_id,
+                    global_id.as_ref(),
+                    available_space,
+                    cx,
+                );
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
+                    retained_root_id,
                     global_id,
                     inspector_id,
                     available_space,
@@ -530,16 +537,18 @@ impl<E: Element> Drawable<E> {
             }
             ElementDrawPhase::LayoutComputed {
                 layout_id,
+                retained_root_id,
                 global_id,
                 inspector_id,
                 available_space: prev_available_space,
                 request_layout,
             } => {
                 if available_space != prev_available_space {
-                    window.compute_layout(layout_id, available_space, cx);
+                    window.compute_layout_in_root(layout_id, retained_root_id, available_space, cx);
                 }
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
+                    retained_root_id,
                     global_id,
                     inspector_id,
                     available_space,

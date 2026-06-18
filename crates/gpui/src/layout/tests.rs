@@ -1,0 +1,115 @@
+use super::*;
+use crate::{AbsoluteLength, AppContext as _, DefiniteLength, Length, size};
+use std::{cell::Cell, ops::Deref as _, rc::Rc, time::Duration};
+
+#[test]
+fn layout_work_sample_counts_requests_and_finish_frame_resets() {
+    let mut engine = LayoutEngine::new();
+    let first_child = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+    let second_child = engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+    engine.request_layout(
+        Style::default(),
+        Pixels(16.0),
+        1.0,
+        &[first_child, second_child],
+    );
+
+    let expected_sample = LayoutWorkSample {
+        draw_index: 0,
+        layout_node_requests: 3,
+        measured_layout_node_requests: 0,
+        child_edges: 2,
+        compute_layout_calls: 0,
+        measured_layout_calls: 0,
+        compute_layout_duration: Duration::default(),
+        measured_layout_duration: Duration::default(),
+        ..LayoutWorkSample::default()
+    };
+    assert_eq!(engine.layout_work_sample(), expected_sample);
+    assert_eq!(engine.finish_frame(), expected_sample);
+    assert_eq!(engine.layout_work_sample(), LayoutWorkSample::default());
+}
+
+#[test]
+fn layout_work_sample_counts_compute_and_measure() {
+    let measure_invocations = Rc::new(Cell::new(0));
+    let measure_invocations_for_closure = measure_invocations.clone();
+    let mut test_app = crate::TestAppContext::single();
+    let window = test_app.add_window(|_, _| crate::Empty);
+
+    let sample = test_app
+        .update_window(*window.deref(), |_, window, cx| {
+            let mut engine = LayoutEngine::new();
+            let measured_layout = engine.request_measured_layout(
+                Style::default(),
+                Pixels(16.0),
+                1.0,
+                move |_, _, _, _| {
+                    measure_invocations_for_closure.set(measure_invocations_for_closure.get() + 1);
+                    std::thread::sleep(Duration::from_micros(1));
+                    size(Pixels(10.0), Pixels(20.0))
+                },
+            );
+
+            engine.compute_layout(
+                measured_layout,
+                size(
+                    AvailableSpace::Definite(Pixels(100.0)),
+                    AvailableSpace::Definite(Pixels(100.0)),
+                ),
+                window,
+                cx,
+            );
+            engine.finish_frame()
+        })
+        .unwrap();
+
+    assert_eq!(
+        sample,
+        LayoutWorkSample {
+            draw_index: 0,
+            layout_node_requests: 0,
+            measured_layout_node_requests: 1,
+            child_edges: 0,
+            compute_layout_calls: 1,
+            measured_layout_calls: 1,
+            compute_layout_duration: sample.compute_layout_duration,
+            measured_layout_duration: sample.measured_layout_duration,
+            retained_layout_creates: 1,
+            retained_layout_miss_no_previous: 1,
+            ..LayoutWorkSample::default()
+        }
+    );
+    assert_eq!(measure_invocations.get(), 1);
+    assert!(sample.compute_layout_duration >= sample.measured_layout_duration);
+    assert!(sample.measured_layout_duration > Duration::default());
+}
+
+#[test]
+fn layout_work_sample_reports_retained_layout_miss_reasons() {
+    let request_leaf = |engine: &mut LayoutEngine, width| {
+        let mut style = Style::default();
+        style.size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(
+            Pixels(width),
+        )));
+        engine.request_layout(style, Pixels(16.0), 1.0, &[])
+    };
+
+    let mut engine = LayoutEngine::new();
+    let root = request_leaf(&mut engine, 10.0);
+    engine.commit_layout(root);
+    engine.finish_frame();
+
+    let root = request_leaf(&mut engine, 20.0);
+    engine.commit_layout(root);
+
+    assert_eq!(
+        engine.finish_frame(),
+        LayoutWorkSample {
+            layout_node_requests: 1,
+            retained_layout_reuses: 1,
+            retained_layout_style_updates: 1,
+            ..LayoutWorkSample::default()
+        }
+    );
+}

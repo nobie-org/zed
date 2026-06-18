@@ -7,19 +7,19 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LayoutWorkSample, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    KeystrokeEvent, LayoutEngine, LayoutId, LayoutWorkSample, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    PaintGroup, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderGroupDrawObservation,
     RenderGroupDrawOutcome, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
     SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
+    TextLayoutArtifact, TextMeasureKey, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point,
     prelude::*,
     px, rems,
     scene::{LogicalVisualPlan, RenderGroupInput},
@@ -63,6 +63,7 @@ use uuid::Uuid;
 
 mod prompts;
 
+use crate::layout::{PureSizeMeasure, RetainedLayoutRootId};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -992,7 +993,7 @@ pub struct Window {
     /// a given rem size.
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
-    layout_engine: Option<TaffyLayoutEngine>,
+    layout_engine: Option<LayoutEngine>,
     last_layout_work_sample: Option<LayoutWorkSample>,
     last_render_group_draw_observation: Option<RenderGroupDrawObservation>,
     next_layout_work_draw_index: u64,
@@ -1649,7 +1650,7 @@ impl Window {
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
-            layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_engine: Some(LayoutEngine::new()),
             last_layout_work_sample: None,
             last_render_group_draw_observation: None,
             next_layout_work_draw_index: 0,
@@ -3450,6 +3451,14 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let layout_checkpoint = self
+            .layout_engine
+            .as_ref()
+            .expect(
+                "retryable prepaint transactions require an installed layout engine; \
+                 nested transactions during layout measurement cannot be rolled back",
+            )
+            .checkpoint();
         let result = f(self);
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
@@ -3466,6 +3475,13 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            self.layout_engine
+                .as_mut()
+                .expect(
+                    "retryable prepaint transactions require an installed layout engine; \
+                     nested transactions during layout measurement cannot be rolled back",
+                )
+                .rollback_to_checkpoint(layout_checkpoint);
         }
         result
     }
@@ -4339,6 +4355,83 @@ impl Window {
             .request_measured_layout(style, rem_size, scale_factor, measure)
     }
 
+    pub(crate) fn request_pure_measured_layout(
+        &mut self,
+        style: Style,
+        measure: PureSizeMeasure,
+    ) -> LayoutId {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_pure_measured_layout(style, rem_size, scale_factor, measure)
+    }
+
+    /// Add a pure measured node whose intrinsic size is completely described by
+    /// `content_size`.
+    ///
+    /// Unlike [`Window::request_measured_layout`], this does not install an
+    /// opaque callback as part of the layout meaning. The layout engine still
+    /// supplies known dimensions and available space at measurement time, but
+    /// the measurement can be retained across frames because GPUI can compare
+    /// the explicit `content_size` input.
+    pub fn request_content_size_measured_layout(
+        &mut self,
+        style: Style,
+        content_size: Size<Pixels>,
+    ) -> LayoutId {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_pure_measured_layout(
+                style,
+                rem_size,
+                scale_factor,
+                PureSizeMeasure::content_size(content_size, scale_factor),
+            )
+    }
+
+    pub(crate) fn request_text_measured_layout<F, H>(
+        &mut self,
+        style: Style,
+        measure_key: TextMeasureKey,
+        hydrate: H,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: FnMut(
+                Size<Option<Pixels>>,
+                Size<AvailableSpace>,
+                &mut Window,
+                &mut App,
+            ) -> TextLayoutArtifact
+            + 'static,
+        H: Fn(&TextLayoutArtifact) + 'static,
+    {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_text_measured_layout(
+                style,
+                rem_size,
+                scale_factor,
+                measure_key,
+                hydrate,
+                measure,
+            )
+    }
+
     /// Compute the layout for the given id within the given available space.
     /// This method is called for its side effect, typically by the framework prior to painting.
     /// After calling it, you can request the bounds of the given layout node id or any descendant.
@@ -4350,10 +4443,36 @@ impl Window {
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) {
+        self.compute_layout_as_root(layout_id, None, available_space, cx);
+    }
+
+    pub(crate) fn compute_layout_as_root(
+        &mut self,
+        layout_id: LayoutId,
+        global_id: Option<&GlobalElementId>,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> RetainedLayoutRootId {
+        let retained_root_id = self
+            .layout_engine
+            .as_mut()
+            .unwrap()
+            .retained_root_id(global_id, &self.element_id_stack);
+        self.compute_layout_in_root(layout_id, retained_root_id, available_space, cx);
+        retained_root_id
+    }
+
+    pub(crate) fn compute_layout_in_root(
+        &mut self,
+        layout_id: LayoutId,
+        root_id: RetainedLayoutRootId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) {
         self.invalidator.debug_assert_prepaint();
 
         let mut layout_engine = self.layout_engine.take().unwrap();
-        layout_engine.compute_layout(layout_id, available_space, self, cx);
+        layout_engine.compute_retained_layout(layout_id, root_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
     }
 

@@ -8,7 +8,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
     IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, px, size,
+    StyleRefinement, Styled, Window, layout::PureSizeMeasure, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -289,26 +289,13 @@ impl Element for UniformList {
             |style, window, cx| match self.sizing_behavior {
                 ListSizingBehavior::Infer => {
                     window.with_text_style(style.text_style().cloned(), |window| {
-                        window.request_measured_layout(
+                        window.request_pure_measured_layout(
                             style,
-                            move |known_dimensions, available_space, _window, _cx| {
-                                let desired_height = item_size.height * max_items;
-                                let width = known_dimensions.width.unwrap_or(match available_space
-                                    .width
-                                {
-                                    AvailableSpace::Definite(x) => x,
-                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                        item_size.width
-                                    }
-                                });
-                                let height = match available_space.height {
-                                    AvailableSpace::Definite(height) => desired_height.min(height),
-                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                        desired_height
-                                    }
-                                };
-                                size(width, height)
-                            },
+                            PureSizeMeasure::uniform_list(
+                                item_size,
+                                max_items,
+                                window.scale_factor(),
+                            ),
                         )
                     })
                 }

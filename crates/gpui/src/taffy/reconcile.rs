@@ -19,6 +19,7 @@ pub(super) type NodeMeasureFn = StackSafe<
     >,
 >;
 
+#[derive(Clone)]
 pub(super) struct NodeContext;
 
 type TextHydrator = Rc<dyn Fn(&TextLayoutArtifact)>;
@@ -149,13 +150,13 @@ impl MeasuredLayoutKind {
     }
 }
 
+#[derive(Clone)]
 pub(super) enum CurrentMeasurement {
-    Opaque(NodeMeasureFn),
+    Opaque(usize),
     PureSize(PureSizeMeasure),
     Text {
         key: TextMeasureKey,
-        measure: NodeMeasureFn,
-        hydrate: TextHydrator,
+        measure: usize,
         hydrated: bool,
     },
 }
@@ -194,7 +195,7 @@ enum LayoutCommitKind {
         children: Vec<LayoutId>,
     },
     Measured {
-        measure: Option<LayoutMeasureContext>,
+        measure: Option<usize>,
         measured_kind: MeasuredLayoutKind,
     },
 }
@@ -205,43 +206,48 @@ enum RetainedLayoutKind {
     Measured,
 }
 
+#[derive(Clone)]
 struct RetainedLayoutDescriptor {
     style: taffy::style::Style,
     kind: RetainedLayoutKind,
     measured_kind: Option<MeasuredLayoutKind>,
 }
 
+#[derive(Clone)]
 pub(super) struct RetainedLayoutNode {
     node_id: NodeId,
     descriptor: RetainedLayoutDescriptor,
     children: Vec<RetainedLayoutNode>,
 }
 
-struct CommitResult {
-    retained_node: RetainedLayoutNode,
-    replaced_previous: Option<RetainedLayoutNode>,
-}
-
-struct RetainedCandidate {
-    node_id: NodeId,
-    previous_descriptor: Option<RetainedLayoutDescriptor>,
-    previous_children: Vec<RetainedLayoutNode>,
-    replaced_previous: Option<RetainedLayoutNode>,
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct TaffyMutationCountsForTests {
-    creates: u64,
-    style_updates: u64,
-    children_updates: u64,
-    context_updates: u64,
-    removes: u64,
+    pub(super) creates: u64,
+    pub(super) context_clears: u64,
+    pub(super) removes: u64,
 }
 
 pub(super) struct ReconcileState {
     layout_descriptors: Vec<LayoutDescriptor>,
     layout_measure_contexts: Vec<Option<LayoutMeasureContext>>,
+    current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
+    pending_text_artifacts: FxHashMap<NodeId, VecDeque<TextLayoutArtifact>>,
+    text_cache_artifacts: FxHashMap<TextCacheArtifactKey, TextLayoutArtifact>,
+    text_final_artifacts: FxHashMap<TextFinalArtifactKey, TextLayoutArtifact>,
+    committed_layout_nodes: FxHashMap<LayoutId, NodeId>,
+    #[cfg(any(test, debug_assertions))]
+    committed_taffy_nodes: FxHashSet<NodeId>,
+    retained_roots: Vec<Option<RetainedLayoutNode>>,
+    current_roots: Vec<RetainedLayoutNode>,
+    root_commit_index: usize,
+    #[cfg(test)]
+    taffy_mutation_counts_for_tests: TaffyMutationCountsForTests,
+}
+
+pub(super) struct ReconcileCheckpoint {
+    layout_descriptors_len: usize,
+    layout_measure_contexts_len: usize,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
     pending_text_artifacts: FxHashMap<NodeId, VecDeque<TextLayoutArtifact>>,
     text_cache_artifacts: FxHashMap<TextCacheArtifactKey, TextLayoutArtifact>,
@@ -279,6 +285,48 @@ impl ReconcileState {
     pub(super) fn begin_frame(&mut self) {
         self.current_measurements.clear();
         self.pending_text_artifacts.clear();
+    }
+
+    pub(super) fn checkpoint(&self) -> ReconcileCheckpoint {
+        ReconcileCheckpoint {
+            layout_descriptors_len: self.layout_descriptors.len(),
+            layout_measure_contexts_len: self.layout_measure_contexts.len(),
+            current_measurements: self.current_measurements.clone(),
+            pending_text_artifacts: self.pending_text_artifacts.clone(),
+            text_cache_artifacts: self.text_cache_artifacts.clone(),
+            text_final_artifacts: self.text_final_artifacts.clone(),
+            committed_layout_nodes: self.committed_layout_nodes.clone(),
+            #[cfg(any(test, debug_assertions))]
+            committed_taffy_nodes: self.committed_taffy_nodes.clone(),
+            retained_roots: self.retained_roots.clone(),
+            current_roots: self.current_roots.clone(),
+            root_commit_index: self.root_commit_index,
+            #[cfg(test)]
+            taffy_mutation_counts_for_tests: self.taffy_mutation_counts_for_tests,
+        }
+    }
+
+    pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: ReconcileCheckpoint) {
+        self.layout_descriptors
+            .truncate(checkpoint.layout_descriptors_len);
+        self.layout_measure_contexts
+            .truncate(checkpoint.layout_measure_contexts_len);
+        self.current_measurements = checkpoint.current_measurements;
+        self.pending_text_artifacts = checkpoint.pending_text_artifacts;
+        self.text_cache_artifacts = checkpoint.text_cache_artifacts;
+        self.text_final_artifacts = checkpoint.text_final_artifacts;
+        self.committed_layout_nodes = checkpoint.committed_layout_nodes;
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.committed_taffy_nodes = checkpoint.committed_taffy_nodes;
+        }
+        self.retained_roots = checkpoint.retained_roots;
+        self.current_roots = checkpoint.current_roots;
+        self.root_commit_index = checkpoint.root_commit_index;
+        #[cfg(test)]
+        {
+            self.taffy_mutation_counts_for_tests = checkpoint.taffy_mutation_counts_for_tests;
+        }
     }
 
     pub(super) fn finish_frame(&mut self, taffy: &mut TaffyTree<NodeContext>) {
@@ -346,6 +394,7 @@ impl ReconcileState {
 
     pub(super) fn begin_compute_measurements(&mut self) -> ComputeMeasurementState<'_> {
         ComputeMeasurementState {
+            layout_measure_contexts: &mut self.layout_measure_contexts,
             current_measurements: &mut self.current_measurements,
             pending_text_artifacts: &mut self.pending_text_artifacts,
             text_cache_artifacts: &mut self.text_cache_artifacts,
@@ -376,6 +425,7 @@ impl ReconcileState {
 }
 
 pub(super) struct ComputeMeasurementState<'a> {
+    layout_measure_contexts: &'a mut Vec<Option<LayoutMeasureContext>>,
     current_measurements: &'a mut FxHashMap<NodeId, CurrentMeasurement>,
     pending_text_artifacts: &'a mut FxHashMap<NodeId, VecDeque<TextLayoutArtifact>>,
     text_cache_artifacts: &'a mut FxHashMap<TextCacheArtifactKey, TextLayoutArtifact>,
@@ -401,12 +451,20 @@ impl ComputeMeasurementState<'_> {
 
         match current_measurement {
             CurrentMeasurement::Opaque(measure) => {
+                let measure = &mut self.layout_measure_contexts[*measure]
+                    .as_mut()
+                    .expect("opaque measured layout should have a current producer")
+                    .measure;
                 measure(known_dimensions, available_space, window, cx).size()
             }
             CurrentMeasurement::PureSize(measure) => {
                 measure.measure(known_dimensions, available_space)
             }
             CurrentMeasurement::Text { key, measure, .. } => {
+                let measure = &mut self.layout_measure_contexts[*measure]
+                    .as_mut()
+                    .expect("text measured layout should have a current producer and hydrator")
+                    .measure;
                 let artifact = match measure(known_dimensions, available_space, window, cx) {
                     MeasuredLayoutResult::Text(artifact) => artifact,
                     MeasuredLayoutResult::Size(_) => {
@@ -542,9 +600,8 @@ impl ComputeMeasurementState<'_> {
     fn hydrate_text_node(&mut self, node_id: NodeId, artifact: &TextLayoutArtifact) {
         let Some(CurrentMeasurement::Text {
             key,
-            hydrate,
+            measure,
             hydrated,
-            ..
         }) = self.current_measurements.get_mut(&node_id)
         else {
             return;
@@ -555,6 +612,11 @@ impl ComputeMeasurementState<'_> {
             "hydrated text artifact should match the current text measure key"
         );
         *hydrated = true;
+        let hydrate = self.layout_measure_contexts[*measure]
+            .as_ref()
+            .and_then(|measure| measure.text_hydrator.as_ref())
+            .cloned()
+            .expect("text measured layout should have a hydrator");
         hydrate(artifact);
     }
 }
@@ -575,14 +637,7 @@ impl ReconcileState {
             .and_then(Option::take);
         self.root_commit_index += 1;
 
-        let CommitResult {
-            retained_node,
-            replaced_previous,
-        } = self.commit_descriptor(taffy, id, retained_root);
-        if let Some(replaced_previous) = replaced_previous {
-            self.remove_retained_subtree(taffy, replaced_previous);
-        }
-
+        let retained_node = self.commit_descriptor(taffy, id, retained_root);
         let node_id = retained_node.node_id;
         self.current_roots.push(retained_node);
         #[cfg(any(test, debug_assertions))]
@@ -608,7 +663,29 @@ impl ReconcileState {
         taffy: &mut TaffyTree<NodeContext>,
         id: LayoutId,
         previous: Option<RetainedLayoutNode>,
-    ) -> CommitResult {
+    ) -> RetainedLayoutNode {
+        assert!(
+            !self.committed_layout_nodes.contains_key(&id),
+            "layout descriptor should appear only once in a committed layout tree"
+        );
+
+        if let Some(previous) = previous {
+            if self.descriptor_subtree_matches(id, &previous) {
+                self.commit_reused_descriptor(id, &previous);
+                return previous;
+            }
+
+            self.remove_retained_subtree(taffy, previous);
+        }
+
+        self.build_fresh_descriptor(taffy, id)
+    }
+
+    fn build_fresh_descriptor(
+        &mut self,
+        taffy: &mut TaffyTree<NodeContext>,
+        id: LayoutId,
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed_layout_nodes.contains_key(&id),
             "layout descriptor should appear only once in a committed layout tree"
@@ -624,112 +701,127 @@ impl ReconcileState {
                 measure,
                 measured_kind,
             } => LayoutCommitKind::Measured {
-                measure: measure.map(|measure| {
-                    self.layout_measure_contexts[measure]
-                        .take()
-                        .expect("measured layout descriptor should be committed only once")
-                }),
+                measure,
                 measured_kind,
             },
         };
 
         match kind {
             LayoutCommitKind::Unmeasured { children } => {
-                let candidate = self.node_for_descriptor(
-                    taffy,
-                    previous,
-                    RetainedLayoutKind::Unmeasured,
-                    &style,
-                );
-                self.apply_style_diff(
-                    taffy,
-                    candidate.node_id,
-                    candidate.previous_descriptor.as_ref(),
-                    &style,
-                );
-
-                let previous_child_node_ids = candidate
-                    .previous_children
-                    .iter()
-                    .map(|child| child.node_id)
-                    .collect::<Vec<_>>();
-                let mut previous_children = candidate.previous_children.into_iter();
                 let mut retained_children = Vec::with_capacity(children.len());
                 let mut child_node_ids = Vec::with_capacity(children.len());
-                let mut detached_subtrees = Vec::new();
                 for child in children {
-                    let committed_child =
-                        self.commit_descriptor(taffy, child, previous_children.next());
-                    child_node_ids.push(committed_child.retained_node.node_id);
-                    retained_children.push(committed_child.retained_node);
-                    if let Some(replaced_previous) = committed_child.replaced_previous {
-                        detached_subtrees.push(replaced_previous);
-                    }
-                }
-                for unused_child in previous_children {
-                    detached_subtrees.push(unused_child);
+                    let retained_child = self.build_fresh_descriptor(taffy, child);
+                    child_node_ids.push(retained_child.node_id);
+                    retained_children.push(retained_child);
                 }
 
-                self.apply_children_diff(
-                    taffy,
-                    candidate.node_id,
-                    &previous_child_node_ids,
-                    &child_node_ids,
-                );
-                for detached_subtree in detached_subtrees {
-                    self.remove_retained_subtree(taffy, detached_subtree);
+                let node_id = if child_node_ids.is_empty() {
+                    taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE)
+                } else {
+                    taffy
+                        .new_with_children(style.clone(), &child_node_ids)
+                        .expect(EXPECT_MESSAGE)
+                };
+                #[cfg(test)]
+                {
+                    self.taffy_mutation_counts_for_tests.creates += 1;
                 }
-
-                self.committed_layout_nodes.insert(id, candidate.node_id);
-                CommitResult {
-                    retained_node: RetainedLayoutNode {
-                        node_id: candidate.node_id,
-                        descriptor: RetainedLayoutDescriptor {
-                            style,
-                            kind: RetainedLayoutKind::Unmeasured,
-                            measured_kind: None,
-                        },
-                        children: retained_children,
+                self.committed_layout_nodes.insert(id, node_id);
+                RetainedLayoutNode {
+                    node_id,
+                    descriptor: RetainedLayoutDescriptor {
+                        style,
+                        kind: RetainedLayoutKind::Unmeasured,
+                        measured_kind: None,
                     },
-                    replaced_previous: candidate.replaced_previous,
+                    children: retained_children,
                 }
             }
             LayoutCommitKind::Measured {
                 measure,
                 measured_kind,
             } => {
-                let candidate =
-                    self.node_for_descriptor(taffy, previous, RetainedLayoutKind::Measured, &style);
-                let style_changed = self.apply_style_diff(
-                    taffy,
-                    candidate.node_id,
-                    candidate.previous_descriptor.as_ref(),
-                    &style,
-                );
-                self.apply_measured_diff(
-                    taffy,
-                    candidate.node_id,
-                    candidate.previous_descriptor.as_ref(),
-                    &measured_kind,
-                    style_changed,
-                );
+                let node_id = taffy
+                    .new_leaf_with_context(style.clone(), NodeContext)
+                    .expect(EXPECT_MESSAGE);
+                #[cfg(test)]
+                {
+                    self.taffy_mutation_counts_for_tests.creates += 1;
+                }
                 self.current_measurements.insert(
-                    candidate.node_id,
+                    node_id,
                     Self::current_measurement(measured_kind.clone(), measure),
                 );
-                self.committed_layout_nodes.insert(id, candidate.node_id);
-                CommitResult {
-                    retained_node: RetainedLayoutNode {
-                        node_id: candidate.node_id,
-                        descriptor: RetainedLayoutDescriptor {
-                            style,
-                            kind: RetainedLayoutKind::Measured,
-                            measured_kind: Some(measured_kind),
-                        },
-                        children: Vec::new(),
+                self.committed_layout_nodes.insert(id, node_id);
+                RetainedLayoutNode {
+                    node_id,
+                    descriptor: RetainedLayoutDescriptor {
+                        style,
+                        kind: RetainedLayoutKind::Measured,
+                        measured_kind: Some(measured_kind),
                     },
-                    replaced_previous: candidate.replaced_previous,
+                    children: Vec::new(),
                 }
+            }
+        }
+    }
+
+    fn commit_reused_descriptor(&mut self, id: LayoutId, retained_node: &RetainedLayoutNode) {
+        assert!(
+            !self.committed_layout_nodes.contains_key(&id),
+            "layout descriptor should appear only once in a committed layout tree"
+        );
+
+        self.committed_layout_nodes
+            .insert(id, retained_node.node_id);
+
+        match self.descriptor(id).kind.clone() {
+            LayoutDescriptorKind::Unmeasured { children } => {
+                debug_assert_eq!(children.len(), retained_node.children.len());
+                for (child, retained_child) in children.iter().zip(&retained_node.children) {
+                    self.commit_reused_descriptor(*child, retained_child);
+                }
+            }
+            LayoutDescriptorKind::Measured {
+                measure,
+                measured_kind,
+            } => {
+                self.current_measurements.insert(
+                    retained_node.node_id,
+                    Self::current_measurement(measured_kind, measure),
+                );
+            }
+        }
+    }
+
+    fn descriptor_subtree_matches(&self, id: LayoutId, retained_node: &RetainedLayoutNode) -> bool {
+        let descriptor = self.descriptor(id);
+        if descriptor.style != retained_node.descriptor.style {
+            return false;
+        }
+
+        match &descriptor.kind {
+            LayoutDescriptorKind::Unmeasured { children } => {
+                if retained_node.descriptor.kind != RetainedLayoutKind::Unmeasured
+                    || retained_node.descriptor.measured_kind.is_some()
+                    || children.len() != retained_node.children.len()
+                {
+                    return false;
+                }
+
+                children
+                    .iter()
+                    .zip(&retained_node.children)
+                    .all(|(child, retained_child)| {
+                        self.descriptor_subtree_matches(*child, retained_child)
+                    })
+            }
+            LayoutDescriptorKind::Measured { measured_kind, .. } => {
+                !measured_kind.is_opaque()
+                    && retained_node.descriptor.kind == RetainedLayoutKind::Measured
+                    && retained_node.children.is_empty()
+                    && retained_node.descriptor.measured_kind.as_ref() == Some(measured_kind)
             }
         }
     }
@@ -809,143 +901,21 @@ impl ReconcileState {
         }
     }
 
-    fn node_for_descriptor(
-        &mut self,
-        taffy: &mut TaffyTree<NodeContext>,
-        previous: Option<RetainedLayoutNode>,
-        kind: RetainedLayoutKind,
-        style: &taffy::style::Style,
-    ) -> RetainedCandidate {
-        match previous {
-            Some(previous) if previous.descriptor.kind == kind => RetainedCandidate {
-                node_id: previous.node_id,
-                previous_descriptor: Some(previous.descriptor),
-                previous_children: previous.children,
-                replaced_previous: None,
-            },
-            Some(previous) => {
-                let node_id = taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE);
-                #[cfg(test)]
-                {
-                    self.taffy_mutation_counts_for_tests.creates += 1;
-                }
-                RetainedCandidate {
-                    node_id,
-                    previous_descriptor: None,
-                    previous_children: Vec::new(),
-                    replaced_previous: Some(previous),
-                }
-            }
-            None => {
-                let node_id = taffy.new_leaf(style.clone()).expect(EXPECT_MESSAGE);
-                #[cfg(test)]
-                {
-                    self.taffy_mutation_counts_for_tests.creates += 1;
-                }
-                RetainedCandidate {
-                    node_id,
-                    previous_descriptor: None,
-                    previous_children: Vec::new(),
-                    replaced_previous: None,
-                }
-            }
-        }
-    }
-
-    fn apply_style_diff(
-        &mut self,
-        taffy: &mut TaffyTree<NodeContext>,
-        node_id: NodeId,
-        previous: Option<&RetainedLayoutDescriptor>,
-        style: &taffy::style::Style,
-    ) -> bool {
-        if let Some(previous) = previous {
-            if previous.style != *style {
-                taffy
-                    .set_style(node_id, style.clone())
-                    .expect(EXPECT_MESSAGE);
-                #[cfg(test)]
-                {
-                    self.taffy_mutation_counts_for_tests.style_updates += 1;
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    fn apply_measured_diff(
-        &mut self,
-        taffy: &mut TaffyTree<NodeContext>,
-        node_id: NodeId,
-        previous: Option<&RetainedLayoutDescriptor>,
-        measured_kind: &MeasuredLayoutKind,
-        style_changed: bool,
-    ) {
-        if taffy.get_node_context(node_id).is_none() {
-            taffy
-                .set_node_context(node_id, Some(NodeContext))
-                .expect(EXPECT_MESSAGE);
-            #[cfg(test)]
-            {
-                self.taffy_mutation_counts_for_tests.context_updates += 1;
-            }
-            return;
-        }
-
-        let measured_kind_changed =
-            previous.and_then(|previous| previous.measured_kind.as_ref()) != Some(measured_kind);
-
-        if style_changed || measured_kind_changed {
-            self.remove_text_artifacts_for_node(node_id);
-        }
-
-        if measured_kind_changed {
-            taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
-        } else if measured_kind.is_opaque() && previous.is_some() && !style_changed {
-            taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
-        }
-    }
-
     fn current_measurement(
         measured_kind: MeasuredLayoutKind,
-        measure: Option<LayoutMeasureContext>,
+        measure: Option<usize>,
     ) -> CurrentMeasurement {
         match measured_kind {
             MeasuredLayoutKind::Opaque => CurrentMeasurement::Opaque(
-                measure
-                    .expect("opaque measured layout should have a current producer")
-                    .measure,
+                measure.expect("opaque measured layout should have a current producer"),
             ),
             MeasuredLayoutKind::PureSize(measure) => CurrentMeasurement::PureSize(measure),
-            MeasuredLayoutKind::Text(key) => {
-                let measure = measure
-                    .expect("text measured layout should have a current producer and hydrator");
-                CurrentMeasurement::Text {
-                    key,
-                    measure: measure.measure,
-                    hydrate: measure
-                        .text_hydrator
-                        .expect("text measured layout should have a hydrator"),
-                    hydrated: false,
-                }
-            }
-        }
-    }
-
-    fn apply_children_diff(
-        &mut self,
-        taffy: &mut TaffyTree<NodeContext>,
-        node_id: NodeId,
-        previous_children: &[NodeId],
-        children: &[NodeId],
-    ) {
-        if previous_children != children {
-            taffy.set_children(node_id, children).expect(EXPECT_MESSAGE);
-            #[cfg(test)]
-            {
-                self.taffy_mutation_counts_for_tests.children_updates += 1;
-            }
+            MeasuredLayoutKind::Text(key) => CurrentMeasurement::Text {
+                key,
+                measure: measure
+                    .expect("text measured layout should have a current producer and hydrator"),
+                hydrated: false,
+            },
         }
     }
 
@@ -964,7 +934,7 @@ impl ReconcileState {
                 .expect(EXPECT_MESSAGE);
             #[cfg(test)]
             {
-                self.taffy_mutation_counts_for_tests.context_updates += 1;
+                self.taffy_mutation_counts_for_tests.context_clears += 1;
             }
         }
         taffy.remove(retained_node.node_id).expect(EXPECT_MESSAGE);

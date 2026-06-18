@@ -22,7 +22,8 @@ pub(crate) use reconcile::PureSizeMeasure;
 #[cfg(test)]
 use reconcile::TaffyMutationCountsForTests;
 use reconcile::{
-    LayoutMeasureContext, MeasuredLayoutKind, MeasuredLayoutResult, NodeContext, ReconcileState,
+    LayoutMeasureContext, MeasuredLayoutKind, MeasuredLayoutResult, NodeContext,
+    ReconcileCheckpoint, ReconcileState,
 };
 
 /// Layout work performed by GPUI for one completed window draw.
@@ -52,6 +53,16 @@ pub struct TaffyLayoutEngine {
     reconcile: ReconcileState,
     absolute_layout_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
+    absolute_outer_origins: FxHashMap<NodeId, Point<f32>>,
+    computed_layouts: FxHashSet<NodeId>,
+    layout_bounds_scratch_space: Vec<NodeId>,
+    layout_work: LayoutWorkSample,
+}
+
+pub(crate) struct TaffyLayoutCheckpoint {
+    taffy: TaffyTree<NodeContext>,
+    reconcile: ReconcileCheckpoint,
+    absolute_layout_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     absolute_outer_origins: FxHashMap<NodeId, Point<f32>>,
     computed_layouts: FxHashSet<NodeId>,
     layout_bounds_scratch_space: Vec<NodeId>,
@@ -88,6 +99,28 @@ impl TaffyLayoutEngine {
     pub fn begin_frame(&mut self) {
         self.layout_work = LayoutWorkSample::default();
         self.reconcile.begin_frame();
+    }
+
+    pub(crate) fn checkpoint(&self) -> TaffyLayoutCheckpoint {
+        TaffyLayoutCheckpoint {
+            taffy: self.taffy.clone(),
+            reconcile: self.reconcile.checkpoint(),
+            absolute_layout_bounds: self.absolute_layout_bounds.clone(),
+            absolute_outer_origins: self.absolute_outer_origins.clone(),
+            computed_layouts: self.computed_layouts.clone(),
+            layout_bounds_scratch_space: self.layout_bounds_scratch_space.clone(),
+            layout_work: self.layout_work,
+        }
+    }
+
+    pub(crate) fn rollback_to_checkpoint(&mut self, checkpoint: TaffyLayoutCheckpoint) {
+        self.taffy = checkpoint.taffy;
+        self.reconcile.rollback_to_checkpoint(checkpoint.reconcile);
+        self.absolute_layout_bounds = checkpoint.absolute_layout_bounds;
+        self.absolute_outer_origins = checkpoint.absolute_outer_origins;
+        self.computed_layouts = checkpoint.computed_layouts;
+        self.layout_bounds_scratch_space = checkpoint.layout_bounds_scratch_space;
+        self.layout_work = checkpoint.layout_work;
     }
 
     #[cfg(test)]
@@ -478,7 +511,8 @@ mod retained_layout_tests {
     use super::*;
     use crate::{
         AbsoluteLength, DefiniteLength, Display, FlexDirection, IntoElement, Length,
-        ParentElement as _, SharedString, Styled as _, TestAppContext, TextStyle, div, point, px,
+        ParentElement as _, SharedString, Styled as _, TestAppContext, TextOverflow, TextStyle,
+        WhiteSpace, div, point, px,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -566,16 +600,29 @@ mod retained_layout_tests {
     }
 
     fn text_measure_key(text: &'static str) -> TextMeasureKey {
+        text_measure_key_with(text, |_| {}, px(16.0), px(20.0), 1.0, 0)
+    }
+
+    fn text_measure_key_with(
+        text: &'static str,
+        configure_style: impl FnOnce(&mut TextStyle),
+        font_size: Pixels,
+        line_height: Pixels,
+        scale_factor: f32,
+        shaping_epoch: u64,
+    ) -> TextMeasureKey {
         let text_style = TextStyle::default();
+        let mut text_style = text_style;
+        configure_style(&mut text_style);
         let text = SharedString::new_static(text);
         TextMeasureKey::new(
             text.clone(),
             vec![text_style.to_run(text.len())],
             &text_style,
-            px(16.0),
-            px(20.0),
-            1.0,
-            0,
+            font_size,
+            line_height,
+            scale_factor,
+            shaping_epoch,
         )
     }
 
@@ -752,6 +799,92 @@ mod retained_layout_tests {
     }
 
     #[test]
+    fn changed_descriptor_subtree_is_rebuilt_instead_of_sparsely_mutated() {
+        let mut engine = TaffyLayoutEngine::new();
+        let first_root = request_row(&mut engine, &[10.0, 20.0]);
+        let first_root_node = engine.commit_layout(first_root);
+        let first_child_nodes = engine
+            .taffy
+            .children(first_root_node)
+            .expect(EXPECT_MESSAGE);
+        engine.finish_frame();
+
+        engine.reset_taffy_mutation_counts_for_tests();
+        let second_root = request_row(&mut engine, &[10.0, 30.0]);
+        let second_root_node = engine.commit_layout(second_root);
+        assert_descriptor_committed_exactly(&engine, second_root);
+        let second_child_nodes = engine
+            .taffy
+            .children(second_root_node)
+            .expect(EXPECT_MESSAGE);
+
+        assert_eq!(
+            engine.taffy_mutation_counts_for_tests(),
+            TaffyMutationCountsForTests {
+                creates: 3,
+                context_clears: 0,
+                removes: 3,
+            }
+        );
+        assert_ne!(second_root_node, first_root_node);
+        assert_ne!(second_child_nodes, first_child_nodes);
+
+        let mut fresh = TaffyLayoutEngine::new();
+        let fresh_root = request_row(&mut fresh, &[10.0, 30.0]);
+        let fresh_root_node = fresh.commit_layout(fresh_root);
+        assert_eq!(
+            taffy_shape(&engine, second_root_node),
+            taffy_shape(&fresh, fresh_root_node)
+        );
+    }
+
+    #[test]
+    fn rollback_discards_failed_transaction_root_slots() {
+        let mut engine = TaffyLayoutEngine::new();
+        let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);
+        engine.commit_layout(root);
+        engine.finish_frame();
+
+        let checkpoint = engine.checkpoint();
+        let transient_root = request_measured(&mut engine, 5.0);
+        engine.commit_layout(transient_root);
+        engine.rollback_to_checkpoint(checkpoint);
+
+        let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);
+        engine.commit_layout(root);
+        engine.finish_frame();
+
+        engine.reset_taffy_mutation_counts_for_tests();
+        let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);
+        engine.commit_layout(root);
+        engine.finish_frame();
+
+        assert_eq!(
+            engine.taffy_mutation_counts_for_tests(),
+            TaffyMutationCountsForTests::default()
+        );
+    }
+
+    #[test]
+    fn rollback_preserves_precheckpoint_measured_producer_for_retry() {
+        let mut engine = TaffyLayoutEngine::new();
+        let drops = Rc::new(Cell::new(0));
+        let measured = request_counted_measured(&mut engine, drops.clone());
+
+        let checkpoint = engine.checkpoint();
+        let transient_node = engine.commit_layout(measured);
+        assert!(engine.taffy.get_node_context(transient_node).is_some());
+        engine.rollback_to_checkpoint(checkpoint);
+
+        assert_eq!(drops.get(), 0);
+        let retried_node = engine.commit_layout(measured);
+        assert!(engine.taffy.get_node_context(retried_node).is_some());
+        engine.finish_frame();
+
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
     fn retained_commit_matches_fresh_commit_for_frame_sequence_gallery() {
         let frames: &[&[f32]] = &[
             &[],
@@ -896,6 +1029,29 @@ mod retained_layout_tests {
         assert!(engine.taffy.get_node_context(leaf_node).is_none());
     }
 
+    #[test]
+    fn unchanged_opaque_measured_node_is_rebuilt_instead_of_reused() {
+        let mut engine = TaffyLayoutEngine::new();
+        let measured = request_auto_measured(&mut engine, 10.0);
+        let first_node = engine.commit_layout(measured);
+        engine.finish_frame();
+
+        engine.reset_taffy_mutation_counts_for_tests();
+        let measured = request_auto_measured(&mut engine, 10.0);
+        let second_node = engine.commit_layout(measured);
+        assert_descriptor_committed_exactly(&engine, measured);
+
+        assert_ne!(second_node, first_node);
+        assert_eq!(
+            engine.taffy_mutation_counts_for_tests(),
+            TaffyMutationCountsForTests {
+                creates: 1,
+                context_clears: 1,
+                removes: 1,
+            }
+        );
+    }
+
     #[gpui::test]
     fn retained_measured_node_recomputes_when_measure_result_changes(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
@@ -1033,6 +1189,61 @@ mod retained_layout_tests {
     }
 
     #[gpui::test]
+    fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let key = text_measure_key("hello");
+        let measure_invocations = Rc::new(Cell::new(0));
+        let hydrations = Rc::new(Cell::new(0));
+        let mut engine = TaffyLayoutEngine::new();
+
+        let root = request_text_measured(
+            &mut engine,
+            key.clone(),
+            size(px(40.0), px(20.0)),
+            measure_invocations.clone(),
+            hydrations.clone(),
+        );
+        cx.update(|window, app| {
+            engine.compute_layout(
+                root,
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                window,
+                app,
+            );
+        });
+        engine.finish_frame();
+
+        let root = request_text_measured(
+            &mut engine,
+            key,
+            size(px(40.0), px(20.0)),
+            measure_invocations.clone(),
+            hydrations.clone(),
+        );
+        let checkpoint = engine.checkpoint();
+        cx.update(|window, app| {
+            engine.compute_layout(
+                root,
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                window,
+                app,
+            );
+        });
+        engine.rollback_to_checkpoint(checkpoint);
+        cx.update(|window, app| {
+            engine.compute_layout(
+                root,
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                window,
+                app,
+            );
+        });
+
+        assert_eq!((measure_invocations.get(), hydrations.get()), (1, 3));
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    }
+
+    #[gpui::test]
     fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         let first_key = text_measure_key("hello");
@@ -1060,6 +1271,7 @@ mod retained_layout_tests {
         });
         engine.finish_frame();
 
+        engine.reset_taffy_mutation_counts_for_tests();
         let root = request_text_measured_with_hydration_log(
             &mut engine,
             second_key.clone(),
@@ -1080,6 +1292,14 @@ mod retained_layout_tests {
         assert_eq!((measure_invocations.get(), hydrations.get()), (2, 2));
         assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
         assert_eq!(
+            engine.taffy_mutation_counts_for_tests(),
+            TaffyMutationCountsForTests {
+                creates: 1,
+                context_clears: 1,
+                removes: 1,
+            }
+        );
+        assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
                 HydratedTextArtifact {
@@ -1090,6 +1310,129 @@ mod retained_layout_tests {
                     key: second_key,
                     size: size(px(60.0), px(20.0)),
                 },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn changed_text_measure_key_layout_facts_remeasure(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let first_key = text_measure_key("hello");
+        let cases = [
+            (
+                "font-size",
+                text_measure_key_with("hello", |_| {}, px(18.0), px(20.0), 1.0, 0),
+            ),
+            (
+                "line-height",
+                text_measure_key_with("hello", |_| {}, px(16.0), px(24.0), 1.0, 0),
+            ),
+            (
+                "white-space",
+                text_measure_key_with(
+                    "hello",
+                    |style| style.white_space = WhiteSpace::Nowrap,
+                    px(16.0),
+                    px(20.0),
+                    1.0,
+                    0,
+                ),
+            ),
+            (
+                "text-overflow",
+                text_measure_key_with(
+                    "hello",
+                    |style| {
+                        style.text_overflow =
+                            Some(TextOverflow::Truncate(SharedString::new_static("...")));
+                    },
+                    px(16.0),
+                    px(20.0),
+                    1.0,
+                    0,
+                ),
+            ),
+            (
+                "line-clamp",
+                text_measure_key_with(
+                    "hello",
+                    |style| style.line_clamp = Some(1),
+                    px(16.0),
+                    px(20.0),
+                    1.0,
+                    0,
+                ),
+            ),
+            (
+                "scale-factor",
+                text_measure_key_with("hello", |_| {}, px(16.0), px(20.0), 2.0, 0),
+            ),
+            (
+                "shaping-epoch",
+                text_measure_key_with("hello", |_| {}, px(16.0), px(20.0), 1.0, 1),
+            ),
+        ];
+        let mut actual = Vec::new();
+
+        for (name, second_key) in cases {
+            let measure_invocations = Rc::new(Cell::new(0));
+            let hydrations = Rc::new(Cell::new(0));
+            let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+            let mut engine = TaffyLayoutEngine::new();
+
+            let root = request_text_measured_with_hydration_log(
+                &mut engine,
+                first_key.clone(),
+                size(px(40.0), px(20.0)),
+                measure_invocations.clone(),
+                hydrations.clone(),
+                Some(hydrated_artifacts.clone()),
+            );
+            cx.update(|window, app| {
+                engine.compute_layout(
+                    root,
+                    size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                    window,
+                    app,
+                );
+            });
+            engine.finish_frame();
+
+            let root = request_text_measured_with_hydration_log(
+                &mut engine,
+                second_key,
+                size(px(60.0), px(24.0)),
+                measure_invocations.clone(),
+                hydrations.clone(),
+                Some(hydrated_artifacts),
+            );
+            cx.update(|window, app| {
+                engine.compute_layout(
+                    root,
+                    size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                    window,
+                    app,
+                );
+            });
+
+            actual.push((
+                name,
+                measure_invocations.get(),
+                hydrations.get(),
+                engine.layout_work_sample().measured_layout_calls,
+            ));
+        }
+
+        assert_eq!(
+            actual,
+            vec![
+                ("font-size", 2, 2, 1),
+                ("line-height", 2, 2, 1),
+                ("white-space", 2, 2, 1),
+                ("text-overflow", 2, 2, 1),
+                ("line-clamp", 2, 2, 1),
+                ("scale-factor", 2, 2, 1),
+                ("shaping-epoch", 2, 2, 1),
             ]
         );
     }

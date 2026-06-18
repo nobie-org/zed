@@ -3439,6 +3439,14 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let layout_checkpoint = self
+            .layout_engine
+            .as_ref()
+            .expect(
+                "retryable prepaint transactions require an installed layout engine; \
+                 nested transactions during layout measurement cannot be rolled back",
+            )
+            .checkpoint();
         let result = f(self);
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
@@ -3455,6 +3463,13 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            self.layout_engine
+                .as_mut()
+                .expect(
+                    "retryable prepaint transactions require an installed layout engine; \
+                     nested transactions during layout measurement cannot be rolled back",
+                )
+                .rollback_to_checkpoint(layout_checkpoint);
         }
         result
     }

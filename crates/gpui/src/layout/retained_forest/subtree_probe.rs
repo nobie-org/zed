@@ -29,6 +29,7 @@ pub(in crate::layout) struct RetainedSubtreeWorkSample {
     pub(in crate::layout) layout_cache_stores: u64,
     pub(in crate::layout) layout_cache_clears: u64,
     pub(in crate::layout) measured_callbacks: u64,
+    pub(in crate::layout) event_details: Vec<String>,
 }
 
 impl RetainedSubtreeWorkSample {
@@ -75,14 +76,16 @@ pub(super) struct SubtreeProbeCheckpoint {
 pub(super) struct SubtreeProbeComputeRecorder {
     active_subtrees: Vec<ActiveSubtree>,
     sample_deltas: Vec<SubtreeProbeComputeDelta>,
+    event_detail_limit: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SubtreeProbeComputeDelta {
     layout_cache_hits: u64,
     layout_cache_stores: u64,
     layout_cache_clears: u64,
     measured_callbacks: u64,
+    event_details: Vec<String>,
 }
 
 impl SubtreeProbe {
@@ -161,7 +164,11 @@ impl SubtreeProbe {
     }
 
     pub(super) fn compute_recorder(&self) -> SubtreeProbeComputeRecorder {
-        SubtreeProbeComputeRecorder::new(self.active_subtrees.clone(), self.frame_samples.len())
+        SubtreeProbeComputeRecorder::new(
+            self.active_subtrees.clone(),
+            self.frame_samples.len(),
+            env_subtree_event_detail_limit(),
+        )
     }
 
     pub(super) fn record_compute(&mut self, recorder: SubtreeProbeComputeRecorder) {
@@ -171,6 +178,7 @@ impl SubtreeProbe {
                 sample.layout_cache_stores += delta.layout_cache_stores;
                 sample.layout_cache_clears += delta.layout_cache_clears;
                 sample.measured_callbacks += delta.measured_callbacks;
+                sample.event_details.extend(delta.event_details);
             }
         }
     }
@@ -213,6 +221,12 @@ impl SubtreeProbe {
                 sample.layout_cache_clears,
                 sample.measured_callbacks,
             );
+            for detail in &sample.event_details {
+                eprintln!(
+                    "gpui retained_layout subtree_event global_id=\"{}\" layout_id={} {}",
+                    sample.global_id, sample.layout_id, detail,
+                );
+            }
         }
     }
 
@@ -228,10 +242,15 @@ impl SubtreeProbe {
 }
 
 impl SubtreeProbeComputeRecorder {
-    fn new(active_subtrees: Vec<ActiveSubtree>, sample_count: usize) -> Self {
+    fn new(
+        active_subtrees: Vec<ActiveSubtree>,
+        sample_count: usize,
+        event_detail_limit: usize,
+    ) -> Self {
         Self {
             active_subtrees,
             sample_deltas: vec![SubtreeProbeComputeDelta::default(); sample_count],
+            event_detail_limit,
         }
     }
 
@@ -245,7 +264,18 @@ impl SubtreeProbeComputeRecorder {
                 self.record_node(entry.node_id(), |delta| delta.layout_cache_hits += 1);
             }
             LayoutCacheEvent::Stored(entry) => {
-                self.record_node(entry.node_id(), |delta| delta.layout_cache_stores += 1);
+                let node_id = entry.node_id();
+                let detail =
+                    (self.event_detail_limit > 0).then(|| cache_entry_detail("stored", entry));
+                let event_detail_limit = self.event_detail_limit;
+                self.record_node(node_id, |delta| {
+                    delta.layout_cache_stores += 1;
+                    if let Some(detail) = detail.as_ref()
+                        && delta.event_details.len() < event_detail_limit
+                    {
+                        delta.event_details.push(detail.clone());
+                    }
+                });
             }
             LayoutCacheEvent::Cleared(clear) => {
                 self.record_node(clear.node_id(), |delta| delta.layout_cache_clears += 1);
@@ -274,6 +304,24 @@ impl SubtreeProbeComputeRecorder {
             .enumerate()
             .filter(|(_, delta)| *delta != SubtreeProbeComputeDelta::default())
     }
+}
+
+fn cache_entry_detail(kind: &'static str, entry: taffy::tree::LayoutCacheEntry) -> String {
+    let input = entry.requested_input();
+    let output = entry.returned_output();
+    format!(
+        "kind={} node_id={:?} entry_id={:?} run_mode={:?} sizing_mode={:?} axis={:?} known_dimensions={:?} parent_size={:?} available_space={:?} output_size={:?}",
+        kind,
+        entry.node_id(),
+        entry.entry_id(),
+        input.run_mode,
+        input.sizing_mode,
+        input.axis,
+        input.known_dimensions,
+        input.parent_size,
+        input.available_space,
+        output.size,
+    )
 }
 
 fn global_id_matches_target(global_id: &str, target: &str) -> bool {
@@ -312,5 +360,15 @@ fn env_subtree_sample_limit() -> usize {
             .ok()
             .and_then(|limit| limit.parse().ok())
             .unwrap_or(120)
+    })
+}
+
+fn env_subtree_event_detail_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("GPUI_TRACE_RETAINED_LAYOUT_SUBTREE_EVENT_LIMIT")
+            .ok()
+            .and_then(|limit| limit.parse().ok())
+            .unwrap_or(0)
     })
 }

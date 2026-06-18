@@ -86,13 +86,13 @@ pub fn current_test_window_renderer() -> Option<Box<dyn gpui::PlatformTestWindow
     }
 }
 
-/// Returns the canonical headless text system for visual-regression capture: a
+/// Returns the text system used by test-window screenshot capture. This is a
 /// cross-platform swash text system ([`gpui_wgpu::CosmicTextSystem`]) with no
 /// system fonts. Glyphs are byte-identical across platforms once the app
 /// registers its embedded fonts (e.g. Inter) via `App::text_system().add_fonts`;
 /// the fallback family name only matters before those fonts are registered.
 #[cfg(feature = "test-support")]
-pub fn current_headless_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
+pub fn current_test_window_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
     #[cfg(not(target_family = "wasm"))]
     {
         std::sync::Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
@@ -102,7 +102,7 @@ pub fn current_headless_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSy
 
     #[cfg(target_family = "wasm")]
     {
-        unimplemented!("headless text system is not available on wasm")
+        unimplemented!("test-window text system is not available on wasm")
     }
 }
 

@@ -42,32 +42,14 @@ fn light_on_dark_contrast(enhancedContrast: f32, color: vec3<f32>) -> f32 {
     return enhancedContrast * multiplier;
 }
 
-fn enhance_contrast(alpha: f32, k: f32) -> f32 {
-    return alpha * (k + 1.0) / (alpha * k + 1.0);
-}
-
 fn enhance_contrast3(alpha: vec3<f32>, k: f32) -> vec3<f32> {
     return alpha * (k + 1.0) / (alpha * k + 1.0);
-}
-
-fn apply_alpha_correction(a: f32, b: f32, g: vec4<f32>) -> f32 {
-    let brightness_adjustment = g.x * b + g.y;
-    let correction = brightness_adjustment * a + (g.z * b + g.w);
-    return a + a * (1.0 - a) * correction;
 }
 
 fn apply_alpha_correction3(a: vec3<f32>, b: vec3<f32>, g: vec4<f32>) -> vec3<f32> {
     let brightness_adjustment = g.x * b + g.y;
     let correction = brightness_adjustment * a + (g.z * b + g.w);
     return a + a * (1.0 - a) * correction;
-}
-
-fn apply_contrast_and_gamma_correction(sample: f32, color: vec3<f32>, enhanced_contrast_factor: f32, gamma_ratios: vec4<f32>) -> f32 {
-    let enhanced_contrast = light_on_dark_contrast(enhanced_contrast_factor, color);
-    let brightness = color_brightness(color);
-
-    let contrasted = enhance_contrast(sample, enhanced_contrast);
-    return apply_alpha_correction(contrasted, brightness, gamma_ratios);
 }
 
 fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enhanced_contrast_factor: f32, gamma_ratios: vec4<f32>) -> vec3<f32> {
@@ -85,10 +67,10 @@ struct GlobalParams {
 
 struct GammaParams {
     gamma_ratios: vec4<f32>,
-    grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
-    pad: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> globals: GlobalParams;
@@ -2055,14 +2037,13 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
-    let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    return blend_color(input.color, sample);
 }
 
 // --- polychrome sprites --- //

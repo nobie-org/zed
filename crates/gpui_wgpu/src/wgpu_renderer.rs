@@ -75,10 +75,9 @@ struct SurfaceParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
-    _pad: u32,
+    _pad: [u32; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -1739,10 +1738,9 @@ impl WgpuRenderer {
     ) -> bool {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
             subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
             is_bgr: self.is_bgr as u32,
-            _pad: 0,
+            _pad: [0; 2],
         };
 
         let globals = GlobalParams {
@@ -3491,7 +3489,6 @@ fn create_surface(
 struct RenderingParameters {
     path_sample_count: u32,
     gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
 }
 
@@ -3516,12 +3513,6 @@ impl RenderingParameters {
             .clamp(1.0, 2.2);
         let gamma_ratios = get_gamma_correction_ratios(gamma);
 
-        let grayscale_enhanced_contrast = env::var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0_f32)
-            .max(0.0);
-
         let subpixel_enhanced_contrast = env::var("ZED_FONTS_SUBPIXEL_ENHANCED_CONTRAST")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3531,7 +3522,6 @@ impl RenderingParameters {
         Self {
             path_sample_count,
             gamma_ratios,
-            grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
         }
     }

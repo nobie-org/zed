@@ -275,8 +275,8 @@ impl LayoutEngine {
     /// GPUI needs the shaped text artifact for paint and hit testing. The
     /// retained forest never replays an artifact from `TextMeasureKey` alone:
     /// it hydrates from the current callback, from an exact query-keyed artifact
-    /// selected by passive Taffy cache observation, or from a retained
-    /// unchanged-node replay whose layout context is proven unchanged.
+    /// selected by passive Taffy cache observation, or from an unchanged-node
+    /// retained artifact whose root layout context is proven unchanged.
     pub(crate) fn request_text_measured_layout(
         &mut self,
         style: Style,
@@ -447,12 +447,6 @@ impl LayoutEngine {
     fn commit_layout(&mut self, id: LayoutId) -> RetainedNodeToken {
         self.forest
             .commit_layout_for_tests(RetainedLayoutRootId::new(0), id)
-    }
-
-    #[cfg(test)]
-    fn commit_layout_in_test_root(&mut self, root_id: u64, id: LayoutId) -> RetainedNodeToken {
-        self.forest
-            .commit_layout_for_tests(RetainedLayoutRootId::new(root_id), id)
     }
 
     #[cfg(test)]

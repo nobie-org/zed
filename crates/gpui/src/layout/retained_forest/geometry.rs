@@ -105,7 +105,7 @@ impl GeometryStore {
         self.solved_roots.contains_key(&root_id)
     }
 
-    pub(super) fn retained_root_solve_context_changed(
+    pub(super) fn retained_root_solve_context_matches(
         &self,
         root_id: RetainedLayoutRootId,
         root_node: NodeId,
@@ -113,7 +113,7 @@ impl GeometryStore {
         scale_factor: f32,
     ) -> bool {
         let solved_root = SolvedRoot::new(root_node, available_space, scale_factor);
-        self.retained_solved_roots.get(&root_id) != Some(&solved_root)
+        self.retained_solved_roots.get(&root_id) == Some(&solved_root)
     }
 
     pub(super) fn capture_from_solver(

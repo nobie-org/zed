@@ -379,9 +379,8 @@ impl IntoElement for StyledText {
 /// The frame-local layout state for a text element.
 ///
 /// Paint, prepaint, and hit testing need shaped lines in this handle. Retained
-/// layout hydrates `TextLayout` only from a current compute callback, an exact
-/// query-keyed artifact selected by passive Taffy cache observation, or an
-/// unchanged retained node whose layout context is proven unchanged.
+/// layout hydrates `TextLayout` only from a current compute callback or an
+/// exact query-keyed artifact selected by passive Taffy cache observation.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 

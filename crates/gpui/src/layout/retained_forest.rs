@@ -122,46 +122,6 @@ struct RetainedLayoutOccurrence {
     children: Vec<RetainedLayoutOccurrence>,
 }
 
-/// Result of committing one current-frame intent into the retained forest.
-///
-/// `layout_context_changed` reports that this occurrence or a descendant needs
-/// the enclosing retained mirror path invalidated before the next legal solve.
-/// Direct mirror mutations (`set_style`, `set_children`, create/remove) still
-/// own their own Taffy dirtying; this flag exists for reused occurrence slots
-/// whose retained history is no longer proven valid by exact equality alone.
-struct RetainedLayoutCommit {
-    occurrence: RetainedLayoutOccurrence,
-    layout_context_changed: bool,
-}
-
-/// Current-frame proof context for committing one retained occurrence.
-///
-/// Taffy mirror hygiene and GPUI measured-artifact validity are deliberately
-/// separate. A reused container can need its Taffy history dirtied because its
-/// parent/root query is no longer proven, while an unchanged measured child may
-/// still let stock Taffy decide whether its cached measurement is usable.
-#[derive(Clone, Copy)]
-struct CommitContext {
-    mirror_query_maybe_changed: bool,
-    measurement_query_maybe_changed: bool,
-}
-
-impl CommitContext {
-    fn root(root_layout_context_changed: bool) -> Self {
-        Self {
-            mirror_query_maybe_changed: root_layout_context_changed,
-            measurement_query_maybe_changed: root_layout_context_changed,
-        }
-    }
-
-    fn with_child_mirror_query(self, mirror_query_maybe_changed: bool) -> Self {
-        Self {
-            mirror_query_maybe_changed,
-            measurement_query_maybe_changed: self.measurement_query_maybe_changed,
-        }
-    }
-}
-
 /// Work observed while committing and computing one root layout.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ComputeLayoutWork {
@@ -1064,18 +1024,18 @@ impl RetainedLayoutForest {
         window: &mut Window,
         cx: &mut App,
     ) -> ComputeLayoutWork {
-        let root_layout_context_changed = self
-            .root_slots
-            .retained_root_node_id(root_id)
-            .is_some_and(|root_node| {
-                self.geometry.retained_root_solve_context_changed(
-                    root_id,
-                    root_node,
-                    available_space,
-                    scale_factor,
-                )
-            });
-        let node_id = self.commit_root_layout(root_id, id, root_layout_context_changed);
+        let artifact_replay_allowed =
+            self.root_slots
+                .retained_root_node_id(root_id)
+                .is_some_and(|root_node| {
+                    self.geometry.retained_root_solve_context_matches(
+                        root_id,
+                        root_node,
+                        available_space,
+                        scale_factor,
+                    )
+                });
+        let node_id = self.commit_root_layout(root_id, id, artifact_replay_allowed);
         assert!(
             !self.geometry.has_solved_root(root_id),
             "retained layout root should be solved at most once per frame"
@@ -1121,7 +1081,8 @@ impl RetainedLayoutForest {
                 |node_id| taffy.children(node_id).expect(EXPECT_MESSAGE),
             );
         }
-        self.measurements.hydrate_registered_text_artifact_replays();
+        self.measurements
+            .hydrate_text_artifacts_from_completed_solve(scale_factor, window, cx);
 
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -1557,18 +1518,7 @@ impl RetainedLayoutForest {
         available_space: Size<AvailableSpace>,
         scale_factor: f32,
     ) -> RetainedNodeToken {
-        let root_layout_context_changed = self
-            .root_slots
-            .retained_root_node_id(root_id)
-            .is_some_and(|root_node| {
-                self.geometry.retained_root_solve_context_changed(
-                    root_id,
-                    root_node,
-                    available_space,
-                    scale_factor,
-                )
-            });
-        let root_node = self.commit_root_layout(root_id, id, root_layout_context_changed);
+        let root_node = self.commit_root_layout(root_id, id, false);
         assert!(
             !self.geometry.has_solved_root(root_id),
             "retained layout root should be solved at most once per frame"
@@ -1946,7 +1896,7 @@ impl RetainedLayoutForest {
         &mut self,
         root_id: RetainedLayoutRootId,
         id: LayoutId,
-        root_layout_context_changed: bool,
+        artifact_replay_allowed: bool,
     ) -> NodeId {
         if let Some(node_id) = self.committed.try_node(id) {
             return node_id;
@@ -1966,13 +1916,7 @@ impl RetainedLayoutForest {
             );
         }
 
-        let retained_node = self
-            .commit_intent(
-                id,
-                retained_root,
-                CommitContext::root(root_layout_context_changed),
-            )
-            .occurrence;
+        let retained_node = self.commit_intent(id, retained_root, artifact_replay_allowed);
         let node_id = retained_node.node_id;
         self.flush_detached_subtree_removals();
         self.root_slots.insert_current_root(root_id, retained_node);
@@ -1995,9 +1939,9 @@ impl RetainedLayoutForest {
         &mut self,
         root_id: RetainedLayoutRootId,
         id: LayoutId,
-        root_layout_context_changed: bool,
+        artifact_replay_allowed: bool,
     ) -> NodeId {
-        let node_id = self.commit_layout(root_id, id, root_layout_context_changed);
+        let node_id = self.commit_layout(root_id, id, artifact_replay_allowed);
         assert!(
             self.taffy.parent(node_id).is_none(),
             "layout root must not already be committed under a parent"
@@ -2030,8 +1974,8 @@ impl RetainedLayoutForest {
         &mut self,
         id: LayoutId,
         previous: Option<RetainedLayoutOccurrence>,
-        context: CommitContext,
-    ) -> RetainedLayoutCommit {
+        artifact_replay_allowed: bool,
+    ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2043,9 +1987,13 @@ impl RetainedLayoutForest {
         let work_snapshot = probe_global_id.as_ref().map(|_| self.work.snapshot());
         let intent = self.intent(id);
         let retained_node = match intent.kind.clone() {
-            LayoutIntentKind::Unmeasured { children } => {
-                self.commit_unmeasured_intent(id, intent.style.clone(), children, previous, context)
-            }
+            LayoutIntentKind::Unmeasured { children } => self.commit_unmeasured_intent(
+                id,
+                intent.style.clone(),
+                children,
+                previous,
+                artifact_replay_allowed,
+            ),
             LayoutIntentKind::Measured {
                 measure,
                 measured_kind,
@@ -2055,13 +2003,13 @@ impl RetainedLayoutForest {
                 measure,
                 measured_kind,
                 previous,
-                context,
+                artifact_replay_allowed,
             ),
         };
 
         if let (Some(global_id), Some(work_snapshot)) = (probe_global_id, work_snapshot) {
             let work_delta = self.work.delta_since(work_snapshot);
-            let node_ids = Self::retained_occurrence_node_ids(&retained_node.occurrence);
+            let node_ids = Self::retained_occurrence_node_ids(&retained_node);
             self.subtree_probe
                 .record_committed_subtree(global_id, id, node_ids, work_delta);
         }
@@ -2180,8 +2128,8 @@ impl RetainedLayoutForest {
         style: taffy::style::Style,
         children: Vec<LayoutId>,
         previous: Option<RetainedLayoutOccurrence>,
-        context: CommitContext,
-    ) -> RetainedLayoutCommit {
+        artifact_replay_allowed: bool,
+    ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2190,13 +2138,16 @@ impl RetainedLayoutForest {
         let Some(previous) = previous else {
             self.work.record_no_previous_miss();
             self.trace_retained_layout_miss("no_previous", id, None, || String::new());
-            return RetainedLayoutCommit {
-                occurrence: self.build_fresh_unmeasured_occurrence(id, style, children),
-                layout_context_changed: true,
-            };
+            return self.build_fresh_unmeasured_occurrence(id, style, children);
         };
 
-        self.update_unmeasured_retained_occurrence(id, style, children, previous, context)
+        self.update_unmeasured_retained_occurrence(
+            id,
+            style,
+            children,
+            previous,
+            artifact_replay_allowed,
+        )
     }
 
     /// Update an unmeasured occurrence and mirror node to match the current intent.
@@ -2206,8 +2157,8 @@ impl RetainedLayoutForest {
         style: taffy::style::Style,
         children: Vec<LayoutId>,
         previous: RetainedLayoutOccurrence,
-        context: CommitContext,
-    ) -> RetainedLayoutCommit {
+        artifact_replay_allowed: bool,
+    ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2216,13 +2167,9 @@ impl RetainedLayoutForest {
         if previous.facts.kind != RetainedLayoutKind::Unmeasured {
             let fresh = self.build_fresh_unmeasured_occurrence(id, style, children);
             self.root_slots.detach_subtree(previous);
-            return RetainedLayoutCommit {
-                occurrence: fresh,
-                layout_context_changed: true,
-            };
+            return fresh;
         }
 
-        let exact_subtree_match = self.retained_occurrence_matches_intent(id, &previous);
         let previous_facts = previous.facts;
         let previous_child_node_ids = previous
             .children
@@ -2249,31 +2196,14 @@ impl RetainedLayoutForest {
                 .any(|(index, child_node_id)| {
                     *child_node_id != previous_child_node_ids.get(index).copied()
                 });
-        let child_subtree_layout_context_will_change =
-            children.iter().enumerate().any(|(index, child)| {
-                match exact_previous_children[index].as_ref() {
-                    Some(previous_child) => {
-                        self.retained_occurrence_will_change_layout_context(*child, previous_child)
-                    }
-                    None => true,
-                }
-            });
-        let child_mirror_query_maybe_changed = context.mirror_query_maybe_changed
-            || style_changed
-            || child_list_will_change
-            || child_subtree_layout_context_will_change;
+        let child_artifact_replay_allowed =
+            artifact_replay_allowed && !style_changed && !child_list_will_change;
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
-        let mut any_child_layout_context_changed = false;
         for (index, child) in children.into_iter().enumerate() {
             let previous_child = exact_previous_children[index].take();
-            let retained_child = self.commit_intent(
-                child,
-                previous_child,
-                context.with_child_mirror_query(child_mirror_query_maybe_changed),
-            );
-            any_child_layout_context_changed |= retained_child.layout_context_changed;
-            let retained_child = retained_child.occurrence;
+            let retained_child =
+                self.commit_intent(child, previous_child, child_artifact_replay_allowed);
             child_node_ids.push(retained_child.node_id);
             retained_children.push(retained_child);
         }
@@ -2283,6 +2213,7 @@ impl RetainedLayoutForest {
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
+            self.mark_mirror_path_dirty(node_id);
             self.work.record_style_update();
         }
 
@@ -2291,6 +2222,7 @@ impl RetainedLayoutForest {
             self.taffy
                 .set_children(node_id, &child_node_ids)
                 .expect(EXPECT_MESSAGE);
+            self.mark_mirror_path_dirty(node_id);
             self.work.record_child_list_update();
         }
 
@@ -2307,31 +2239,7 @@ impl RetainedLayoutForest {
             },
             children: retained_children,
         };
-        let layout_context_changed = context.mirror_query_maybe_changed
-            || style_changed
-            || children_changed
-            || any_child_layout_context_changed
-            || !exact_subtree_match;
-        if context.mirror_query_maybe_changed
-            || ((!exact_subtree_match || any_child_layout_context_changed)
-                && !style_changed
-                && !children_changed)
-        {
-            let reason = if context.mirror_query_maybe_changed {
-                "mirror_query_maybe_changed"
-            } else if any_child_layout_context_changed {
-                "child_layout_context_changed"
-            } else {
-                "updated_retained_occurrence"
-            };
-            self.trace_retained_dirty_mark(id, node_id, reason);
-            self.mark_taffy_node_dirty(node_id);
-        }
-
-        RetainedLayoutCommit {
-            occurrence: retained_node,
-            layout_context_changed,
-        }
+        retained_node
     }
 
     /// Find previous child occurrences that exactly match current child intents.
@@ -2417,8 +2325,8 @@ impl RetainedLayoutForest {
         measure: Option<usize>,
         measured_kind: MeasuredLayoutKind,
         previous: Option<RetainedLayoutOccurrence>,
-        context: CommitContext,
-    ) -> RetainedLayoutCommit {
+        artifact_replay_allowed: bool,
+    ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2427,10 +2335,7 @@ impl RetainedLayoutForest {
         let Some(previous) = previous else {
             self.work.record_no_previous_miss();
             self.trace_retained_layout_miss("no_previous", id, None, || String::new());
-            return RetainedLayoutCommit {
-                occurrence: self.build_fresh_measured_occurrence(id, style, measure, measured_kind),
-                layout_context_changed: true,
-            };
+            return self.build_fresh_measured_occurrence(id, style, measure, measured_kind);
         };
 
         let previous_measured_kind = previous.facts.measured_kind.clone();
@@ -2451,14 +2356,9 @@ impl RetainedLayoutForest {
                     Self::debug_fingerprint(&measured_kind)
                 )
             });
-            let layout_context_changed = context.mirror_query_maybe_changed
-                || !self.retained_occurrence_has_same_layout_context(id, &previous);
             let fresh = self.build_fresh_measured_occurrence(id, style, measure, measured_kind);
             self.root_slots.detach_subtree(previous);
-            return RetainedLayoutCommit {
-                occurrence: fresh,
-                layout_context_changed,
-            };
+            return fresh;
         }
 
         let node_id = previous.node_id;
@@ -2474,15 +2374,11 @@ impl RetainedLayoutForest {
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
+            self.mark_mirror_path_dirty(node_id);
             self.work.record_style_update();
         }
-        if measured_kind_changed || context.measurement_query_maybe_changed {
-            let reason = if measured_kind_changed {
-                "measured_kind_changed"
-            } else {
-                "measurement_query_maybe_changed"
-            };
-            self.trace_retained_dirty_mark(id, node_id, reason);
+        if measured_kind_changed && !style_changed {
+            self.trace_retained_dirty_mark(id, node_id, "measured_kind_changed");
             self.mark_taffy_node_dirty(node_id);
         }
 
@@ -2490,14 +2386,18 @@ impl RetainedLayoutForest {
             node_id,
             Self::current_measurement(measured_kind.clone(), measure),
         );
-        if !style_changed && !measured_kind_changed && !context.measurement_query_maybe_changed {
-            if let MeasuredLayoutKind::Text(measure_key) = &measured_kind {
-                self.measurements
-                    .register_unchanged_text_artifact_replay(node_id, measure_key);
+        if !style_changed && !measured_kind_changed {
+            if artifact_replay_allowed {
+                if let MeasuredLayoutKind::Text(measure_key) = &measured_kind {
+                    self.measurements
+                        .register_unchanged_text_artifact_replay(node_id, measure_key);
+                }
+            } else if matches!(measured_kind, MeasuredLayoutKind::Text(_)) {
+                self.trace_retained_dirty_mark(id, node_id, "text_artifact_query_unproven");
+                self.mark_taffy_node_dirty(node_id);
             }
         }
-
-        let retained_node = RetainedLayoutOccurrence {
+        RetainedLayoutOccurrence {
             node_id,
             facts: RetainedLayoutFacts {
                 style,
@@ -2505,45 +2405,6 @@ impl RetainedLayoutForest {
                 measured_kind: Some(measured_kind),
             },
             children: Vec::new(),
-        };
-        let layout_context_changed =
-            context.mirror_query_maybe_changed || style_changed || measured_kind_changed;
-
-        RetainedLayoutCommit {
-            occurrence: retained_node,
-            layout_context_changed,
-        }
-    }
-
-    /// Return whether committing this occurrence may change the layout question seen by siblings.
-    ///
-    /// Parent algorithms can ask siblings sizing questions before final layout.
-    /// If one child will change, exact siblings need a refreshed Taffy cache path
-    /// so stock Taffy publishes descendant geometry for the current solve rather
-    /// than leaving slots from an earlier sizing probe.
-    fn retained_occurrence_will_change_layout_context(
-        &self,
-        id: LayoutId,
-        previous: &RetainedLayoutOccurrence,
-    ) -> bool {
-        let intent = self.intent(id);
-        if previous.facts.style != intent.style {
-            return true;
-        }
-
-        match &intent.kind {
-            LayoutIntentKind::Unmeasured { .. } => {
-                !self.retained_occurrence_matches_intent(id, previous)
-            }
-            LayoutIntentKind::Measured { measured_kind, .. } => {
-                previous.facts.kind != RetainedLayoutKind::Measured
-                    || !previous.children.is_empty()
-                    || !Self::measured_kinds_compatible(
-                        previous.facts.measured_kind.as_ref(),
-                        measured_kind,
-                    )
-                    || previous.facts.measured_kind.as_ref() != Some(measured_kind)
-            }
         }
     }
 
@@ -2621,45 +2482,6 @@ impl RetainedLayoutForest {
         }
     }
 
-    /// Return whether a previous occurrence has the same shallow layout meaning.
-    ///
-    /// This is weaker than retained-node compatibility. Text nodes with the same
-    /// explicit measure key are layout-equivalent, but still not node-reusable
-    /// under stock Taffy because their paint artifact must be hydrated from a
-    /// current callback.
-    fn retained_occurrence_has_same_layout_context(
-        &self,
-        id: LayoutId,
-        previous: &RetainedLayoutOccurrence,
-    ) -> bool {
-        let intent = self.intent(id);
-        if previous.facts.style != intent.style {
-            return false;
-        }
-
-        match &intent.kind {
-            LayoutIntentKind::Unmeasured { .. } => {
-                previous.facts.kind == RetainedLayoutKind::Unmeasured
-                    && previous.facts.measured_kind.is_none()
-            }
-            LayoutIntentKind::Measured { measured_kind, .. } => {
-                previous.facts.kind == RetainedLayoutKind::Measured
-                    && previous.children.is_empty()
-                    && match (previous.facts.measured_kind.as_ref(), measured_kind) {
-                        (
-                            Some(MeasuredLayoutKind::PureSize(previous)),
-                            MeasuredLayoutKind::PureSize(current),
-                        ) => previous == current,
-                        (
-                            Some(MeasuredLayoutKind::Text(previous)),
-                            MeasuredLayoutKind::Text(current),
-                        ) => previous == current,
-                        _ => false,
-                    }
-            }
-        }
-    }
-
     /// Mark a mirror node as used at one current-frame position.
     fn mark_taffy_node_committed(&mut self, node_id: NodeId) {
         self.committed.mark_taffy_node_committed(node_id);
@@ -2668,8 +2490,23 @@ impl RetainedLayoutForest {
     /// Mark a private mirror node dirty at most once in the current frame.
     fn mark_taffy_node_dirty(&mut self, node_id: NodeId) {
         if self.committed.mark_taffy_node_dirty(node_id) {
-            self.taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
+            self.mark_mirror_path_dirty(node_id);
             self.work.record_dirty_mark();
+        }
+    }
+
+    /// Make a mirror mutation visible to the next legal root solve.
+    ///
+    /// Taffy's dirty flag is implemented as cache clearing, so a direct
+    /// `mark_dirty(node)` may stop when that node's cache is already empty.
+    /// The retained forest owns the mutation transaction: once it changes a
+    /// mirror node's style, children, or measurement facts, every ancestor on
+    /// the retained parent path must be eligible for the scheduled root solve.
+    fn mark_mirror_path_dirty(&mut self, node_id: NodeId) {
+        let mut current = Some(node_id);
+        while let Some(node_id) = current {
+            self.taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
+            current = self.taffy.parent(node_id);
         }
     }
 

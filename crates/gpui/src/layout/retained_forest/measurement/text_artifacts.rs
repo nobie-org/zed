@@ -7,13 +7,14 @@ use taffy::{LayoutCacheEntry, style::AvailableSpace as TaffyAvailableSpace, tree
 ///
 /// Taffy owns whether a measured callback runs. This store owns only the
 /// artifact validity facts GPUI can prove: exact query-keyed artifacts observed
-/// from callbacks/cache events, plus unchanged-node retained replays registered
-/// by the forest.
+/// from callbacks/passive Taffy cache events, plus retained unchanged-node
+/// replays registered by the forest.
 pub(super) struct TextArtifactStore {
     current_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
     current_queries: FxHashSet<TextArtifactCacheKey>,
     replay_candidates: FxHashMap<NodeId, TextMeasureKey>,
     retained_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
+    pending_queries: Vec<PendingTextArtifactQuery>,
     query_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
 }
 
@@ -23,7 +24,17 @@ pub(super) struct TextArtifactStoreCheckpoint {
     current_queries: FxHashSet<TextArtifactCacheKey>,
     replay_candidates: FxHashMap<NodeId, TextMeasureKey>,
     retained_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
+    pending_queries: Vec<PendingTextArtifactQuery>,
     query_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
+}
+
+#[derive(Clone)]
+pub(super) struct PendingTextArtifactQuery {
+    pub(super) node_id: NodeId,
+    pub(super) text_key: TextMeasureKey,
+    pub(super) known_dimensions: Size<Option<Pixels>>,
+    pub(super) available_space: Size<AvailableSpace>,
+    pub(super) expected_taffy_size: Size<f32>,
 }
 
 impl TextArtifactStore {
@@ -33,6 +44,7 @@ impl TextArtifactStore {
             current_queries: FxHashSet::default(),
             replay_candidates: FxHashMap::default(),
             retained_artifacts: FxHashMap::default(),
+            pending_queries: Vec::new(),
             query_cache: FxHashMap::default(),
         }
     }
@@ -41,6 +53,7 @@ impl TextArtifactStore {
         self.current_artifacts.clear();
         self.current_queries.clear();
         self.replay_candidates.clear();
+        self.pending_queries.clear();
     }
 
     pub(super) fn finish_frame(&mut self, current_text_nodes: &FxHashSet<NodeId>) {
@@ -49,6 +62,7 @@ impl TextArtifactStore {
         self.current_artifacts.clear();
         self.current_queries.clear();
         self.replay_candidates.clear();
+        self.pending_queries.clear();
     }
 
     pub(super) fn checkpoint(&self) -> TextArtifactStoreCheckpoint {
@@ -57,6 +71,7 @@ impl TextArtifactStore {
             current_queries: self.current_queries.clone(),
             replay_candidates: self.replay_candidates.clone(),
             retained_artifacts: self.retained_artifacts.clone(),
+            pending_queries: self.pending_queries.clone(),
             query_cache: self.query_cache.clone(),
         }
     }
@@ -66,6 +81,7 @@ impl TextArtifactStore {
         self.current_queries = checkpoint.current_queries;
         self.replay_candidates = checkpoint.replay_candidates;
         self.retained_artifacts = checkpoint.retained_artifacts;
+        self.pending_queries = checkpoint.pending_queries;
         self.query_cache = checkpoint.query_cache;
     }
 
@@ -83,6 +99,14 @@ impl TextArtifactStore {
 
     pub(super) fn retained_artifact(&self, node_id: NodeId) -> Option<TextLayoutArtifact> {
         self.retained_artifacts.get(&node_id).cloned()
+    }
+
+    pub(super) fn push_pending_query(&mut self, query: PendingTextArtifactQuery) {
+        self.pending_queries.push(query);
+    }
+
+    pub(super) fn take_pending_queries(&mut self) -> Vec<PendingTextArtifactQuery> {
+        std::mem::take(&mut self.pending_queries)
     }
 
     pub(super) fn insert_current_artifact(
@@ -146,7 +170,49 @@ impl TextArtifactStore {
     }
 }
 
-/// Exact validity key for a retained text artifact observed through Taffy.
+impl PendingTextArtifactQuery {
+    pub(super) fn from_taffy_entry(
+        node_id: NodeId,
+        text_key: TextMeasureKey,
+        entry: LayoutCacheEntry,
+        scale_factor: f32,
+    ) -> Self {
+        let input = entry.requested_input();
+        Self {
+            node_id,
+            text_key,
+            known_dimensions: size(
+                input
+                    .known_dimensions
+                    .width
+                    .map(|value| Pixels(value / scale_factor)),
+                input
+                    .known_dimensions
+                    .height
+                    .map(|value| Pixels(value / scale_factor)),
+            ),
+            available_space: size(
+                available_space_from_taffy(input.available_space.width, scale_factor),
+                available_space_from_taffy(input.available_space.height, scale_factor),
+            ),
+            expected_taffy_size: size(
+                entry.returned_output().size.width,
+                entry.returned_output().size.height,
+            ),
+        }
+    }
+
+    pub(super) fn cache_key(&self) -> TextArtifactCacheKey {
+        TextArtifactCacheKey::new(
+            self.node_id,
+            self.text_key.clone(),
+            self.known_dimensions,
+            self.available_space,
+        )
+    }
+}
+
+/// Exact validity key for a text artifact observed through Taffy.
 ///
 /// This key is built only from the measurement query Taffy passes to GPUI. It
 /// does not predict or reconstruct Taffy's cache key; it lets GPUI avoid

@@ -8,14 +8,16 @@
 mod producer_registry;
 mod text_artifacts;
 
-use super::AvailableSpace;
+use super::{AvailableSpace, snap_measured_size_to_device_pixels};
 use crate::{App, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size};
 use collections::{FxHashMap, FxHashSet};
 use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
 use stacksafe::StackSafe;
 use std::rc::Rc;
 use taffy::{LayoutCacheEntry, LayoutCacheEvent, tree::NodeId};
-use text_artifacts::{TextArtifactCacheKey, TextArtifactStore, TextArtifactStoreCheckpoint};
+use text_artifacts::{
+    PendingTextArtifactQuery, TextArtifactCacheKey, TextArtifactStore, TextArtifactStoreCheckpoint,
+};
 
 /// Current-frame executable producer for measured layout.
 ///
@@ -219,9 +221,8 @@ impl ContentSizePureSizeMeasure {
 /// is explicit data and may preserve Taffy measurement cache when unchanged.
 /// `Text` is explicit layout identity, but the shaped artifact also depends on
 /// Taffy's measurement query (`known_dimensions` and `available_space`). GPUI
-/// therefore hydrates artifacts from callbacks, exact query-keyed cache
-/// observations, or retained unchanged-node replay; it never treats
-/// `TextMeasureKey` alone as artifact proof.
+/// therefore hydrates artifacts from callbacks or exact query-keyed cache
+/// observations; it never treats `TextMeasureKey` alone as artifact proof.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum MeasuredLayoutKind {
     Opaque,
@@ -331,14 +332,13 @@ impl MeasurementStore {
         self.current_measurements.get(&node_id)
     }
 
-    /// Register that an unchanged text node may replay its previous artifact after the solve.
+    /// Register that an unchanged retained text node may replay its artifact after the solve.
     ///
-    /// The caller may only register a retained text node when the retained
-    /// occurrence, text key, style, and incoming layout context are unchanged.
-    /// This does not hydrate during commit: commit only records the current
-    /// retained-tree fact. After stock Taffy solves, GPUI replays the artifact only
-    /// if Taffy skipped the text callback and therefore did not already produce a
-    /// current artifact.
+    /// This is an artifact-validity proof, not a Taffy cache predicate. The
+    /// forest may call it only when the retained occurrence and current text
+    /// facts are unchanged. If Taffy produces a current artifact during the
+    /// solve, that artifact wins; otherwise GPUI reuses the retained artifact
+    /// for the same node and text key.
     pub(super) fn register_unchanged_text_artifact_replay(
         &mut self,
         node_id: NodeId,
@@ -347,13 +347,18 @@ impl MeasurementStore {
         self.text_artifacts.register_replay(node_id, expected_key);
     }
 
-    /// Hydrate text nodes from the artifact selected by the completed solve.
+    /// Hydrate text nodes from the artifacts selected by the completed solve.
     ///
-    /// Taffy may invoke a callback, reuse one or more cache entries, or skip an
-    /// unchanged subtree entirely. Those events are artifact producers, not GPUI
-    /// paint-state side effects. Hydration happens once here after the solve,
-    /// from `current_text_artifacts`.
-    pub(super) fn hydrate_registered_text_artifact_replays(&mut self) {
+    /// Taffy may invoke a callback or report a passive cache hit/store event.
+    /// It may also skip an unchanged subtree entirely. Those events are
+    /// artifact producers, not GPUI paint-state side effects. Hydration happens
+    /// once here after the solve.
+    pub(super) fn hydrate_text_artifacts_from_completed_solve(
+        &mut self,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let replay_candidates = self.text_artifacts.take_replay_candidates();
         for (node_id, expected_key) in replay_candidates {
             if self.text_artifacts.has_current_artifact(node_id) {
@@ -371,6 +376,13 @@ impl MeasurementStore {
                 .insert_current_artifact(node_id, artifact);
         }
 
+        for query in self.text_artifacts.take_pending_queries() {
+            if self.text_artifacts.has_current_artifact(query.node_id) {
+                continue;
+            }
+            self.hydrate_text_query_from_current_producer(query, scale_factor, window, cx);
+        }
+
         for (node_id, artifact) in self.text_artifacts.current_artifacts() {
             self.hydrate_text_node(node_id, &artifact);
         }
@@ -382,6 +394,53 @@ impl MeasurementStore {
             &mut self.current_measurements,
             &mut self.text_artifacts,
         )
+    }
+
+    fn hydrate_text_query_from_current_producer(
+        &mut self,
+        query: PendingTextArtifactQuery,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(CurrentMeasurement::Text { key, measure }) =
+            self.current_measurements.get(&query.node_id).cloned()
+        else {
+            return;
+        };
+        assert_eq!(
+            &key, &query.text_key,
+            "Taffy cache-hit text query should match the current text measure key"
+        );
+
+        let artifact = {
+            let measure = &mut self
+                .producers
+                .context_mut(measure)
+                .expect("text measured layout should have a current producer and hydrator")
+                .measure;
+            match measure(query.known_dimensions, query.available_space, window, cx) {
+                MeasuredLayoutResult::Text(artifact) => artifact,
+                MeasuredLayoutResult::Size(_) => {
+                    panic!("text measured layout producer returned a size-only result");
+                }
+            }
+        };
+        assert_eq!(
+            artifact.key(),
+            &key,
+            "hydrated Taffy cache-hit text artifact should match the current text measure key"
+        );
+        assert_eq!(
+            snap_measured_size_to_device_pixels(artifact.size(), scale_factor),
+            query.expected_taffy_size,
+            "hydrated Taffy cache-hit text artifact should match the cached measurement size"
+        );
+
+        let cache_key = query.cache_key();
+        self.text_artifacts
+            .record_for_query(query.node_id, cache_key.clone(), &artifact);
+        self.text_artifacts.cache_artifact(cache_key, artifact);
     }
 
     fn hydrate_text_node(&mut self, node_id: NodeId, artifact: &TextLayoutArtifact) {
@@ -537,9 +596,11 @@ impl<'a> ComputeMeasurementState<'a> {
             return;
         };
         let key = key.clone();
-        let query_key =
-            TextArtifactCacheKey::from_taffy_entry(node_id, key.clone(), entry, scale_factor);
+        let pending_query =
+            PendingTextArtifactQuery::from_taffy_entry(node_id, key.clone(), entry, scale_factor);
+        let query_key = pending_query.cache_key();
         let Some(artifact) = self.text_artifacts.artifact_for_query(&query_key) else {
+            self.text_artifacts.push_pending_query(pending_query);
             return;
         };
         assert_eq!(

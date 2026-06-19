@@ -932,19 +932,6 @@ fn request_generated_frame(engine: &mut LayoutEngine, frame: &GeneratedFrame) ->
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn commit_generated_roots(engine: &mut LayoutEngine, roots: &[LayoutId]) -> Vec<RetainedNodeToken> {
-    roots
-        .iter()
-        .enumerate()
-        .map(|(index, root)| {
-            let node = engine.commit_layout_in_test_root(index as u64, *root);
-            assert_intent_committed_exactly(engine, *root);
-            node
-        })
-        .collect()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn retained_layout_shapes(
     engine: &LayoutEngine,
     roots: &[RetainedNodeToken],
@@ -1060,7 +1047,6 @@ fn expected_mutations(
 #[derive(Clone, Copy)]
 struct ExpectedCommitResult {
     retained_same_node: bool,
-    layout_context_changed: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1070,31 +1056,25 @@ trait ExpectedMutationCountsExt {
         &mut self,
         previous: &GeneratedTree,
         current: &GeneratedTree,
-        parent_layout_context_changed: bool,
     ) -> ExpectedCommitResult;
     fn add_fresh_tree(&mut self, current: &GeneratedTree);
     fn add_remove_tree(&mut self, previous: &GeneratedTree);
-    fn add_reused_tree(
-        &mut self,
-        current: &GeneratedTree,
-        parent_layout_context_changed: bool,
-    ) -> ExpectedCommitResult;
+    fn add_reused_tree(&mut self, current: &GeneratedTree) -> ExpectedCommitResult;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ExpectedMutationCountsExt for RetainedForestMutationSample {
     fn add_commit(&mut self, previous: &GeneratedTree, current: &GeneratedTree) {
-        self.add_commit_with_context(previous, current, false);
+        self.add_commit_with_context(previous, current);
     }
 
     fn add_commit_with_context(
         &mut self,
         previous: &GeneratedTree,
         current: &GeneratedTree,
-        parent_layout_context_changed: bool,
     ) -> ExpectedCommitResult {
         if previous.retained_occurrence_matches_intent(current) {
-            return self.add_reused_tree(current, parent_layout_context_changed);
+            return self.add_reused_tree(current);
         }
 
         match (previous, current) {
@@ -1170,39 +1150,21 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                         child_list_changed = true;
                     }
                 }
-                let child_layout_context_changed = parent_layout_context_changed
-                    || previous_style != current_style
-                    || child_list_changed;
-
-                let mut any_child_layout_context_changed = false;
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     let matching_previous_index = assigned_previous_indices[current_index];
                     if let Some(index) = matching_previous_index {
-                        let child_result = self.add_commit_with_context(
-                            &previous_children[index],
-                            current_child,
-                            child_layout_context_changed,
-                        );
-                        any_child_layout_context_changed |= child_result.layout_context_changed;
+                        let child_result =
+                            self.add_commit_with_context(&previous_children[index], current_child);
                         if !child_result.retained_same_node || index != current_index {
                             child_list_changed = true;
                         }
                     } else {
                         self.add_fresh_tree(current_child);
                         child_list_changed = true;
-                        any_child_layout_context_changed = true;
                     }
                 }
                 if child_list_changed {
                     self.child_list_updates += 1;
-                }
-                let compatible_update_changed_meaning = true;
-                if parent_layout_context_changed
-                    || ((compatible_update_changed_meaning || any_child_layout_context_changed)
-                        && previous_style == current_style
-                        && !child_list_changed)
-                {
-                    self.dirty_marks += 1;
                 }
 
                 for (previous_child, used) in previous_children.iter().zip(previous_used) {
@@ -1212,11 +1174,6 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 }
                 ExpectedCommitResult {
                     retained_same_node: true,
-                    layout_context_changed: parent_layout_context_changed
-                        || previous_style != current_style
-                        || child_list_changed
-                        || any_child_layout_context_changed
-                        || compatible_update_changed_meaning,
                 }
             }
             (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
@@ -1251,12 +1208,11 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     }
                     _ => false,
                 };
-                if parent_layout_context_changed || measured_kind_changed {
+                if measured_kind_changed {
                     self.dirty_marks += 1;
                 }
                 ExpectedCommitResult {
                     retained_same_node: true,
-                    layout_context_changed: parent_layout_context_changed || measured_kind_changed,
                 }
             }
             _ => {
@@ -1264,7 +1220,6 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 self.add_fresh_tree(current);
                 ExpectedCommitResult {
                     retained_same_node: false,
-                    layout_context_changed: true,
                 }
             }
         }
@@ -1279,20 +1234,10 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
         self.context_clears += previous.measured_count();
     }
 
-    fn add_reused_tree(
-        &mut self,
-        current: &GeneratedTree,
-        parent_layout_context_changed: bool,
-    ) -> ExpectedCommitResult {
+    fn add_reused_tree(&mut self, current: &GeneratedTree) -> ExpectedCommitResult {
         self.reuses += current.node_count();
-        self.dirty_marks += if parent_layout_context_changed {
-            current.node_count()
-        } else {
-            0
-        };
         ExpectedCommitResult {
             retained_same_node: true,
-            layout_context_changed: parent_layout_context_changed,
         }
     }
 }
@@ -1652,19 +1597,85 @@ fn retained_layout_matches_fresh_after_root_constraint_aba_regression(cx: &mut T
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[test]
-fn generated_reusable_exact_repeat_emits_no_retained_mutations() {
+#[gpui::test]
+fn retained_layout_matches_fresh_with_opaque_leaf_after_same_root_constraint_repeat(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    let frame = GeneratedFrame {
+        roots: vec![GeneratedTree::Unmeasured {
+            style: GeneratedStyle::FlexRow { gap: 0, wrap: true },
+            children: vec![GeneratedTree::Unmeasured {
+                style: GeneratedStyle::Default,
+                children: vec![GeneratedTree::Unmeasured {
+                    style: GeneratedStyle::FixedWidth(0),
+                    children: vec![GeneratedTree::Opaque { width: 0 }],
+                }],
+            }],
+        }],
+    };
+    let mut retained = LayoutEngine::new();
+
+    for (available_width, available_height) in [(1, 1), (1, 1), (1, 1)] {
+        let retained_ids = request_generated_frame(&mut retained, &frame);
+        let retained_roots = compute_generated_roots(
+            cx,
+            &mut retained,
+            &retained_ids,
+            available_width,
+            available_height,
+        );
+        for root in &retained_ids {
+            assert_intent_committed_exactly(&retained, *root);
+        }
+
+        let mut fresh = LayoutEngine::new();
+        let fresh_ids = request_generated_frame(&mut fresh, &frame);
+        let fresh_roots = compute_generated_roots(
+            cx,
+            &mut fresh,
+            &fresh_ids,
+            available_width,
+            available_height,
+        );
+        for root in &fresh_ids {
+            assert_intent_committed_exactly(&fresh, *root);
+        }
+
+        assert_eq!(
+            retained_layout_shapes(&retained, &retained_roots),
+            retained_layout_shapes(&fresh, &fresh_roots)
+        );
+        assert_eq!(
+            retained_layout_projections(&retained, &retained_roots),
+            retained_layout_projections(&fresh, &fresh_roots)
+        );
+        assert_eq!(
+            retained_layout_bounds_trees(&mut retained, &retained_roots, 1.0),
+            retained_layout_bounds_trees(&mut fresh, &fresh_roots, 1.0)
+        );
+
+        retained.finish_frame();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
         let frame = draw_generated_frame(&tc, false, 3);
+        let available_width = draw_u16(&tc, 1, 360);
+        let available_height = draw_u16(&tc, 1, 240);
         let mut engine = LayoutEngine::new();
 
         let roots = request_generated_frame(&mut engine, &frame);
-        commit_generated_roots(&mut engine, &roots);
+        compute_generated_roots(cx, &mut engine, &roots, available_width, available_height);
         engine.finish_frame();
 
         engine.reset_retained_mutation_sample_for_tests();
         let roots = request_generated_frame(&mut engine, &frame);
-        commit_generated_roots(&mut engine, &roots);
+        compute_generated_roots(cx, &mut engine, &roots, available_width, available_height);
         engine.finish_frame();
 
         assert_eq!(
@@ -1677,34 +1688,67 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[test]
-fn generated_rollback_restores_retained_layout_state_for_next_repeat() {
+#[gpui::test]
+fn generated_rollback_restores_retained_layout_state_for_next_repeat(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
         let prefix = draw_generated_frame(&tc, false, 3);
         let real = draw_generated_frame(&tc, false, 3);
         let transient = draw_generated_frame(&tc, true, 3);
+        let available_width = draw_u16(&tc, 1, 360);
+        let available_height = draw_u16(&tc, 1, 240);
 
         let mut with_rollback = LayoutEngine::new();
         let prefix_roots = request_generated_frame(&mut with_rollback, &prefix);
-        commit_generated_roots(&mut with_rollback, &prefix_roots);
+        compute_generated_roots(
+            cx,
+            &mut with_rollback,
+            &prefix_roots,
+            available_width,
+            available_height,
+        );
         with_rollback.finish_frame();
         with_rollback.reset_retained_mutation_sample_for_tests();
 
         let checkpoint = with_rollback.checkpoint();
         let transient_roots = request_generated_frame(&mut with_rollback, &transient);
-        commit_generated_roots(&mut with_rollback, &transient_roots);
+        compute_generated_roots(
+            cx,
+            &mut with_rollback,
+            &transient_roots,
+            available_width,
+            available_height,
+        );
         with_rollback.rollback_to_checkpoint(checkpoint);
 
         let real_roots = request_generated_frame(&mut with_rollback, &real);
-        let with_rollback_roots = commit_generated_roots(&mut with_rollback, &real_roots);
+        let with_rollback_roots = compute_generated_roots(
+            cx,
+            &mut with_rollback,
+            &real_roots,
+            available_width,
+            available_height,
+        );
 
         let mut skipped = LayoutEngine::new();
         let prefix_roots = request_generated_frame(&mut skipped, &prefix);
-        commit_generated_roots(&mut skipped, &prefix_roots);
+        compute_generated_roots(
+            cx,
+            &mut skipped,
+            &prefix_roots,
+            available_width,
+            available_height,
+        );
         skipped.finish_frame();
         skipped.reset_retained_mutation_sample_for_tests();
         let real_roots = request_generated_frame(&mut skipped, &real);
-        let skipped_roots = commit_generated_roots(&mut skipped, &real_roots);
+        let skipped_roots = compute_generated_roots(
+            cx,
+            &mut skipped,
+            &real_roots,
+            available_width,
+            available_height,
+        );
 
         assert_eq!(
             retained_layout_shapes(&with_rollback, &with_rollback_roots),
@@ -1720,7 +1764,13 @@ fn generated_rollback_restores_retained_layout_state_for_next_repeat() {
 
         with_rollback.reset_retained_mutation_sample_for_tests();
         let repeat_roots = request_generated_frame(&mut with_rollback, &real);
-        commit_generated_roots(&mut with_rollback, &repeat_roots);
+        compute_generated_roots(
+            cx,
+            &mut with_rollback,
+            &repeat_roots,
+            available_width,
+            available_height,
+        );
         with_rollback.finish_frame();
 
         assert_eq!(
@@ -1981,6 +2031,70 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
     })
     .settings(hegel_settings(64))
     .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let key_index = 0;
+    let fallback_width = 1;
+    let first_parent_width = 2;
+    let second_parent_width = 3;
+    let root_width = 4;
+    let height = 1;
+    let retained_measure_invocations = Rc::new(Cell::new(0));
+    let retained_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = LayoutEngine::new();
+
+    let text = request_input_sensitive_text_measured(
+        &mut engine,
+        0,
+        key_index,
+        fallback_width,
+        height,
+        retained_measure_invocations.clone(),
+        retained_hydrated_artifacts.clone(),
+    );
+    let parent = engine.request_layout(
+        style_with_width(first_parent_width as f32),
+        px(16.0),
+        1.0,
+        &[text],
+    );
+    let root = request_container(&mut engine, &[parent]);
+    compute_generated_text_root(cx, &mut engine, root, root_width);
+    engine.finish_frame();
+    retained_measure_invocations.set(0);
+    retained_hydrated_artifacts.borrow_mut().clear();
+
+    let text = request_input_sensitive_text_measured(
+        &mut engine,
+        1,
+        key_index,
+        fallback_width,
+        height,
+        retained_measure_invocations.clone(),
+        retained_hydrated_artifacts.clone(),
+    );
+    let parent = engine.request_layout(
+        style_with_width(second_parent_width as f32),
+        px(16.0),
+        1.0,
+        &[text],
+    );
+    let root = request_container(&mut engine, &[parent]);
+    compute_generated_text_root(cx, &mut engine, root, root_width);
+
+    assert_eq!(
+        retained_hydrated_artifacts.borrow().as_slice(),
+        [GeneratedTextHydration {
+            label: 1,
+            key_index,
+            width: 2,
+            height,
+        }]
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2264,7 +2378,6 @@ fn changed_unmeasured_child_reuses_position_and_updates_style() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2374,7 +2487,6 @@ fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
         RetainedForestMutationSample {
             reuses: 5,
             style_updates: 1,
-            dirty_marks: 5,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2525,7 +2637,6 @@ fn retained_layout_recomputes_after_child_delete_from_content_sized_parent() {
         RetainedForestMutationSample {
             reuses: 2,
             child_list_updates: 1,
-            dirty_marks: 1,
             removes: 1,
             ..RetainedForestMutationSample::default()
         }
@@ -2533,7 +2644,7 @@ fn retained_layout_recomputes_after_child_delete_from_content_sized_parent() {
 }
 
 #[test]
-fn compatible_same_position_child_change_dirties_parent_and_matches_fresh_layout() {
+fn compatible_same_position_child_change_updates_style_and_matches_fresh_layout() {
     let mut retained = LayoutEngine::new();
     let stable = request_leaf(&mut retained, 10.0);
     let changing = request_leaf(&mut retained, 20.0);
@@ -2580,7 +2691,6 @@ fn compatible_same_position_child_change_dirties_parent_and_matches_fresh_layout
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2634,7 +2744,6 @@ fn same_position_exact_child_is_not_stolen_by_changed_equal_sibling() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2678,7 +2787,6 @@ fn flex_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
             creates: 1,
             reuses: 3,
             child_list_updates: 1,
-            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2722,7 +2830,6 @@ fn grid_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
             creates: 1,
             reuses: 3,
             child_list_updates: 1,
-            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2759,7 +2866,6 @@ fn duplicate_exact_children_reuse_at_most_one_previous_node() {
         RetainedForestMutationSample {
             reuses: 2,
             child_list_updates: 1,
-            dirty_marks: 1,
             removes: 1,
             ..RetainedForestMutationSample::default()
         }
@@ -2831,7 +2937,6 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3190,7 +3295,6 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3260,7 +3364,6 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
         RetainedForestMutationSample {
             reuses: 4,
             style_updates: 1,
-            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3343,12 +3446,12 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         ),
         (0, 1, 1, 1)
     );
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 3);
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 4,
-            dirty_marks: 3,
+            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3987,7 +4090,6 @@ fn retained_layout_recomputes_when_root_scale_factor_changes() {
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 2,
-            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4092,7 +4194,6 @@ fn changed_flex_ancestor_updates_canvas_subtree_and_matches_fresh_layout() {
         RetainedForestMutationSample {
             reuses: 7,
             style_updates: 1,
-            dirty_marks: 7,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4163,7 +4264,6 @@ fn reused_canvas_panel_under_inserted_sidebar_matches_fresh_layout() {
             creates: 1,
             reuses: 7,
             child_list_updates: 1,
-            dirty_marks: 6,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4233,7 +4333,6 @@ fn reused_canvas_panel_inside_chrome_shell_after_sidebar_resize_matches_fresh_la
         RetainedForestMutationSample {
             reuses: 14,
             style_updates: 1,
-            dirty_marks: 14,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4303,7 +4402,6 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
         RetainedForestMutationSample {
             reuses: 14,
             style_updates: 1,
-            dirty_marks: 14,
             ..RetainedForestMutationSample::default()
         }
     );

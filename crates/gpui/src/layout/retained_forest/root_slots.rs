@@ -9,7 +9,6 @@ use super::super::RetainedLayoutRootId;
 use super::RetainedLayoutOccurrence;
 use collections::FxHashMap;
 use std::mem;
-use taffy::tree::NodeId;
 
 /// Owns previous/current root slots and detached subtree removals.
 pub(super) struct RootSlots {
@@ -60,15 +59,18 @@ impl RootSlots {
         self.current_roots.contains_key(&root_id)
     }
 
+    pub(super) fn retained_root_node_id(
+        &self,
+        root_id: RetainedLayoutRootId,
+    ) -> Option<taffy::tree::NodeId> {
+        self.retained_roots.get(&root_id).map(|root| root.node_id)
+    }
+
     pub(super) fn take_retained_root(
         &mut self,
         root_id: RetainedLayoutRootId,
     ) -> Option<RetainedLayoutOccurrence> {
         self.retained_roots.remove(&root_id)
-    }
-
-    pub(super) fn retained_root_node_id(&self, root_id: RetainedLayoutRootId) -> Option<NodeId> {
-        self.retained_roots.get(&root_id).map(|root| root.node_id)
     }
 
     pub(super) fn insert_current_root(

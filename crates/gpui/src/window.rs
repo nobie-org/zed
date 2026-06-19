@@ -4446,27 +4446,6 @@ impl Window {
             )
     }
 
-    /// Compute the layout for the given id within the given available space.
-    /// This method is called for its side effect, typically by the framework prior to painting.
-    /// After calling it, you can request the bounds of the given layout node id or any descendant.
-    ///
-    /// This method should only be called as part of the prepaint phase of element drawing.
-    #[track_caller]
-    pub(crate) fn compute_layout(
-        &mut self,
-        layout_id: LayoutId,
-        available_space: Size<AvailableSpace>,
-        cx: &mut App,
-    ) {
-        self.compute_layout_as_root(
-            layout_id,
-            None,
-            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-            available_space,
-            cx,
-        );
-    }
-
     pub(crate) fn compute_layout_as_root(
         &mut self,
         layout_id: LayoutId,

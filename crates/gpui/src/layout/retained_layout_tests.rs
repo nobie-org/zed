@@ -821,6 +821,14 @@ impl GeneratedTree {
             _ => false,
         }
     }
+
+    fn retained_occurrence_can_update_intent(&self, current: &Self) -> bool {
+        matches!(
+            (self, current),
+            (Self::Unmeasured { .. }, Self::Unmeasured { .. })
+                | (Self::PureSize { .. }, Self::PureSize { .. })
+        )
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1052,7 +1060,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 }
 
                 let mut previous_used = vec![false; previous_children.len()];
-                let assigned_previous_indices = current_children
+                let mut assigned_previous_indices = current_children
                     .iter()
                     .map(|current_child| {
                         let matching_previous_index = previous_children
@@ -1069,6 +1077,20 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                         matching_previous_index
                     })
                     .collect::<Vec<_>>();
+
+                for (current_index, current_child) in current_children.iter().enumerate() {
+                    if assigned_previous_indices[current_index].is_some() {
+                        continue;
+                    }
+                    if let Some(previous_child) = previous_children.get(current_index) {
+                        if !previous_used[current_index]
+                            && previous_child.retained_occurrence_can_update_intent(current_child)
+                        {
+                            previous_used[current_index] = true;
+                            assigned_previous_indices[current_index] = Some(current_index);
+                        }
+                    }
+                }
 
                 let mut child_list_changed = previous_children.len() != current_children.len();
                 for (current_index, current_child) in current_children.iter().enumerate() {
@@ -1825,7 +1847,7 @@ fn unchanged_unmeasured_tree_emits_no_retained_mutations_on_second_frame() {
 }
 
 #[test]
-fn changed_unmeasured_child_builds_fresh_subtree_instead_of_reusing_position() {
+fn changed_unmeasured_child_reuses_position_and_updates_style() {
     let mut engine = LayoutEngine::new();
     let first_root = request_row(&mut engine, &[10.0, 20.0]);
     let first_root_node = engine.commit_layout(first_root);
@@ -1841,16 +1863,14 @@ fn changed_unmeasured_child_builds_fresh_subtree_instead_of_reusing_position() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 1,
-            reuses: 2,
-            removes: 1,
-            child_list_updates: 1,
+            reuses: 3,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
     assert_eq!(second_root_node, first_root_node);
     assert_eq!(second_child_nodes[0], first_child_nodes[0]);
-    assert_ne!(second_child_nodes[1], first_child_nodes[1]);
+    assert_eq!(second_child_nodes[1], first_child_nodes[1]);
 
     let mut fresh = LayoutEngine::new();
     let fresh_root = request_row(&mut fresh, &[10.0, 30.0]);
@@ -1862,7 +1882,7 @@ fn changed_unmeasured_child_builds_fresh_subtree_instead_of_reusing_position() {
 }
 
 #[test]
-fn changed_ancestor_rebuilds_non_exact_subtree_instead_of_decomposing_it() {
+fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
     let mut engine = LayoutEngine::new();
     let stable_grandchild = request_leaf(&mut engine, 10.0);
     let changing_grandchild = request_leaf(&mut engine, 20.0);
@@ -1895,10 +1915,10 @@ fn changed_ancestor_rebuilds_non_exact_subtree_instead_of_decomposing_it() {
     let second_changing_grandchild_node = second_grandchild_nodes[1];
 
     assert_eq!(second_root_node, first_root_node);
-    assert_ne!(second_changed_child_node, first_changed_child_node);
+    assert_eq!(second_changed_child_node, first_changed_child_node);
     assert_eq!(second_stable_sibling_node, first_stable_sibling_node);
-    assert_ne!(second_stable_grandchild_node, first_stable_grandchild_node);
-    assert_ne!(
+    assert_eq!(second_stable_grandchild_node, first_stable_grandchild_node);
+    assert_eq!(
         second_changing_grandchild_node,
         first_changing_grandchild_node
     );
@@ -1909,10 +1929,8 @@ fn changed_ancestor_rebuilds_non_exact_subtree_instead_of_decomposing_it() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 3,
-            reuses: 2,
-            removes: 3,
-            child_list_updates: 1,
+            reuses: 5,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2252,10 +2270,8 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 1,
-            reuses: 2,
-            removes: 1,
-            child_list_updates: 1,
+            reuses: 3,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2625,11 +2641,12 @@ fn changed_unmeasured_sibling_remeasures_text_child(cx: &mut TestAppContext) {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            creates: 2,
-            removes: 2,
+            reuses: 2,
+            creates: 1,
+            removes: 1,
             child_list_updates: 1,
             context_clears: 1,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2686,7 +2703,7 @@ fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppConte
         );
     });
 
-    assert_ne!(
+    assert_eq!(
         engine.retained_node_token_for_tests(stable_container),
         first_container_node
     );
@@ -2695,11 +2712,12 @@ fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppConte
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            creates: 3,
-            removes: 3,
+            reuses: 3,
+            creates: 1,
+            removes: 1,
             child_list_updates: 1,
             context_clears: 1,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3223,7 +3241,7 @@ fn retained_layout_recomputes_when_root_available_space_changes() {
 }
 
 #[test]
-fn changed_flex_ancestor_rebuilds_canvas_subtree_and_matches_fresh_layout() {
+fn changed_flex_ancestor_updates_canvas_subtree_and_matches_fresh_layout() {
     let mut retained = LayoutEngine::new();
     let (root, _flex_child, _canvas_host, _canvas) =
         request_canvas_like_flex_frame(&mut retained, 0.0);
@@ -3273,10 +3291,8 @@ fn changed_flex_ancestor_rebuilds_canvas_subtree_and_matches_fresh_layout() {
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 6,
-            reuses: 1,
-            removes: 6,
-            child_list_updates: 1,
+            reuses: 7,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3414,10 +3430,8 @@ fn reused_canvas_panel_inside_chrome_shell_after_sidebar_resize_matches_fresh_la
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 12,
-            reuses: 2,
-            removes: 12,
-            child_list_updates: 1,
+            reuses: 14,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3485,10 +3499,8 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 12,
-            reuses: 2,
-            removes: 12,
-            child_list_updates: 1,
+            reuses: 14,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );

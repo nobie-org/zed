@@ -2125,17 +2125,36 @@ impl RetainedLayoutForest {
     ///
     /// This preserves retention across insert/delete/reorder only when a
     /// previous child subtree is already compatible with a current child. If no
-    /// exact match exists, the current child must be built fresh; old retained
-    /// nodes are never reused as allocation slots for changed subtrees.
+    /// exact match exists, the child at the same position may still be updated
+    /// in place when the retained node kind can host the current intent. This
+    /// keeps conservative measured leaves from forcing every ancestor to churn.
     fn assign_matching_previous_children(
         &self,
         children: &[LayoutId],
         previous_children: &mut [Option<RetainedLayoutOccurrence>],
     ) -> Vec<Option<RetainedLayoutOccurrence>> {
-        children
+        let mut assigned = children
             .iter()
             .map(|child| self.take_matching_previous_child(*child, previous_children))
-            .collect()
+            .collect::<Vec<_>>();
+
+        for (index, child) in children.iter().enumerate() {
+            if assigned[index].is_some() {
+                continue;
+            }
+
+            let Some(previous_child) = previous_children.get_mut(index) else {
+                continue;
+            };
+            let Some(candidate) = previous_child.as_ref() else {
+                continue;
+            };
+            if self.retained_occurrence_can_update_intent(*child, candidate) {
+                assigned[index] = previous_child.take();
+            }
+        }
+
+        assigned
     }
 
     /// Remove one exact previous child match from the available sibling set.
@@ -2273,6 +2292,33 @@ impl RetainedLayoutForest {
                         .all(|(child, previous_child)| {
                             self.retained_occurrence_matches_intent(*child, previous_child)
                         })
+            }
+            LayoutIntentKind::Measured { measured_kind, .. } => {
+                previous.facts.kind == RetainedLayoutKind::Measured
+                    && previous.children.is_empty()
+                    && Self::measured_kinds_compatible(
+                        previous.facts.measured_kind.as_ref(),
+                        measured_kind,
+                    )
+            }
+        }
+    }
+
+    /// Return whether a retained occurrence may be updated to host an intent.
+    ///
+    /// This is a shallow compatibility check. It does not claim the retained
+    /// subtree is still valid; it only says that committing the current intent
+    /// through this occurrence can update all retained facts and mirror edges
+    /// without changing the node category.
+    fn retained_occurrence_can_update_intent(
+        &self,
+        id: LayoutId,
+        previous: &RetainedLayoutOccurrence,
+    ) -> bool {
+        match &self.intent(id).kind {
+            LayoutIntentKind::Unmeasured { .. } => {
+                previous.facts.kind == RetainedLayoutKind::Unmeasured
+                    && previous.facts.measured_kind.is_none()
             }
             LayoutIntentKind::Measured { measured_kind, .. } => {
                 previous.facts.kind == RetainedLayoutKind::Measured

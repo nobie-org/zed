@@ -2085,9 +2085,7 @@ impl RetainedLayoutForest {
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
         for (index, child) in children.into_iter().enumerate() {
-            let previous_child = exact_previous_children[index]
-                .take()
-                .or_else(|| previous_children.get_mut(index).and_then(Option::take));
+            let previous_child = exact_previous_children[index].take();
             let retained_child = self.commit_intent(child, previous_child);
             child_node_ids.push(retained_child.node_id);
             retained_children.push(retained_child);
@@ -2127,8 +2125,8 @@ impl RetainedLayoutForest {
     ///
     /// This preserves retention across insert/delete/reorder only when a
     /// previous child subtree is already compatible with a current child. If no
-    /// exact match exists, the caller may still fall back to positional reuse
-    /// with explicit mirror updates.
+    /// exact match exists, the current child must be built fresh; old retained
+    /// nodes are never reused as allocation slots for changed subtrees.
     fn assign_matching_previous_children(
         &self,
         children: &[LayoutId],

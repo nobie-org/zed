@@ -1072,17 +1072,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
 
                 let mut child_list_changed = previous_children.len() != current_children.len();
                 for (current_index, current_child) in current_children.iter().enumerate() {
-                    let matching_previous_index =
-                        assigned_previous_indices[current_index].or_else(|| {
-                            previous_children.get(current_index).and_then(|_| {
-                                if previous_used[current_index] {
-                                    None
-                                } else {
-                                    previous_used[current_index] = true;
-                                    Some(current_index)
-                                }
-                            })
-                        });
+                    let matching_previous_index = assigned_previous_indices[current_index];
                     if let Some(index) = matching_previous_index {
                         let reused_existing_node =
                             self.add_commit(&previous_children[index], current_child);
@@ -1835,7 +1825,7 @@ fn unchanged_unmeasured_tree_emits_no_retained_mutations_on_second_frame() {
 }
 
 #[test]
-fn changed_unmeasured_parent_projects_style_update_into_retained_node() {
+fn changed_unmeasured_child_builds_fresh_subtree_instead_of_reusing_position() {
     let mut engine = LayoutEngine::new();
     let first_root = request_row(&mut engine, &[10.0, 20.0]);
     let first_root_node = engine.commit_layout(first_root);
@@ -1851,14 +1841,16 @@ fn changed_unmeasured_parent_projects_style_update_into_retained_node() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            style_updates: 1,
+            creates: 1,
+            reuses: 2,
+            removes: 1,
+            child_list_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
     assert_eq!(second_root_node, first_root_node);
     assert_eq!(second_child_nodes[0], first_child_nodes[0]);
-    assert_eq!(second_child_nodes[1], first_child_nodes[1]);
+    assert_ne!(second_child_nodes[1], first_child_nodes[1]);
 
     let mut fresh = LayoutEngine::new();
     let fresh_root = request_row(&mut fresh, &[10.0, 30.0]);
@@ -1870,7 +1862,7 @@ fn changed_unmeasured_parent_projects_style_update_into_retained_node() {
 }
 
 #[test]
-fn changed_ancestor_decomposes_previous_tree_to_reuse_exact_grandchildren() {
+fn changed_ancestor_rebuilds_non_exact_subtree_instead_of_decomposing_it() {
     let mut engine = LayoutEngine::new();
     let stable_grandchild = request_leaf(&mut engine, 10.0);
     let changing_grandchild = request_leaf(&mut engine, 20.0);
@@ -1903,10 +1895,10 @@ fn changed_ancestor_decomposes_previous_tree_to_reuse_exact_grandchildren() {
     let second_changing_grandchild_node = second_grandchild_nodes[1];
 
     assert_eq!(second_root_node, first_root_node);
-    assert_eq!(second_changed_child_node, first_changed_child_node);
+    assert_ne!(second_changed_child_node, first_changed_child_node);
     assert_eq!(second_stable_sibling_node, first_stable_sibling_node);
-    assert_eq!(second_stable_grandchild_node, first_stable_grandchild_node);
-    assert_eq!(
+    assert_ne!(second_stable_grandchild_node, first_stable_grandchild_node);
+    assert_ne!(
         second_changing_grandchild_node,
         first_changing_grandchild_node
     );
@@ -1917,8 +1909,10 @@ fn changed_ancestor_decomposes_previous_tree_to_reuse_exact_grandchildren() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 5,
-            style_updates: 1,
+            creates: 3,
+            reuses: 2,
+            removes: 3,
+            child_list_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2258,8 +2252,10 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            style_updates: 1,
+            creates: 1,
+            reuses: 2,
+            removes: 1,
+            child_list_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2629,10 +2625,9 @@ fn changed_unmeasured_sibling_remeasures_text_child(cx: &mut TestAppContext) {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
-            creates: 1,
-            removes: 1,
-            style_updates: 1,
+            reuses: 1,
+            creates: 2,
+            removes: 2,
             child_list_updates: 1,
             context_clears: 1,
             ..RetainedForestMutationSample::default()
@@ -2691,7 +2686,7 @@ fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppConte
         );
     });
 
-    assert_eq!(
+    assert_ne!(
         engine.retained_node_token_for_tests(stable_container),
         first_container_node
     );
@@ -2700,10 +2695,9 @@ fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppConte
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            creates: 1,
-            removes: 1,
-            style_updates: 1,
+            reuses: 1,
+            creates: 3,
+            removes: 3,
             child_list_updates: 1,
             context_clears: 1,
             ..RetainedForestMutationSample::default()
@@ -3229,7 +3223,7 @@ fn retained_layout_recomputes_when_root_available_space_changes() {
 }
 
 #[test]
-fn reused_full_size_subtree_under_changed_flex_ancestor_matches_fresh_layout() {
+fn changed_flex_ancestor_rebuilds_canvas_subtree_and_matches_fresh_layout() {
     let mut retained = LayoutEngine::new();
     let (root, _flex_child, _canvas_host, _canvas) =
         request_canvas_like_flex_frame(&mut retained, 0.0);
@@ -3279,8 +3273,10 @@ fn reused_full_size_subtree_under_changed_flex_ancestor_matches_fresh_layout() {
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 7,
-            style_updates: 1,
+            creates: 6,
+            reuses: 1,
+            removes: 6,
+            child_list_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3345,7 +3341,15 @@ fn reused_canvas_panel_under_inserted_sidebar_matches_fresh_layout() {
             size(1676.0, 1145.0),
         )
     );
-    assert!(retained.retained_mutation_sample_for_tests().reuses >= 5);
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            creates: 1,
+            reuses: 7,
+            child_list_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
 }
 
 #[test]
@@ -3407,7 +3411,16 @@ fn reused_canvas_panel_inside_chrome_shell_after_sidebar_resize_matches_fresh_la
             size(1676.0, 1145.0),
         )
     );
-    assert!(retained.retained_mutation_sample_for_tests().reuses >= 5);
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            creates: 12,
+            reuses: 2,
+            removes: 12,
+            child_list_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
 }
 
 #[test]
@@ -3469,7 +3482,16 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
             size(1676.0, 1145.0),
         )
     );
-    assert!(retained.retained_mutation_sample_for_tests().reuses >= 5);
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            creates: 12,
+            reuses: 2,
+            removes: 12,
+            child_list_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use gpui::{
     scene_protocol::{
         LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
         RenderGroupBackendCounters, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
-        Scene, TransformationMatrix,
+        Scene, Shadow, TransformationMatrix,
     },
     size, transparent_black,
 };
@@ -58,6 +58,22 @@ fn quad(order: u32, bounds: Bounds<ScaledPixels>, background: impl Into<Backgrou
         border_color: transparent_black(),
         corner_radii: Corners::all(sp(0.)),
         border_widths: Edges::all(sp(0.)),
+    }
+}
+
+fn shadow(
+    order: u32,
+    bounds: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    color: Hsla,
+) -> Shadow {
+    Shadow {
+        order,
+        blur_radius: sp(0.),
+        bounds,
+        corner_radii,
+        content_mask: mask(),
+        color,
     }
 }
 
@@ -226,6 +242,27 @@ fn identity_render_group_matches_inline_rendering() {
     let grouped_image = render(&grouped);
 
     assert_eq!(grouped_image.as_raw(), inline_image.as_raw());
+}
+
+#[test]
+fn zero_blur_shadow_matches_hard_quad_coverage() {
+    let bounds = rect(8., 8., 16., 16.);
+    let corner_radii = Corners::all(sp(4.));
+
+    let mut shadow_scene = Scene::default();
+    shadow_scene.insert_primitive(quad(0, viewport(), black()));
+    shadow_scene.insert_primitive(shadow(1, bounds, corner_radii, red()));
+    shadow_scene.finish();
+
+    let mut quad_scene = Scene::default();
+    quad_scene.insert_primitive(quad(0, viewport(), black()));
+    quad_scene.insert_primitive(Quad {
+        corner_radii,
+        ..quad(1, bounds, red())
+    });
+    quad_scene.finish();
+
+    assert_eq!(render(&shadow_scene).as_raw(), render(&quad_scene).as_raw());
 }
 
 // --- M2b: measured backend render-group counters match the planner ---

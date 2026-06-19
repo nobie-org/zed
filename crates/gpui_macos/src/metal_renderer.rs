@@ -517,6 +517,26 @@ impl Renderer {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub fn current_test_window_renderer() -> Option<Box<dyn gpui::PlatformTestWindowRenderer>> {
+    match RendererChoice::from_env() {
+        RendererChoice::Metal => {
+            let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+            let renderer =
+                MetalRenderer::try_new_internal(None, true, pool).unwrap_or_else(|error| {
+                    panic!("failed to initialize test-window Metal renderer: {error}")
+                });
+            Some(Box::new(renderer))
+        }
+        RendererChoice::Wgpu => {
+            let renderer = gpui_wgpu::WgpuTestWindowRenderer::new().unwrap_or_else(|error| {
+                panic!("failed to initialize test-window wgpu renderer: {error:#}")
+            });
+            Some(Box::new(renderer))
+        }
+    }
+}
+
 pub(crate) struct InstanceBufferPool {
     buffer_size: usize,
     buffers: Vec<metal::Buffer>,
@@ -2983,6 +3003,29 @@ fn first_and_last_path(
     let first_path = paths.first()?;
     let last_path = paths.last()?;
     Some((first_path, last_path))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl gpui::PlatformTestWindowRenderer for MetalRenderer {
+    fn draw_presented_frame(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<SceneCapture> {
+        let image = MetalRenderer::draw_presented_frame_to_image(self, scene, size)?;
+        let width_px = image.width();
+        let height_px = image.height();
+        Ok(SceneCapture {
+            rgba: image.into_raw(),
+            width_px,
+            height_px,
+            backend: SceneCaptureBackend::Metal,
+        })
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
+        self.sprite_atlas.clone()
+    }
 }
 
 fn new_command_encoder_for_texture<'a>(

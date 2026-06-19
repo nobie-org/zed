@@ -2029,9 +2029,7 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
-    @location(2) @interpolate(flat) sprite_id: u32,
-    @location(3) clip_distances: vec4<f32>,
-    @location(4) scene_position: vec2<f32>,
+    @location(2) clip_distances: vec4<f32>,
 }
 
 @vertex
@@ -2044,39 +2042,13 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
-    out.scene_position = scene_position(unit_vertex, sprite.bounds);
     return out;
-}
-
-fn mono_sprite_uses_texel_load(sprite: MonochromeSprite) -> bool {
-    let tile_size = vec2<f32>(
-        f32(sprite.tile.bounds.size.x),
-        f32(sprite.tile.bounds.size.y),
-    );
-    let identity_transform =
-        sprite.transformation.rotation_scale[0][0] == 1.0 &&
-        sprite.transformation.rotation_scale[0][1] == 0.0 &&
-        sprite.transformation.rotation_scale[1][0] == 0.0 &&
-        sprite.transformation.rotation_scale[1][1] == 1.0 &&
-        sprite.transformation.translation.x == 0.0 &&
-        sprite.transformation.translation.y == 0.0;
-    return identity_transform && all(sprite.bounds.size == tile_size);
-}
-
-fn mono_sprite_texel(input: MonoSpriteVarying, sprite: MonochromeSprite) -> vec2<i32> {
-    let local = vec2<i32>(floor(input.scene_position - sprite.bounds.origin));
-    let max_texel = sprite.tile.bounds.size - vec2<i32>(1, 1);
-    return sprite.tile.bounds.origin + clamp(local, vec2<i32>(0, 0), max_texel);
 }
 
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
-    let sprite = b_mono_sprites[input.sprite_id];
-    let linear_sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
-    let texel_sample = textureLoad(t_sprite, mono_sprite_texel(input, sprite), 0).r;
-    let sample = select(linear_sample, texel_sample, mono_sprite_uses_texel_load(sprite));
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {

@@ -13,7 +13,7 @@ path = "src/gpui_macos.rs"
 
 [features]
 default = ["gpui/default"]
-test-support = ["gpui/test-support"]
+test-support = ["gpui/test-support", "gpui_wgpu/test-support"]
 runtime_shaders = []
 font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture"]

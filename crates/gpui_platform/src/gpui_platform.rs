@@ -60,13 +60,19 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
-/// Returns the current test-window renderer for screenshots. Native platforms
+/// Returns the current test-window renderer for screenshots. macOS delegates to
+/// the same renderer choice used by headed windows; non-macOS native platforms
 /// use the wgpu renderer's shared presentation texture path without a platform
 /// surface. There is no silent fallback: a missing native test renderer is an
 /// environment misconfiguration and fails loudly.
 #[cfg(feature = "test-support")]
 pub fn current_test_window_renderer() -> Option<Box<dyn gpui::PlatformTestWindowRenderer>> {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::metal_renderer::current_test_window_renderer()
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
     {
         match gpui_wgpu::WgpuTestWindowRenderer::new() {
             Ok(renderer) => Some(Box::new(renderer)),

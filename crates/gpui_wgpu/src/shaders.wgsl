@@ -317,6 +317,28 @@ fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(color, alpha);
 }
 
+fn gradient_dither(position: vec2<f32>) -> f32 {
+    let x = u32(floor(position.x));
+    let y = u32(floor(position.y));
+    var h = x * 0x1f123bb5u + y * 0x05491333u + 0x9e3779b9u;
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    let r1 = h & 0xffu;
+
+    h = h + 0x9e3779b9u;
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    let r2 = h & 0xffu;
+
+    return (f32(r1 + r2) - 255.0) / 255.0;
+}
+
 // A standard gaussian function, used for weighting samples
 fn gaussian(x: f32, sigma: f32) -> f32{
     return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * M_PI_F) * sigma);
@@ -474,14 +496,7 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
                 }
             }
 
-            // Dither to reduce banding in gradients (especially dark/alpha).
-            // Triangular-distributed noise breaks up 8-bit quantization steps.
-            // ±2/255 for RGB (enough for dark-on-dark compositing),
-            // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
-            let seed = position * 0.6180339887;
-            let r1 = fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-            let r2 = fract(sin(dot(seed, vec2<f32>(39.3460, 11.135))) * 24634.6345);
-            let tri = r1 + r2 - 1.0;
+            let tri = gradient_dither(position);
             background_color = vec4<f32>(
                 background_color.rgb + vec3<f32>(tri * 2.0 / 255.0),
                 background_color.a + tri * 3.0 / 255.0,

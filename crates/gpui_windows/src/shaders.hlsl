@@ -309,6 +309,28 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
+float gradient_dither(float2 position) {
+    uint x = (uint)floor(position.x);
+    uint y = (uint)floor(position.y);
+    uint h = x * 0x1f123bb5u + y * 0x05491333u + 0x9e3779b9u;
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    uint r1 = h & 0xffu;
+
+    h = h + 0x9e3779b9u;
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    h = h * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    uint r2 = h & 0xffu;
+
+    return (float(r1 + r2) - 255.0) / 255.0;
+}
+
 GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
     GradientColor output;
     if (tag == 0 || tag == 2 || tag == 3) {
@@ -387,15 +409,8 @@ float4 gradient_color(Background background,
                 }
             }
 
-            // Dither to reduce banding in gradients (especially dark/alpha).
-            // Triangular-distributed noise breaks up 8-bit quantization steps.
-            // ±2/255 for RGB (enough for dark-on-dark compositing),
-            // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
             {
-                float2 seed = position * 0.6180339887; // golden ratio spread
-                float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-                float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
-                float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
+                float tri = gradient_dither(position);
                 color.rgb += tri * 2.0 / 255.0;
                 color.a   += tri * 3.0 / 255.0;
             }

@@ -283,6 +283,11 @@ fn linear_srgb_to_oklab(color: vec4<f32>) -> vec4<f32> {
 	);
 }
 
+/// Convert a sRGBA color to Oklab space.
+fn srgb_to_oklab(color: vec4<f32>) -> vec4<f32> {
+	return linear_srgb_to_oklab(srgba_to_linear(color));
+}
+
 /// Convert an Oklab color to linear sRGB space.
 fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 	let l_ = color.r + 0.3963377774 * color.g + 0.2158037573 * color.b;
@@ -299,6 +304,11 @@ fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 		-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
 		color.a
 	);
+}
+
+/// Convert an Oklab color to sRGBA space.
+fn oklab_to_srgb(color: vec4<f32>) -> vec4<f32> {
+	return linear_to_srgba(oklab_to_linear_srgb(color));
 }
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
@@ -399,20 +409,15 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
     if (tag == 0u || tag == 2u || tag == 3u) {
         result.solid = hsla_to_rgba(solid);
     } else if (tag == 1u) {
-        // The hsla_to_rgba is returns a linear sRGB color
         result.color0 = hsla_to_rgba(colors[0].color);
         result.color1 = hsla_to_rgba(colors[1].color);
 
         // Prepare color space in vertex for avoid conversion
         // in fragment shader for performance reasons
-        if (color_space == 0u) {
-            // sRGB
-            result.color0 = linear_to_srgba(result.color0);
-            result.color1 = linear_to_srgba(result.color1);
-        } else if (color_space == 1u) {
+        if (color_space == 1u) {
             // Oklab
-            result.color0 = linear_srgb_to_oklab(result.color0);
-            result.color1 = linear_srgb_to_oklab(result.color1);
+            result.color0 = srgb_to_oklab(result.color0);
+            result.color1 = srgb_to_oklab(result.color1);
         }
     }
 
@@ -461,13 +466,26 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
             switch (background.color_space) {
                 default: {
-                    background_color = srgba_to_linear(mix(color0, color1, t));
+                    background_color = mix(color0, color1, t);
                 }
                 case 1u: {
                     let oklab_color = mix(color0, color1, t);
-                    background_color = oklab_to_linear_srgb(oklab_color);
+                    background_color = oklab_to_srgb(oklab_color);
                 }
             }
+
+            // Dither to reduce banding in gradients (especially dark/alpha).
+            // Triangular-distributed noise breaks up 8-bit quantization steps.
+            // ±2/255 for RGB (enough for dark-on-dark compositing),
+            // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
+            let seed = position * 0.6180339887;
+            let r1 = fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+            let r2 = fract(sin(dot(seed, vec2<f32>(39.3460, 11.135))) * 24634.6345);
+            let tri = r1 + r2 - 1.0;
+            background_color = vec4<f32>(
+                background_color.rgb + vec3<f32>(tri * 2.0 / 255.0),
+                background_color.a + tri * 3.0 / 255.0,
+            );
         }
         case 2u: {
             // pattern slash

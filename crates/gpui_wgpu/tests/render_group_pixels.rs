@@ -10,8 +10,8 @@ use gpui::{
     RenderImageParams, RenderSvgParams, ScaledPixels, SurfacePrimitive, SurfaceSilhouette, point,
     px, rgba,
     scene_protocol::{
-        LogicalVisualPlan, MonochromeSprite, MonochromeSpriteAlphaMode, PaintGroup, Path,
-        PolychromeSprite, Quad, RenderGroupBackendCounters, RenderGroupShadowModeCounters,
+        LogicalVisualPlan, MONOCHROME_SPRITE_ALPHA_MODE_INTERPOLATED, MonochromeSprite, PaintGroup,
+        Path, PolychromeSprite, Quad, RenderGroupBackendCounters, RenderGroupShadowModeCounters,
         RenderGroupShadowSourceCounters, Scene, Shadow, TransformationMatrix,
     },
     size, transparent_black,
@@ -2066,7 +2066,7 @@ fn monochrome_sprite(
 ) -> MonochromeSprite {
     MonochromeSprite {
         order,
-        alpha_mode: MonochromeSpriteAlphaMode::Interpolated,
+        alpha_mode: MONOCHROME_SPRITE_ALPHA_MODE_INTERPOLATED,
         bounds,
         content_mask: mask(),
         color,

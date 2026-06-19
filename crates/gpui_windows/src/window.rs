@@ -32,6 +32,7 @@ use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
 use gpui::scene_protocol::Scene;
 use gpui::*;
+use gpui::{RenderGroupBackendTotals, RenderGroupDrawOutcome};
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
@@ -938,12 +939,21 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
-    fn draw(&self, scene: &Scene) {
-        self.state
+    fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome {
+        if self
+            .state
             .renderer
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
-            .log_err();
+            .log_err()
+            == Some(true)
+        {
+            RenderGroupDrawOutcome::Completed {
+                backend_totals: RenderGroupBackendTotals::Unknown,
+            }
+        } else {
+            RenderGroupDrawOutcome::NotCompleted
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

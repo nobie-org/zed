@@ -6,9 +6,10 @@ use std::{cell::Cell, cell::RefCell, rc::Rc};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
     Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px, scene_protocol::Scene,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RenderGroupBackendTotals, RenderGroupDrawOutcome, RequestFrameOptions, ResizeEdge, Size,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowParams, px, scene_protocol::Scene,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use wasm_bindgen::prelude::*;
@@ -664,7 +665,7 @@ impl PlatformWindow for WebWindow {
         self.inner.callbacks.borrow_mut().appearance_changed = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome {
         if let Some((width, height)) = self.inner.pending_physical_size.take() {
             if self.inner.canvas.width() != width || self.inner.canvas.height() != height {
                 self.inner.canvas.set_width(width);
@@ -679,7 +680,18 @@ impl PlatformWindow for WebWindow {
             drop(state);
         }
 
-        self.inner.state.borrow_mut().renderer.draw(scene);
+        let mut state = self.inner.state.borrow_mut();
+        if state.renderer.draw(scene) {
+            RenderGroupDrawOutcome::Completed {
+                backend_totals: state
+                    .renderer
+                    .render_group_backend_counters()
+                    .map(RenderGroupBackendTotals::Measured)
+                    .unwrap_or(RenderGroupBackendTotals::Unknown),
+            }
+        } else {
+            RenderGroupDrawOutcome::NotCompleted
+        }
     }
 
     fn completed_frame(&self) {

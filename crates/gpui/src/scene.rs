@@ -164,6 +164,40 @@ impl Scene {
         })
     }
 
+    /// Returns a completed-draw observation for all render groups in this scene.
+    pub fn render_group_draw_observation(
+        &self,
+        draw_id: u64,
+        backend_totals: RenderGroupBackendTotals,
+    ) -> RenderGroupDrawObservation {
+        let mut groups = Vec::new();
+        let mut predicted_totals = RenderGroupSupportCounters::default();
+        self.collect_render_group_observations(draw_id, &mut groups, &mut predicted_totals);
+        RenderGroupDrawObservation {
+            draw_id,
+            groups,
+            predicted_totals,
+            backend_totals,
+        }
+    }
+
+    fn collect_render_group_observations(
+        &self,
+        draw_id: u64,
+        groups: &mut Vec<RenderGroupObservation>,
+        predicted_totals: &mut RenderGroupSupportCounters,
+    ) {
+        for group in &self.groups {
+            let group_index = groups.len();
+            let observation = RenderGroupObservation::from_group(draw_id, group_index, group);
+            predicted_totals.add(observation.model_counters);
+            groups.push(observation);
+            group
+                .scene()
+                .collect_render_group_observations(draw_id, groups, predicted_totals);
+        }
+    }
+
     #[cfg_attr(
         all(
             any(target_os = "linux", target_os = "freebsd"),
@@ -2523,6 +2557,8 @@ impl RenderGroupInput {
 /// Backend-independent visual meaning for a render group.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalVisualPlan {
+    scale_factor: f32,
+    boundary_opacity: f32,
     effects: Vec<CompositeEffect>,
     accepted_effects: Vec<CompositeEffect>,
     planning_rejections: Vec<RenderGroupPlanningRejection>,
@@ -2554,6 +2590,8 @@ impl LogicalVisualPlan {
             RenderGroupRequirements::from_effect_plan(scale_factor, &accepted_effects, &normalized);
         let physical = PhysicalRenderGroupPlan::from_effect_plan(&requirements, &normalized);
         Self {
+            scale_factor,
+            boundary_opacity,
             effects,
             accepted_effects,
             planning_rejections,
@@ -2572,6 +2610,16 @@ impl LogicalVisualPlan {
     /// Returns the raw effects accepted into the current backend plan.
     pub fn accepted_effects(&self) -> &[CompositeEffect] {
         &self.accepted_effects
+    }
+
+    /// Returns the window scale factor used to lower this plan.
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Returns opacity inherited from ancestors outside this render group.
+    pub fn boundary_opacity(&self) -> f32 {
+        self.boundary_opacity
     }
 
     /// Returns typed planning rejections produced while lowering this plan.
@@ -2769,6 +2817,34 @@ pub struct RenderGroupSupportCounters {
     pub content_alpha_shadow_sample_count_estimate: u64,
 }
 
+impl RenderGroupSupportCounters {
+    /// Adds another support counter set into this total.
+    pub fn add(&mut self, other: RenderGroupSupportCounters) {
+        self.rendered_groups += other.rendered_groups;
+        self.elided_groups += other.elided_groups;
+        self.rejected_groups += other.rejected_groups;
+        self.source_capture_groups += other.source_capture_groups;
+        self.direct_surface_groups += other.direct_surface_groups;
+        self.source_capture_pixels += other.source_capture_pixels;
+        self.backdrop_read_pixels += other.backdrop_read_pixels;
+        self.surface_shadow_draw_pixels += other.surface_shadow_draw_pixels;
+        self.logical_passes += other.logical_passes;
+        self.physical_passes += other.physical_passes;
+        self.intermediate_textures += other.intermediate_textures;
+        self.backdrop_copies += other.backdrop_copies;
+        self.shadow_sources.content_alpha += other.shadow_sources.content_alpha;
+        self.shadow_sources.surface_geometry += other.shadow_sources.surface_geometry;
+        self.shadow_modes.separable += other.shadow_modes.separable;
+        self.shadow_modes.exact += other.shadow_modes.exact;
+        self.shadow_modes.downsampled += other.shadow_modes.downsampled;
+        self.content_alpha_shadow_max_kernel_radius = self
+            .content_alpha_shadow_max_kernel_radius
+            .max(other.content_alpha_shadow_max_kernel_radius);
+        self.content_alpha_shadow_sample_count_estimate +=
+            other.content_alpha_shadow_sample_count_estimate;
+    }
+}
+
 /// Additive render-group shadow-source diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2848,6 +2924,124 @@ impl RenderGroupBackendCounters {
         self.content_alpha_shadow_sample_count_estimate +=
             support.content_alpha_shadow_sample_count_estimate;
     }
+}
+
+/// Backend measurement state for a completed render-group draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenderGroupBackendTotals {
+    /// The draw completed but the backend did not report render-group counters.
+    Unknown,
+    /// The backend measured render-group counters for the completed draw.
+    Measured(RenderGroupBackendCounters),
+}
+
+/// Result of handing a completed GPUI scene to the platform renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenderGroupDrawOutcome {
+    /// The platform did not complete a draw for the supplied scene.
+    NotCompleted,
+    /// The platform completed a draw and may have reported backend counters.
+    Completed {
+        /// Backend measurement state for the completed draw.
+        backend_totals: RenderGroupBackendTotals,
+    },
+}
+
+/// Completed-draw render-group work reported by GPUI.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RenderGroupDrawObservation {
+    /// GPUI draw id associated with the scene.
+    pub draw_id: u64,
+    /// Frame-order render-group rows, including nested groups.
+    pub groups: Vec<RenderGroupObservation>,
+    /// Sum of every group's model counters for this draw.
+    pub predicted_totals: RenderGroupSupportCounters,
+    /// Backend-measured totals when the renderer can report them.
+    pub backend_totals: RenderGroupBackendTotals,
+}
+
+/// One render group observed in a completed draw.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RenderGroupObservation {
+    /// Frame-local identity for this group.
+    pub identity: RenderGroupObservationIdentity,
+    /// The semantic group bounds used for masks and material shapes.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The screen-space bounds captured into the group intermediate.
+    pub capture_bounds: Bounds<ScaledPixels>,
+    /// The content mask constraining this group.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Window scale factor used when lowering the logical plan.
+    pub scale_factor: f32,
+    /// Opacity inherited from ancestors outside this render group.
+    pub boundary_opacity: f32,
+    /// Raw authored effects that produced the plan.
+    pub effects: Vec<CompositeEffect>,
+    /// Effects accepted into the current backend-independent plan.
+    pub accepted_effects: Vec<CompositeEffect>,
+    /// Typed rejections produced while lowering the plan.
+    pub planning_rejections: Vec<RenderGroupPlanningRejection>,
+    /// Backend-independent requirements for this group.
+    pub requirements: RenderGroupRequirements,
+    /// Backend-independent source/backdrop/shape dependencies for this group.
+    pub dependencies: RenderGroupDependencies,
+    /// Current physical execution summary for this group.
+    pub physical_plan: PhysicalRenderGroupPlan,
+    /// Model counters for this group over its computed bounds and mask.
+    pub model_counters: RenderGroupSupportCounters,
+}
+
+impl RenderGroupObservation {
+    fn from_group(draw_id: u64, group_index: usize, group: &PaintGroup) -> Self {
+        let plan = group.plan();
+        Self {
+            identity: RenderGroupObservationIdentity {
+                draw_id,
+                group_index,
+                stable_identity: RenderGroupStableIdentity::Unavailable,
+            },
+            bounds: group.bounds(),
+            capture_bounds: group.capture_bounds(),
+            content_mask: group.content_mask(),
+            scale_factor: plan.scale_factor(),
+            boundary_opacity: plan.boundary_opacity(),
+            effects: plan.effects().to_vec(),
+            accepted_effects: plan.accepted_effects().to_vec(),
+            planning_rejections: plan.planning_rejections().to_vec(),
+            requirements: plan.requirements(),
+            dependencies: plan.dependencies(),
+            physical_plan: plan.physical_plan(),
+            model_counters: plan.support_counters(
+                group.bounds(),
+                group.capture_bounds(),
+                group.content_mask(),
+            ),
+        }
+    }
+}
+
+/// Identity for one observed render group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderGroupObservationIdentity {
+    /// GPUI draw id associated with the scene.
+    pub draw_id: u64,
+    /// Frame-order index among observed groups in this draw.
+    pub group_index: usize,
+    /// Best available stable identity for this group.
+    pub stable_identity: RenderGroupStableIdentity,
+}
+
+/// Stable render-group identity when GPUI can prove one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RenderGroupStableIdentity {
+    /// No stable identity is available; use `draw_id + group_index` only.
+    Unavailable,
 }
 
 /// A typed reason why an authored render-group effect could not enter the exact plan.
@@ -4574,14 +4768,23 @@ mod tests {
         capture_bounds: Bounds<ScaledPixels>,
         content_mask: ContentMask<ScaledPixels>,
     ) -> PaintGroup {
-        PaintGroup::new(
-            0,
+        group_with_plan_and_scene(
             bounds,
             capture_bounds,
             content_mask,
             LogicalVisualPlan::from_effects(1., 0.5, vec![CompositeEffect::opacity(0.5)]),
             Scene::default(),
         )
+    }
+
+    fn group_with_plan_and_scene(
+        bounds: Bounds<ScaledPixels>,
+        capture_bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        plan: LogicalVisualPlan,
+        scene: Scene,
+    ) -> PaintGroup {
+        PaintGroup::new(0, bounds, capture_bounds, content_mask, plan, scene)
     }
 
     fn apply_filter(filter: SourceColorFilter, rgb: [f32; 3]) -> [f32; 3] {
@@ -4636,6 +4839,130 @@ mod tests {
         scene.insert_primitive(group(bounds, capture_bounds, content_mask));
 
         assert_eq!(scene.visual_bounds(), Some(capture_bounds));
+    }
+
+    #[test]
+    fn render_group_draw_observation_reports_frame_order_groups_and_totals() {
+        let nested_bounds = scaled_bounds(2., 3., 8., 6.);
+        let nested_capture_bounds = scaled_bounds(1., 2., 10., 8.);
+        let nested_mask = mask(scaled_bounds(0., 0., 20., 20.));
+        let nested_group = group_with_plan_and_scene(
+            nested_bounds,
+            nested_capture_bounds,
+            nested_mask,
+            LogicalVisualPlan::from_effects(
+                2.,
+                0.75,
+                vec![CompositeEffect::source_blur(Pixels(2.))],
+            ),
+            Scene::default(),
+        );
+
+        let mut child_scene = Scene::default();
+        child_scene.insert_primitive(nested_group.clone());
+
+        let outer_bounds = scaled_bounds(0., 0., 24., 16.);
+        let outer_capture_bounds = scaled_bounds(-4., -4., 32., 24.);
+        let outer_mask = mask(scaled_bounds(-8., -8., 40., 32.));
+        let outer_group = group_with_plan_and_scene(
+            outer_bounds,
+            outer_capture_bounds,
+            outer_mask,
+            LogicalVisualPlan::from_effects(1., 1., vec![CompositeEffect::opacity(0.5)]),
+            child_scene,
+        );
+
+        let sibling_bounds = scaled_bounds(40., 2., 5., 5.);
+        let sibling_group = group_with_plan_and_scene(
+            sibling_bounds,
+            sibling_bounds,
+            mask(sibling_bounds),
+            LogicalVisualPlan::from_effects(1., 1., Vec::new()),
+            Scene::default(),
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(outer_group.clone());
+        scene.insert_primitive(sibling_group.clone());
+
+        let backend_totals = RenderGroupBackendTotals::Measured(RenderGroupBackendCounters {
+            source_capture_groups: 2,
+            source_capture_pixels: 848,
+            intermediate_textures: 3,
+            backdrop_copies: 1,
+            ..Default::default()
+        });
+        let mut predicted_totals = RenderGroupSupportCounters::default();
+        for group in [&outer_group, &nested_group, &sibling_group] {
+            predicted_totals.add(group.plan().support_counters(
+                group.bounds(),
+                group.capture_bounds(),
+                group.content_mask(),
+            ));
+        }
+
+        let observation = scene.render_group_draw_observation(42, backend_totals);
+
+        assert_eq!(
+            observation,
+            RenderGroupDrawObservation {
+                draw_id: 42,
+                groups: vec![
+                    expected_observation(42, 0, &outer_group),
+                    expected_observation(42, 1, &nested_group),
+                    expected_observation(42, 2, &sibling_group),
+                ],
+                predicted_totals,
+                backend_totals,
+            }
+        );
+    }
+
+    #[test]
+    fn render_group_draw_observation_preserves_unknown_backend_state() {
+        let observation =
+            Scene::default().render_group_draw_observation(7, RenderGroupBackendTotals::Unknown);
+
+        assert_eq!(
+            observation,
+            RenderGroupDrawObservation {
+                draw_id: 7,
+                groups: Vec::new(),
+                predicted_totals: RenderGroupSupportCounters::default(),
+                backend_totals: RenderGroupBackendTotals::Unknown,
+            }
+        );
+    }
+
+    fn expected_observation(
+        draw_id: u64,
+        group_index: usize,
+        group: &PaintGroup,
+    ) -> RenderGroupObservation {
+        let plan = group.plan();
+        RenderGroupObservation {
+            identity: RenderGroupObservationIdentity {
+                draw_id,
+                group_index,
+                stable_identity: RenderGroupStableIdentity::Unavailable,
+            },
+            bounds: group.bounds(),
+            capture_bounds: group.capture_bounds(),
+            content_mask: group.content_mask(),
+            scale_factor: plan.scale_factor(),
+            boundary_opacity: plan.boundary_opacity(),
+            effects: plan.effects().to_vec(),
+            accepted_effects: plan.accepted_effects().to_vec(),
+            planning_rejections: plan.planning_rejections().to_vec(),
+            requirements: plan.requirements(),
+            dependencies: plan.dependencies(),
+            physical_plan: plan.physical_plan(),
+            model_counters: plan.support_counters(
+                group.bounds(),
+                group.capture_bounds(),
+                group.content_mask(),
+            ),
+        }
     }
 
     #[test]

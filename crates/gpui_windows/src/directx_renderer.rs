@@ -309,11 +309,11 @@ impl DirectXRenderer {
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
-            return Ok(());
+            return Ok(false);
         }
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
@@ -359,7 +359,8 @@ impl DirectXRenderer {
                 scene.groups.len(),
             ))?;
         }
-        self.present()
+        self.present()?;
+        Ok(true)
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {

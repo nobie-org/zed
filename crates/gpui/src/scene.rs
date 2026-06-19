@@ -781,17 +781,12 @@ impl Default for TransformationMatrix {
     }
 }
 
-#[expect(missing_docs)]
-pub const MONOCHROME_SPRITE_ALPHA_MODE_INTERPOLATED: u32 = 0;
-#[expect(missing_docs)]
-pub const MONOCHROME_SPRITE_ALPHA_MODE_EXACT: u32 = 1;
-
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub alpha_mode: u32,
+    pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,

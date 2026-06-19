@@ -7,10 +7,9 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LayoutWorkSample, LineLayoutIndex,
-    MONOCHROME_SPRITE_ALPHA_MODE_EXACT, MONOCHROME_SPRITE_ALPHA_MODE_INTERPOLATED, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    PaintGroup, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    KeystrokeEvent, LayoutId, LayoutWorkSample, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Replay, ResizeEdge, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
@@ -3993,7 +3992,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    alpha_mode: MONOCHROME_SPRITE_ALPHA_MODE_INTERPOLATED,
+                    pad: 0,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -4137,7 +4136,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            alpha_mode: MONOCHROME_SPRITE_ALPHA_MODE_EXACT,
+            pad: 0,
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),

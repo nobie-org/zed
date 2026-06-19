@@ -78,6 +78,7 @@ fn select_emoji_font(
 }
 
 const SMOOTH_SVG_SCALE: usize = 2;
+const SVG_ALPHA_MASK_SCALE: usize = 4;
 
 /// When rendering SVGs, we supersample them before uploading or displaying the result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = SMOOTH_SVG_SCALE as f32;
@@ -263,7 +264,7 @@ impl SvgRenderer {
 }
 
 fn supersampled_size(size: Size<DevicePixels>) -> Size<DevicePixels> {
-    size.map(|value| DevicePixels(value.0 * SMOOTH_SVG_SCALE as i32))
+    size.map(|value| DevicePixels(value.0 * SVG_ALPHA_MASK_SCALE as i32))
 }
 
 fn downsample_alpha_mask(pixmap: &Pixmap, size: Size<DevicePixels>) -> Vec<u8> {
@@ -271,18 +272,18 @@ fn downsample_alpha_mask(pixmap: &Pixmap, size: Size<DevicePixels>) -> Vec<u8> {
     let height = size.height.0 as usize;
     let source_width = pixmap.width() as usize;
     let pixels = pixmap.pixels();
-    let samples = (SMOOTH_SVG_SCALE * SMOOTH_SVG_SCALE) as u32;
+    let samples = (SVG_ALPHA_MASK_SCALE * SVG_ALPHA_MASK_SCALE) as u32;
     let rounding = samples / 2;
 
     let mut alpha_mask = Vec::with_capacity(width * height);
     for y in 0..height {
         for x in 0..width {
             let mut alpha = 0u32;
-            for sample_y in 0..SMOOTH_SVG_SCALE {
-                let source_y = y * SMOOTH_SVG_SCALE + sample_y;
+            for sample_y in 0..SVG_ALPHA_MASK_SCALE {
+                let source_y = y * SVG_ALPHA_MASK_SCALE + sample_y;
                 let row_start = source_y * source_width;
-                for sample_x in 0..SMOOTH_SVG_SCALE {
-                    let source_x = x * SMOOTH_SVG_SCALE + sample_x;
+                for sample_x in 0..SVG_ALPHA_MASK_SCALE {
+                    let source_x = x * SVG_ALPHA_MASK_SCALE + sample_x;
                     alpha += pixels[row_start + source_x].alpha() as u32;
                 }
             }
@@ -389,21 +390,29 @@ mod tests {
 
     #[test]
     fn downsample_alpha_mask_averages_supersample_blocks() {
-        let mut pixmap = Pixmap::new(4, 4).unwrap();
-        let alphas = [
-            0, 1, 10, 11, //
-            2, 3, 12, 13, //
-            100, 101, 110, 111, //
-            102, 103, 112, 113,
-        ];
+        let scale = SVG_ALPHA_MASK_SCALE;
+        let mut pixmap = Pixmap::new((2 * scale) as u32, (2 * scale) as u32).unwrap();
+        let block_bases = [[0, 10], [100, 110]];
 
-        for (pixel, alpha) in pixmap.pixels_mut().iter_mut().zip(alphas) {
-            *pixel = resvg::tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, alpha).unwrap();
+        for block_y in 0..2 {
+            for block_x in 0..2 {
+                let base = block_bases[block_y][block_x];
+                for sample_y in 0..scale {
+                    for sample_x in 0..scale {
+                        let x = block_x * scale + sample_x;
+                        let y = block_y * scale + sample_y;
+                        let alpha = base + sample_y * scale + sample_x;
+                        pixmap.pixels_mut()[y * 2 * scale + x] =
+                            resvg::tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, alpha as u8)
+                                .unwrap();
+                    }
+                }
+            }
         }
 
         let mask = downsample_alpha_mask(&pixmap, Size::new(DevicePixels(2), DevicePixels(2)));
 
-        assert_eq!(mask, vec![2, 12, 102, 112]);
+        assert_eq!(mask, vec![8, 18, 108, 118]);
     }
 
     #[test]

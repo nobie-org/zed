@@ -3992,7 +3992,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    alpha_mode: MonochromeSpriteAlphaMode::Interpolated,
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -4136,7 +4136,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            alpha_mode: MonochromeSpriteAlphaMode::Exact,
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),

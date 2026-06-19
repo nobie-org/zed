@@ -49,8 +49,8 @@ mod scene;
 pub mod scene_protocol {
     pub use crate::scene::{
         CompositeEffectPlan, CompositeProcessedContentGlowPlan, DrawOrder, LogicalVisualPlan,
-        MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, PaintGroup, PaintSurface,
-        PaintSurfaceSource, Path, PathId, PathVertex, PathVertex_ScaledPixels,
+        MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, MonochromeSpriteAlphaMode, PaintGroup,
+        PaintSurface, PaintSurfaceSource, Path, PathId, PathVertex, PathVertex_ScaledPixels,
         PhysicalRenderGroupPlan, PolychromeSprite, Primitive, PrimitiveBatch, Quad,
         RenderGroupBackendCounters, RenderGroupDependencies, RenderGroupInput,
         RenderGroupLimitUnit, RenderGroupPhysicalPlanKind, RenderGroupPlanningRejection,
@@ -152,7 +152,8 @@ pub use scene::{
     SurfacePrimitive, SurfaceSilhouette, SurfaceSilhouetteError, TransformationMatrix,
 };
 pub(crate) use scene::{
-    MonochromeSprite, PaintGroup, PolychromeSprite, Quad, Scene, Shadow, SubpixelSprite, Underline,
+    MonochromeSprite, MonochromeSpriteAlphaMode, PaintGroup, PolychromeSprite, Quad, Scene, Shadow,
+    SubpixelSprite, Underline,
 };
 pub(crate) use scene::{PaintSurface, PaintSurfaceSource};
 pub use shared_uri::*;

@@ -782,11 +782,19 @@ impl Default for TransformationMatrix {
 }
 
 #[derive(Copy, Clone, Debug)]
+#[repr(u32)]
+#[expect(missing_docs)]
+pub enum MonochromeSpriteAlphaMode {
+    Interpolated = 0,
+    Exact = 1,
+}
+
+#[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    pub alpha_mode: MonochromeSpriteAlphaMode,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,

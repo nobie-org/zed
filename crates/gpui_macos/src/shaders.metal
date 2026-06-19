@@ -627,6 +627,7 @@ struct MonochromeSpriteVertexOutput {
   float2 tile_position;
   float4 color [[flat]];
   float4 clip_distance;
+  uint alpha_mode [[flat]];
 };
 
 struct MonochromeSpriteFragmentInput {
@@ -634,6 +635,7 @@ struct MonochromeSpriteFragmentInput {
   float2 tile_position;
   float4 color [[flat]];
   float4 clip_distance;
+  uint alpha_mode [[flat]];
 };
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
@@ -656,7 +658,8 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       device_position,
       tile_position,
       color,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      sprite.alpha_mode};
 }
 
 fragment float4 monochrome_sprite_fragment(
@@ -669,10 +672,17 @@ fragment float4 monochrome_sprite_fragment(
 
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  uint2 atlas_size = uint2(atlas_texture.get_width(), atlas_texture.get_height());
+  uint2 exact_coord = uint2(clamp(
+      floor(input.tile_position * float2(atlas_size)),
+      float2(0.0),
+      float2(atlas_size - uint2(1))));
+  float interpolated_alpha =
+      atlas_texture.sample(atlas_texture_sampler, input.tile_position).a;
+  float exact_alpha = atlas_texture.read(exact_coord).a;
+  float alpha = input.alpha_mode == 1 ? exact_alpha : interpolated_alpha;
   float4 color = input.color;
-  color.a *= sample.a;
+  color.a *= alpha;
   return color;
 }
 

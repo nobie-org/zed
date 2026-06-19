@@ -2044,7 +2044,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
 struct MonochromeSprite {
     order: u32,
-    pad: u32,
+    alpha_mode: u32,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
@@ -2058,6 +2058,7 @@ struct MonoSpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(2) clip_distances: vec4<f32>,
+    @location(3) @interpolate(flat) alpha_mode: u32,
 }
 
 @vertex
@@ -2071,12 +2072,21 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.alpha_mode = sprite.alpha_mode;
     return out;
 }
 
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    let atlas_size = textureDimensions(t_sprite, 0);
+    let exact_coord = clamp(
+        vec2<i32>(floor(input.tile_position * vec2<f32>(atlas_size))),
+        vec2<i32>(0, 0),
+        vec2<i32>(atlas_size) - vec2<i32>(1, 1),
+    );
+    let interpolated_sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    let exact_sample = textureLoad(t_sprite, exact_coord, 0).r;
+    let sample = select(interpolated_sample, exact_sample, input.alpha_mode == 1u);
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {

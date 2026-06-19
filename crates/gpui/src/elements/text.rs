@@ -620,7 +620,11 @@ impl TextLayout {
 
     /// Install a newly measured artifact into this frame's layout state.
     fn hydrate(&self, artifact: &TextLayoutArtifact) {
-        self.0.borrow_mut().replace(artifact.inner.clone());
+        let mut state = self.0.borrow_mut();
+        let bounds = state.as_ref().and_then(|inner| inner.bounds);
+        let mut inner = artifact.inner.clone();
+        inner.bounds = bounds;
+        state.replace(inner);
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {

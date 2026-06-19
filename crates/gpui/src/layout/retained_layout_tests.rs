@@ -1890,6 +1890,101 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
+fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    hegel::Hegel::new(|tc| {
+        let key_index = draw_u8(&tc, 0, 3);
+        let fallback_width = draw_u16(&tc, 1, 200);
+        let first_parent_width = fallback_width + draw_u16(&tc, 1, 40);
+        let second_parent_width = first_parent_width + draw_u16(&tc, 1, 40);
+        let root_width = second_parent_width + draw_u16(&tc, 1, 40);
+        let height = draw_u16(&tc, 1, 120);
+        let retained_measure_invocations = Rc::new(Cell::new(0));
+        let retained_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+        let mut engine = LayoutEngine::new();
+
+        let text = request_input_sensitive_text_measured(
+            &mut engine,
+            0,
+            key_index,
+            fallback_width,
+            height,
+            retained_measure_invocations.clone(),
+            retained_hydrated_artifacts.clone(),
+        );
+        let parent = engine.request_layout(
+            style_with_width(first_parent_width as f32),
+            px(16.0),
+            1.0,
+            &[text],
+        );
+        let root = request_container(&mut engine, &[parent]);
+        compute_generated_text_root(cx, &mut engine, root, root_width);
+        engine.finish_frame();
+        retained_measure_invocations.set(0);
+        retained_hydrated_artifacts.borrow_mut().clear();
+
+        let text = request_input_sensitive_text_measured(
+            &mut engine,
+            1,
+            key_index,
+            fallback_width,
+            height,
+            retained_measure_invocations.clone(),
+            retained_hydrated_artifacts.clone(),
+        );
+        let parent = engine.request_layout(
+            style_with_width(second_parent_width as f32),
+            px(16.0),
+            1.0,
+            &[text],
+        );
+        let root = request_container(&mut engine, &[parent]);
+        compute_generated_text_root(cx, &mut engine, root, root_width);
+
+        let fresh_measure_invocations = Rc::new(Cell::new(0));
+        let fresh_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+        let mut fresh_engine = LayoutEngine::new();
+        let fresh_text = request_input_sensitive_text_measured(
+            &mut fresh_engine,
+            1,
+            key_index,
+            fallback_width,
+            height,
+            fresh_measure_invocations.clone(),
+            fresh_hydrated_artifacts.clone(),
+        );
+        let fresh_parent = fresh_engine.request_layout(
+            style_with_width(second_parent_width as f32),
+            px(16.0),
+            1.0,
+            &[fresh_text],
+        );
+        let fresh_root = request_container(&mut fresh_engine, &[fresh_parent]);
+        compute_generated_text_root(cx, &mut fresh_engine, fresh_root, root_width);
+
+        assert_ne!(
+            fresh_measure_invocations.get(),
+            0,
+            "fresh layout should observe the current-frame text measurement query"
+        );
+        assert_eq!(
+            retained_hydrated_artifacts.borrow().as_slice(),
+            fresh_hydrated_artifacts.borrow().as_slice(),
+            "retained layout must hydrate text artifacts equivalent to a fresh current-frame layout"
+        );
+        assert_eq!(
+            engine.layout_work_sample().solver_compute_layout_calls,
+            1,
+            "retained layout should still perform exactly one legal root solve"
+        );
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
 fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
     cx: &mut TestAppContext,
 ) {
@@ -3041,7 +3136,7 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_hydrates_stable_text_from_query_cache(cx: &mut TestAppContext) {
+fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -3089,20 +3184,20 @@ fn changed_unmeasured_sibling_hydrates_stable_text_from_query_cache(cx: &mut Tes
     });
 
     assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 3,
+            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_hydrates_nested_stable_text_from_query_cache(
+fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
     cx: &mut TestAppContext,
 ) {
     let cx = cx.add_empty_window();
@@ -3159,13 +3254,13 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_from_query_cache(
         first_container_node
     );
     assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 4,
             style_updates: 1,
-            dirty_marks: 4,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3246,14 +3341,14 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
             dynamic_measures.get(),
             dynamic_hydrations.get()
         ),
-        (0, 2, 1, 1)
+        (0, 1, 1, 1)
     );
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 3);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 4,
-            dirty_marks: 4,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );

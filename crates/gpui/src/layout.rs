@@ -17,10 +17,12 @@ pub(crate) use retained_forest::PureSizeMeasure;
 #[cfg(test)]
 use retained_forest::{
     FreshLayoutComparisonSummary, RetainedForestMutationSample, RetainedLayoutProjectionForTests,
-    RetainedLayoutShapeForTests, RetainedNodeToken, RetainedSubtreeWorkSample,
+    RetainedLayoutShapeForTests, RetainedNodeToken,
 };
 use retained_forest::{RetainedLayoutForest, RetainedLayoutForestCheckpoint};
 pub use telemetry::LayoutWorkSample;
+#[cfg(any(test, feature = "test-support"))]
+pub use telemetry::RetainedSubtreeWorkSample;
 
 /// Layout entry point used by `Window`.
 ///
@@ -178,8 +180,8 @@ impl LayoutEngine {
         self.forest.retained_mutation_sample_for_tests()
     }
 
-    #[cfg(test)]
-    fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
         self.forest
             .set_retained_subtree_probe_targets_for_tests(targets);
     }
@@ -187,6 +189,13 @@ impl LayoutEngine {
     #[cfg(test)]
     fn retained_subtree_work_samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
         self.forest.retained_subtree_work_samples_for_tests()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn last_retained_subtree_work_samples_for_tests(
+        &self,
+    ) -> &[RetainedSubtreeWorkSample] {
+        self.forest.last_retained_subtree_work_samples_for_tests()
     }
 
     /// Test-only helper for recording an anonymous unmeasured layout intent.

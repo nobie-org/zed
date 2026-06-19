@@ -4508,6 +4508,31 @@ impl Window {
         self.last_render_group_draw_observation.as_ref()
     }
 
+    /// Configure retained-layout subtree proof targets for test-support harnesses.
+    ///
+    /// Targets are suffix-matched against rendered `GlobalElementId` strings.
+    /// The retained forest owns the private Taffy attribution; this method only
+    /// selects which GPUI-facing subtree samples should be retained for the
+    /// next completed draw.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
+        self.layout_engine
+            .as_mut()
+            .expect("window layout engine should exist before configuring subtree probes")
+            .set_retained_subtree_probe_targets_for_tests(targets);
+    }
+
+    /// Returns retained-layout subtree samples for the most recently completed draw.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_retained_subtree_work_samples_for_tests(
+        &self,
+    ) -> &[crate::RetainedSubtreeWorkSample] {
+        self.layout_engine
+            .as_ref()
+            .expect("window layout engine should exist when reading subtree probes")
+            .last_retained_subtree_work_samples_for_tests()
+    }
+
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///

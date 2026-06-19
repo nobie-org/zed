@@ -52,8 +52,6 @@ use std::{
     },
     time::Duration,
 };
-#[cfg(test)]
-pub(super) use subtree_probe::RetainedSubtreeWorkSample;
 use subtree_probe::{SubtreeProbe, SubtreeProbeCheckpoint, SubtreeProbeComputeRecorder};
 use taffy::{
     TaffyTree,
@@ -134,6 +132,34 @@ struct RetainedLayoutOccurrence {
 struct RetainedLayoutCommit {
     occurrence: RetainedLayoutOccurrence,
     layout_context_changed: bool,
+}
+
+/// Current-frame proof context for committing one retained occurrence.
+///
+/// Taffy mirror hygiene and GPUI measured-artifact validity are deliberately
+/// separate. A reused container can need its Taffy history dirtied because its
+/// parent/root query is no longer proven, while an unchanged measured child may
+/// still let stock Taffy decide whether its cached measurement is usable.
+#[derive(Clone, Copy)]
+struct CommitContext {
+    mirror_query_maybe_changed: bool,
+    measurement_query_maybe_changed: bool,
+}
+
+impl CommitContext {
+    fn root(root_layout_context_changed: bool) -> Self {
+        Self {
+            mirror_query_maybe_changed: root_layout_context_changed,
+            measurement_query_maybe_changed: root_layout_context_changed,
+        }
+    }
+
+    fn with_child_mirror_query(self, mirror_query_maybe_changed: bool) -> Self {
+        Self {
+            mirror_query_maybe_changed,
+            measurement_query_maybe_changed: self.measurement_query_maybe_changed,
+        }
+    }
 }
 
 /// Work observed while committing and computing one root layout.
@@ -658,6 +684,25 @@ fn retained_layout_zero_bounds_trace_limit() -> Option<usize> {
     })
 }
 
+fn retained_layout_mutation_trace_limit() -> Option<usize> {
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("GPUI_TRACE_RETAINED_LAYOUT_MUTATIONS").ok()?;
+        if value.is_empty() {
+            return Some(256);
+        }
+        value.parse::<usize>().ok().or(Some(256))
+    })
+}
+
+fn should_trace_retained_mutation() -> bool {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let Some(limit) = retained_layout_mutation_trace_limit() else {
+        return false;
+    };
+    COUNT.fetch_add(1, Ordering::Relaxed) < limit
+}
+
 fn should_trace_retained_zero_bounds() -> bool {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let Some(limit) = retained_layout_zero_bounds_trace_limit() else {
@@ -953,14 +998,23 @@ impl RetainedLayoutForest {
         self.frame.push_intent(intent)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
         self.subtree_probe.set_targets_for_tests(targets);
     }
 
     #[cfg(test)]
-    pub(super) fn retained_subtree_work_samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
+    pub(super) fn retained_subtree_work_samples_for_tests(
+        &self,
+    ) -> &[super::telemetry::RetainedSubtreeWorkSample] {
         self.subtree_probe.samples_for_tests()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn last_retained_subtree_work_samples_for_tests(
+        &self,
+    ) -> &[super::telemetry::RetainedSubtreeWorkSample] {
+        self.subtree_probe.last_finished_samples_for_tests()
     }
 
     fn committed_node(&self, id: LayoutId) -> NodeId {
@@ -1204,7 +1258,7 @@ impl RetainedLayoutForest {
         let subtree_compute_recorder = std::cell::RefCell::new(subtree_compute_recorder);
 
         taffy
-            .compute_layout_with_measure(
+            .compute_layout_with_measure_and_cache_events(
                 node_id,
                 available_space,
                 |known_dimensions, available_space, node_id, node_context, _style| {
@@ -1255,6 +1309,11 @@ impl RetainedLayoutForest {
                     measured_layout_duration += measure_start.elapsed();
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
+                |event| {
+                    compute_measurements
+                        .borrow_mut()
+                        .observe_layout_cache_event(event, scale_factor);
+                },
             )
             .expect(EXPECT_MESSAGE);
 
@@ -1285,6 +1344,39 @@ impl RetainedLayoutForest {
         eprintln!(
             "gpui retained_layout match_miss_sample sample={} layout_id={} reason={} current={} previous={} detail={}",
             miss_trace_sample, id.0, reason, current, previous, detail,
+        );
+    }
+
+    fn trace_retained_style_update(
+        &self,
+        id: LayoutId,
+        node_id: NodeId,
+        previous_style: &taffy::style::Style,
+        current_style: &taffy::style::Style,
+    ) {
+        if !should_trace_retained_mutation() {
+            return;
+        }
+        eprintln!(
+            "gpui retained_layout mutation kind=style_update layout_id={} node_id={:?} intent={} previous_style={} current_style={}",
+            id.0,
+            node_id,
+            Self::layout_intent_summary(self.intent(id)),
+            Self::debug_fingerprint(previous_style),
+            Self::debug_fingerprint(current_style)
+        );
+    }
+
+    fn trace_retained_dirty_mark(&self, id: LayoutId, node_id: NodeId, reason: &str) {
+        if !should_trace_retained_mutation() {
+            return;
+        }
+        eprintln!(
+            "gpui retained_layout mutation kind=dirty_mark layout_id={} node_id={:?} reason={} intent={}",
+            id.0,
+            node_id,
+            reason,
+            Self::layout_intent_summary(self.intent(id))
         );
     }
 
@@ -1875,7 +1967,11 @@ impl RetainedLayoutForest {
         }
 
         let retained_node = self
-            .commit_intent(id, retained_root, root_layout_context_changed)
+            .commit_intent(
+                id,
+                retained_root,
+                CommitContext::root(root_layout_context_changed),
+            )
             .occurrence;
         let node_id = retained_node.node_id;
         self.flush_detached_subtree_removals();
@@ -1934,7 +2030,7 @@ impl RetainedLayoutForest {
         &mut self,
         id: LayoutId,
         previous: Option<RetainedLayoutOccurrence>,
-        parent_layout_context_changed: bool,
+        context: CommitContext,
     ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
@@ -1947,13 +2043,9 @@ impl RetainedLayoutForest {
         let work_snapshot = probe_global_id.as_ref().map(|_| self.work.snapshot());
         let intent = self.intent(id);
         let retained_node = match intent.kind.clone() {
-            LayoutIntentKind::Unmeasured { children } => self.commit_unmeasured_intent(
-                id,
-                intent.style.clone(),
-                children,
-                previous,
-                parent_layout_context_changed,
-            ),
+            LayoutIntentKind::Unmeasured { children } => {
+                self.commit_unmeasured_intent(id, intent.style.clone(), children, previous, context)
+            }
             LayoutIntentKind::Measured {
                 measure,
                 measured_kind,
@@ -1963,7 +2055,7 @@ impl RetainedLayoutForest {
                 measure,
                 measured_kind,
                 previous,
-                parent_layout_context_changed,
+                context,
             ),
         };
 
@@ -2088,7 +2180,7 @@ impl RetainedLayoutForest {
         style: taffy::style::Style,
         children: Vec<LayoutId>,
         previous: Option<RetainedLayoutOccurrence>,
-        parent_layout_context_changed: bool,
+        context: CommitContext,
     ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
@@ -2104,13 +2196,7 @@ impl RetainedLayoutForest {
             };
         };
 
-        self.update_unmeasured_retained_occurrence(
-            id,
-            style,
-            children,
-            previous,
-            parent_layout_context_changed,
-        )
+        self.update_unmeasured_retained_occurrence(id, style, children, previous, context)
     }
 
     /// Update an unmeasured occurrence and mirror node to match the current intent.
@@ -2120,7 +2206,7 @@ impl RetainedLayoutForest {
         style: taffy::style::Style,
         children: Vec<LayoutId>,
         previous: RetainedLayoutOccurrence,
-        parent_layout_context_changed: bool,
+        context: CommitContext,
     ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
@@ -2172,18 +2258,20 @@ impl RetainedLayoutForest {
                     None => true,
                 }
             });
-        let child_layout_context_changed = parent_layout_context_changed
+        let child_mirror_query_maybe_changed = context.mirror_query_maybe_changed
             || style_changed
             || child_list_will_change
             || child_subtree_layout_context_will_change;
-
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
         let mut any_child_layout_context_changed = false;
         for (index, child) in children.into_iter().enumerate() {
             let previous_child = exact_previous_children[index].take();
-            let retained_child =
-                self.commit_intent(child, previous_child, child_layout_context_changed);
+            let retained_child = self.commit_intent(
+                child,
+                previous_child,
+                context.with_child_mirror_query(child_mirror_query_maybe_changed),
+            );
             any_child_layout_context_changed |= retained_child.layout_context_changed;
             let retained_child = retained_child.occurrence;
             child_node_ids.push(retained_child.node_id);
@@ -2191,6 +2279,7 @@ impl RetainedLayoutForest {
         }
 
         if style_changed {
+            self.trace_retained_style_update(id, node_id, &previous_facts.style, &style);
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
@@ -2218,16 +2307,24 @@ impl RetainedLayoutForest {
             },
             children: retained_children,
         };
-        let layout_context_changed = parent_layout_context_changed
+        let layout_context_changed = context.mirror_query_maybe_changed
             || style_changed
             || children_changed
             || any_child_layout_context_changed
             || !exact_subtree_match;
-        if parent_layout_context_changed
+        if context.mirror_query_maybe_changed
             || ((!exact_subtree_match || any_child_layout_context_changed)
                 && !style_changed
                 && !children_changed)
         {
+            let reason = if context.mirror_query_maybe_changed {
+                "mirror_query_maybe_changed"
+            } else if any_child_layout_context_changed {
+                "child_layout_context_changed"
+            } else {
+                "updated_retained_occurrence"
+            };
+            self.trace_retained_dirty_mark(id, node_id, reason);
             self.mark_taffy_node_dirty(node_id);
         }
 
@@ -2320,7 +2417,7 @@ impl RetainedLayoutForest {
         measure: Option<usize>,
         measured_kind: MeasuredLayoutKind,
         previous: Option<RetainedLayoutOccurrence>,
-        parent_layout_context_changed: bool,
+        context: CommitContext,
     ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
@@ -2354,7 +2451,7 @@ impl RetainedLayoutForest {
                     Self::debug_fingerprint(&measured_kind)
                 )
             });
-            let layout_context_changed = parent_layout_context_changed
+            let layout_context_changed = context.mirror_query_maybe_changed
                 || !self.retained_occurrence_has_same_layout_context(id, &previous);
             let fresh = self.build_fresh_measured_occurrence(id, style, measure, measured_kind);
             self.root_slots.detach_subtree(previous);
@@ -2373,12 +2470,19 @@ impl RetainedLayoutForest {
         let style_changed = previous_style != style;
         let measured_kind_changed = previous_measured_kind.as_ref() != Some(&measured_kind);
         if style_changed {
+            self.trace_retained_style_update(id, node_id, &previous_style, &style);
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
             self.work.record_style_update();
         }
-        if measured_kind_changed || parent_layout_context_changed {
+        if measured_kind_changed || context.measurement_query_maybe_changed {
+            let reason = if measured_kind_changed {
+                "measured_kind_changed"
+            } else {
+                "measurement_query_maybe_changed"
+            };
+            self.trace_retained_dirty_mark(id, node_id, reason);
             self.mark_taffy_node_dirty(node_id);
         }
 
@@ -2386,7 +2490,7 @@ impl RetainedLayoutForest {
             node_id,
             Self::current_measurement(measured_kind.clone(), measure),
         );
-        if !style_changed && !measured_kind_changed && !parent_layout_context_changed {
+        if !style_changed && !measured_kind_changed && !context.measurement_query_maybe_changed {
             if let MeasuredLayoutKind::Text(measure_key) = &measured_kind {
                 self.measurements
                     .register_unchanged_text_artifact_replay(node_id, measure_key);
@@ -2403,7 +2507,7 @@ impl RetainedLayoutForest {
             children: Vec::new(),
         };
         let layout_context_changed =
-            parent_layout_context_changed || style_changed || measured_kind_changed;
+            context.mirror_query_maybe_changed || style_changed || measured_kind_changed;
 
         RetainedLayoutCommit {
             occurrence: retained_node,

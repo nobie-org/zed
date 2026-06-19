@@ -174,18 +174,22 @@ fn stable_subtree_probe_reports_zero_write_work_after_admission() {
         .unwrap();
 
     let samples = engine.retained_subtree_work_samples_for_tests();
-    assert_eq!(samples.len(), 1);
-    assert_eq!(
-        samples[0],
-        RetainedSubtreeWorkSample {
-            global_id: "tracked-subtree".to_string(),
-            layout_id: 0,
-            node_count: 1,
-            retained_reuses: 1,
-            ..RetainedSubtreeWorkSample::default()
-        }
-    );
+    let expected_sample = RetainedSubtreeWorkSample {
+        global_id: "tracked-subtree".to_string(),
+        layout_id: 0,
+        node_count: 1,
+        retained_reuses: 1,
+        ..RetainedSubtreeWorkSample::default()
+    };
+    assert_eq!(samples, std::slice::from_ref(&expected_sample));
     assert_eq!(samples[0].no_work_total(), 0);
+
+    engine.finish_frame();
+    assert_eq!(
+        engine.last_retained_subtree_work_samples_for_tests(),
+        std::slice::from_ref(&expected_sample)
+    );
+    assert_eq!(engine.retained_subtree_work_samples_for_tests(), &[]);
 }
 
 #[test]

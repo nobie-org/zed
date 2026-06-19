@@ -12399,9 +12399,9 @@ dependencies = [
 
 [[package]]
 name = "pathfinder_simd"
-version = "0.5.5"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf9027960355bf3afff9841918474a81a5f972ac6d226d518060bba758b5ad57"
+checksum = "4500030c302e4af1d423f36f3b958d1aecb6c04184356ed5a833bf6b60435777"
 dependencies = [
  "rustc_version",
 ]
@@ -17806,8 +17806,7 @@ dependencies = [
 [[package]]
 name = "taffy"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfde4e2f8595f222ceaae1fb16b4963952e9b33e358869dc4cd6316b0e0790cd"
+source = "git+https://github.com/nobie-org/taffy.git?rev=ec2b236c78d8b2a775b1f655872da82b32cf8961#ec2b236c78d8b2a775b1f655872da82b32cf8961"
 dependencies = [
  "arrayvec",
  "grid",

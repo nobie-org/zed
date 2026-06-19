@@ -5,45 +5,13 @@
 //! layout ids, node counts, and typed retained-forest work counters.
 
 use super::super::LayoutId;
+use super::super::telemetry::RetainedSubtreeWorkSample;
 use super::measurement::MeasurementCallbackKind;
 use super::work::RetainedWorkDelta;
 use crate::GlobalElementId;
 use collections::FxHashSet;
 use std::sync::OnceLock;
 use taffy::tree::NodeId;
-
-/// Work observed for one explicitly identified retained subtree in one frame.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(in crate::layout) struct RetainedSubtreeWorkSample {
-    pub(in crate::layout) global_id: String,
-    pub(in crate::layout) layout_id: usize,
-    pub(in crate::layout) node_count: usize,
-    pub(in crate::layout) retained_reuses: u64,
-    pub(in crate::layout) retained_misses: u64,
-    pub(in crate::layout) mirror_node_creates: u64,
-    pub(in crate::layout) mirror_node_removes: u64,
-    pub(in crate::layout) mirror_set_style: u64,
-    pub(in crate::layout) mirror_set_children: u64,
-    pub(in crate::layout) mirror_measured_context_clears: u64,
-    pub(in crate::layout) measured_callbacks: u64,
-    pub(in crate::layout) conservative_text_measured_callbacks: u64,
-}
-
-impl RetainedSubtreeWorkSample {
-    /// Return the observable work that must be zero for a stable subtree.
-    pub(in crate::layout) fn no_work_total(&self) -> u64 {
-        let hard_measured_callbacks = self
-            .measured_callbacks
-            .saturating_sub(self.conservative_text_measured_callbacks);
-        self.retained_misses
-            + self.mirror_node_creates
-            + self.mirror_node_removes
-            + self.mirror_set_style
-            + self.mirror_set_children
-            + self.mirror_measured_context_clears
-            + hard_measured_callbacks
-    }
-}
 
 #[derive(Clone)]
 struct ActiveSubtree {
@@ -56,6 +24,7 @@ struct ActiveSubtree {
 pub(super) struct SubtreeProbe {
     active_subtrees: Vec<ActiveSubtree>,
     frame_samples: Vec<RetainedSubtreeWorkSample>,
+    last_finished_samples: Vec<RetainedSubtreeWorkSample>,
     emitted_samples: usize,
     targets_for_tests: Option<Vec<String>>,
 }
@@ -65,6 +34,7 @@ pub(super) struct SubtreeProbe {
 pub(super) struct SubtreeProbeCheckpoint {
     active_subtrees: Vec<ActiveSubtree>,
     frame_samples: Vec<RetainedSubtreeWorkSample>,
+    last_finished_samples: Vec<RetainedSubtreeWorkSample>,
     emitted_samples: usize,
     targets_for_tests: Option<Vec<String>>,
 }
@@ -95,6 +65,7 @@ impl SubtreeProbe {
         SubtreeProbeCheckpoint {
             active_subtrees: self.active_subtrees.clone(),
             frame_samples: self.frame_samples.clone(),
+            last_finished_samples: self.last_finished_samples.clone(),
             emitted_samples: self.emitted_samples,
             targets_for_tests: self.targets_for_tests.clone(),
         }
@@ -103,12 +74,14 @@ impl SubtreeProbe {
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: SubtreeProbeCheckpoint) {
         self.active_subtrees = checkpoint.active_subtrees;
         self.frame_samples = checkpoint.frame_samples;
+        self.last_finished_samples = checkpoint.last_finished_samples;
         self.emitted_samples = checkpoint.emitted_samples;
         self.targets_for_tests = checkpoint.targets_for_tests;
     }
 
     pub(super) fn finish_frame(&mut self) {
         self.emit_samples();
+        self.last_finished_samples.clone_from(&self.frame_samples);
         self.active_subtrees.clear();
         self.frame_samples.clear();
     }
@@ -207,14 +180,22 @@ impl SubtreeProbe {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn set_targets_for_tests(&mut self, targets: Vec<String>) {
         self.targets_for_tests = Some(targets);
+        self.active_subtrees.clear();
+        self.frame_samples.clear();
+        self.last_finished_samples.clear();
     }
 
     #[cfg(test)]
     pub(super) fn samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
         &self.frame_samples
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn last_finished_samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
+        &self.last_finished_samples
     }
 }
 

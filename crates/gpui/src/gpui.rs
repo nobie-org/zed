@@ -141,6 +141,8 @@ pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
 use layout::LayoutEngine;
+#[cfg(any(test, feature = "test-support"))]
+pub use layout::RetainedSubtreeWorkSample;
 pub use layout::{AvailableSpace, LayoutId, LayoutWorkSample};
 pub use path_builder::*;
 pub use platform::*;

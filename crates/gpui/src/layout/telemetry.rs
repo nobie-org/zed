@@ -7,6 +7,57 @@ use super::retained_forest::FreshLayoutComparisonSummary;
 use super::retained_forest::{RetainedLayoutMissWork, RetainedLayoutWork};
 use std::time::Duration;
 
+/// Retained-layout work observed for one explicitly identified subtree.
+///
+/// This is a GPUI-facing diagnostic sample. The retained forest may use private
+/// Taffy mirror nodes to attribute work internally, but exported samples expose
+/// only element identity strings, layout ids, node counts, and typed retained
+/// work counters.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RetainedSubtreeWorkSample {
+    /// The matched [`GlobalElementId`](crate::GlobalElementId) rendered as a string.
+    pub global_id: String,
+    /// The current-frame [`LayoutId`](super::LayoutId) at the subtree root.
+    pub layout_id: usize,
+    /// Number of retained mirror nodes inside the observed subtree.
+    pub node_count: usize,
+    /// Retained occurrences reused while committing this subtree.
+    pub retained_reuses: u64,
+    /// Retained occurrence misses while committing this subtree.
+    pub retained_misses: u64,
+    /// Mirror nodes created inside this subtree.
+    pub mirror_node_creates: u64,
+    /// Mirror nodes removed inside this subtree.
+    pub mirror_node_removes: u64,
+    /// Mirror `set_style` operations inside this subtree.
+    pub mirror_set_style: u64,
+    /// Mirror `set_children` operations inside this subtree.
+    pub mirror_set_children: u64,
+    /// Measured-context clears caused by subtree removal.
+    pub mirror_measured_context_clears: u64,
+    /// Measured callbacks attributed to nodes inside this subtree.
+    pub measured_callbacks: u64,
+    /// Text measured callbacks attributed to conservative text fallback.
+    pub conservative_text_measured_callbacks: u64,
+}
+
+impl RetainedSubtreeWorkSample {
+    /// Return the observable work that must be zero for a stable subtree.
+    pub fn no_work_total(&self) -> u64 {
+        let hard_measured_callbacks = self
+            .measured_callbacks
+            .saturating_sub(self.conservative_text_measured_callbacks);
+        self.retained_misses
+            + self.mirror_node_creates
+            + self.mirror_node_removes
+            + self.mirror_set_style
+            + self.mirror_set_children
+            + self.mirror_measured_context_clears
+            + hard_measured_callbacks
+    }
+}
+
 /// Layout work performed by GPUI for one completed window draw.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -197,26 +197,16 @@ fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, c
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
-// https://gamedev.stackexchange.com/questions/92015/optimized-linear-to-srgb-glsl
 fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
-    let cutoff = srgb < vec3<f32>(0.04045);
-    let higher = pow((srgb + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-    let lower = srgb / vec3<f32>(12.92);
-    return select(higher, lower, cutoff);
+    return pow(srgb, vec3<f32>(2.2));
 }
 
 fn srgb_to_linear_component(a: f32) -> f32 {
-    let cutoff = a < 0.04045;
-    let higher = pow((a + 0.055) / 1.055, 2.4);
-    let lower = a / 12.92;
-    return select(higher, lower, cutoff);
+    return pow(a, 2.2);
 }
 
 fn linear_to_srgb(linear: vec3<f32>) -> vec3<f32> {
-    let cutoff = linear < vec3<f32>(0.0031308);
-    let higher = vec3<f32>(1.055) * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
-    let lower = linear * vec3<f32>(12.92);
-    return select(higher, lower, cutoff);
+    return pow(linear, vec3<f32>(1.0 / 2.2));
 }
 
 /// Convert a linear color to sRGBA space.

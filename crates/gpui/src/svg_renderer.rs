@@ -77,10 +77,8 @@ fn select_emoji_font(
     None
 }
 
-const SMOOTH_SVG_SCALE: usize = 2;
-
-/// When rendering SVGs, we supersample them before uploading or displaying the result.
-pub const SMOOTH_SVG_SCALE_FACTOR: f32 = SMOOTH_SVG_SCALE as f32;
+/// When rendering SVGs, we render them at twice the size to get a higher-quality result.
+pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 
 #[derive(Clone, PartialEq, Hash, Eq)]
 #[expect(missing_docs)]
@@ -204,14 +202,18 @@ impl SvgRenderer {
         anyhow::ensure!(!params.size.is_zero(), "can't render at a zero size");
 
         let render_pixmap = |bytes| {
-            let pixmap =
-                self.render_pixmap(bytes, SvgSize::Size(supersampled_size(params.size)))?;
+            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size))?;
 
+            // Convert the pixmap's pixels into an alpha mask.
             let size = Size::new(
-                DevicePixels((pixmap.width() / SMOOTH_SVG_SCALE as u32) as i32),
-                DevicePixels((pixmap.height() / SMOOTH_SVG_SCALE as u32) as i32),
+                DevicePixels(pixmap.width() as i32),
+                DevicePixels(pixmap.height() as i32),
             );
-            let alpha_mask = downsample_alpha_mask(&pixmap, size);
+            let alpha_mask = pixmap
+                .pixels()
+                .iter()
+                .map(|p| p.alpha())
+                .collect::<Vec<_>>();
 
             Ok(Some((size, alpha_mask)))
         };
@@ -246,37 +248,6 @@ impl SvgRenderer {
 
         Ok(pixmap)
     }
-}
-
-fn supersampled_size(size: Size<DevicePixels>) -> Size<DevicePixels> {
-    size.map(|value| DevicePixels(value.0 * SMOOTH_SVG_SCALE as i32))
-}
-
-fn downsample_alpha_mask(pixmap: &Pixmap, size: Size<DevicePixels>) -> Vec<u8> {
-    let width = size.width.0 as usize;
-    let height = size.height.0 as usize;
-    let source_width = pixmap.width() as usize;
-    let pixels = pixmap.pixels();
-    let samples = (SMOOTH_SVG_SCALE * SMOOTH_SVG_SCALE) as u32;
-    let rounding = samples / 2;
-
-    let mut alpha_mask = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            let mut alpha = 0u32;
-            for sample_y in 0..SMOOTH_SVG_SCALE {
-                let source_y = y * SMOOTH_SVG_SCALE + sample_y;
-                let row_start = source_y * source_width;
-                for sample_x in 0..SMOOTH_SVG_SCALE {
-                    let source_x = x * SMOOTH_SVG_SCALE + sample_x;
-                    alpha += pixels[row_start + source_x].alpha() as u32;
-                }
-            }
-            alpha_mask.push(((alpha + rounding) / samples) as u8);
-        }
-    }
-
-    alpha_mask
 }
 
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {

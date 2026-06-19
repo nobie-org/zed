@@ -8,6 +8,7 @@
 use super::super::{AvailableSpace, RetainedLayoutRootId};
 use crate::{Size, size};
 use collections::FxHashMap;
+use std::mem;
 use taffy::tree::{Layout, NodeId};
 
 /// Current-frame proof that one retained root was solved exactly once.
@@ -55,12 +56,14 @@ impl From<AvailableSpace> for AvailableSpaceKey {
 /// root may be captured once per frame; a second capture with different inputs
 /// is a lifecycle bug and fails loudly.
 pub(super) struct GeometryStore {
+    retained_solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     current_layouts: FxHashMap<NodeId, Layout>,
 }
 
-/// Transaction checkpoint for retained geometry snapshots.
+/// Transaction checkpoint for retained geometry state.
 pub(super) struct GeometryStoreCheckpoint {
+    retained_solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     current_layouts: FxHashMap<NodeId, Layout>,
 }
@@ -68,6 +71,7 @@ pub(super) struct GeometryStoreCheckpoint {
 impl GeometryStore {
     pub(super) fn new() -> Self {
         Self {
+            retained_solved_roots: FxHashMap::default(),
             solved_roots: FxHashMap::default(),
             current_layouts: FxHashMap::default(),
         }
@@ -80,23 +84,36 @@ impl GeometryStore {
 
     pub(super) fn checkpoint(&self) -> GeometryStoreCheckpoint {
         GeometryStoreCheckpoint {
+            retained_solved_roots: self.retained_solved_roots.clone(),
             solved_roots: self.solved_roots.clone(),
             current_layouts: self.current_layouts.clone(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: GeometryStoreCheckpoint) {
+        self.retained_solved_roots = checkpoint.retained_solved_roots;
         self.solved_roots = checkpoint.solved_roots;
         self.current_layouts = checkpoint.current_layouts;
     }
 
     pub(super) fn finish_frame(&mut self) {
-        self.solved_roots.clear();
+        self.retained_solved_roots = mem::take(&mut self.solved_roots);
         self.current_layouts.clear();
     }
 
     pub(super) fn has_solved_root(&self, root_id: RetainedLayoutRootId) -> bool {
         self.solved_roots.contains_key(&root_id)
+    }
+
+    pub(super) fn retained_root_solve_context_changed(
+        &self,
+        root_id: RetainedLayoutRootId,
+        root_node: NodeId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+    ) -> bool {
+        let solved_root = SolvedRoot::new(root_node, available_space, scale_factor);
+        self.retained_solved_roots.get(&root_id) != Some(&solved_root)
     }
 
     pub(super) fn capture_from_solver(
@@ -125,43 +142,7 @@ impl GeometryStore {
         }
     }
 
-    pub(super) fn capture_from_snapshot(
-        &mut self,
-        root_id: RetainedLayoutRootId,
-        root_node: NodeId,
-        available_space: Size<AvailableSpace>,
-        scale_factor: f32,
-        layouts: &FxHashMap<NodeId, Layout>,
-    ) {
-        let solved_root = SolvedRoot::new(root_node, available_space, scale_factor);
-        if let Some(previous) = self.solved_roots.insert(root_id, solved_root) {
-            assert_eq!(
-                previous, solved_root,
-                "retained layout root should be solved at most once per frame"
-            );
-            return;
-        }
-
-        assert!(
-            layouts.contains_key(&root_node),
-            "snapshot geometry should include the retained root node"
-        );
-        for (node_id, layout) in layouts {
-            self.current_layouts.insert(*node_id, layout.clone());
-        }
-    }
-
     pub(super) fn layout(&self, node_id: NodeId) -> Option<Layout> {
         self.current_layouts.get(&node_id).cloned()
-    }
-
-    pub(super) fn layouts(&self) -> &FxHashMap<NodeId, Layout> {
-        &self.current_layouts
-    }
-
-    pub(super) fn replace_layouts(&mut self, layouts: &FxHashMap<NodeId, Layout>) {
-        for (node_id, layout) in layouts {
-            self.current_layouts.insert(*node_id, layout.clone());
-        }
     }
 }

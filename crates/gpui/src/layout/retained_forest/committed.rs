@@ -12,12 +12,14 @@ use taffy::tree::NodeId;
 pub(super) struct CommittedLayoutState {
     layout_nodes: FxHashMap<LayoutId, NodeId>,
     taffy_nodes: FxHashSet<NodeId>,
+    dirty_taffy_nodes: FxHashSet<NodeId>,
 }
 
 /// Transaction checkpoint for committed-node state.
 pub(super) struct CommittedLayoutCheckpoint {
     layout_nodes: FxHashMap<LayoutId, NodeId>,
     taffy_nodes: FxHashSet<NodeId>,
+    dirty_taffy_nodes: FxHashSet<NodeId>,
 }
 
 impl CommittedLayoutState {
@@ -25,6 +27,7 @@ impl CommittedLayoutState {
         Self {
             layout_nodes: FxHashMap::default(),
             taffy_nodes: FxHashSet::default(),
+            dirty_taffy_nodes: FxHashSet::default(),
         }
     }
 
@@ -32,17 +35,20 @@ impl CommittedLayoutState {
         CommittedLayoutCheckpoint {
             layout_nodes: self.layout_nodes.clone(),
             taffy_nodes: self.taffy_nodes.clone(),
+            dirty_taffy_nodes: self.dirty_taffy_nodes.clone(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: CommittedLayoutCheckpoint) {
         self.layout_nodes = checkpoint.layout_nodes;
         self.taffy_nodes = checkpoint.taffy_nodes;
+        self.dirty_taffy_nodes = checkpoint.dirty_taffy_nodes;
     }
 
     pub(super) fn clear(&mut self) {
         self.layout_nodes.clear();
         self.taffy_nodes.clear();
+        self.dirty_taffy_nodes.clear();
     }
 
     pub(super) fn node(&self, id: LayoutId) -> NodeId {
@@ -81,5 +87,9 @@ impl CommittedLayoutState {
             self.taffy_nodes.insert(node_id),
             "committed Taffy node should appear at only one current frame position"
         );
+    }
+
+    pub(super) fn mark_taffy_node_dirty(&mut self, node_id: NodeId) -> bool {
+        self.dirty_taffy_nodes.insert(node_id)
     }
 }

@@ -37,16 +37,12 @@ pub struct LayoutWorkSample {
     pub retained_layout_style_updates: u64,
     /// Retained layout child-list updates emitted while committing current intent.
     pub retained_layout_child_list_updates: u64,
+    /// Explicit retained mirror dirty marks emitted while committing current intent.
+    pub retained_layout_dirty_marks: u64,
     /// Retained measured-context clears emitted while removing retained occurrences.
     pub retained_layout_measured_context_clears: u64,
     /// Retained layout occurrences removed while sweeping old subtrees.
     pub retained_layout_removes: u64,
-    /// Legal root layouts published from an exact GPUI-owned snapshot.
-    pub retained_layout_snapshot_hits: u64,
-    /// Legal root layouts that missed the exact snapshot path and invoked Taffy.
-    pub retained_layout_snapshot_misses: u64,
-    /// Text artifacts replayed from exact root snapshots into current hydrators.
-    pub retained_layout_snapshot_text_artifact_replays: u64,
     /// Retained occurrence matches missed because no previous occurrence was available.
     pub retained_layout_miss_no_previous: u64,
     /// Retained occurrence matches missed because style changed.
@@ -83,11 +79,9 @@ impl LayoutWorkSample {
         self.retained_layout_reuses = work.reuses;
         self.retained_layout_style_updates = work.style_updates;
         self.retained_layout_child_list_updates = work.child_list_updates;
+        self.retained_layout_dirty_marks = work.dirty_marks;
         self.retained_layout_measured_context_clears = work.measured_context_clears;
         self.retained_layout_removes = work.removes;
-        self.retained_layout_snapshot_hits = work.snapshot_hits;
-        self.retained_layout_snapshot_misses = work.snapshot_misses;
-        self.retained_layout_snapshot_text_artifact_replays = work.snapshot_text_artifact_replays;
         self.retained_layout_miss_no_previous = misses.no_previous;
         self.retained_layout_miss_style = misses.style;
         self.retained_layout_miss_kind = misses.kind;

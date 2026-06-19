@@ -15,7 +15,6 @@ mod geometry;
 mod measurement;
 mod root_slots;
 mod roots;
-mod snapshots;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod state_tests;
 mod subtree_probe;
@@ -29,7 +28,7 @@ use crate::{
     },
 };
 use bounds_cache::{BoundsCache, BoundsCacheCheckpoint};
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashSet;
 use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
 use frame::{FrameIntents, FrameIntentsCheckpoint};
 use geometry::{GeometryStore, GeometryStoreCheckpoint};
@@ -40,7 +39,6 @@ use measurement::{
 };
 use root_slots::{RootSlots, RootSlotsCheckpoint};
 use roots::{RootRegistry, RootRegistryCheckpoint};
-use snapshots::{RootSnapshotStore, RootSnapshotStoreCheckpoint};
 use stacksafe::StackSafe;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -233,14 +231,13 @@ pub(super) struct RetainedLayoutForest {
     committed: CommittedLayoutState,
     bounds: BoundsCache,
     root_slots: RootSlots,
-    snapshots: RootSnapshotStore,
     subtree_probe: SubtreeProbe,
     work: RetainedWorkState,
 }
 
-/// Full rollback snapshot for retryable layout transactions.
+/// Full rollback checkpoint for retryable layout transactions.
 ///
-/// This intentionally snapshots both retained GPUI authority and the mirror. A
+/// This intentionally checkpoints both retained GPUI authority and the mirror. A
 /// speculative prepaint that fails must leave no retained layout side effects.
 pub(super) struct RetainedLayoutForestCheckpoint {
     taffy: TaffyTree<NodeContext>,
@@ -251,7 +248,6 @@ pub(super) struct RetainedLayoutForestCheckpoint {
     committed: CommittedLayoutCheckpoint,
     bounds: BoundsCacheCheckpoint,
     root_slots: RootSlotsCheckpoint,
-    snapshots: RootSnapshotStoreCheckpoint,
     subtree_probe: SubtreeProbeCheckpoint,
     work: RetainedWorkCheckpoint,
 }
@@ -712,7 +708,6 @@ impl RetainedLayoutForest {
             committed: CommittedLayoutState::new(),
             bounds: BoundsCache::new(),
             root_slots: RootSlots::new(),
-            snapshots: RootSnapshotStore::new(),
             subtree_probe: SubtreeProbe::new(),
             work: RetainedWorkState::new(),
         }
@@ -738,7 +733,6 @@ impl RetainedLayoutForest {
             committed: self.committed.checkpoint(),
             bounds: self.bounds.checkpoint(),
             root_slots: self.root_slots.checkpoint(),
-            snapshots: self.snapshots.checkpoint(),
             subtree_probe: self.subtree_probe.checkpoint(),
             work: self.work.checkpoint(),
         }
@@ -756,7 +750,6 @@ impl RetainedLayoutForest {
         self.bounds.rollback_to_checkpoint(checkpoint.bounds);
         self.root_slots
             .rollback_to_checkpoint(checkpoint.root_slots);
-        self.snapshots.rollback_to_checkpoint(checkpoint.snapshots);
         self.subtree_probe
             .rollback_to_checkpoint(checkpoint.subtree_probe);
         self.work.rollback_to_checkpoint(checkpoint.work);
@@ -788,9 +781,7 @@ impl RetainedLayoutForest {
             self.remove_retained_subtree(retained_root);
         }
 
-        let current_root_ids = self.root_slots.current_root_ids();
         self.root_slots.promote_current_roots();
-        self.snapshots.retain_roots(current_root_ids);
         self.geometry.finish_frame();
         self.frame.clear();
         self.measurements.finish_frame();
@@ -1018,7 +1009,18 @@ impl RetainedLayoutForest {
         window: &mut Window,
         cx: &mut App,
     ) -> ComputeLayoutWork {
-        let node_id = self.commit_root_layout(root_id, id);
+        let root_layout_context_changed = self
+            .root_slots
+            .retained_root_node_id(root_id)
+            .is_some_and(|root_node| {
+                self.geometry.retained_root_solve_context_changed(
+                    root_id,
+                    root_node,
+                    available_space,
+                    scale_factor,
+                )
+            });
+        let node_id = self.commit_root_layout(root_id, id, root_layout_context_changed);
         assert!(
             !self.geometry.has_solved_root(root_id),
             "retained layout root should be solved at most once per frame"
@@ -1029,7 +1031,6 @@ impl RetainedLayoutForest {
             "retained layout node should not be computed through multiple roots in one frame"
         );
 
-        let retained_root = self.root_slots.current_root(root_id).clone();
         let taffy_available_space = scale_available_space_for_taffy(available_space, scale_factor);
 
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
@@ -1040,47 +1041,6 @@ impl RetainedLayoutForest {
         }
 
         let compute_start = std::time::Instant::now();
-        if let Some(snapshot) =
-            self.snapshots
-                .replay_for(root_id, &retained_root, available_space, scale_factor)
-        {
-            self.geometry.capture_from_snapshot(
-                root_id,
-                node_id,
-                available_space,
-                scale_factor,
-                &snapshot.layouts,
-            );
-            let replayed_text_artifacts = self
-                .measurements
-                .hydrate_text_artifacts(&snapshot.text_artifacts);
-            let compute_layout_duration = compute_start.elapsed();
-            self.work.record_snapshot_hit(replayed_text_artifacts);
-
-            return ComputeLayoutWork {
-                solver_compute_layout_calls: 0,
-                measured_layout_calls: 0,
-                compute_layout_duration,
-                measured_layout_duration: Duration::default(),
-                fresh_layout_comparison: if retained_layout_fresh_compare_enabled() {
-                    let target_layout_ids = retained_layout_trace_layout_ids().map(Vec::as_slice);
-                    Some(self.trace_retained_fresh_layout_comparison(
-                        id,
-                        node_id,
-                        taffy_available_space,
-                        scale_factor,
-                        window,
-                        cx,
-                        target_layout_ids,
-                    ))
-                } else {
-                    None
-                },
-            };
-        }
-
-        self.work.record_snapshot_miss();
-
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
             node_id,
@@ -1107,20 +1067,6 @@ impl RetainedLayoutForest {
             );
         }
 
-        let subtree_replay = self.snapshots.replay_matching_subtrees_for(
-            root_id,
-            &retained_root,
-            available_space,
-            scale_factor,
-            self.geometry.layouts(),
-        );
-        self.geometry.replace_layouts(&subtree_replay.layouts);
-        let replayed_text_artifacts = self
-            .measurements
-            .hydrate_missing_text_artifacts(&subtree_replay.text_artifacts);
-        self.work
-            .record_snapshot_text_artifact_replays(replayed_text_artifacts);
-
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
             let solver_layout = self.try_solver_layout(node_id);
@@ -1129,17 +1075,6 @@ impl RetainedLayoutForest {
                 id.0, node_id, repeated_root, layout, solver_layout
             );
         }
-
-        let snapshot_layouts = self.snapshot_layouts_for_occurrence(&retained_root);
-        let text_artifacts = self.measurements.current_text_artifacts();
-        self.snapshots.store(
-            root_id,
-            &retained_root,
-            available_space,
-            scale_factor,
-            snapshot_layouts,
-            text_artifacts,
-        );
 
         let work = ComputeLayoutWork {
             solver_compute_layout_calls: 1,
@@ -1526,8 +1461,20 @@ impl RetainedLayoutForest {
         root_id: RetainedLayoutRootId,
         id: LayoutId,
         available_space: Size<AvailableSpace>,
+        scale_factor: f32,
     ) -> RetainedNodeToken {
-        let root_node = self.commit_root_layout(root_id, id);
+        let root_layout_context_changed = self
+            .root_slots
+            .retained_root_node_id(root_id)
+            .is_some_and(|root_node| {
+                self.geometry.retained_root_solve_context_changed(
+                    root_id,
+                    root_node,
+                    available_space,
+                    scale_factor,
+                )
+            });
+        let root_node = self.commit_root_layout(root_id, id, root_layout_context_changed);
         assert!(
             !self.geometry.has_solved_root(root_id),
             "retained layout root should be solved at most once per frame"
@@ -1539,7 +1486,7 @@ impl RetainedLayoutForest {
         self.taffy
             .compute_layout_with_measure(
                 root_node,
-                available_space.into(),
+                scale_available_space_for_taffy(available_space, scale_factor),
                 |_known_dimensions, _available_space, _id, _node_context, _style| TaffySize::ZERO,
             )
             .expect(EXPECT_MESSAGE);
@@ -1551,7 +1498,7 @@ impl RetainedLayoutForest {
                 root_id,
                 root_node,
                 available_space,
-                1.0,
+                scale_factor,
                 |node_id| taffy.layout(node_id).expect(EXPECT_MESSAGE).clone(),
                 |node_id| taffy.children(node_id).expect(EXPECT_MESSAGE),
             );
@@ -1901,7 +1848,12 @@ impl RetainedLayoutForest {
     /// This method is the root of the retained occurrence update. It may reuse a
     /// previous occurrence, build fresh mirror nodes, or detach obsolete
     /// subtrees, but all resulting Taffy mutations stay inside the forest.
-    fn commit_layout(&mut self, root_id: RetainedLayoutRootId, id: LayoutId) -> NodeId {
+    fn commit_layout(
+        &mut self,
+        root_id: RetainedLayoutRootId,
+        id: LayoutId,
+        root_layout_context_changed: bool,
+    ) -> NodeId {
         if let Some(node_id) = self.committed.try_node(id) {
             return node_id;
         }
@@ -1920,7 +1872,9 @@ impl RetainedLayoutForest {
             );
         }
 
-        let retained_node = self.commit_intent(id, retained_root, false).occurrence;
+        let retained_node = self
+            .commit_intent(id, retained_root, root_layout_context_changed)
+            .occurrence;
         let node_id = retained_node.node_id;
         self.flush_detached_subtree_removals();
         self.root_slots.insert_current_root(root_id, retained_node);
@@ -1939,8 +1893,13 @@ impl RetainedLayoutForest {
     }
 
     /// Commit an intent that must be a mirror root before computing layout.
-    fn commit_root_layout(&mut self, root_id: RetainedLayoutRootId, id: LayoutId) -> NodeId {
-        let node_id = self.commit_layout(root_id, id);
+    fn commit_root_layout(
+        &mut self,
+        root_id: RetainedLayoutRootId,
+        id: LayoutId,
+        root_layout_context_changed: bool,
+    ) -> NodeId {
+        let node_id = self.commit_layout(root_id, id, root_layout_context_changed);
         assert!(
             self.taffy.parent(node_id).is_none(),
             "layout root must not already be committed under a parent"
@@ -1955,7 +1914,7 @@ impl RetainedLayoutForest {
         root_id: RetainedLayoutRootId,
         id: LayoutId,
     ) -> RetainedNodeToken {
-        RetainedNodeToken(self.commit_layout(root_id, id))
+        RetainedNodeToken(self.commit_layout(root_id, id, false))
     }
 
     /// Test-only root commit probe that preserves Taffy privacy.
@@ -1965,7 +1924,7 @@ impl RetainedLayoutForest {
         root_id: RetainedLayoutRootId,
         id: LayoutId,
     ) -> RetainedNodeToken {
-        RetainedNodeToken(self.commit_root_layout(root_id, id))
+        RetainedNodeToken(self.commit_root_layout(root_id, id, false))
     }
 
     /// Commit one intent against an optional previous retained occurrence.
@@ -2192,17 +2151,9 @@ impl RetainedLayoutForest {
             self.assign_matching_previous_children(&children, previous_children.as_mut_slice());
         let assigned_previous_child_node_ids = exact_previous_children
             .iter()
-            .enumerate()
-            .map(|(index, child)| {
-                child.as_ref().map(|child| child.node_id).or_else(|| {
-                    let current_child = children.get(index)?;
-                    let previous_child = previous_children.get(index)?.as_ref()?;
-                    self.retained_occurrence_has_same_layout_context(*current_child, previous_child)
-                        .then_some(previous_child.node_id)
-                })
-            })
+            .map(|child| child.as_ref().map(|child| child.node_id))
             .collect::<Vec<_>>();
-        let child_assignment_changed = previous_child_node_ids.len() != children.len()
+        let child_list_will_change = previous_child_node_ids.len() != children.len()
             || assigned_previous_child_node_ids
                 .iter()
                 .enumerate()
@@ -2210,7 +2161,7 @@ impl RetainedLayoutForest {
                     *child_node_id != previous_child_node_ids.get(index).copied()
                 });
         let child_layout_context_changed =
-            parent_layout_context_changed || style_changed || child_assignment_changed;
+            parent_layout_context_changed || style_changed || child_list_will_change;
 
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
@@ -2257,6 +2208,9 @@ impl RetainedLayoutForest {
             || style_changed
             || children_changed
             || any_child_layout_context_changed;
+        if parent_layout_context_changed {
+            self.mark_taffy_node_dirty(node_id);
+        }
 
         RetainedLayoutCommit {
             occurrence: retained_node,
@@ -2382,14 +2336,19 @@ impl RetainedLayoutForest {
 
         let style_changed = previous_style != style;
         let measured_kind_changed = previous_measured_kind.as_ref() != Some(&measured_kind);
+        let text_measurement_needs_hydration =
+            matches!(&measured_kind, MeasuredLayoutKind::Text(_));
         if style_changed {
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
             self.work.record_style_update();
         }
-        if measured_kind_changed {
-            self.taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
+        if measured_kind_changed
+            || text_measurement_needs_hydration
+            || parent_layout_context_changed
+        {
+            self.mark_taffy_node_dirty(node_id);
         }
 
         self.measurements.insert_current_measurement(
@@ -2457,10 +2416,7 @@ impl RetainedLayoutForest {
             LayoutIntentKind::Measured { measured_kind, .. } => {
                 previous.facts.kind == RetainedLayoutKind::Measured
                     && previous.children.is_empty()
-                    && Self::measured_kinds_compatible(
-                        previous.facts.measured_kind.as_ref(),
-                        measured_kind,
-                    )
+                    && previous.facts.measured_kind.as_ref() == Some(measured_kind)
             }
         }
     }
@@ -2536,26 +2492,11 @@ impl RetainedLayoutForest {
         self.committed.mark_taffy_node_committed(node_id);
     }
 
-    fn snapshot_layouts_for_occurrence(
-        &self,
-        retained_node: &RetainedLayoutOccurrence,
-    ) -> FxHashMap<NodeId, Layout> {
-        let mut layouts = FxHashMap::default();
-        self.collect_snapshot_layouts(retained_node, &mut layouts);
-        layouts
-    }
-
-    fn collect_snapshot_layouts(
-        &self,
-        retained_node: &RetainedLayoutOccurrence,
-        layouts: &mut FxHashMap<NodeId, Layout>,
-    ) {
-        layouts.insert(
-            retained_node.node_id,
-            self.geometry_layout(retained_node.node_id),
-        );
-        for child in &retained_node.children {
-            self.collect_snapshot_layouts(child, layouts);
+    /// Mark a private mirror node dirty at most once in the current frame.
+    fn mark_taffy_node_dirty(&mut self, node_id: NodeId) {
+        if self.committed.mark_taffy_node_dirty(node_id) {
+            self.taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
+            self.work.record_dirty_mark();
         }
     }
 

@@ -507,15 +507,17 @@ impl LayoutEngine {
     }
 
     #[cfg(test)]
-    fn compute_unmeasured_layout_for_tests(
+    fn compute_unmeasured_layout_with_scale_for_tests(
         &mut self,
         id: LayoutId,
         available_space: Size<AvailableSpace>,
+        scale_factor: f32,
     ) -> RetainedNodeToken {
         self.forest.compute_unmeasured_layout_for_tests(
             RetainedLayoutRootId::new(0),
             id,
             available_space,
+            scale_factor,
         )
     }
 

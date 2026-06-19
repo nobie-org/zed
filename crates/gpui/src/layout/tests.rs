@@ -84,7 +84,6 @@ fn layout_work_sample_counts_compute_and_measure() {
             compute_layout_duration: sample.compute_layout_duration,
             measured_layout_duration: sample.measured_layout_duration,
             retained_layout_creates: 1,
-            retained_layout_snapshot_misses: 1,
             retained_layout_miss_no_previous: 1,
             ..LayoutWorkSample::default()
         }

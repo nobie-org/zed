@@ -30,6 +30,35 @@ pub use telemetry::LayoutWorkSample;
 pub(crate) struct LayoutEngine {
     forest: RetainedLayoutForest,
     layout_work: LayoutWorkSample,
+    mode: LayoutEngineMode,
+}
+
+/// Retained-layout execution policy.
+///
+/// `Retained` is the production path. `Immediate` rebuilds the forest and its
+/// private Taffy mirror at the start of every frame, which gives GPUI a
+/// same-user-code baseline for debugging and correctness oracles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutEngineMode {
+    Retained,
+    Immediate,
+}
+
+impl LayoutEngineMode {
+    fn from_env() -> Self {
+        if let Ok(mode) = std::env::var("GPUI_LAYOUT_MODE") {
+            match mode.to_ascii_lowercase().as_str() {
+                "immediate" | "fresh" | "fresh-taffy" => return Self::Immediate,
+                _ => {}
+            }
+        }
+
+        if std::env::var_os("GPUI_DISABLE_RETAINED_LAYOUT").is_some() {
+            Self::Immediate
+        } else {
+            Self::Retained
+        }
+    }
 }
 
 /// Stable identity for a computed layout root across frames.
@@ -64,6 +93,7 @@ impl LayoutEngine {
         LayoutEngine {
             forest: RetainedLayoutForest::new(),
             layout_work: LayoutWorkSample::default(),
+            mode: LayoutEngineMode::from_env(),
         }
     }
 
@@ -79,7 +109,12 @@ impl LayoutEngine {
     /// Reset frame-local request/measurement state before a new render pass.
     pub fn begin_frame(&mut self) {
         self.layout_work = LayoutWorkSample::default();
-        self.forest.begin_frame();
+        match self.mode {
+            LayoutEngineMode::Retained => self.forest.begin_frame(),
+            LayoutEngineMode::Immediate => {
+                self.forest = RetainedLayoutForest::new();
+            }
+        }
     }
 
     /// Allocate or look up a retained root id for a root compute site.

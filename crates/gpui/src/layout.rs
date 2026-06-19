@@ -292,7 +292,6 @@ impl LayoutEngine {
         self.layout_work.compute_layout_duration += compute_work.compute_layout_duration;
         self.layout_work.measured_layout_calls += compute_work.measured_layout_calls;
         self.layout_work.measured_layout_duration += compute_work.measured_layout_duration;
-        #[cfg(any(test, debug_assertions))]
         if let Some(comparison) = compute_work.fresh_layout_comparison {
             self.layout_work
                 .record_retained_fresh_layout_comparison(comparison);

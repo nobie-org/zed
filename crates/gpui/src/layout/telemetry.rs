@@ -3,7 +3,6 @@
 //! These counters are intentionally separate from the retained forest so timing
 //! and observability do not become part of the layout authority model.
 
-#[cfg(any(test, debug_assertions))]
 use super::retained_forest::FreshLayoutComparisonSummary;
 use super::retained_forest::{RetainedLayoutMissWork, RetainedLayoutWork};
 use std::time::Duration;
@@ -87,7 +86,6 @@ impl LayoutWorkSample {
         self.retained_layout_miss_no_exact_child = misses.no_exact_child;
     }
 
-    #[cfg(any(test, debug_assertions))]
     pub(super) fn record_retained_fresh_layout_comparison(
         &mut self,
         summary: FreshLayoutComparisonSummary,

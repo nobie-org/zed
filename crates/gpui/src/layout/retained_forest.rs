@@ -42,7 +42,10 @@ use std::{
     hash::{Hash, Hasher},
     ops::Range,
     rc::Rc,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 #[cfg(test)]
@@ -123,17 +126,14 @@ pub(super) struct ComputeLayoutWork {
     pub(super) measured_layout_calls: u64,
     pub(super) compute_layout_duration: Duration,
     pub(super) measured_layout_duration: Duration,
-    #[cfg(any(test, debug_assertions))]
     pub(super) fresh_layout_comparison: Option<FreshLayoutComparisonSummary>,
 }
 
-#[cfg(any(test, debug_assertions))]
 #[derive(Clone)]
 struct FreshLayoutCompareNodeContext {
     layout_id: LayoutId,
 }
 
-#[cfg(any(test, debug_assertions))]
 #[derive(Default)]
 struct FreshLayoutComparison {
     summary: FreshLayoutComparisonSummary,
@@ -142,7 +142,6 @@ struct FreshLayoutComparison {
     target_lines: Vec<String>,
 }
 
-#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct FreshLayoutComparisonSummary {
     pub(super) checked_nodes: u64,
@@ -624,10 +623,28 @@ fn retained_layout_miss_trace_limit() -> Option<usize> {
     })
 }
 
-#[cfg(any(test, debug_assertions))]
 fn retained_layout_fresh_compare_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GPUI_TRACE_RETAINED_LAYOUT_FRESH_COMPARE").is_some())
+}
+
+fn retained_layout_zero_bounds_trace_limit() -> Option<usize> {
+    static LIMIT: OnceLock<Option<usize>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("GPUI_TRACE_RETAINED_LAYOUT_ZERO_BOUNDS").ok()?;
+        if value.is_empty() {
+            return Some(128);
+        }
+        value.parse::<usize>().ok().or(Some(128))
+    })
+}
+
+fn should_trace_retained_zero_bounds() -> bool {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let Some(limit) = retained_layout_zero_bounds_trace_limit() else {
+        return false;
+    };
+    COUNT.fetch_add(1, Ordering::Relaxed) < limit
 }
 
 fn retained_layout_trace_layout_ids() -> Option<&'static Vec<usize>> {
@@ -1000,7 +1017,6 @@ impl RetainedLayoutForest {
             measured_layout_calls,
             compute_layout_duration,
             measured_layout_duration,
-            #[cfg(any(test, debug_assertions))]
             fresh_layout_comparison: if retained_layout_fresh_compare_enabled() {
                 let target_layout_ids = retained_layout_trace_layout_ids().map(Vec::as_slice);
                 Some(self.trace_retained_fresh_layout_comparison(
@@ -1023,10 +1039,10 @@ impl RetainedLayoutForest {
     pub(super) fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         let node_id = self.committed_node(id);
         let bounds = self.layout_bounds_for_node(node_id, scale_factor);
-        if retained_layout_detail_trace_enabled()
-            && trace_layout_id_is_targeted(Some(id.0))
-            && (bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0)
-        {
+        let has_zero_size = bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0;
+        let trace_targeted_zero_bounds =
+            retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0));
+        if has_zero_size && (trace_targeted_zero_bounds || should_trace_retained_zero_bounds()) {
             let layout = self.try_layout(node_id);
             let parent = self.parent(node_id);
             let parent_layout = parent.and_then(|parent| self.try_layout(parent));
@@ -1191,7 +1207,8 @@ impl RetainedLayoutForest {
 
     fn layout_intent_summary(intent: &LayoutIntent) -> String {
         format!(
-            "{{kind={}, style={}}}",
+            "{{global_id={:?}, kind={}, style={}}}",
+            intent.global_id,
             Self::layout_intent_kind_summary(&intent.kind),
             Self::debug_fingerprint(&intent.style)
         )
@@ -1413,7 +1430,6 @@ impl RetainedLayoutForest {
         )
     }
 
-    #[cfg(any(test, debug_assertions))]
     pub(super) fn trace_retained_fresh_layout_comparison(
         &self,
         root_layout_id: LayoutId,
@@ -1545,7 +1561,6 @@ impl RetainedLayoutForest {
         comparison.summary
     }
 
-    #[cfg(any(test, debug_assertions))]
     fn build_fresh_layout_compare_tree(
         &self,
         fresh_taffy: &mut TaffyTree<FreshLayoutCompareNodeContext>,
@@ -1577,7 +1592,6 @@ impl RetainedLayoutForest {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
     fn intent_subtree_contains_opaque_measurement(&self, id: LayoutId) -> bool {
         match &self.intent(id).kind {
             LayoutIntentKind::Unmeasured { children } => children
@@ -1589,7 +1603,6 @@ impl RetainedLayoutForest {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
     fn observe_retained_fresh_layout_comparison(
         &self,
         fresh_taffy: &TaffyTree<FreshLayoutCompareNodeContext>,
@@ -1685,7 +1698,6 @@ impl RetainedLayoutForest {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
     fn fresh_layout_comparison_line(
         &self,
         label: &'static str,
@@ -1711,7 +1723,6 @@ impl RetainedLayoutForest {
         )
     }
 
-    #[cfg(any(test, debug_assertions))]
     fn format_layout_id_path(path: &[LayoutId]) -> String {
         path.iter()
             .map(|id| id.0.to_string())
@@ -1719,7 +1730,6 @@ impl RetainedLayoutForest {
             .join("/")
     }
 
-    #[cfg(any(test, debug_assertions))]
     fn layout_has_zero_size(layout: &Layout) -> bool {
         layout.size.width <= 0.0 || layout.size.height <= 0.0
     }

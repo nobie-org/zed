@@ -126,10 +126,11 @@ struct RetainedLayoutOccurrence {
 
 /// Result of committing one current-frame intent into the retained forest.
 ///
-/// `layout_context_changed` is retained-forest bookkeeping about whether this
-/// occurrence or a descendant changed. Taffy dirtying itself is owned by the
-/// mirror mutation methods (`set_style`, `set_children`, create/remove), not by
-/// this flag.
+/// `layout_context_changed` reports that this occurrence or a descendant needs
+/// the enclosing retained mirror path invalidated before the next legal solve.
+/// Direct mirror mutations (`set_style`, `set_children`, create/remove) still
+/// own their own Taffy dirtying; this flag exists for reused occurrence slots
+/// whose retained history is no longer proven valid by exact equality alone.
 struct RetainedLayoutCommit {
     occurrence: RetainedLayoutOccurrence,
     layout_context_changed: bool,
@@ -2208,7 +2209,9 @@ impl RetainedLayoutForest {
             || style_changed
             || children_changed
             || any_child_layout_context_changed;
-        if parent_layout_context_changed {
+        if parent_layout_context_changed
+            || (any_child_layout_context_changed && !style_changed && !children_changed)
+        {
             self.mark_taffy_node_dirty(node_id);
         }
 

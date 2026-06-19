@@ -1065,23 +1065,34 @@ fn expected_mutations(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct ExpectedCommitResult {
+    retained_same_node: bool,
+    layout_context_changed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 trait ExpectedMutationCountsExt {
-    fn add_commit(&mut self, previous: &GeneratedTree, current: &GeneratedTree) -> bool;
+    fn add_commit(&mut self, previous: &GeneratedTree, current: &GeneratedTree);
     fn add_commit_with_context(
         &mut self,
         previous: &GeneratedTree,
         current: &GeneratedTree,
         parent_layout_context_changed: bool,
-    ) -> bool;
+    ) -> ExpectedCommitResult;
     fn add_fresh_tree(&mut self, current: &GeneratedTree);
     fn add_remove_tree(&mut self, previous: &GeneratedTree);
-    fn add_reused_tree(&mut self, current: &GeneratedTree, parent_layout_context_changed: bool);
+    fn add_reused_tree(
+        &mut self,
+        current: &GeneratedTree,
+        parent_layout_context_changed: bool,
+    ) -> ExpectedCommitResult;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ExpectedMutationCountsExt for RetainedForestMutationSample {
-    fn add_commit(&mut self, previous: &GeneratedTree, current: &GeneratedTree) -> bool {
-        self.add_commit_with_context(previous, current, false)
+    fn add_commit(&mut self, previous: &GeneratedTree, current: &GeneratedTree) {
+        self.add_commit_with_context(previous, current, false);
     }
 
     fn add_commit_with_context(
@@ -1089,10 +1100,9 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
         previous: &GeneratedTree,
         current: &GeneratedTree,
         parent_layout_context_changed: bool,
-    ) -> bool {
+    ) -> ExpectedCommitResult {
         if previous.retained_occurrence_matches_intent(current) {
-            self.add_reused_tree(current, parent_layout_context_changed);
-            return true;
+            return self.add_reused_tree(current, parent_layout_context_changed);
         }
 
         match (previous, current) {
@@ -1160,28 +1170,34 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     || previous_style != current_style
                     || child_list_changed;
 
-                if parent_layout_context_changed {
-                    self.dirty_marks += 1;
-                }
-
+                let mut any_child_layout_context_changed = false;
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     let matching_previous_index = assigned_previous_indices[current_index];
                     if let Some(index) = matching_previous_index {
-                        let reused_existing_node = self.add_commit_with_context(
+                        let child_result = self.add_commit_with_context(
                             &previous_children[index],
                             current_child,
                             child_layout_context_changed,
                         );
-                        if !reused_existing_node || index != current_index {
+                        any_child_layout_context_changed |= child_result.layout_context_changed;
+                        if !child_result.retained_same_node || index != current_index {
                             child_list_changed = true;
                         }
                     } else {
                         self.add_fresh_tree(current_child);
                         child_list_changed = true;
+                        any_child_layout_context_changed = true;
                     }
                 }
                 if child_list_changed {
                     self.child_list_updates += 1;
+                }
+                if parent_layout_context_changed
+                    || (any_child_layout_context_changed
+                        && previous_style == current_style
+                        && !child_list_changed)
+                {
+                    self.dirty_marks += 1;
                 }
 
                 for (previous_child, used) in previous_children.iter().zip(previous_used) {
@@ -1189,11 +1205,21 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                         self.add_remove_tree(previous_child);
                     }
                 }
-                true
+                ExpectedCommitResult {
+                    retained_same_node: true,
+                    layout_context_changed: parent_layout_context_changed
+                        || previous_style != current_style
+                        || child_list_changed
+                        || any_child_layout_context_changed,
+                }
             }
             (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
             | (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => {
                 self.reuses += 1;
+                let text_measurement_needs_hydration = matches!(
+                    (previous, current),
+                    (GeneratedTree::Text { .. }, GeneratedTree::Text { .. })
+                );
                 let measured_kind_changed = match (previous, current) {
                     (
                         GeneratedTree::PureSize {
@@ -1208,15 +1234,24 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => true,
                     _ => false,
                 };
-                if parent_layout_context_changed || measured_kind_changed {
+                if parent_layout_context_changed
+                    || measured_kind_changed
+                    || text_measurement_needs_hydration
+                {
                     self.dirty_marks += 1;
                 }
-                true
+                ExpectedCommitResult {
+                    retained_same_node: true,
+                    layout_context_changed: parent_layout_context_changed || measured_kind_changed,
+                }
             }
             _ => {
                 self.add_remove_tree(previous);
                 self.add_fresh_tree(current);
-                false
+                ExpectedCommitResult {
+                    retained_same_node: false,
+                    layout_context_changed: true,
+                }
             }
         }
     }
@@ -1230,13 +1265,21 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
         self.context_clears += previous.measured_count();
     }
 
-    fn add_reused_tree(&mut self, current: &GeneratedTree, parent_layout_context_changed: bool) {
+    fn add_reused_tree(
+        &mut self,
+        current: &GeneratedTree,
+        parent_layout_context_changed: bool,
+    ) -> ExpectedCommitResult {
         self.reuses += current.node_count();
         self.dirty_marks += if parent_layout_context_changed {
             current.node_count()
         } else {
             current.text_count()
         };
+        ExpectedCommitResult {
+            retained_same_node: true,
+            layout_context_changed: parent_layout_context_changed,
+        }
     }
 }
 
@@ -2112,6 +2155,7 @@ fn changed_unmeasured_child_reuses_position_and_updates_style() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
+            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2221,6 +2265,7 @@ fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
         RetainedForestMutationSample {
             reuses: 5,
             style_updates: 1,
+            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2569,6 +2614,7 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
+            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2928,7 +2974,7 @@ fn changed_unmeasured_sibling_hydrates_stable_text_from_query_cache(cx: &mut Tes
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 1,
+            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2998,7 +3044,7 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_from_query_cache(
         RetainedForestMutationSample {
             reuses: 4,
             style_updates: 1,
-            dirty_marks: 1,
+            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3086,7 +3132,7 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 4,
-            dirty_marks: 2,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3831,6 +3877,7 @@ fn changed_flex_ancestor_updates_canvas_subtree_and_matches_fresh_layout() {
         RetainedForestMutationSample {
             reuses: 7,
             style_updates: 1,
+            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3971,6 +4018,7 @@ fn reused_canvas_panel_inside_chrome_shell_after_sidebar_resize_matches_fresh_la
         RetainedForestMutationSample {
             reuses: 14,
             style_updates: 1,
+            dirty_marks: 5,
             ..RetainedForestMutationSample::default()
         }
     );

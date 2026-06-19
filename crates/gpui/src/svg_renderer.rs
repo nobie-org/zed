@@ -78,7 +78,7 @@ fn select_emoji_font(
 }
 
 const SMOOTH_SVG_SCALE: usize = 2;
-const SVG_ALPHA_MASK_SCALE: usize = 4;
+const SVG_ALPHA_MASK_SCALE: usize = 8;
 
 /// When rendering SVGs, we supersample them before uploading or displaying the result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = SMOOTH_SVG_SCALE as f32;
@@ -412,7 +412,17 @@ mod tests {
 
         let mask = downsample_alpha_mask(&pixmap, Size::new(DevicePixels(2), DevicePixels(2)));
 
-        assert_eq!(mask, vec![8, 18, 108, 118]);
+        let samples = (scale * scale) as u32;
+        let rounded_average_offset = ((samples - 1) * samples / 2 + samples / 2) / samples;
+        assert_eq!(
+            mask,
+            vec![
+                rounded_average_offset as u8,
+                (10 + rounded_average_offset) as u8,
+                (100 + rounded_average_offset) as u8,
+                (110 + rounded_average_offset) as u8,
+            ]
+        );
     }
 
     #[test]

@@ -97,6 +97,36 @@ impl RootSnapshotStore {
         })
     }
 
+    pub(super) fn replay_matching_subtrees_for(
+        &self,
+        root_id: RetainedLayoutRootId,
+        occurrence: &RetainedLayoutOccurrence,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        current_layouts: &FxHashMap<NodeId, Layout>,
+    ) -> RootSnapshotReplay {
+        let Some(snapshot) = self.snapshots.get(&root_id) else {
+            return RootSnapshotReplay::default();
+        };
+        if snapshot.input != SnapshotRootInput::new(available_space, scale_factor) {
+            return RootSnapshotReplay::default();
+        }
+
+        let mut previous_by_node = FxHashMap::default();
+        collect_occurrences_by_node(&snapshot.occurrence, &mut previous_by_node);
+
+        let mut replay = RootSnapshotReplay::default();
+        collect_matching_subtree_replay(
+            occurrence,
+            &previous_by_node,
+            &snapshot.layouts,
+            &snapshot.text_artifacts,
+            current_layouts,
+            &mut replay,
+        );
+        replay
+    }
+
     pub(super) fn store(
         &mut self,
         root_id: RetainedLayoutRootId,
@@ -132,6 +162,15 @@ impl SnapshotRootInput {
                 SnapshotAvailableSpace::from(available_space.height),
             ),
             scale_factor_bits: scale_factor.to_bits(),
+        }
+    }
+}
+
+impl Default for RootSnapshotReplay {
+    fn default() -> Self {
+        Self {
+            layouts: FxHashMap::default(),
+            text_artifacts: FxHashMap::default(),
         }
     }
 }
@@ -179,5 +218,71 @@ fn debug_assert_snapshot_complete(
 
     for child in &occurrence.children {
         debug_assert_snapshot_complete(child, layouts, text_artifacts);
+    }
+}
+
+fn collect_occurrences_by_node<'a>(
+    occurrence: &'a RetainedLayoutOccurrence,
+    occurrences: &mut FxHashMap<NodeId, &'a RetainedLayoutOccurrence>,
+) {
+    occurrences.insert(occurrence.node_id, occurrence);
+    for child in &occurrence.children {
+        collect_occurrences_by_node(child, occurrences);
+    }
+}
+
+fn collect_matching_subtree_replay(
+    occurrence: &RetainedLayoutOccurrence,
+    previous_by_node: &FxHashMap<NodeId, &RetainedLayoutOccurrence>,
+    snapshot_layouts: &FxHashMap<NodeId, Layout>,
+    snapshot_text_artifacts: &FxHashMap<NodeId, TextLayoutArtifact>,
+    current_layouts: &FxHashMap<NodeId, Layout>,
+    replay: &mut RootSnapshotReplay,
+) {
+    if let Some(previous) = previous_by_node.get(&occurrence.node_id) {
+        let current_layout = current_layouts.get(&occurrence.node_id);
+        let snapshot_layout = snapshot_layouts.get(&occurrence.node_id);
+        if *previous == occurrence && current_layout == snapshot_layout {
+            collect_snapshot_subtree(
+                occurrence,
+                snapshot_layouts,
+                snapshot_text_artifacts,
+                replay,
+            );
+            return;
+        }
+    }
+
+    for child in &occurrence.children {
+        collect_matching_subtree_replay(
+            child,
+            previous_by_node,
+            snapshot_layouts,
+            snapshot_text_artifacts,
+            current_layouts,
+            replay,
+        );
+    }
+}
+
+fn collect_snapshot_subtree(
+    occurrence: &RetainedLayoutOccurrence,
+    snapshot_layouts: &FxHashMap<NodeId, Layout>,
+    snapshot_text_artifacts: &FxHashMap<NodeId, TextLayoutArtifact>,
+    replay: &mut RootSnapshotReplay,
+) {
+    let layout = snapshot_layouts
+        .get(&occurrence.node_id)
+        .expect("root snapshot should include every retained node layout");
+    replay.layouts.insert(occurrence.node_id, layout.clone());
+
+    if let Some(artifact) = snapshot_text_artifacts.get(&occurrence.node_id) {
+        replay
+            .text_artifacts
+            .insert(occurrence.node_id, artifact.clone());
+    }
+
+    for child in &occurrence.children {
+        collect_snapshot_subtree(child, snapshot_layouts, snapshot_text_artifacts, replay);
     }
 }

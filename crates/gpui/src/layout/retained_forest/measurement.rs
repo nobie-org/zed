@@ -247,8 +247,9 @@ pub(super) enum MeasurementCallbackKind {
 /// This is GPUI state, not Taffy state. Taffy can decide whether a measured node
 /// cache entry is valid, but GPUI owns the executable producer slots and text
 /// artifacts. Under stock Taffy, text artifacts are hydrated only from
-/// callbacks that run during the current compute because `TextMeasureKey` does
-/// not include the full Taffy measurement query.
+/// callbacks that run during the current compute or from a solved subtree
+/// snapshot whose retained facts and published geometry prove the artifact is
+/// still the current-frame artifact. `TextMeasureKey` alone is never enough.
 pub(super) struct MeasurementStore {
     producer_contexts: Vec<Option<LayoutMeasureContext>>,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
@@ -357,15 +358,47 @@ impl MeasurementStore {
         }
         hydrated
     }
+
+    pub(super) fn hydrate_missing_text_artifacts(
+        &mut self,
+        artifacts: &FxHashMap<NodeId, TextLayoutArtifact>,
+    ) -> u64 {
+        let mut hydrated = 0;
+        for (node_id, artifact) in artifacts {
+            if self.current_text_artifacts.contains_key(node_id) {
+                continue;
+            }
+            let Some(CurrentMeasurement::Text { key, measure }) =
+                self.current_measurements.get(node_id)
+            else {
+                panic!("subtree text artifact should correspond to a current text measured node");
+            };
+            assert_eq!(
+                artifact.key(),
+                key,
+                "subtree text artifact should match the current text measure key"
+            );
+            let hydrate = self.producer_contexts[*measure]
+                .as_ref()
+                .and_then(|measure| measure.text_hydrator.as_ref())
+                .map(Rc::clone)
+                .expect("text measured layout should have a current hydrator");
+            hydrate(artifact);
+            self.current_text_artifacts
+                .insert(*node_id, artifact.clone());
+            hydrated += 1;
+        }
+        hydrated
+    }
 }
 
 /// Per-compute bridge between Taffy measurement callbacks and GPUI artifacts.
 ///
-/// Taffy owns whether a measured node callback runs. GPUI hydrates text only
-/// from a callback result in the same compute because stock Taffy does not
-/// expose the measurement query that selected a cached text result. Replaying a
-/// text artifact from `TextMeasureKey` alone is under-keyed and therefore
-/// forbidden.
+/// Taffy owns whether a measured node callback runs. GPUI hydrates text from a
+/// callback result in the same compute, or later from a retained solved-subtree
+/// snapshot that proves the artifact still belongs to the current published
+/// geometry. Replaying a text artifact from `TextMeasureKey` alone is
+/// under-keyed and therefore forbidden.
 pub(super) struct ComputeMeasurementState<'a> {
     producer_contexts: &'a mut Vec<Option<LayoutMeasureContext>>,
     current_measurements: &'a mut FxHashMap<NodeId, CurrentMeasurement>,

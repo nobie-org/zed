@@ -246,6 +246,15 @@ impl RetainedWorkState {
         }
     }
 
+    pub(super) fn record_snapshot_text_artifact_replays(&mut self, text_artifact_replays: u64) {
+        self.work.snapshot_text_artifact_replays += text_artifact_replays;
+        #[cfg(test)]
+        {
+            self.mutation_sample_for_tests
+                .snapshot_text_artifact_replays += text_artifact_replays;
+        }
+    }
+
     pub(super) fn record_no_previous_miss(&mut self) {
         self.miss_work.no_previous += 1;
     }

@@ -128,9 +128,10 @@ struct RetainedLayoutOccurrence {
 
 /// Result of committing one current-frame intent into the retained forest.
 ///
-/// `layout_context_changed` means a retained mirror node may keep its identity,
-/// but at least one layout-visible dependency below or above that node changed
-/// enough that descendant Taffy layout slots cannot be published from cache.
+/// `layout_context_changed` is retained-forest bookkeeping about whether this
+/// occurrence or a descendant changed. Taffy dirtying itself is owned by the
+/// mirror mutation methods (`set_style`, `set_children`, create/remove), not by
+/// this flag.
 struct RetainedLayoutCommit {
     occurrence: RetainedLayoutOccurrence,
     layout_context_changed: bool,
@@ -1079,7 +1080,6 @@ impl RetainedLayoutForest {
         }
 
         self.work.record_snapshot_miss();
-        self.dirty_retained_text_layout_slots(&retained_root);
 
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
@@ -1106,6 +1106,20 @@ impl RetainedLayoutForest {
                 |node_id| taffy.children(node_id).expect(EXPECT_MESSAGE),
             );
         }
+
+        let subtree_replay = self.snapshots.replay_matching_subtrees_for(
+            root_id,
+            &retained_root,
+            available_space,
+            scale_factor,
+            self.geometry.layouts(),
+        );
+        self.geometry.replace_layouts(&subtree_replay.layouts);
+        let replayed_text_artifacts = self
+            .measurements
+            .hydrate_missing_text_artifacts(&subtree_replay.text_artifacts);
+        self.work
+            .record_snapshot_text_artifact_replays(replayed_text_artifacts);
 
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -2243,9 +2257,6 @@ impl RetainedLayoutForest {
             || style_changed
             || children_changed
             || any_child_layout_context_changed;
-        if layout_context_changed {
-            self.dirty_retained_layout_slots(&retained_node);
-        }
 
         RetainedLayoutCommit {
             occurrence: retained_node,
@@ -2308,9 +2319,10 @@ impl RetainedLayoutForest {
 
     /// Commit a measured intent and register its current-frame producer.
     ///
-    /// A retained measured node may be reused only when its comparable measured
-    /// kind is compatible. Opaque producers are never compatible because their
-    /// closure body is not layout-visible data.
+    /// Pure-size and text measured nodes keep their mirror identity across
+    /// explicit key changes; the key change dirties the node and replaces the
+    /// comparable retained facts. Opaque producers are still rebuilt because
+    /// their closure body is not layout-visible data.
     fn commit_measured_intent(
         &mut self,
         id: LayoutId,
@@ -2334,12 +2346,10 @@ impl RetainedLayoutForest {
             };
         };
 
+        let previous_measured_kind = previous.facts.measured_kind.clone();
         let compatible = previous.facts.kind == RetainedLayoutKind::Measured
             && previous.children.is_empty()
-            && Self::measured_kinds_compatible(
-                previous.facts.measured_kind.as_ref(),
-                &measured_kind,
-            );
+            && Self::measured_kinds_compatible(previous_measured_kind.as_ref(), &measured_kind);
         if !compatible {
             self.work.record_measured_kind_miss();
             self.trace_retained_layout_miss("measured_kind", id, Some(&previous), || {
@@ -2371,11 +2381,15 @@ impl RetainedLayoutForest {
         self.committed.insert(id, node_id);
 
         let style_changed = previous_style != style;
+        let measured_kind_changed = previous_measured_kind.as_ref() != Some(&measured_kind);
         if style_changed {
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
             self.work.record_style_update();
+        }
+        if measured_kind_changed {
+            self.taffy.mark_dirty(node_id).expect(EXPECT_MESSAGE);
         }
 
         self.measurements.insert_current_measurement(
@@ -2392,10 +2406,8 @@ impl RetainedLayoutForest {
             },
             children: Vec::new(),
         };
-        let layout_context_changed = parent_layout_context_changed || style_changed;
-        if parent_layout_context_changed {
-            self.dirty_retained_layout_slots(&retained_node);
-        }
+        let layout_context_changed =
+            parent_layout_context_changed || style_changed || measured_kind_changed;
 
         RetainedLayoutCommit {
             occurrence: retained_node,
@@ -2403,19 +2415,14 @@ impl RetainedLayoutForest {
         }
     }
 
-    /// Return whether a retained measured node can preserve Taffy history.
+    /// Return whether a retained measured node can preserve mirror identity.
     fn measured_kinds_compatible(
         previous: Option<&MeasuredLayoutKind>,
         current: &MeasuredLayoutKind,
     ) -> bool {
         match (previous, current) {
-            (
-                Some(MeasuredLayoutKind::PureSize(previous)),
-                MeasuredLayoutKind::PureSize(current),
-            ) => previous == current,
-            (Some(MeasuredLayoutKind::Text(previous)), MeasuredLayoutKind::Text(current)) => {
-                previous == current
-            }
+            (Some(MeasuredLayoutKind::PureSize(_)), MeasuredLayoutKind::PureSize(_)) => true,
+            (Some(MeasuredLayoutKind::Text(_)), MeasuredLayoutKind::Text(_)) => true,
             _ => false,
         }
     }
@@ -2527,42 +2534,6 @@ impl RetainedLayoutForest {
     /// Mark a mirror node as used at one current-frame position.
     fn mark_taffy_node_committed(&mut self, node_id: NodeId) {
         self.committed.mark_taffy_node_committed(node_id);
-    }
-
-    /// Dirty every mirror slot in a reused subtree whose layout context changed.
-    ///
-    /// Taffy may satisfy an ancestor solve from cache without rewriting every
-    /// descendant `layout()` slot. GPUI publishes geometry for every retained
-    /// occurrence, so when identity is preserved across a changed layout
-    /// context the forest must force those private slots to be refreshed during
-    /// the single legal root solve.
-    fn dirty_retained_layout_slots(&mut self, retained_node: &RetainedLayoutOccurrence) {
-        self.taffy
-            .mark_dirty(retained_node.node_id)
-            .expect(EXPECT_MESSAGE);
-        for child in &retained_node.children {
-            self.dirty_retained_layout_slots(child);
-        }
-    }
-
-    /// Dirty retained text nodes before a snapshot miss compute.
-    ///
-    /// Text callbacks hydrate GPUI paint/hit-test artifacts. If an exact root
-    /// snapshot is unavailable, reused text nodes must be forced through the
-    /// stock Taffy measurement path instead of relying on an internal cache hit
-    /// that may skip the callback.
-    fn dirty_retained_text_layout_slots(&mut self, retained_node: &RetainedLayoutOccurrence) {
-        if matches!(
-            retained_node.facts.measured_kind.as_ref(),
-            Some(MeasuredLayoutKind::Text(_))
-        ) {
-            self.taffy
-                .mark_dirty(retained_node.node_id)
-                .expect(EXPECT_MESSAGE);
-        }
-        for child in &retained_node.children {
-            self.dirty_retained_text_layout_slots(child);
-        }
     }
 
     fn snapshot_layouts_for_occurrence(

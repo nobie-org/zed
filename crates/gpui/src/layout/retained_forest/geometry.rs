@@ -154,4 +154,14 @@ impl GeometryStore {
     pub(super) fn layout(&self, node_id: NodeId) -> Option<Layout> {
         self.current_layouts.get(&node_id).cloned()
     }
+
+    pub(super) fn layouts(&self) -> &FxHashMap<NodeId, Layout> {
+        &self.current_layouts
+    }
+
+    pub(super) fn replace_layouts(&mut self, layouts: &FxHashMap<NodeId, Layout>) {
+        for (node_id, layout) in layouts {
+            self.current_layouts.insert(*node_id, layout.clone());
+        }
+    }
 }

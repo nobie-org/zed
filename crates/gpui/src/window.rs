@@ -4452,7 +4452,7 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     #[track_caller]
-    pub fn compute_layout(
+    pub(crate) fn compute_layout(
         &mut self,
         layout_id: LayoutId,
         available_space: Size<AvailableSpace>,

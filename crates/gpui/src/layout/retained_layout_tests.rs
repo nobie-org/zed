@@ -1184,6 +1184,11 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 }
                 true
             }
+            (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
+            | (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => {
+                self.reuses += 1;
+                true
+            }
             _ => {
                 self.add_remove_tree(previous);
                 self.add_fresh_tree(current);
@@ -2677,7 +2682,7 @@ fn unchanged_nested_text_measure_replays_root_snapshot(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_remeasures_text_child(cx: &mut TestAppContext) {
+fn changed_unmeasured_sibling_replays_stable_text_child(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2724,21 +2729,22 @@ fn changed_unmeasured_sibling_remeasures_text_child(cx: &mut TestAppContext) {
         );
     });
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
             snapshot_misses: 1,
+            snapshot_text_artifact_replays: 1,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppContext) {
+fn changed_unmeasured_sibling_replays_nested_stable_text_child(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2792,13 +2798,102 @@ fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppConte
         engine.retained_node_token_for_tests(stable_container),
         first_container_node
     );
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 4,
             style_updates: 1,
+            snapshot_misses: 1,
+            snapshot_text_artifact_replays: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+}
+
+#[gpui::test]
+fn changed_text_outside_stable_subtree_remeasures_only_changed_text(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let stable_key = text_measure_key("stable");
+    let first_dynamic_key = text_measure_key("frame 1");
+    let second_dynamic_key = text_measure_key("frame 2");
+    let stable_measures = Rc::new(Cell::new(0));
+    let stable_hydrations = Rc::new(Cell::new(0));
+    let dynamic_measures = Rc::new(Cell::new(0));
+    let dynamic_hydrations = Rc::new(Cell::new(0));
+    let mut engine = LayoutEngine::new();
+
+    let stable_text = request_text_measured(
+        &mut engine,
+        stable_key.clone(),
+        size(px(40.0), px(20.0)),
+        stable_measures.clone(),
+        stable_hydrations.clone(),
+    );
+    let stable_subtree = request_container(&mut engine, &[stable_text]);
+    let dynamic_text = request_text_measured(
+        &mut engine,
+        first_dynamic_key,
+        size(px(50.0), px(20.0)),
+        dynamic_measures.clone(),
+        dynamic_hydrations.clone(),
+    );
+    let root = request_container(&mut engine, &[stable_subtree, dynamic_text]);
+    cx.update(|window, app| {
+        engine.compute_layout(
+            root,
+            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+            window,
+            app,
+        );
+    });
+    engine.finish_frame();
+
+    stable_measures.set(0);
+    stable_hydrations.set(0);
+    dynamic_measures.set(0);
+    dynamic_hydrations.set(0);
+    engine.reset_retained_mutation_sample_for_tests();
+    let stable_text = request_text_measured(
+        &mut engine,
+        stable_key,
+        size(px(40.0), px(20.0)),
+        stable_measures.clone(),
+        stable_hydrations.clone(),
+    );
+    let stable_subtree = request_container(&mut engine, &[stable_text]);
+    let dynamic_text = request_text_measured(
+        &mut engine,
+        second_dynamic_key,
+        size(px(50.0), px(20.0)),
+        dynamic_measures.clone(),
+        dynamic_hydrations.clone(),
+    );
+    let root = request_container(&mut engine, &[stable_subtree, dynamic_text]);
+    cx.update(|window, app| {
+        engine.compute_layout(
+            root,
+            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+            window,
+            app,
+        );
+    });
+
+    assert_eq!(
+        (
+            stable_measures.get(),
+            stable_hydrations.get(),
+            dynamic_measures.get(),
+            dynamic_hydrations.get()
+        ),
+        (2, 2, 1, 1)
+    );
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 3);
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 4,
             snapshot_misses: 1,
             ..RetainedForestMutationSample::default()
         }
@@ -3125,9 +3220,7 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 1,
-            context_clears: 1,
-            removes: 1,
+            reuses: 1,
             snapshot_misses: 1,
             ..RetainedForestMutationSample::default()
         }
@@ -3671,4 +3764,16 @@ fn intent_committed_under_parent_cannot_be_computed_as_root() {
 
     compute_layout_without_measure(&mut engine, root, 800.0, 100.0);
     engine.commit_root_layout(child);
+}
+
+#[test]
+#[should_panic(expected = "retained layout root should be committed at most once per frame")]
+fn intent_computed_as_root_cannot_later_be_committed_under_parent() {
+    let mut engine = LayoutEngine::new();
+    let child = request_full_leaf(&mut engine);
+
+    compute_layout_without_measure(&mut engine, child, 800.0, 100.0);
+
+    let root = request_full_container(&mut engine, &[child]);
+    engine.commit_root_layout(root);
 }

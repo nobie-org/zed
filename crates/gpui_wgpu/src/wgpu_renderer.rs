@@ -181,7 +181,6 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
-    monochrome_atlas_sampler: wgpu::Sampler,
     group_sampler: wgpu::Sampler,
     _group_binding_placeholder_texture: wgpu::Texture,
     group_binding_placeholder_view: wgpu::TextureView,
@@ -498,12 +497,6 @@ impl WgpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let monochrome_atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("monochrome_atlas_sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
         let group_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("group_sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -613,7 +606,6 @@ impl WgpuRenderer {
             pipelines,
             bind_group_layouts,
             atlas_sampler,
-            monochrome_atlas_sampler,
             group_sampler,
             _group_binding_placeholder_texture: group_binding_placeholder_texture,
             group_binding_placeholder_view,
@@ -2014,11 +2006,10 @@ impl WgpuRenderer {
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
-        self.draw_instances_with_texture_and_sampler(
+        self.draw_instances_with_texture(
             data,
             sprites.len() as u32,
             &tex_info.view,
-            &self.resources().monochrome_atlas_sampler,
             &self.resources().pipelines.mono_sprites,
             instance_offset,
             pass,

@@ -124,6 +124,16 @@ struct RetainedLayoutOccurrence {
     children: Vec<RetainedLayoutOccurrence>,
 }
 
+/// Result of committing one current-frame intent into the retained forest.
+///
+/// `layout_context_changed` means a retained mirror node may keep its identity,
+/// but at least one layout-visible dependency below or above that node changed
+/// enough that descendant Taffy layout slots cannot be published from cache.
+struct RetainedLayoutCommit {
+    occurrence: RetainedLayoutOccurrence,
+    layout_context_changed: bool,
+}
+
 /// Work observed while committing and computing one root layout.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ComputeLayoutWork {
@@ -1831,7 +1841,7 @@ impl RetainedLayoutForest {
             );
         }
 
-        let retained_node = self.commit_intent(id, retained_root);
+        let retained_node = self.commit_intent(id, retained_root, false).occurrence;
         let node_id = retained_node.node_id;
         self.flush_detached_subtree_removals();
         self.root_slots.insert_current_root(root_id, retained_node);
@@ -1884,7 +1894,8 @@ impl RetainedLayoutForest {
         &mut self,
         id: LayoutId,
         previous: Option<RetainedLayoutOccurrence>,
-    ) -> RetainedLayoutOccurrence {
+        parent_layout_context_changed: bool,
+    ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -1896,9 +1907,13 @@ impl RetainedLayoutForest {
         let work_snapshot = probe_global_id.as_ref().map(|_| self.work.snapshot());
         let intent = self.intent(id);
         let retained_node = match intent.kind.clone() {
-            LayoutIntentKind::Unmeasured { children } => {
-                self.commit_unmeasured_intent(id, intent.style.clone(), children, previous)
-            }
+            LayoutIntentKind::Unmeasured { children } => self.commit_unmeasured_intent(
+                id,
+                intent.style.clone(),
+                children,
+                previous,
+                parent_layout_context_changed,
+            ),
             LayoutIntentKind::Measured {
                 measure,
                 measured_kind,
@@ -1908,12 +1923,13 @@ impl RetainedLayoutForest {
                 measure,
                 measured_kind,
                 previous,
+                parent_layout_context_changed,
             ),
         };
 
         if let (Some(global_id), Some(work_snapshot)) = (probe_global_id, work_snapshot) {
             let work_delta = self.work.delta_since(work_snapshot);
-            let node_ids = Self::retained_occurrence_node_ids(&retained_node);
+            let node_ids = Self::retained_occurrence_node_ids(&retained_node.occurrence);
             self.subtree_probe
                 .record_committed_subtree(global_id, id, node_ids, work_delta);
         }
@@ -2032,7 +2048,8 @@ impl RetainedLayoutForest {
         style: taffy::style::Style,
         children: Vec<LayoutId>,
         previous: Option<RetainedLayoutOccurrence>,
-    ) -> RetainedLayoutOccurrence {
+        parent_layout_context_changed: bool,
+    ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2041,10 +2058,19 @@ impl RetainedLayoutForest {
         let Some(previous) = previous else {
             self.work.record_no_previous_miss();
             self.trace_retained_layout_miss("no_previous", id, None, || String::new());
-            return self.build_fresh_unmeasured_occurrence(id, style, children);
+            return RetainedLayoutCommit {
+                occurrence: self.build_fresh_unmeasured_occurrence(id, style, children),
+                layout_context_changed: true,
+            };
         };
 
-        self.update_unmeasured_retained_occurrence(id, style, children, previous)
+        self.update_unmeasured_retained_occurrence(
+            id,
+            style,
+            children,
+            previous,
+            parent_layout_context_changed,
+        )
     }
 
     /// Update an unmeasured occurrence and mirror node to match the current intent.
@@ -2054,7 +2080,8 @@ impl RetainedLayoutForest {
         style: taffy::style::Style,
         children: Vec<LayoutId>,
         previous: RetainedLayoutOccurrence,
-    ) -> RetainedLayoutOccurrence {
+        parent_layout_context_changed: bool,
+    ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2063,7 +2090,10 @@ impl RetainedLayoutForest {
         if previous.facts.kind != RetainedLayoutKind::Unmeasured {
             let fresh = self.build_fresh_unmeasured_occurrence(id, style, children);
             self.root_slots.detach_subtree(previous);
-            return fresh;
+            return RetainedLayoutCommit {
+                occurrence: fresh,
+                layout_context_changed: true,
+            };
         }
 
         let previous_facts = previous.facts;
@@ -2081,12 +2111,37 @@ impl RetainedLayoutForest {
 
         let mut exact_previous_children =
             self.assign_matching_previous_children(&children, previous_children.as_mut_slice());
+        let assigned_previous_child_node_ids = exact_previous_children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                child.as_ref().map(|child| child.node_id).or_else(|| {
+                    let current_child = children.get(index)?;
+                    let previous_child = previous_children.get(index)?.as_ref()?;
+                    self.retained_occurrence_has_same_layout_context(*current_child, previous_child)
+                        .then_some(previous_child.node_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        let child_assignment_changed = previous_child_node_ids.len() != children.len()
+            || assigned_previous_child_node_ids
+                .iter()
+                .enumerate()
+                .any(|(index, child_node_id)| {
+                    *child_node_id != previous_child_node_ids.get(index).copied()
+                });
+        let child_layout_context_changed =
+            parent_layout_context_changed || style_changed || child_assignment_changed;
 
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
+        let mut any_child_layout_context_changed = false;
         for (index, child) in children.into_iter().enumerate() {
             let previous_child = exact_previous_children[index].take();
-            let retained_child = self.commit_intent(child, previous_child);
+            let retained_child =
+                self.commit_intent(child, previous_child, child_layout_context_changed);
+            any_child_layout_context_changed |= retained_child.layout_context_changed;
+            let retained_child = retained_child.occurrence;
             child_node_ids.push(retained_child.node_id);
             retained_children.push(retained_child);
         }
@@ -2110,7 +2165,7 @@ impl RetainedLayoutForest {
             self.root_slots.detach_subtree(previous_child);
         }
 
-        RetainedLayoutOccurrence {
+        let retained_node = RetainedLayoutOccurrence {
             node_id,
             facts: RetainedLayoutFacts {
                 style,
@@ -2118,6 +2173,18 @@ impl RetainedLayoutForest {
                 measured_kind: None,
             },
             children: retained_children,
+        };
+        let layout_context_changed = parent_layout_context_changed
+            || style_changed
+            || children_changed
+            || any_child_layout_context_changed;
+        if layout_context_changed {
+            self.dirty_retained_layout_slots(&retained_node);
+        }
+
+        RetainedLayoutCommit {
+            occurrence: retained_node,
+            layout_context_changed,
         }
     }
 
@@ -2186,7 +2253,8 @@ impl RetainedLayoutForest {
         measure: Option<usize>,
         measured_kind: MeasuredLayoutKind,
         previous: Option<RetainedLayoutOccurrence>,
-    ) -> RetainedLayoutOccurrence {
+        parent_layout_context_changed: bool,
+    ) -> RetainedLayoutCommit {
         assert!(
             !self.committed.contains_layout(id),
             "layout intent should appear only once in a committed layout tree"
@@ -2195,7 +2263,10 @@ impl RetainedLayoutForest {
         let Some(previous) = previous else {
             self.work.record_no_previous_miss();
             self.trace_retained_layout_miss("no_previous", id, None, || String::new());
-            return self.build_fresh_measured_occurrence(id, style, measure, measured_kind);
+            return RetainedLayoutCommit {
+                occurrence: self.build_fresh_measured_occurrence(id, style, measure, measured_kind),
+                layout_context_changed: true,
+            };
         };
 
         let compatible = previous.facts.kind == RetainedLayoutKind::Measured
@@ -2218,9 +2289,14 @@ impl RetainedLayoutForest {
                     Self::debug_fingerprint(&measured_kind)
                 )
             });
+            let layout_context_changed = parent_layout_context_changed
+                || !self.retained_occurrence_has_same_layout_context(id, &previous);
             let fresh = self.build_fresh_measured_occurrence(id, style, measure, measured_kind);
             self.root_slots.detach_subtree(previous);
-            return fresh;
+            return RetainedLayoutCommit {
+                occurrence: fresh,
+                layout_context_changed,
+            };
         }
 
         let node_id = previous.node_id;
@@ -2229,7 +2305,8 @@ impl RetainedLayoutForest {
         self.mark_taffy_node_committed(node_id);
         self.committed.insert(id, node_id);
 
-        if previous_style != style {
+        let style_changed = previous_style != style;
+        if style_changed {
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
@@ -2241,7 +2318,7 @@ impl RetainedLayoutForest {
             Self::current_measurement(measured_kind.clone(), measure),
         );
 
-        RetainedLayoutOccurrence {
+        let retained_node = RetainedLayoutOccurrence {
             node_id,
             facts: RetainedLayoutFacts {
                 style,
@@ -2249,6 +2326,15 @@ impl RetainedLayoutForest {
                 measured_kind: Some(measured_kind),
             },
             children: Vec::new(),
+        };
+        let layout_context_changed = parent_layout_context_changed || style_changed;
+        if parent_layout_context_changed {
+            self.dirty_retained_layout_slots(&retained_node);
+        }
+
+        RetainedLayoutCommit {
+            occurrence: retained_node,
+            layout_context_changed,
         }
     }
 
@@ -2331,9 +2417,64 @@ impl RetainedLayoutForest {
         }
     }
 
+    /// Return whether a previous occurrence has the same shallow layout meaning.
+    ///
+    /// This is weaker than retained-node compatibility. Text nodes with the same
+    /// explicit measure key are layout-equivalent, but still not node-reusable
+    /// under stock Taffy because their paint artifact must be hydrated from a
+    /// current callback.
+    fn retained_occurrence_has_same_layout_context(
+        &self,
+        id: LayoutId,
+        previous: &RetainedLayoutOccurrence,
+    ) -> bool {
+        let intent = self.intent(id);
+        if previous.facts.style != intent.style {
+            return false;
+        }
+
+        match &intent.kind {
+            LayoutIntentKind::Unmeasured { .. } => {
+                previous.facts.kind == RetainedLayoutKind::Unmeasured
+                    && previous.facts.measured_kind.is_none()
+            }
+            LayoutIntentKind::Measured { measured_kind, .. } => {
+                previous.facts.kind == RetainedLayoutKind::Measured
+                    && previous.children.is_empty()
+                    && match (previous.facts.measured_kind.as_ref(), measured_kind) {
+                        (
+                            Some(MeasuredLayoutKind::PureSize(previous)),
+                            MeasuredLayoutKind::PureSize(current),
+                        ) => previous == current,
+                        (
+                            Some(MeasuredLayoutKind::Text(previous)),
+                            MeasuredLayoutKind::Text(current),
+                        ) => previous == current,
+                        _ => false,
+                    }
+            }
+        }
+    }
+
     /// Mark a mirror node as used at one current-frame position.
     fn mark_taffy_node_committed(&mut self, node_id: NodeId) {
         self.committed.mark_taffy_node_committed(node_id);
+    }
+
+    /// Dirty every mirror slot in a reused subtree whose layout context changed.
+    ///
+    /// Taffy may satisfy an ancestor solve from cache without rewriting every
+    /// descendant `layout()` slot. GPUI publishes geometry for every retained
+    /// occurrence, so when identity is preserved across a changed layout
+    /// context the forest must force those private slots to be refreshed during
+    /// the single legal root solve.
+    fn dirty_retained_layout_slots(&mut self, retained_node: &RetainedLayoutOccurrence) {
+        self.taffy
+            .mark_dirty(retained_node.node_id)
+            .expect(EXPECT_MESSAGE);
+        for child in &retained_node.children {
+            self.dirty_retained_layout_slots(child);
+        }
     }
 
     fn retained_occurrence_node_ids(retained_node: &RetainedLayoutOccurrence) -> Vec<NodeId> {

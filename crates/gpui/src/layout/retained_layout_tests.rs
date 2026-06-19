@@ -1122,10 +1122,23 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 }
 
                 let mut previous_used = vec![false; previous_children.len()];
-                let mut assigned_previous_indices = current_children
-                    .iter()
-                    .map(|current_child| {
-                        let matching_previous_index = previous_children
+                let mut assigned_previous_indices = vec![None; current_children.len()];
+
+                for (current_index, current_child) in current_children.iter().enumerate() {
+                    if let Some(previous_child) = previous_children.get(current_index) {
+                        if previous_child.retained_occurrence_matches_intent(current_child) {
+                            previous_used[current_index] = true;
+                            assigned_previous_indices[current_index] = Some(current_index);
+                        }
+                    }
+                }
+
+                for (current_index, current_child) in current_children.iter().enumerate() {
+                    if assigned_previous_indices[current_index].is_some() {
+                        continue;
+                    }
+                    let matching_previous_index =
+                        previous_children
                             .iter()
                             .enumerate()
                             .position(|(index, previous_child)| {
@@ -1133,12 +1146,11 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                                     && previous_child
                                         .retained_occurrence_matches_intent(current_child)
                             });
-                        if let Some(index) = matching_previous_index {
-                            previous_used[index] = true;
-                        }
-                        matching_previous_index
-                    })
-                    .collect::<Vec<_>>();
+                    if let Some(index) = matching_previous_index {
+                        previous_used[index] = true;
+                        assigned_previous_indices[current_index] = Some(index);
+                    }
+                }
 
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     if assigned_previous_indices[current_index].is_some() {
@@ -1192,8 +1204,9 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 if child_list_changed {
                     self.child_list_updates += 1;
                 }
+                let compatible_update_changed_meaning = true;
                 if parent_layout_context_changed
-                    || (any_child_layout_context_changed
+                    || ((compatible_update_changed_meaning || any_child_layout_context_changed)
                         && previous_style == current_style
                         && !child_list_changed)
                 {
@@ -1210,7 +1223,8 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     layout_context_changed: parent_layout_context_changed
                         || previous_style != current_style
                         || child_list_changed
-                        || any_child_layout_context_changed,
+                        || any_child_layout_context_changed
+                        || compatible_update_changed_meaning,
                 }
             }
             (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
@@ -2418,6 +2432,114 @@ fn retained_layout_recomputes_after_child_delete_from_content_sized_parent() {
             child_list_updates: 1,
             dirty_marks: 1,
             removes: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+}
+
+#[test]
+fn compatible_same_position_child_change_dirties_parent_and_matches_fresh_layout() {
+    let mut retained = LayoutEngine::new();
+    let stable = request_leaf(&mut retained, 10.0);
+    let changing = request_leaf(&mut retained, 20.0);
+    let first_root = request_flex_container(&mut retained, &[stable, changing]);
+    let first_root_node = compute_layout_without_measure(&mut retained, first_root, 240.0, 80.0);
+    let first_stable_node = retained.retained_node_token_for_tests(stable);
+    let first_changing_node = retained.retained_node_token_for_tests(changing);
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let stable = request_leaf(&mut retained, 10.0);
+    let changing = request_leaf(&mut retained, 30.0);
+    let second_root = request_flex_container(&mut retained, &[stable, changing]);
+    let retained_stable = stable;
+    let retained_changing = changing;
+    let retained_root = compute_layout_without_measure(&mut retained, second_root, 240.0, 80.0);
+
+    let mut fresh = LayoutEngine::new();
+    let stable = request_leaf(&mut fresh, 10.0);
+    let changing = request_leaf(&mut fresh, 30.0);
+    let fresh_root = request_flex_container(&mut fresh, &[stable, changing]);
+    let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, 240.0, 80.0);
+
+    assert_intent_committed_exactly(&retained, second_root);
+    assert_eq!(retained_root, first_root_node);
+    assert_eq!(
+        retained.retained_node_token_for_tests(retained_stable),
+        first_stable_node
+    );
+    assert_eq!(
+        retained.retained_node_token_for_tests(retained_changing),
+        first_changing_node
+    );
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root),
+        retained_layout_projection(&fresh, fresh_root)
+    );
+    assert_eq!(
+        retained_layout_bounds_trees(&mut retained, &[retained_root], 1.0),
+        retained_layout_bounds_trees(&mut fresh, &[fresh_root], 1.0)
+    );
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 3,
+            style_updates: 1,
+            dirty_marks: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+}
+
+#[test]
+fn same_position_exact_child_is_not_stolen_by_changed_equal_sibling() {
+    let mut retained = LayoutEngine::new();
+    let changing = request_leaf(&mut retained, 10.0);
+    let stable = request_leaf(&mut retained, 99.0);
+    let first_root = request_flex_container(&mut retained, &[changing, stable]);
+    let first_root_node = compute_layout_without_measure(&mut retained, first_root, 240.0, 80.0);
+    let first_changing_node = retained.retained_node_token_for_tests(changing);
+    let first_stable_node = retained.retained_node_token_for_tests(stable);
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let changing = request_leaf(&mut retained, 99.0);
+    let stable = request_leaf(&mut retained, 99.0);
+    let second_root = request_flex_container(&mut retained, &[changing, stable]);
+    let retained_changing = changing;
+    let retained_stable = stable;
+    let retained_root = compute_layout_without_measure(&mut retained, second_root, 240.0, 80.0);
+
+    let mut fresh = LayoutEngine::new();
+    let changing = request_leaf(&mut fresh, 99.0);
+    let stable = request_leaf(&mut fresh, 99.0);
+    let fresh_root = request_flex_container(&mut fresh, &[changing, stable]);
+    let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, 240.0, 80.0);
+
+    assert_intent_committed_exactly(&retained, second_root);
+    assert_eq!(retained_root, first_root_node);
+    assert_eq!(
+        retained.retained_node_token_for_tests(retained_changing),
+        first_changing_node
+    );
+    assert_eq!(
+        retained.retained_node_token_for_tests(retained_stable),
+        first_stable_node
+    );
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root),
+        retained_layout_projection(&fresh, fresh_root)
+    );
+    assert_eq!(
+        retained_layout_bounds_trees(&mut retained, &[retained_root], 1.0),
+        retained_layout_bounds_trees(&mut fresh, &[fresh_root], 1.0)
+    );
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 3,
+            style_updates: 1,
+            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );

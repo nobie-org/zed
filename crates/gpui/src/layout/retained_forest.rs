@@ -2135,6 +2135,7 @@ impl RetainedLayoutForest {
             };
         }
 
+        let exact_subtree_match = self.retained_occurrence_matches_intent(id, &previous);
         let previous_facts = previous.facts;
         let previous_child_node_ids = previous
             .children
@@ -2208,9 +2209,12 @@ impl RetainedLayoutForest {
         let layout_context_changed = parent_layout_context_changed
             || style_changed
             || children_changed
-            || any_child_layout_context_changed;
+            || any_child_layout_context_changed
+            || !exact_subtree_match;
         if parent_layout_context_changed
-            || (any_child_layout_context_changed && !style_changed && !children_changed)
+            || ((!exact_subtree_match || any_child_layout_context_changed)
+                && !style_changed
+                && !children_changed)
         {
             self.mark_taffy_node_dirty(node_id);
         }
@@ -2233,10 +2237,27 @@ impl RetainedLayoutForest {
         children: &[LayoutId],
         previous_children: &mut [Option<RetainedLayoutOccurrence>],
     ) -> Vec<Option<RetainedLayoutOccurrence>> {
-        let mut assigned = children
-            .iter()
-            .map(|child| self.take_matching_previous_child(*child, previous_children))
+        let mut assigned = std::iter::repeat_with(|| None)
+            .take(children.len())
             .collect::<Vec<_>>();
+
+        for (index, child) in children.iter().enumerate() {
+            let Some(previous_child) = previous_children.get_mut(index) else {
+                continue;
+            };
+            let Some(candidate) = previous_child.as_ref() else {
+                continue;
+            };
+            if self.retained_occurrence_matches_intent(*child, candidate) {
+                assigned[index] = previous_child.take();
+            }
+        }
+
+        for (index, child) in children.iter().enumerate() {
+            if assigned[index].is_none() {
+                assigned[index] = self.take_matching_previous_child(*child, previous_children);
+            }
+        }
 
         for (index, child) in children.iter().enumerate() {
             if assigned[index].is_some() {

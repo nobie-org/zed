@@ -1,9 +1,10 @@
 use super::*;
 use crate::{
-    AbsoluteLength, DefiniteLength, Display, Drawable, Element, ElementId, FlexDirection,
-    GlobalElementId, GridPlacement, GridTemplate, InspectorElementId, IntoElement, Length,
-    Overflow, ParentElement as _, Position, SharedString, Styled as _, TemplateColumnMinSize,
-    TestAppContext, TextOverflow, TextStyle, VisualTestContext, WhiteSpace, div, point, px, size,
+    AbsoluteLength, DefiniteLength, Display, Drawable, Edges, Element, ElementId, FlexDirection,
+    FlexWrap, GlobalElementId, GridPlacement, GridTemplate, InspectorElementId, IntoElement,
+    Length, Overflow, ParentElement as _, Position, SharedString, Styled as _,
+    TemplateColumnMinSize, TestAppContext, TextOverflow, TextStyle, VisualTestContext, WhiteSpace,
+    div, point, px, size,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -13,9 +14,24 @@ use std::{
 
 fn style_with_width(width: f32) -> Style {
     let mut style = Style::default();
-    style.size.width =
-        Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(width))));
+    style.size.width = length_px(width);
     style
+}
+
+fn absolute_px(value: f32) -> AbsoluteLength {
+    AbsoluteLength::Pixels(px(value))
+}
+
+fn definite_px(value: f32) -> DefiniteLength {
+    DefiniteLength::Absolute(absolute_px(value))
+}
+
+fn length_px(value: f32) -> Length {
+    Length::Definite(definite_px(value))
+}
+
+fn length_fraction(percent: u16) -> Length {
+    Length::Definite(DefiniteLength::Fraction(percent as f32 / 100.0))
 }
 
 fn request_leaf(engine: &mut LayoutEngine, width: f32) -> LayoutId {
@@ -398,10 +414,50 @@ struct HydratedTextArtifact {
 enum GeneratedStyle {
     Default,
     FixedWidth(u16),
-    FlexRow,
-    Grid { cols: u16, rows: u16 },
-    GridItem { column: i16, row: i16, width: u16 },
+    FixedSize {
+        width: u16,
+        height: u16,
+    },
+    FlexRow {
+        gap: u16,
+        wrap: bool,
+    },
+    Grid {
+        cols: u16,
+        rows: u16,
+    },
+    GridItem {
+        column: i16,
+        row: i16,
+        width: u16,
+    },
     Full,
+    PaddedBox {
+        width: u16,
+        height: u16,
+        padding: u16,
+        border: u16,
+    },
+    MarginBox {
+        width: u16,
+        height: u16,
+        margin: u16,
+    },
+    MinMaxWidth {
+        width: u16,
+        min_width: u16,
+        max_width: u16,
+    },
+    AbsoluteBox {
+        left: u16,
+        top: u16,
+        width: u16,
+        height: u16,
+    },
+    PercentWidth {
+        percent: u16,
+        height: u16,
+    },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -441,6 +497,13 @@ struct GeneratedTextHydration {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq)]
+struct RetainedLayoutBoundsTreeForTests {
+    bounds: Bounds<Pixels>,
+    children: Vec<RetainedLayoutBoundsTreeForTests>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn hegel_settings(test_cases: u64) -> hegel::Settings {
     hegel::Settings::new().test_cases(test_cases)
 }
@@ -474,20 +537,65 @@ fn draw_usize(tc: &hegel::TestCase, min: usize, max: usize) -> usize {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn draw_generated_style(tc: &hegel::TestCase) -> GeneratedStyle {
-    match draw_u8(tc, 0, 5) {
+    match draw_u8(tc, 0, 13) {
         0 => GeneratedStyle::Default,
         1 => GeneratedStyle::FixedWidth(draw_u16(tc, 0, 240)),
-        2 => GeneratedStyle::FlexRow,
-        3 => GeneratedStyle::Grid {
-            cols: draw_u16(tc, 1, 3),
-            rows: draw_u16(tc, 1, 3),
+        2 => GeneratedStyle::FixedSize {
+            width: draw_u16(tc, 0, 240),
+            height: draw_u16(tc, 0, 160),
         },
-        4 => GeneratedStyle::GridItem {
-            column: draw_u8(tc, 1, 3) as i16,
-            row: draw_u8(tc, 1, 3) as i16,
+        3 => GeneratedStyle::FlexRow {
+            gap: draw_u16(tc, 0, 24),
+            wrap: draw_u8(tc, 0, 1) == 1,
+        },
+        4 => GeneratedStyle::Grid {
+            cols: draw_u16(tc, 1, 4),
+            rows: draw_u16(tc, 1, 4),
+        },
+        5 => GeneratedStyle::GridItem {
+            column: draw_u8(tc, 1, 4) as i16,
+            row: draw_u8(tc, 1, 4) as i16,
             width: draw_u16(tc, 0, 240),
         },
-        _ => GeneratedStyle::Full,
+        6 => GeneratedStyle::Full,
+        7 => GeneratedStyle::PaddedBox {
+            width: draw_u16(tc, 0, 240),
+            height: draw_u16(tc, 0, 160),
+            padding: draw_u16(tc, 0, 24),
+            border: draw_u16(tc, 0, 12),
+        },
+        8 => GeneratedStyle::MarginBox {
+            width: draw_u16(tc, 0, 240),
+            height: draw_u16(tc, 0, 160),
+            margin: draw_u16(tc, 0, 32),
+        },
+        9 => {
+            let min_width = draw_u16(tc, 0, 120);
+            let max_width = draw_u16(tc, min_width, 260);
+            GeneratedStyle::MinMaxWidth {
+                width: draw_u16(tc, 0, 300),
+                min_width,
+                max_width,
+            }
+        }
+        10 => GeneratedStyle::AbsoluteBox {
+            left: draw_u16(tc, 0, 80),
+            top: draw_u16(tc, 0, 80),
+            width: draw_u16(tc, 0, 200),
+            height: draw_u16(tc, 0, 120),
+        },
+        11 => GeneratedStyle::PercentWidth {
+            percent: draw_u16(tc, 0, 100),
+            height: draw_u16(tc, 0, 160),
+        },
+        12 => GeneratedStyle::Grid {
+            cols: draw_u16(tc, 1, 4),
+            rows: draw_u16(tc, 1, 4),
+        },
+        _ => GeneratedStyle::FlexRow {
+            gap: draw_u16(tc, 0, 24),
+            wrap: true,
+        },
     }
 }
 
@@ -517,7 +625,7 @@ fn draw_generated_tree(tc: &hegel::TestCase, depth: u8, allow_opaque: bool) -> G
             width: draw_u16(tc, 0, 240),
         },
         _ => {
-            let child_count = draw_usize(tc, 0, 3);
+            let child_count = draw_usize(tc, 0, 5);
             let children = (0..child_count)
                 .map(|_| draw_generated_tree(tc, depth.saturating_sub(1), allow_opaque))
                 .collect();
@@ -552,7 +660,7 @@ fn draw_generated_frames(
 ) -> Vec<GeneratedFrame> {
     let frame_count = draw_usize(tc, min_frames, max_frames);
     (0..frame_count)
-        .map(|_| draw_generated_frame(tc, allow_opaque, 3))
+        .map(|_| draw_generated_frame(tc, allow_opaque, 5))
         .collect()
 }
 
@@ -562,10 +670,21 @@ impl GeneratedStyle {
         match self {
             Self::Default => Style::default(),
             Self::FixedWidth(width) => style_with_width(*width as f32),
-            Self::FlexRow => {
+            Self::FixedSize { width, height } => {
+                let mut style = style_with_width(*width as f32);
+                style.size.height = length_px(*height as f32);
+                style
+            }
+            Self::FlexRow { gap, wrap } => {
                 let mut style = Style::default();
                 style.display = Display::Flex;
                 style.flex_direction = FlexDirection::Row;
+                style.flex_wrap = if *wrap {
+                    FlexWrap::Wrap
+                } else {
+                    FlexWrap::NoWrap
+                };
+                style.gap = size(definite_px(*gap as f32), definite_px(*gap as f32));
                 style
             }
             Self::Grid { cols, rows } => {
@@ -592,6 +711,57 @@ impl GeneratedStyle {
             Self::Full => {
                 let mut style = Style::default();
                 style.size = Size::full();
+                style
+            }
+            Self::PaddedBox {
+                width,
+                height,
+                padding,
+                border,
+            } => {
+                let mut style = style_with_width(*width as f32);
+                style.size.height = length_px(*height as f32);
+                style.padding = Edges::all(definite_px(*padding as f32));
+                style.border_widths = Edges::all(absolute_px(*border as f32));
+                style
+            }
+            Self::MarginBox {
+                width,
+                height,
+                margin,
+            } => {
+                let mut style = style_with_width(*width as f32);
+                style.size.height = length_px(*height as f32);
+                style.margin = Edges::all(length_px(*margin as f32));
+                style
+            }
+            Self::MinMaxWidth {
+                width,
+                min_width,
+                max_width,
+            } => {
+                let mut style = style_with_width(*width as f32);
+                style.min_size.width = length_px(*min_width as f32);
+                style.max_size.width = length_px(*max_width as f32);
+                style
+            }
+            Self::AbsoluteBox {
+                left,
+                top,
+                width,
+                height,
+            } => {
+                let mut style = style_with_width(*width as f32);
+                style.position = Position::Absolute;
+                style.inset.left = length_px(*left as f32);
+                style.inset.top = length_px(*top as f32);
+                style.size.height = length_px(*height as f32);
+                style
+            }
+            Self::PercentWidth { percent, height } => {
+                let mut style = Style::default();
+                style.size.width = length_fraction(*percent);
+                style.size.height = length_px(*height as f32);
                 style
             }
         }
@@ -647,18 +817,7 @@ impl GeneratedTree {
                     height: right_height,
                 },
             ) => left_width == right_width && left_height == right_height,
-            (
-                Self::Text {
-                    key_index: left_key,
-                    width: left_width,
-                    height: left_height,
-                },
-                Self::Text {
-                    key_index: right_key,
-                    width: right_width,
-                    height: right_height,
-                },
-            ) => left_key == right_key && left_width == right_width && left_height == right_height,
+            (Self::Text { .. }, Self::Text { .. }) => false,
             _ => false,
         }
     }
@@ -775,6 +934,35 @@ fn retained_layout_projections(
     roots
         .iter()
         .map(|root| retained_layout_projection(engine, *root))
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn retained_layout_bounds_tree(
+    engine: &mut LayoutEngine,
+    root: RetainedNodeToken,
+    scale_factor: f32,
+) -> RetainedLayoutBoundsTreeForTests {
+    let children = engine.retained_child_tokens_for_tests(root);
+    let bounds = engine.retained_node_layout_bounds_for_tests(root, scale_factor);
+    RetainedLayoutBoundsTreeForTests {
+        bounds,
+        children: children
+            .into_iter()
+            .map(|child| retained_layout_bounds_tree(engine, child, scale_factor))
+            .collect(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn retained_layout_bounds_trees(
+    engine: &mut LayoutEngine,
+    roots: &[RetainedNodeToken],
+    scale_factor: f32,
+) -> Vec<RetainedLayoutBoundsTreeForTests> {
+    roots
+        .iter()
+        .map(|root| retained_layout_bounds_tree(engine, *root, scale_factor))
         .collect()
 }
 
@@ -1133,6 +1321,10 @@ fn generated_retained_commit_matches_fresh_and_expected_mutation_counts(cx: &mut
                 retained_layout_projections(&retained, &retained_roots),
                 retained_layout_projections(&fresh, &fresh_roots)
             );
+            assert_eq!(
+                retained_layout_bounds_trees(&mut retained, &retained_roots, 1.0),
+                retained_layout_bounds_trees(&mut fresh, &fresh_roots, 1.0)
+            );
 
             let expected = expected_mutations(&previous_roots, &frame.roots);
             retained.finish_frame();
@@ -1275,7 +1467,7 @@ fn generated_recompute_invalidates_cached_layout_bounds(cx: &mut TestAppContext)
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_text_exact_repeat_hydrates_without_remeasurement(cx: &mut TestAppContext) {
+fn generated_text_exact_repeat_remeasures_under_stock_taffy(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
         let key_index = draw_u8(&tc, 0, 3);
@@ -1308,8 +1500,8 @@ fn generated_text_exact_repeat_hydrates_without_remeasurement(cx: &mut TestAppCo
         );
         compute_generated_text_root(cx, &mut engine, root, width);
 
-        assert_eq!(measure_invocations.get(), 1);
-        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+        assert_eq!(measure_invocations.get(), 2);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
@@ -1369,6 +1561,8 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
         );
         compute_generated_text_root(cx, &mut engine, root, second_width);
 
+        assert_eq!(measure_invocations.get(), 2);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
@@ -1382,6 +1576,93 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
                     label: 1,
                     key_index,
                     width: second_width,
+                    height,
+                },
+            ]
+        );
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    hegel::Hegel::new(|tc| {
+        let key_index = draw_u8(&tc, 0, 3);
+        let first_width = draw_u16(&tc, 1, 200);
+        let width_delta = draw_u16(&tc, 1, 40);
+        let second_width = first_width + width_delta;
+        let height = draw_u16(&tc, 1, 120);
+        let measure_invocations = Rc::new(Cell::new(0));
+        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+        let mut engine = LayoutEngine::new();
+
+        let root = request_input_sensitive_text_measured(
+            &mut engine,
+            0,
+            key_index,
+            first_width,
+            height,
+            measure_invocations.clone(),
+            hydrated_artifacts.clone(),
+        );
+        cx.update(|window, app| {
+            engine.compute_layout(
+                root,
+                size(
+                    AvailableSpace::Definite(px(first_width as f32)),
+                    AvailableSpace::MaxContent,
+                ),
+                window,
+                app,
+            );
+            engine.compute_layout(
+                root,
+                size(
+                    AvailableSpace::Definite(px(second_width as f32)),
+                    AvailableSpace::MaxContent,
+                ),
+                window,
+                app,
+            );
+        });
+        engine.finish_frame();
+
+        let root = request_input_sensitive_text_measured(
+            &mut engine,
+            1,
+            key_index,
+            first_width,
+            height,
+            measure_invocations.clone(),
+            hydrated_artifacts.clone(),
+        );
+        compute_generated_text_root(cx, &mut engine, root, first_width);
+
+        assert_eq!(measure_invocations.get(), 3);
+        assert_eq!(
+            hydrated_artifacts.borrow().as_slice(),
+            [
+                GeneratedTextHydration {
+                    label: 0,
+                    key_index,
+                    width: first_width,
+                    height,
+                },
+                GeneratedTextHydration {
+                    label: 0,
+                    key_index,
+                    width: second_width,
+                    height,
+                },
+                GeneratedTextHydration {
+                    label: 1,
+                    key_index,
+                    width: first_width,
                     height,
                 },
             ]
@@ -1496,7 +1777,7 @@ fn generated_text_same_frame_recompute_hydrates_current_available_width(cx: &mut
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_text_rollback_restores_retained_artifact_state(cx: &mut TestAppContext) {
+fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
         let key_index = draw_u8(&tc, 0, 3);
@@ -1555,8 +1836,8 @@ fn generated_text_rollback_restores_retained_artifact_state(cx: &mut TestAppCont
         );
         compute_generated_text_root(cx, &mut engine, repeat_root, width);
 
-        assert_eq!(measure_invocations.get(), 2);
-        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+        assert_eq!(measure_invocations.get(), 4);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
@@ -2269,7 +2550,7 @@ fn unchanged_pure_size_measure_reuses_taffy_cache(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn unchanged_text_measure_hydrates_from_retained_artifact(cx: &mut TestAppContext) {
+fn unchanged_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2309,12 +2590,12 @@ fn unchanged_text_measure_hydrates_from_retained_artifact(cx: &mut TestAppContex
         );
     });
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 2));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (2, 2));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
 }
 
 #[gpui::test]
-fn unchanged_nested_text_measure_hydrates_from_reused_subtree(cx: &mut TestAppContext) {
+fn unchanged_nested_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2360,19 +2641,23 @@ fn unchanged_nested_text_measure_hydrates_from_reused_subtree(cx: &mut TestAppCo
     });
 
     assert_intent_committed_exactly(&engine, root);
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 1));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
+            reuses: 1,
+            creates: 1,
+            removes: 1,
+            child_list_updates: 1,
+            context_clears: 1,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_reuses_exact_text_child_under_fresh_parent(cx: &mut TestAppContext) {
+fn changed_unmeasured_sibling_remeasures_text_child(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2419,22 +2704,24 @@ fn changed_unmeasured_sibling_reuses_exact_text_child_under_fresh_parent(cx: &mu
         );
     });
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 1));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
+            reuses: 2,
+            creates: 1,
+            removes: 1,
             style_updates: 1,
+            child_list_updates: 1,
+            context_clears: 1,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_reuses_exact_nested_text_child_under_fresh_parent(
-    cx: &mut TestAppContext,
-) {
+fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2488,20 +2775,24 @@ fn changed_unmeasured_sibling_reuses_exact_nested_text_child_under_fresh_parent(
         engine.retained_node_token_for_tests(stable_container),
         first_container_node
     );
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 1));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 4,
+            reuses: 3,
+            creates: 1,
+            removes: 1,
             style_updates: 1,
+            child_list_updates: 1,
+            context_clears: 1,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[test]
-fn same_text_measure_key_with_changed_taffy_style_updates_retained_node() {
+fn same_text_measure_key_with_changed_taffy_style_builds_fresh_text_node() {
     let key = text_measure_key("hello");
     let mut engine = LayoutEngine::new();
     let text = request_text_measured_with_style(
@@ -2523,12 +2814,13 @@ fn same_text_measure_key_with_changed_taffy_style_updates_retained_node() {
     let second_node = engine.commit_layout(text);
     assert_intent_committed_exactly(&engine, text);
 
-    assert_eq!(second_node, first_node);
+    assert_ne!(second_node, first_node);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            style_updates: 1,
+            creates: 1,
+            removes: 1,
+            context_clears: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2652,8 +2944,8 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
         );
     });
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 3));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (3, 3));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
 }
 
 #[gpui::test]

@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    AbsoluteLength, AppContext as _, DefiniteLength, ElementId, GlobalElementId, Length, size,
+    AbsoluteLength, AppContext as _, DefiniteLength, ElementId, GlobalElementId, Length,
+    SharedString, TextLayoutArtifact, TextMeasureKey, TextStyle, size,
 };
 use std::{cell::Cell, ops::Deref as _, rc::Rc, sync::Arc, time::Duration};
 
@@ -226,4 +227,68 @@ fn subtree_probe_attributes_measured_callbacks_to_tagged_parent() {
     assert_eq!(samples[0].node_count, 2);
     assert_eq!(samples[0].measured_callbacks, 1);
     assert!(samples[0].no_work_total() > 0);
+}
+
+#[test]
+fn subtree_probe_reports_conservative_text_callbacks_separately() {
+    let mut test_app = crate::TestAppContext::single();
+    let window = test_app.add_window(|_, _| crate::Empty);
+    let global_id = global_id("tracked-text-parent");
+    let mut engine = LayoutEngine::new();
+    engine.set_retained_subtree_probe_targets_for_tests(vec!["tracked-text-parent".to_string()]);
+
+    let text = SharedString::new_static("tracked text");
+    let text_style = TextStyle::default();
+    let key = TextMeasureKey::new(
+        text.clone(),
+        vec![text_style.to_run(text.len())],
+        &text_style,
+        Pixels(16.0),
+        Pixels(20.0),
+        1.0,
+        0,
+    );
+    let artifact = TextLayoutArtifact::for_tests(key.clone(), size(Pixels(20.0), Pixels(20.0)));
+    let text_layout = engine.request_text_measured_layout(
+        Style::default(),
+        Pixels(16.0),
+        1.0,
+        key,
+        |_| {},
+        move |_, _, _, _| artifact.clone(),
+    );
+    let root = engine.request_layout_with_global_id(
+        Some(&global_id),
+        Style::default(),
+        Pixels(16.0),
+        1.0,
+        &[text_layout],
+    );
+
+    test_app
+        .update_window(*window.deref(), |_, window, cx| {
+            engine.compute_layout(
+                root,
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    let samples = engine.retained_subtree_work_samples_for_tests();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].global_id, "tracked-text-parent");
+    assert_eq!(samples[0].node_count, 2);
+    assert_eq!(samples[0].measured_callbacks, 1);
+    assert_eq!(samples[0].conservative_text_measured_callbacks, 1);
+    assert_eq!(
+        samples[0].no_work_total(),
+        samples[0].retained_misses
+            + samples[0].mirror_node_creates
+            + samples[0].mirror_node_removes
+            + samples[0].mirror_set_style
+            + samples[0].mirror_set_children
+            + samples[0].mirror_measured_context_clears
+    );
 }

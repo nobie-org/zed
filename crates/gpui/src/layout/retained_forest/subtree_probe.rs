@@ -5,6 +5,7 @@
 //! layout ids, node counts, and typed retained-forest work counters.
 
 use super::super::LayoutId;
+use super::measurement::MeasurementCallbackKind;
 use super::work::RetainedWorkDelta;
 use crate::GlobalElementId;
 use collections::FxHashSet;
@@ -25,18 +26,22 @@ pub(in crate::layout) struct RetainedSubtreeWorkSample {
     pub(in crate::layout) mirror_set_children: u64,
     pub(in crate::layout) mirror_measured_context_clears: u64,
     pub(in crate::layout) measured_callbacks: u64,
+    pub(in crate::layout) conservative_text_measured_callbacks: u64,
 }
 
 impl RetainedSubtreeWorkSample {
     /// Return the observable work that must be zero for a stable subtree.
     pub(in crate::layout) fn no_work_total(&self) -> u64 {
+        let hard_measured_callbacks = self
+            .measured_callbacks
+            .saturating_sub(self.conservative_text_measured_callbacks);
         self.retained_misses
             + self.mirror_node_creates
             + self.mirror_node_removes
             + self.mirror_set_style
             + self.mirror_set_children
             + self.mirror_measured_context_clears
-            + self.measured_callbacks
+            + hard_measured_callbacks
     }
 }
 
@@ -73,6 +78,7 @@ pub(super) struct SubtreeProbeComputeRecorder {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SubtreeProbeComputeDelta {
     measured_callbacks: u64,
+    conservative_text_measured_callbacks: u64,
 }
 
 impl SubtreeProbe {
@@ -157,6 +163,8 @@ impl SubtreeProbe {
         for (sample_index, delta) in recorder.into_deltas() {
             if let Some(sample) = self.frame_samples.get_mut(sample_index) {
                 sample.measured_callbacks += delta.measured_callbacks;
+                sample.conservative_text_measured_callbacks +=
+                    delta.conservative_text_measured_callbacks;
             }
         }
     }
@@ -181,7 +189,7 @@ impl SubtreeProbe {
             }
             self.emitted_samples += 1;
             eprintln!(
-                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} context_clears={} measured_callbacks={}",
+                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={}",
                 sample.global_id,
                 sample.layout_id,
                 sample.node_count,
@@ -194,6 +202,7 @@ impl SubtreeProbe {
                 sample.mirror_set_children,
                 sample.mirror_measured_context_clears,
                 sample.measured_callbacks,
+                sample.conservative_text_measured_callbacks,
             );
         }
     }
@@ -217,8 +226,17 @@ impl SubtreeProbeComputeRecorder {
         }
     }
 
-    pub(super) fn record_measured_callback(&mut self, node_id: NodeId) {
-        self.record_node(node_id, |delta| delta.measured_callbacks += 1);
+    pub(super) fn record_measured_callback(
+        &mut self,
+        node_id: NodeId,
+        kind: MeasurementCallbackKind,
+    ) {
+        self.record_node(node_id, |delta| {
+            delta.measured_callbacks += 1;
+            if kind == MeasurementCallbackKind::Text {
+                delta.conservative_text_measured_callbacks += 1;
+            }
+        });
     }
 
     fn record_node(

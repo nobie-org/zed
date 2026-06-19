@@ -209,9 +209,10 @@ impl LayoutEngine {
 
     /// Record a text measured layout intent with explicit artifact hydration.
     ///
-    /// Text measurement can be skipped by Taffy's cache, but GPUI still needs the
-    /// shaped text artifact for paint and hit testing. The key says when the
-    /// artifact is valid; the hydrator installs it into this frame's `TextLayout`.
+    /// GPUI needs the shaped text artifact for paint and hit testing. Under
+    /// stock Taffy, retained layout treats text conservatively: the hydrator
+    /// installs artifacts produced by the current compute's callback, and the
+    /// retained forest does not replay artifacts from `TextMeasureKey` alone.
     pub(crate) fn request_text_measured_layout(
         &mut self,
         style: Style,

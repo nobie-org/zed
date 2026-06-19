@@ -731,8 +731,8 @@ impl RetainedLayoutForest {
     /// Promote successfully computed current roots and sweep everything else.
     ///
     /// After this call, current-frame intents, committed mappings, measurement
-    /// producers, and bounds caches are gone. Only retained root occurrences and
-    /// reusable text artifacts survive to the next frame.
+    /// producers, and bounds caches are gone. Only retained root occurrences
+    /// survive to the next frame.
     pub(super) fn finish_frame(&mut self) -> (RetainedLayoutWork, RetainedLayoutMissWork) {
         self.flush_detached_subtree_removals();
 
@@ -1139,9 +1139,13 @@ impl RetainedLayoutForest {
                     );
 
                     measured_layout_calls += 1;
+                    let callback_kind = compute_measurements
+                        .borrow()
+                        .callback_kind(node_id)
+                        .expect("measured layout mirror node should have a current measurement");
                     subtree_compute_recorder
                         .borrow_mut()
-                        .record_measured_callback(node_id);
+                        .record_measured_callback(node_id, callback_kind);
                     let measure_start = std::time::Instant::now();
                     let measured_size = compute_measurements.borrow_mut().measure(
                         node_id,
@@ -1155,8 +1159,6 @@ impl RetainedLayoutForest {
                 },
             )
             .expect(EXPECT_MESSAGE);
-        compute_measurements.into_inner().finish_compute(node_id);
-
         (measured_layout_calls, measured_layout_duration)
     }
 
@@ -1751,7 +1753,6 @@ impl RetainedLayoutForest {
         let retained_node = self.commit_intent(id, retained_root);
         let node_id = retained_node.node_id;
         self.flush_detached_subtree_removals();
-        self.record_current_text_descendants(&retained_node);
         self.root_slots.insert_current_root(root_id, retained_node);
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             eprintln!(
@@ -2159,9 +2160,10 @@ impl RetainedLayoutForest {
         current: &MeasuredLayoutKind,
     ) -> bool {
         match (previous, current) {
-            (Some(previous), current) if !previous.is_opaque() && !current.is_opaque() => {
-                previous == current
-            }
+            (
+                Some(MeasuredLayoutKind::PureSize(previous)),
+                MeasuredLayoutKind::PureSize(current),
+            ) => previous == current,
             _ => false,
         }
     }
@@ -2202,28 +2204,6 @@ impl RetainedLayoutForest {
                     )
             }
         }
-    }
-
-    /// Cache current text descendants for subtree-level text artifact hydration.
-    fn record_current_text_descendants(
-        &mut self,
-        retained_node: &RetainedLayoutOccurrence,
-    ) -> Vec<NodeId> {
-        let mut text_descendants = Vec::new();
-        if matches!(
-            retained_node.facts.measured_kind.as_ref(),
-            Some(MeasuredLayoutKind::Text(_))
-        ) {
-            text_descendants.push(retained_node.node_id);
-        }
-        for child in &retained_node.children {
-            text_descendants.extend(self.record_current_text_descendants(child));
-        }
-        if !text_descendants.is_empty() {
-            self.measurements
-                .record_text_descendants(retained_node.node_id, text_descendants.clone());
-        }
-        text_descendants
     }
 
     /// Mark a mirror node as used at one current-frame position.
@@ -2344,8 +2324,6 @@ impl RetainedLayoutForest {
         for child in retained_node.children {
             self.remove_retained_subtree(child);
         }
-        self.measurements
-            .remove_text_artifacts_for_node(retained_node.node_id);
         if retained_node.facts.kind == RetainedLayoutKind::Measured {
             self.taffy
                 .set_node_context(retained_node.node_id, None)

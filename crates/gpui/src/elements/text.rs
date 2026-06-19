@@ -378,10 +378,11 @@ impl IntoElement for StyledText {
 
 /// The frame-local layout state for a text element.
 ///
-/// Retained layout may let Taffy skip a text measurement callback, but paint,
-/// prepaint, and hit testing still need shaped lines in this handle. The layout
-/// engine therefore hydrates `TextLayout` from a `TextLayoutArtifact` whenever
-/// the retained text key is valid.
+/// Paint, prepaint, and hit testing need shaped lines in this handle. Under
+/// stock Taffy, retained layout hydrates `TextLayout` only from an artifact
+/// returned by the current compute's measurement callback because a retained
+/// `TextMeasureKey` does not include the Taffy measurement query that controls
+/// wrapping and truncation.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
@@ -394,11 +395,17 @@ struct TextLayoutInner {
     bounds: Option<Bounds<Pixels>>,
 }
 
-/// Layout-visible identity for text measurement and artifact reuse.
+/// Layout-visible identity for text measurement.
 ///
 /// The key contains every input that can affect shaped text size or glyph runs,
 /// including scale factor and the text system shaping epoch. If the key changes,
-/// retained layout cannot reuse a previous text artifact.
+/// retained layout cannot preserve text measurement state.
+///
+/// This key is not a complete text artifact key by itself: shaped text also
+/// depends on Taffy's measurement query, such as known dimensions and available
+/// space. Under stock Taffy, GPUI does not observe that query when Taffy reuses
+/// an internal measurement result, so retained layout treats text measurement
+/// conservatively unless a future API exposes the full query identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TextMeasureKey {
     text: SharedString,
@@ -440,8 +447,8 @@ impl TextMeasureKey {
 
     /// Produce a shaped text artifact for one Taffy measurement query.
     ///
-    /// This returns data only. Hydrating `TextLayout` is a separate step so the
-    /// retained layout engine can also hydrate from Taffy cache hits.
+    /// This returns data only. Hydrating `TextLayout` is a separate step owned
+    /// by the layout engine's same-compute measurement callback.
     pub(crate) fn measure(
         &self,
         known_dimensions: Size<Option<Pixels>>,
@@ -529,10 +536,10 @@ impl TextMeasureKey {
     }
 }
 
-/// Shaped text data valid for one `TextMeasureKey` and measurement result.
+/// Shaped text data valid for one `TextMeasureKey` and measurement query.
 ///
-/// The artifact is retained outside Taffy and can be replayed into a current
-/// frame's `TextLayout` when Taffy reuses a cached measured layout.
+/// The artifact is deliberately not retained by `TextMeasureKey` alone because
+/// wrapping and truncation also depend on Taffy's measurement query.
 #[derive(Clone)]
 pub(crate) struct TextLayoutArtifact {
     key: TextMeasureKey,
@@ -611,7 +618,7 @@ impl TextLayout {
         )
     }
 
-    /// Install a retained or newly measured artifact into this frame's layout state.
+    /// Install a newly measured artifact into this frame's layout state.
     fn hydrate(&self, artifact: &TextLayoutArtifact) {
         self.0.borrow_mut().replace(artifact.inner.clone());
     }

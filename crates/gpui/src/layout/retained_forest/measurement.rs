@@ -5,12 +5,17 @@
 //! artifacts such as shaped text. Taffy node context stays a private marker and
 //! never stores GPUI paint or hit-test state.
 
+mod producer_registry;
+mod text_artifacts;
+
 use super::AvailableSpace;
 use crate::{App, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size};
 use collections::{FxHashMap, FxHashSet};
+use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
 use stacksafe::StackSafe;
 use std::rc::Rc;
-use taffy::{LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, tree::NodeId};
+use taffy::{LayoutCacheEntry, LayoutCacheEvent, tree::NodeId};
+use text_artifacts::{TextArtifactCacheKey, TextArtifactStore, TextArtifactStoreCheckpoint};
 
 /// Current-frame executable producer for measured layout.
 ///
@@ -212,10 +217,11 @@ impl ContentSizePureSizeMeasure {
 ///
 /// `Opaque` means no retained measurement identity has been proven. `PureSize`
 /// is explicit data and may preserve Taffy measurement cache when unchanged.
-/// `Text` is still an explicit layout fact, but it is conservative under stock
-/// Taffy because the shaped artifact also depends on Taffy's measurement query
-/// (`known_dimensions` and `available_space`), which GPUI cannot observe when
-/// Taffy reuses an internal measurement result.
+/// `Text` is explicit layout identity, but the shaped artifact also depends on
+/// Taffy's measurement query (`known_dimensions` and `available_space`). GPUI
+/// therefore hydrates artifacts from callbacks, exact query-keyed cache
+/// observations, or retained unchanged-node replay; it never treats
+/// `TextMeasureKey` alone as artifact proof.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum MeasuredLayoutKind {
     Opaque,
@@ -246,94 +252,67 @@ pub(super) enum MeasurementCallbackKind {
 ///
 /// This is GPUI state, not Taffy state. Taffy can decide whether a measured node
 /// cache entry is valid, but GPUI owns the executable producer slots and text
-/// artifacts. Under stock Taffy, text artifacts are hydrated only from
-/// callbacks that run during the current compute. The text artifact cache is
-/// keyed by the exact callback query GPUI has observed; `TextMeasureKey` alone
-/// is never enough.
+/// artifacts. Taffy's passive cache events may report that it reused a
+/// measurement result, but GPUI treats that only as a query observation. Text
+/// artifacts are reused only through the exact query key GPUI observed from a
+/// callback or cache event; `TextMeasureKey` alone is never enough.
 pub(super) struct MeasurementStore {
-    producer_contexts: Vec<Option<LayoutMeasureContext>>,
+    producers: ProducerRegistry,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
-    current_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
-    current_text_artifact_queries: FxHashSet<TextArtifactCacheKey>,
-    current_text_artifact_replays: FxHashMap<NodeId, TextMeasureKey>,
-    retained_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
-    text_artifact_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
-    text_cache_entry_artifacts: FxHashMap<TextCacheEntryArtifactKey, TextLayoutArtifact>,
+    text_artifacts: TextArtifactStore,
 }
 
 /// Transaction checkpoint for current-frame measurement producers and mappings.
 pub(super) struct MeasurementStoreCheckpoint {
-    producer_contexts_len: usize,
+    producers: ProducerRegistryCheckpoint,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
-    current_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
-    current_text_artifact_queries: FxHashSet<TextArtifactCacheKey>,
-    current_text_artifact_replays: FxHashMap<NodeId, TextMeasureKey>,
-    retained_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
-    text_artifact_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
-    text_cache_entry_artifacts: FxHashMap<TextCacheEntryArtifactKey, TextLayoutArtifact>,
+    text_artifacts: TextArtifactStoreCheckpoint,
 }
 
 impl MeasurementStore {
     pub(super) fn new() -> Self {
         Self {
-            producer_contexts: Vec::new(),
+            producers: ProducerRegistry::new(),
             current_measurements: FxHashMap::default(),
-            current_text_artifacts: FxHashMap::default(),
-            current_text_artifact_queries: FxHashSet::default(),
-            current_text_artifact_replays: FxHashMap::default(),
-            retained_text_artifacts: FxHashMap::default(),
-            text_artifact_cache: FxHashMap::default(),
-            text_cache_entry_artifacts: FxHashMap::default(),
+            text_artifacts: TextArtifactStore::new(),
         }
     }
 
     pub(super) fn begin_frame(&mut self) {
         self.current_measurements.clear();
-        self.current_text_artifacts.clear();
-        self.current_text_artifact_queries.clear();
-        self.current_text_artifact_replays.clear();
+        self.text_artifacts.begin_frame();
     }
 
     pub(super) fn finish_frame(&mut self) {
-        self.retain_current_text_artifacts();
-        self.retain_current_text_artifacts_by_node();
-        self.retain_text_cache_entry_artifacts();
-        self.producer_contexts.clear();
+        let current_text_nodes = self
+            .current_measurements
+            .iter()
+            .filter_map(|(node_id, measurement)| {
+                matches!(measurement, CurrentMeasurement::Text { .. }).then_some(*node_id)
+            })
+            .collect::<FxHashSet<_>>();
+        self.text_artifacts.finish_frame(&current_text_nodes);
+        self.producers.clear();
         self.current_measurements.clear();
-        self.current_text_artifacts.clear();
-        self.current_text_artifact_queries.clear();
-        self.current_text_artifact_replays.clear();
     }
 
     pub(super) fn checkpoint(&self) -> MeasurementStoreCheckpoint {
         MeasurementStoreCheckpoint {
-            producer_contexts_len: self.producer_contexts.len(),
+            producers: self.producers.checkpoint(),
             current_measurements: self.current_measurements.clone(),
-            current_text_artifacts: self.current_text_artifacts.clone(),
-            current_text_artifact_queries: self.current_text_artifact_queries.clone(),
-            current_text_artifact_replays: self.current_text_artifact_replays.clone(),
-            retained_text_artifacts: self.retained_text_artifacts.clone(),
-            text_artifact_cache: self.text_artifact_cache.clone(),
-            text_cache_entry_artifacts: self.text_cache_entry_artifacts.clone(),
+            text_artifacts: self.text_artifacts.checkpoint(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: MeasurementStoreCheckpoint) {
-        self.producer_contexts
-            .truncate(checkpoint.producer_contexts_len);
+        self.producers.rollback_to_checkpoint(checkpoint.producers);
         self.current_measurements = checkpoint.current_measurements;
-        self.current_text_artifacts = checkpoint.current_text_artifacts;
-        self.current_text_artifact_queries = checkpoint.current_text_artifact_queries;
-        self.current_text_artifact_replays = checkpoint.current_text_artifact_replays;
-        self.retained_text_artifacts = checkpoint.retained_text_artifacts;
-        self.text_artifact_cache = checkpoint.text_artifact_cache;
-        self.text_cache_entry_artifacts = checkpoint.text_cache_entry_artifacts;
+        self.text_artifacts
+            .rollback_to_checkpoint(checkpoint.text_artifacts);
     }
 
     pub(super) fn push_producer_context(&mut self, measure_context: LayoutMeasureContext) -> usize {
-        let measure_id = self.producer_contexts.len();
-        self.producer_contexts.push(Some(measure_context));
-        measure_id
+        self.producers.push(measure_context)
     }
 
     pub(super) fn insert_current_measurement(
@@ -365,8 +344,7 @@ impl MeasurementStore {
         node_id: NodeId,
         expected_key: &TextMeasureKey,
     ) {
-        self.current_text_artifact_replays
-            .insert(node_id, expected_key.clone());
+        self.text_artifacts.register_replay(node_id, expected_key);
     }
 
     /// Hydrate text nodes from the artifact selected by the completed solve.
@@ -376,12 +354,12 @@ impl MeasurementStore {
     /// paint-state side effects. Hydration happens once here after the solve,
     /// from `current_text_artifacts`.
     pub(super) fn hydrate_registered_text_artifact_replays(&mut self) {
-        let replay_candidates = std::mem::take(&mut self.current_text_artifact_replays);
+        let replay_candidates = self.text_artifacts.take_replay_candidates();
         for (node_id, expected_key) in replay_candidates {
-            if self.current_text_artifacts.contains_key(&node_id) {
+            if self.text_artifacts.has_current_artifact(node_id) {
                 continue;
             }
-            let Some(artifact) = self.retained_text_artifacts.get(&node_id).cloned() else {
+            let Some(artifact) = self.text_artifacts.retained_artifact(node_id) else {
                 continue;
             };
             assert_eq!(
@@ -389,66 +367,21 @@ impl MeasurementStore {
                 &expected_key,
                 "retained text artifact should match the current text measure key"
             );
-            self.current_text_artifacts.insert(node_id, artifact);
+            self.text_artifacts
+                .insert_current_artifact(node_id, artifact);
         }
 
-        for (node_id, artifact) in self.current_text_artifacts.clone() {
+        for (node_id, artifact) in self.text_artifacts.current_artifacts() {
             self.hydrate_text_node(node_id, &artifact);
         }
     }
 
     pub(super) fn compute_state(&mut self) -> ComputeMeasurementState<'_> {
         ComputeMeasurementState::new(
-            &mut self.producer_contexts,
+            &mut self.producers,
             &mut self.current_measurements,
-            &mut self.current_text_artifacts,
-            &mut self.current_text_artifact_queries,
-            &mut self.text_artifact_cache,
-            &mut self.text_cache_entry_artifacts,
+            &mut self.text_artifacts,
         )
-    }
-
-    fn retain_current_text_artifacts(&mut self) {
-        let current_text_artifact_queries = &self.current_text_artifact_queries;
-        self.text_artifact_cache
-            .retain(|artifact_key, _| current_text_artifact_queries.contains(artifact_key));
-    }
-
-    fn retain_current_text_artifacts_by_node(&mut self) {
-        let current_text_nodes = self
-            .current_measurements
-            .iter()
-            .filter_map(|(node_id, measurement)| {
-                matches!(measurement, CurrentMeasurement::Text { .. }).then_some(*node_id)
-            })
-            .collect::<FxHashSet<_>>();
-        self.retained_text_artifacts.retain(|node_id, _| {
-            current_text_nodes.contains(node_id)
-                && self.current_text_artifacts.contains_key(node_id)
-        });
-        for (node_id, artifact) in &self.current_text_artifacts {
-            self.retained_text_artifacts
-                .insert(*node_id, artifact.clone());
-        }
-    }
-
-    fn retain_text_cache_entry_artifacts(&mut self) {
-        let current_text_keys = self
-            .current_measurements
-            .iter()
-            .filter_map(|(node_id, measurement)| {
-                if let CurrentMeasurement::Text { key, .. } = measurement {
-                    Some((*node_id, key.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<FxHashMap<_, _>>();
-        self.text_cache_entry_artifacts.retain(|artifact_key, _| {
-            current_text_keys
-                .get(&artifact_key.node_id)
-                .is_some_and(|text_key| text_key == &artifact_key.text_key)
-        });
     }
 
     fn hydrate_text_node(&mut self, node_id: NodeId, artifact: &TextLayoutArtifact) {
@@ -462,8 +395,9 @@ impl MeasurementStore {
             key,
             "hydrated text artifact should match the current text measure key"
         );
-        let hydrate = self.producer_contexts[*measure]
-            .as_ref()
+        let hydrate = self
+            .producers
+            .context(*measure)
             .and_then(|measure| measure.text_hydrator.as_ref())
             .map(Rc::clone)
             .expect("text measured layout should have a hydrator");
@@ -478,33 +412,21 @@ impl MeasurementStore {
 /// measured with the same exact callback query, GPUI can hydrate from its
 /// query-keyed artifact cache without running the text producer again.
 pub(super) struct ComputeMeasurementState<'a> {
-    producer_contexts: &'a mut Vec<Option<LayoutMeasureContext>>,
+    producers: &'a mut ProducerRegistry,
     current_measurements: &'a mut FxHashMap<NodeId, CurrentMeasurement>,
-    current_text_artifacts: &'a mut FxHashMap<NodeId, TextLayoutArtifact>,
-    current_text_artifact_queries: &'a mut FxHashSet<TextArtifactCacheKey>,
-    text_artifact_cache: &'a mut FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
-    text_cache_entry_artifacts: &'a mut FxHashMap<TextCacheEntryArtifactKey, TextLayoutArtifact>,
+    text_artifacts: &'a mut TextArtifactStore,
 }
 
 impl<'a> ComputeMeasurementState<'a> {
     fn new(
-        producer_contexts: &'a mut Vec<Option<LayoutMeasureContext>>,
+        producers: &'a mut ProducerRegistry,
         current_measurements: &'a mut FxHashMap<NodeId, CurrentMeasurement>,
-        current_text_artifacts: &'a mut FxHashMap<NodeId, TextLayoutArtifact>,
-        current_text_artifact_queries: &'a mut FxHashSet<TextArtifactCacheKey>,
-        text_artifact_cache: &'a mut FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
-        text_cache_entry_artifacts: &'a mut FxHashMap<
-            TextCacheEntryArtifactKey,
-            TextLayoutArtifact,
-        >,
+        text_artifacts: &'a mut TextArtifactStore,
     ) -> Self {
         Self {
-            producer_contexts,
+            producers,
             current_measurements,
-            current_text_artifacts,
-            current_text_artifact_queries,
-            text_artifact_cache,
-            text_cache_entry_artifacts,
+            text_artifacts,
         }
     }
 
@@ -535,8 +457,9 @@ impl<'a> ComputeMeasurementState<'a> {
 
         match current_measurement {
             CurrentMeasurement::Opaque(measure) => {
-                let measure = &mut self.producer_contexts[measure]
-                    .as_mut()
+                let measure = &mut self
+                    .producers
+                    .context_mut(measure)
                     .expect("opaque measured layout should have a current producer")
                     .measure;
                 measure(known_dimensions, available_space, window, cx).size()
@@ -551,7 +474,7 @@ impl<'a> ComputeMeasurementState<'a> {
                     known_dimensions,
                     available_space,
                 );
-                if let Some(artifact) = self.text_artifact_cache.get(&cache_key).cloned() {
+                if let Some(artifact) = self.text_artifacts.artifact_for_query(&cache_key) {
                     let size = artifact.size();
                     self.record_text_artifact_for_query(node_id, cache_key, &artifact);
                     return size;
@@ -559,8 +482,9 @@ impl<'a> ComputeMeasurementState<'a> {
 
                 let measure_id = measure;
                 let artifact = {
-                    let measure = &mut self.producer_contexts[measure_id]
-                        .as_mut()
+                    let measure = &mut self
+                        .producers
+                        .context_mut(measure_id)
                         .expect("text measured layout should have a current producer and hydrator")
                         .measure;
                     match measure(known_dimensions, available_space, window, cx) {
@@ -577,9 +501,9 @@ impl<'a> ComputeMeasurementState<'a> {
                 );
                 let size = artifact.size();
                 self.record_text_artifact_for_query(node_id, cache_key.clone(), &artifact);
-                self.current_text_artifacts
-                    .insert(node_id, artifact.clone());
-                self.text_artifact_cache.insert(cache_key, artifact);
+                self.text_artifacts
+                    .insert_current_artifact(node_id, artifact.clone());
+                self.text_artifacts.cache_artifact(cache_key, artifact);
                 size
             }
         }
@@ -597,11 +521,7 @@ impl<'a> ComputeMeasurementState<'a> {
             LayoutCacheEvent::Stored(entry) => {
                 self.store_text_artifact_for_cache_entry(entry, scale_factor)
             }
-            LayoutCacheEvent::Cleared(clear) => {
-                let node_id = clear.node_id();
-                self.text_cache_entry_artifacts
-                    .retain(|artifact_key, _| artifact_key.node_id != node_id);
-            }
+            LayoutCacheEvent::Cleared(_) => {}
             _ => {}
         }
     }
@@ -617,21 +537,16 @@ impl<'a> ComputeMeasurementState<'a> {
             return;
         };
         let key = key.clone();
-        let cache_entry_key =
-            TextCacheEntryArtifactKey::new(node_id, key.clone(), entry.entry_id());
-        let Some(artifact) = self
-            .text_cache_entry_artifacts
-            .get(&cache_entry_key)
-            .cloned()
-        else {
+        let query_key =
+            TextArtifactCacheKey::from_taffy_entry(node_id, key.clone(), entry, scale_factor);
+        let Some(artifact) = self.text_artifacts.artifact_for_query(&query_key) else {
             return;
         };
         assert_eq!(
             artifact.key(),
             &key,
-            "Taffy cache-entry text artifact should match the current text measure key"
+            "Taffy cache-hit text artifact should match the current text measure key"
         );
-        let query_key = TextArtifactCacheKey::from_taffy_entry(node_id, key, entry, scale_factor);
         self.record_text_artifact_for_query(node_id, query_key, &artifact);
     }
 
@@ -642,7 +557,7 @@ impl<'a> ComputeMeasurementState<'a> {
             return;
         };
         let key = key.clone();
-        let Some(artifact) = self.current_text_artifacts.get(&node_id).cloned() else {
+        let Some(artifact) = self.text_artifacts.current_artifact(node_id) else {
             debug_assert!(
                 false,
                 "text cache store should follow a text measurement callback or cache hydration"
@@ -652,15 +567,12 @@ impl<'a> ComputeMeasurementState<'a> {
         assert_eq!(
             artifact.key(),
             &key,
-            "stored Taffy cache-entry text artifact should match the current text measure key"
+            "stored Taffy cache-event text artifact should match the current text measure key"
         );
         let query_key =
             TextArtifactCacheKey::from_taffy_entry(node_id, key.clone(), entry, scale_factor);
-        self.current_text_artifact_queries.insert(query_key);
-        self.text_cache_entry_artifacts.insert(
-            TextCacheEntryArtifactKey::new(node_id, key, entry.entry_id()),
-            artifact,
-        );
+        self.record_text_artifact_for_query(node_id, query_key.clone(), &artifact);
+        self.text_artifacts.cache_artifact(query_key, artifact);
     }
 
     fn record_text_artifact_for_query(
@@ -669,124 +581,7 @@ impl<'a> ComputeMeasurementState<'a> {
         cache_key: TextArtifactCacheKey,
         artifact: &TextLayoutArtifact,
     ) {
-        if self.current_text_artifact_queries.contains(&cache_key) {
-            return;
-        }
-        self.current_text_artifacts
-            .insert(node_id, artifact.clone());
-        self.current_text_artifact_queries.insert(cache_key);
-    }
-}
-
-/// Exact validity key for a retained text artifact observed through Taffy.
-///
-/// This key is built only from the measurement query Taffy passes to GPUI. It
-/// does not predict or reconstruct Taffy's cache key; it lets GPUI avoid
-/// rebuilding a paint artifact when Taffy asks the same text node the same
-/// question again.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct TextArtifactCacheKey {
-    node_id: NodeId,
-    text_key: TextMeasureKey,
-    known_dimensions: Size<Option<Pixels>>,
-    available_space: Size<AvailableSpaceCacheKey>,
-}
-
-impl TextArtifactCacheKey {
-    fn new(
-        node_id: NodeId,
-        text_key: TextMeasureKey,
-        known_dimensions: Size<Option<Pixels>>,
-        available_space: Size<AvailableSpace>,
-    ) -> Self {
-        Self {
-            node_id,
-            text_key,
-            known_dimensions,
-            available_space: size(
-                AvailableSpaceCacheKey::from(available_space.width),
-                AvailableSpaceCacheKey::from(available_space.height),
-            ),
-        }
-    }
-
-    fn from_taffy_entry(
-        node_id: NodeId,
-        text_key: TextMeasureKey,
-        entry: LayoutCacheEntry,
-        scale_factor: f32,
-    ) -> Self {
-        let input = entry.requested_input();
-        Self::new(
-            node_id,
-            text_key,
-            size(
-                input
-                    .known_dimensions
-                    .width
-                    .map(|value| Pixels(value / scale_factor)),
-                input
-                    .known_dimensions
-                    .height
-                    .map(|value| Pixels(value / scale_factor)),
-            ),
-            size(
-                available_space_from_taffy(input.available_space.width, scale_factor),
-                available_space_from_taffy(input.available_space.height, scale_factor),
-            ),
-        )
-    }
-}
-
-fn available_space_from_taffy(
-    value: taffy::style::AvailableSpace,
-    scale_factor: f32,
-) -> AvailableSpace {
-    match value {
-        taffy::style::AvailableSpace::Definite(value) => {
-            AvailableSpace::Definite(Pixels(value / scale_factor))
-        }
-        taffy::style::AvailableSpace::MinContent => AvailableSpace::MinContent,
-        taffy::style::AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-    }
-}
-
-/// Text artifact validity tied to one exact Taffy cache entry.
-///
-/// This is intentionally observational: GPUI does not reconstruct Taffy's cache
-/// key. It stores an artifact when Taffy says it stored an entry, and hydrates
-/// that artifact only when Taffy later says it hit the same entry.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct TextCacheEntryArtifactKey {
-    node_id: NodeId,
-    text_key: TextMeasureKey,
-    entry_id: LayoutCacheEntryId,
-}
-
-impl TextCacheEntryArtifactKey {
-    fn new(node_id: NodeId, text_key: TextMeasureKey, entry_id: LayoutCacheEntryId) -> Self {
-        Self {
-            node_id,
-            text_key,
-            entry_id,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-enum AvailableSpaceCacheKey {
-    Definite(Pixels),
-    #[default]
-    MinContent,
-    MaxContent,
-}
-
-impl From<AvailableSpace> for AvailableSpaceCacheKey {
-    fn from(value: AvailableSpace) -> Self {
-        match value {
-            AvailableSpace::Definite(pixels) => Self::Definite(pixels),
-            AvailableSpace::MinContent => Self::MinContent,
-            AvailableSpace::MaxContent => Self::MaxContent,
-        }
+        self.text_artifacts
+            .record_for_query(node_id, cache_key, artifact);
     }
 }

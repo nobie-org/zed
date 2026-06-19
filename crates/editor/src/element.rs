@@ -3963,25 +3963,35 @@ impl EditorElement {
         block_resize_offset: &mut i32,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(AnyElement, Size<Pixels>, DisplayRow, Pixels)> {
+    ) -> Option<(
+        AnyElement,
+        Size<Pixels>,
+        Size<AvailableSpace>,
+        DisplayRow,
+        Pixels,
+    )> {
         let mut x_position = None;
-        let mut element = match block {
-            Block::Custom(custom) => {
-                let block_start = custom.start().to_point(&snapshot.buffer_snapshot());
-                let block_end = custom.end().to_point(&snapshot.buffer_snapshot());
-                if block.place_near() && snapshot.is_line_folded(MultiBufferRow(block_start.row)) {
-                    return None;
-                }
-                let align_to = block_start.to_display_point(snapshot);
-                let x_and_width = |layout: &LineWithInvisibles| {
-                    Some((
-                        text_x + layout.x_for_index(align_to.column() as usize),
-                        text_x + layout.width,
-                    ))
-                };
-                let line_ix = align_to.row().0.checked_sub(rows.start.0);
-                x_position =
-                    if let Some(layout) = line_ix.and_then(|ix| line_layouts.get(ix as usize)) {
+        let mut render_element = |window: &mut Window, cx: &mut App| -> Option<AnyElement> {
+            Some(match block {
+                Block::Custom(custom) => {
+                    let block_start = custom.start().to_point(&snapshot.buffer_snapshot());
+                    let block_end = custom.end().to_point(&snapshot.buffer_snapshot());
+                    if block.place_near()
+                        && snapshot.is_line_folded(MultiBufferRow(block_start.row))
+                    {
+                        return None;
+                    }
+                    let align_to = block_start.to_display_point(snapshot);
+                    let x_and_width = |layout: &LineWithInvisibles| {
+                        Some((
+                            text_x + layout.x_for_index(align_to.column() as usize),
+                            text_x + layout.width,
+                        ))
+                    };
+                    let line_ix = align_to.row().0.checked_sub(rows.start.0);
+                    x_position = if let Some(layout) =
+                        line_ix.and_then(|ix| line_layouts.get(ix as usize))
+                    {
                         x_and_width(layout)
                     } else {
                         x_and_width(&layout_line(
@@ -3995,162 +4005,167 @@ impl EditorElement {
                         ))
                     };
 
-                let anchor_x = x_position.unwrap().0;
+                    let anchor_x = x_position.unwrap().0;
 
-                let selected = selections
-                    .binary_search_by(|selection| {
-                        if selection.end <= block_start {
-                            Ordering::Less
-                        } else if selection.start >= block_end {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Equal
-                        }
-                    })
-                    .is_ok();
+                    let selected = selections
+                        .binary_search_by(|selection| {
+                            if selection.end <= block_start {
+                                Ordering::Less
+                            } else if selection.start >= block_end {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Equal
+                            }
+                        })
+                        .is_ok();
 
-                div()
-                    .size_full()
-                    .child(
-                        custom.render(&mut BlockContext {
-                            window,
-                            app: cx,
-                            anchor_x,
-                            margins: editor_margins,
-                            line_height,
-                            em_width,
-                            block_id,
-                            height: custom.height.unwrap_or(1),
-                            selected,
-                            max_width: text_hitbox.size.width.max(*scroll_width),
-                            editor_style: &self.style,
-                            indent_guide_padding: indent_guides
-                                .as_ref()
-                                .map(|guides| {
-                                    Self::depth_zero_indent_guide_padding_for_row(
-                                        guides,
-                                        block_row_start,
-                                    )
-                                })
-                                .unwrap_or(px(0.0)),
-                        }),
-                    )
-                    .into_any()
-            }
-
-            Block::FoldedBuffer {
-                first_excerpt,
-                height,
-                ..
-            } => {
-                let mut result = v_flex().id(block_id).w_full().pr(editor_margins.right);
-
-                if self.should_show_buffer_headers() {
-                    let selected = selected_buffer_ids.contains(&first_excerpt.buffer_id());
-                    let jump_data = header_jump_data(
-                        snapshot,
-                        block_row_start,
-                        *height,
-                        first_excerpt,
-                        latest_selection_anchors,
-                    );
-                    result = result.child(self.render_buffer_header(
-                        first_excerpt,
-                        true,
-                        selected,
-                        false,
-                        jump_data,
-                        window,
-                        cx,
-                    ));
-                } else {
-                    result =
-                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                    div()
+                        .size_full()
+                        .child(
+                            custom.render(&mut BlockContext {
+                                window,
+                                app: cx,
+                                anchor_x,
+                                margins: editor_margins,
+                                line_height,
+                                em_width,
+                                block_id,
+                                height: custom.height.unwrap_or(1),
+                                selected,
+                                max_width: text_hitbox.size.width.max(*scroll_width),
+                                editor_style: &self.style,
+                                indent_guide_padding: indent_guides
+                                    .as_ref()
+                                    .map(|guides| {
+                                        Self::depth_zero_indent_guide_padding_for_row(
+                                            guides,
+                                            block_row_start,
+                                        )
+                                    })
+                                    .unwrap_or(px(0.0)),
+                            }),
+                        )
+                        .into_any()
                 }
 
-                result.into_any_element()
-            }
+                Block::FoldedBuffer {
+                    first_excerpt,
+                    height,
+                    ..
+                } => {
+                    let mut result = v_flex().id(block_id).w_full().pr(editor_margins.right);
 
-            Block::ExcerptBoundary { .. } => {
-                let color = cx.theme().colors().clone();
-                let mut result = v_flex().id(block_id).w_full();
-
-                result = result.child(
-                    h_flex().relative().child(
-                        div()
-                            .top(line_height / 2.)
-                            .absolute()
-                            .w_full()
-                            .h_px()
-                            .bg(color.border_variant),
-                    ),
-                );
-
-                result.into_any()
-            }
-
-            Block::BufferHeader { excerpt, height } => {
-                let mut result = v_flex().id(block_id).w_full();
-
-                if self.should_show_buffer_headers() {
-                    let jump_data = header_jump_data(
-                        snapshot,
-                        block_row_start,
-                        *height,
-                        excerpt,
-                        latest_selection_anchors,
-                    );
-
-                    if sticky_header_excerpt_id != Some(excerpt.buffer_id()) {
-                        let selected = selected_buffer_ids.contains(&excerpt.buffer_id());
-
-                        result = result.child(div().pr(editor_margins.right).child(
-                            self.render_buffer_header(
-                                excerpt, false, selected, false, jump_data, window, cx,
-                            ),
+                    if self.should_show_buffer_headers() {
+                        let selected = selected_buffer_ids.contains(&first_excerpt.buffer_id());
+                        let jump_data = header_jump_data(
+                            snapshot,
+                            block_row_start,
+                            *height,
+                            first_excerpt,
+                            latest_selection_anchors,
+                        );
+                        result = result.child(self.render_buffer_header(
+                            first_excerpt,
+                            true,
+                            selected,
+                            false,
+                            jump_data,
+                            window,
+                            cx,
                         ));
                     } else {
                         result =
                             result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
                     }
-                } else {
-                    result =
-                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+
+                    result.into_any_element()
                 }
 
-                result.into_any()
-            }
+                Block::ExcerptBoundary { .. } => {
+                    let color = cx.theme().colors().clone();
+                    let mut result = v_flex().id(block_id).w_full();
 
-            Block::Spacer { height, .. } => {
-                let indent_guide_padding = indent_guides
-                    .as_ref()
-                    .map(|guides| {
-                        Self::depth_zero_indent_guide_padding_for_row(guides, block_row_start)
-                    })
-                    .unwrap_or(px(0.0));
-                Self::render_spacer_block(
-                    block_id,
-                    *height,
-                    line_height,
-                    indent_guide_padding,
-                    window,
-                    cx,
-                )
-            }
+                    result = result.child(
+                        h_flex().relative().child(
+                            div()
+                                .top(line_height / 2.)
+                                .absolute()
+                                .w_full()
+                                .h_px()
+                                .bg(color.border_variant),
+                        ),
+                    );
+
+                    result.into_any()
+                }
+
+                Block::BufferHeader { excerpt, height } => {
+                    let mut result = v_flex().id(block_id).w_full();
+
+                    if self.should_show_buffer_headers() {
+                        let jump_data = header_jump_data(
+                            snapshot,
+                            block_row_start,
+                            *height,
+                            excerpt,
+                            latest_selection_anchors,
+                        );
+
+                        if sticky_header_excerpt_id != Some(excerpt.buffer_id()) {
+                            let selected = selected_buffer_ids.contains(&excerpt.buffer_id());
+
+                            result = result.child(div().pr(editor_margins.right).child(
+                                self.render_buffer_header(
+                                    excerpt, false, selected, false, jump_data, window, cx,
+                                ),
+                            ));
+                        } else {
+                            result = result
+                                .child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                        }
+                    } else {
+                        result =
+                            result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                    }
+
+                    result.into_any()
+                }
+
+                Block::Spacer { height, .. } => {
+                    let indent_guide_padding = indent_guides
+                        .as_ref()
+                        .map(|guides| {
+                            Self::depth_zero_indent_guide_padding_for_row(guides, block_row_start)
+                        })
+                        .unwrap_or(px(0.0));
+                    Self::render_spacer_block(
+                        block_id,
+                        *height,
+                        line_height,
+                        indent_guide_padding,
+                        window,
+                        cx,
+                    )
+                }
+            })
         };
 
         // Discover the element's content height, then round up to the nearest multiple of line height.
-        let preliminary_size = element.layout_as_root(
-            size(available_width, AvailableSpace::MinContent),
-            window,
-            cx,
-        );
+        let preliminary_available_space = size(available_width, AvailableSpace::MinContent);
+        let mut element = render_element(window, cx)?;
+        let preliminary_size = element.layout_as_root(preliminary_available_space, window, cx);
         let quantized_height = (preliminary_size.height / line_height).ceil() * line_height;
+        let final_available_space;
         let final_size = if preliminary_size.height == quantized_height {
+            final_available_space = preliminary_available_space;
             preliminary_size
         } else {
-            element.layout_as_root(size(available_width, quantized_height.into()), window, cx)
+            element = render_element(window, cx)?;
+            final_available_space = size(available_width, quantized_height.into());
+            element.layout_as_root(final_available_space, window, cx)
         };
+        drop(render_element);
+        let x_position = x_position;
         let mut element_height_in_lines = ((final_size.height / line_height).ceil() as u32).max(1);
 
         let effective_row_start = block_row_start.0 as i32 + *block_resize_offset;
@@ -4195,7 +4210,7 @@ impl EditorElement {
             row_block_types.insert(row + i, is_block);
         }
 
-        Some((element, final_size, row, x_offset))
+        Some((element, final_size, final_available_space, row, x_offset))
     }
 
     /// The spacer pattern period must be an even factor of the line height, so
@@ -4326,40 +4341,42 @@ impl EditorElement {
                 focused_block = None;
             }
 
-            if let Some((element, element_size, row, x_offset)) = self.render_block(
-                block,
-                AvailableSpace::MinContent,
-                block_id,
-                row,
-                snapshot,
-                text_x,
-                &rows,
-                line_layouts,
-                editor_margins,
-                line_height,
-                em_width,
-                text_hitbox,
-                editor_width,
-                scroll_width,
-                &mut resized_blocks,
-                &mut row_block_types,
-                selections,
-                selected_buffer_ids,
-                latest_selection_anchors,
-                is_row_soft_wrapped,
-                sticky_header_excerpt_id,
-                indent_guides,
-                &mut block_resize_offset,
-                window,
-                cx,
-            ) {
+            if let Some((element, element_size, available_space, row, x_offset)) = self
+                .render_block(
+                    block,
+                    AvailableSpace::MinContent,
+                    block_id,
+                    row,
+                    snapshot,
+                    text_x,
+                    &rows,
+                    line_layouts,
+                    editor_margins,
+                    line_height,
+                    em_width,
+                    text_hitbox,
+                    editor_width,
+                    scroll_width,
+                    &mut resized_blocks,
+                    &mut row_block_types,
+                    selections,
+                    selected_buffer_ids,
+                    latest_selection_anchors,
+                    is_row_soft_wrapped,
+                    sticky_header_excerpt_id,
+                    indent_guides,
+                    &mut block_resize_offset,
+                    window,
+                    cx,
+                )
+            {
                 fixed_block_max_width = fixed_block_max_width.max(element_size.width + em_width);
                 blocks.push(BlockLayout {
                     id: block_id,
                     x_offset,
                     row: Some(row),
                     element,
-                    available_space: size(AvailableSpace::MinContent, element_size.height.into()),
+                    available_space,
                     style: BlockStyle::Fixed,
                     overlaps_gutter: true,
                     is_buffer_header: block.is_buffer_header(),
@@ -4394,39 +4411,41 @@ impl EditorElement {
                 focused_block = None;
             }
 
-            if let Some((element, element_size, row, x_offset)) = self.render_block(
-                block,
-                width,
-                block_id,
-                row,
-                snapshot,
-                text_x,
-                &rows,
-                line_layouts,
-                editor_margins,
-                line_height,
-                em_width,
-                text_hitbox,
-                editor_width,
-                scroll_width,
-                &mut resized_blocks,
-                &mut row_block_types,
-                selections,
-                selected_buffer_ids,
-                latest_selection_anchors,
-                is_row_soft_wrapped,
-                sticky_header_excerpt_id,
-                indent_guides,
-                &mut block_resize_offset,
-                window,
-                cx,
-            ) {
+            if let Some((element, _element_size, available_space, row, x_offset)) = self
+                .render_block(
+                    block,
+                    width,
+                    block_id,
+                    row,
+                    snapshot,
+                    text_x,
+                    &rows,
+                    line_layouts,
+                    editor_margins,
+                    line_height,
+                    em_width,
+                    text_hitbox,
+                    editor_width,
+                    scroll_width,
+                    &mut resized_blocks,
+                    &mut row_block_types,
+                    selections,
+                    selected_buffer_ids,
+                    latest_selection_anchors,
+                    is_row_soft_wrapped,
+                    sticky_header_excerpt_id,
+                    indent_guides,
+                    &mut block_resize_offset,
+                    window,
+                    cx,
+                )
+            {
                 let layout = BlockLayout {
                     id: block_id,
                     x_offset,
                     row: Some(row),
                     element,
-                    available_space: size(width, element_size.height.into()),
+                    available_space,
                     style,
                     overlaps_gutter: !block.place_near() && style != BlockStyle::Spacer,
                     is_buffer_header: block.is_buffer_header(),
@@ -4462,7 +4481,7 @@ impl EditorElement {
                 BlockStyle::Sticky => AvailableSpace::Definite(hitbox.size.width),
             };
 
-            if let Some((element, element_size, _, x_offset)) = self.render_block(
+            if let Some((element, _element_size, available_space, _, x_offset)) = self.render_block(
                 &block,
                 width,
                 focused_block.id,
@@ -4494,7 +4513,7 @@ impl EditorElement {
                     x_offset,
                     row: None,
                     element,
-                    available_space: size(width, element_size.height.into()),
+                    available_space,
                     style,
                     overlaps_gutter: true,
                     is_buffer_header: block.is_buffer_header(),

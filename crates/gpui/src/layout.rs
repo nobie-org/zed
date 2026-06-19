@@ -272,10 +272,11 @@ impl LayoutEngine {
 
     /// Record a text measured layout intent with explicit artifact hydration.
     ///
-    /// GPUI needs the shaped text artifact for paint and hit testing. Under
-    /// stock Taffy, retained layout treats text conservatively: the hydrator
-    /// installs artifacts produced by the current compute's callback, and the
-    /// retained forest does not replay artifacts from `TextMeasureKey` alone.
+    /// GPUI needs the shaped text artifact for paint and hit testing. The
+    /// retained forest never replays an artifact from `TextMeasureKey` alone:
+    /// it hydrates from the current callback, from an exact query-keyed artifact
+    /// selected by passive Taffy cache observation, or from a retained
+    /// unchanged-node replay whose layout context is proven unchanged.
     pub(crate) fn request_text_measured_layout(
         &mut self,
         style: Style,

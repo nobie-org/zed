@@ -378,11 +378,10 @@ impl IntoElement for StyledText {
 
 /// The frame-local layout state for a text element.
 ///
-/// Paint, prepaint, and hit testing need shaped lines in this handle. Under
-/// stock Taffy, retained layout hydrates `TextLayout` only from an artifact
-/// returned by the current compute's measurement callback because a retained
-/// `TextMeasureKey` does not include the Taffy measurement query that controls
-/// wrapping and truncation.
+/// Paint, prepaint, and hit testing need shaped lines in this handle. Retained
+/// layout hydrates `TextLayout` only from a current compute callback, an exact
+/// query-keyed artifact selected by passive Taffy cache observation, or an
+/// unchanged retained node whose layout context is proven unchanged.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
@@ -403,9 +402,9 @@ struct TextLayoutInner {
 ///
 /// This key is not a complete text artifact key by itself: shaped text also
 /// depends on Taffy's measurement query, such as known dimensions and available
-/// space. Under stock Taffy, GPUI does not observe that query when Taffy reuses
-/// an internal measurement result, so retained layout treats text measurement
-/// conservatively unless a future API exposes the full query identity.
+/// space. Retained layout records that query when Taffy calls the callback or
+/// passively reports a cache hit/store, but it never treats `TextMeasureKey`
+/// alone as proof that a shaped artifact can be replayed.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TextMeasureKey {
     text: SharedString,

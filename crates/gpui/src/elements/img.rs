@@ -345,33 +345,46 @@ impl Element for Img {
                             }
 
                             let image_size = data.render_size(frame_index);
-                            style.aspect_ratio = Some(image_size.width / image_size.height);
+                            let has_intrinsic_aspect_ratio =
+                                image_size.width.0 > 0. && image_size.height.0 > 0.;
+
+                            if has_intrinsic_aspect_ratio {
+                                style.aspect_ratio = Some(image_size.width / image_size.height);
+                            }
 
                             if let Length::Auto = style.size.width {
-                                style.size.width = match style.size.height {
-                                    Length::Definite(DefiniteLength::Absolute(abs_length)) => {
-                                        let height_px = abs_length.to_pixels(window.rem_size());
-                                        Length::Definite(
-                                            px(image_size.width.0 * height_px.0
-                                                / image_size.height.0)
-                                            .into(),
-                                        )
+                                style.size.width = if has_intrinsic_aspect_ratio {
+                                    match style.size.height {
+                                        Length::Definite(DefiniteLength::Absolute(abs_length)) => {
+                                            let height_px = abs_length.to_pixels(window.rem_size());
+                                            Length::Definite(
+                                                px(image_size.width.0 * height_px.0
+                                                    / image_size.height.0)
+                                                .into(),
+                                            )
+                                        }
+                                        _ => Length::Definite(image_size.width.into()),
                                     }
-                                    _ => Length::Definite(image_size.width.into()),
+                                } else {
+                                    Length::Definite(image_size.width.into())
                                 };
                             }
 
                             if let Length::Auto = style.size.height {
-                                style.size.height = match style.size.width {
-                                    Length::Definite(DefiniteLength::Absolute(abs_length)) => {
-                                        let width_px = abs_length.to_pixels(window.rem_size());
-                                        Length::Definite(
-                                            px(image_size.height.0 * width_px.0
-                                                / image_size.width.0)
-                                            .into(),
-                                        )
+                                style.size.height = if has_intrinsic_aspect_ratio {
+                                    match style.size.width {
+                                        Length::Definite(DefiniteLength::Absolute(abs_length)) => {
+                                            let width_px = abs_length.to_pixels(window.rem_size());
+                                            Length::Definite(
+                                                px(image_size.height.0 * width_px.0
+                                                    / image_size.width.0)
+                                                .into(),
+                                            )
+                                        }
+                                        _ => Length::Definite(image_size.height.into()),
                                     }
-                                    _ => Length::Definite(image_size.height.into()),
+                                } else {
+                                    Length::Definite(image_size.height.into())
                                 };
                             }
 

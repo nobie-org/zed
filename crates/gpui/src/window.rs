@@ -63,7 +63,7 @@ use uuid::Uuid;
 
 mod prompts;
 
-use crate::layout::{PureSizeMeasure, RetainedLayoutRootId};
+use crate::layout::{PureSizeMeasure, RetainedLayoutRootId, RetainedLayoutRootSite};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -4451,27 +4451,35 @@ impl Window {
     /// After calling it, you can request the bounds of the given layout node id or any descendant.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
+    #[track_caller]
     pub fn compute_layout(
         &mut self,
         layout_id: LayoutId,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) {
-        self.compute_layout_as_root(layout_id, None, available_space, cx);
+        self.compute_layout_as_root(
+            layout_id,
+            None,
+            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            available_space,
+            cx,
+        );
     }
 
     pub(crate) fn compute_layout_as_root(
         &mut self,
         layout_id: LayoutId,
         global_id: Option<&GlobalElementId>,
+        root_site: RetainedLayoutRootSite,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) -> RetainedLayoutRootId {
-        let retained_root_id = self
-            .layout_engine
-            .as_mut()
-            .unwrap()
-            .retained_root_id(global_id, &self.element_id_stack);
+        let retained_root_id = self.layout_engine.as_mut().unwrap().retained_root_id(
+            root_site,
+            global_id,
+            &self.element_id_stack,
+        );
         self.compute_layout_in_root(layout_id, retained_root_id, available_space, cx);
         retained_root_id
     }

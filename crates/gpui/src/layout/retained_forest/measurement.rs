@@ -245,9 +245,10 @@ pub(super) enum MeasurementCallbackKind {
 /// Owner of measured producers and current-frame text layout hydration.
 ///
 /// This is GPUI state, not Taffy state. Taffy can decide whether a measured node
-/// cache entry is valid, but GPUI owns the executable producer slots. Under
-/// stock Taffy, text artifacts are hydrated only from current compute callbacks
-/// because replaying them from `TextMeasureKey` alone is under-keyed.
+/// cache entry is valid, but GPUI owns the executable producer slots and text
+/// artifacts. Under stock Taffy, text artifacts are hydrated only from
+/// callbacks that run during the current compute because `TextMeasureKey` does
+/// not include the full Taffy measurement query.
 pub(super) struct MeasurementStore {
     producer_contexts: Vec<Option<LayoutMeasureContext>>,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,

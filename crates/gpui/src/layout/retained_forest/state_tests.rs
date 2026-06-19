@@ -1,4 +1,4 @@
-use super::super::{LayoutId, RetainedLayoutRootId};
+use super::super::{LayoutId, RetainedLayoutRootId, RetainedLayoutRootSite};
 use super::{
     LayoutIntent, LayoutIntentKind, RetainedLayoutFacts, RetainedLayoutKind,
     RetainedLayoutOccurrence,
@@ -111,8 +111,35 @@ fn sized_style(width: f32, height: f32) -> TaffyStyle {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ModelRootKey {
-    Global(u8),
-    Anonymous { stack: Vec<u8>, occurrence: u64 },
+    Global {
+        site: u8,
+        id: u8,
+    },
+    Anonymous {
+        site: u8,
+        stack: Vec<u8>,
+        occurrence: u64,
+    },
+}
+
+fn root_site(site: u8) -> RetainedLayoutRootSite {
+    match site {
+        0 => root_site_zero(),
+        1 => root_site_one(),
+        _ => root_site_two(),
+    }
+}
+
+fn root_site_zero() -> RetainedLayoutRootSite {
+    RetainedLayoutRootSite::caller(core::panic::Location::caller())
+}
+
+fn root_site_one() -> RetainedLayoutRootSite {
+    RetainedLayoutRootSite::caller(core::panic::Location::caller())
+}
+
+fn root_site_two() -> RetainedLayoutRootSite {
+    RetainedLayoutRootSite::caller(core::panic::Location::caller())
 }
 
 #[gpui::test]
@@ -125,27 +152,30 @@ fn root_registry_matches_generated_identity_model(_cx: &mut TestAppContext) {
         let frame_count = draw_usize(&tc, 1, 8);
         for _ in 0..frame_count {
             registry.begin_frame();
-            let mut anonymous_occurrences = HashMap::<Vec<u8>, u64>::new();
+            let mut anonymous_occurrences = HashMap::<(u8, Vec<u8>), u64>::new();
             let request_count = draw_usize(&tc, 0, 10);
             let mut actual = Vec::new();
             let mut expected = Vec::new();
 
             for _ in 0..request_count {
+                let site = draw_u8(&tc, 0, 2);
+                let root_site = root_site(site);
                 let stack_key = draw_element_stack(&tc);
                 let stack = element_stack(&stack_key);
                 let use_global = tc.draw(generators::booleans());
                 let model_key = if use_global {
                     let id = draw_u8(&tc, 0, 4);
                     let global = global_id(id);
-                    actual.push(registry.retained_root_id(Some(&global), &stack));
-                    ModelRootKey::Global(id)
+                    actual.push(registry.retained_root_id(root_site, Some(&global), &stack));
+                    ModelRootKey::Global { site, id }
                 } else {
-                    actual.push(registry.retained_root_id(None, &stack));
+                    actual.push(registry.retained_root_id(root_site, None, &stack));
                     let occurrence = anonymous_occurrences
-                        .entry(stack_key.clone())
+                        .entry((site, stack_key.clone()))
                         .and_modify(|occurrence| *occurrence += 1)
                         .or_insert(0);
                     let key = ModelRootKey::Anonymous {
+                        site,
                         stack: stack_key,
                         occurrence: *occurrence,
                     };
@@ -348,7 +378,6 @@ fn bounds_cache_checkpoint_restores_cached_absolute_bounds(_cx: &mut TestAppCont
             |node_id| taffy.parent(node_id),
         );
         let checkpoint = cache.checkpoint();
-        cache.invalidate_subtree(root, |node_id| taffy.children(node_id).unwrap());
         let _ = cache.layout_bounds_for_node(
             root,
             scale_factor,

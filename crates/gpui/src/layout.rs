@@ -8,6 +8,7 @@ use crate::{
     App, Bounds, ElementId, GlobalElementId, Pixels, Size, Style, TextLayoutArtifact,
     TextMeasureKey, Window,
 };
+use core::panic::Location;
 use stacksafe::stacksafe;
 
 mod retained_forest;
@@ -31,6 +32,22 @@ pub(crate) struct LayoutEngine {
     forest: RetainedLayoutForest,
     layout_work: LayoutWorkSample,
     mode: LayoutEngineMode,
+}
+
+/// Stable framework identity for one legal root compute site.
+///
+/// A root site is not user-authored element identity. It identifies the GPUI
+/// code path that is allowed to solve an independent layout root, so private
+/// sizing probes, visible list items, tooltips, and the window root cannot
+/// accidentally reuse the same retained root just because they are anonymous
+/// under the same element stack.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RetainedLayoutRootSite(&'static Location<'static>);
+
+impl RetainedLayoutRootSite {
+    pub(crate) fn caller(location: &'static Location<'static>) -> Self {
+        Self(location)
+    }
 }
 
 /// Retained-layout execution policy.
@@ -124,10 +141,12 @@ impl LayoutEngine {
     /// anonymous roots from aliasing the same retained Taffy node.
     pub(crate) fn retained_root_id(
         &mut self,
+        root_site: RetainedLayoutRootSite,
         global_id: Option<&GlobalElementId>,
         element_id_stack: &[ElementId],
     ) -> RetainedLayoutRootId {
-        self.forest.retained_root_id(global_id, element_id_stack)
+        self.forest
+            .retained_root_id(root_site, global_id, element_id_stack)
     }
 
     /// Snapshot all retained layout state affected by speculative layout.

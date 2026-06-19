@@ -1425,44 +1425,34 @@ fn generated_rollback_restores_retained_layout_state_for_next_repeat() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_recompute_invalidates_cached_layout_bounds(cx: &mut TestAppContext) {
+#[should_panic(expected = "retained layout root should be solved at most once per frame")]
+fn same_frame_root_recompute_panics(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
-    hegel::Hegel::new(|tc| {
-        let first_width = draw_u16(&tc, 0, 400);
-        let second_width = draw_u16(&tc, 0, 400);
-        let height = draw_u16(&tc, 1, 200);
-        let mut engine = LayoutEngine::new();
-        let child = request_full_leaf(&mut engine);
-        let root = request_full_container(&mut engine, &[child]);
+    let mut engine = LayoutEngine::new();
+    let child = request_full_leaf(&mut engine);
+    let root = request_full_container(&mut engine, &[child]);
 
-        cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(first_width as f32)),
-                    AvailableSpace::Definite(px(height as f32)),
-                ),
-                window,
-                app,
-            );
-            let _ = engine.layout_bounds(child, window.scale_factor());
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(second_width as f32)),
-                    AvailableSpace::Definite(px(height as f32)),
-                ),
-                window,
-                app,
-            );
-            assert_eq!(
-                engine.layout_bounds(child, window.scale_factor()).size,
-                size(px(second_width as f32), px(height as f32))
-            );
-        });
-    })
-    .settings(hegel_settings(64))
-    .run();
+    cx.update(|window, app| {
+        engine.compute_layout(
+            root,
+            size(
+                AvailableSpace::Definite(px(100.0)),
+                AvailableSpace::Definite(px(80.0)),
+            ),
+            window,
+            app,
+        );
+        let _ = engine.layout_bounds(child, window.scale_factor());
+        engine.compute_layout(
+            root,
+            size(
+                AvailableSpace::Definite(px(200.0)),
+                AvailableSpace::Definite(px(80.0)),
+            ),
+            window,
+            app,
+        );
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1610,26 +1600,19 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
             measure_invocations.clone(),
             hydrated_artifacts.clone(),
         );
-        cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(first_width as f32)),
-                    AvailableSpace::MaxContent,
-                ),
-                window,
-                app,
-            );
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(second_width as f32)),
-                    AvailableSpace::MaxContent,
-                ),
-                window,
-                app,
-            );
-        });
+        compute_generated_text_root(cx, &mut engine, root, first_width);
+        engine.finish_frame();
+
+        let root = request_input_sensitive_text_measured(
+            &mut engine,
+            0,
+            key_index,
+            first_width,
+            height,
+            measure_invocations.clone(),
+            hydrated_artifacts.clone(),
+        );
+        compute_generated_text_root(cx, &mut engine, root, second_width);
         engine.finish_frame();
 
         let root = request_input_sensitive_text_measured(
@@ -1674,105 +1657,42 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_text_same_frame_recompute_hydrates_current_available_width(cx: &mut TestAppContext) {
+#[should_panic(expected = "retained layout root should be solved at most once per frame")]
+fn text_same_frame_root_recompute_panics(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
-    hegel::Hegel::new(|tc| {
-        let key_index = draw_u8(&tc, 0, 3);
-        let first_width = draw_u16(&tc, 1, 200);
-        let width_delta = draw_u16(&tc, 1, 40);
-        let second_width = first_width + width_delta;
-        let height = draw_u16(&tc, 1, 120);
-        let measure_invocations = Rc::new(Cell::new(0));
-        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
-        let mut engine = LayoutEngine::new();
+    let measure_invocations = Rc::new(Cell::new(0));
+    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = LayoutEngine::new();
+    let root = request_input_sensitive_text_measured(
+        &mut engine,
+        0,
+        1,
+        120,
+        24,
+        measure_invocations,
+        hydrated_artifacts,
+    );
 
-        let root = request_input_sensitive_text_measured(
-            &mut engine,
-            0,
-            key_index,
-            first_width,
-            height,
-            measure_invocations.clone(),
-            hydrated_artifacts.clone(),
+    cx.update(|window, app| {
+        engine.compute_layout(
+            root,
+            size(
+                AvailableSpace::Definite(px(120.0)),
+                AvailableSpace::MaxContent,
+            ),
+            window,
+            app,
         );
-        compute_generated_text_root(cx, &mut engine, root, first_width);
-        engine.finish_frame();
-
-        let root = request_input_sensitive_text_measured(
-            &mut engine,
-            1,
-            key_index,
-            first_width,
-            height,
-            measure_invocations.clone(),
-            hydrated_artifacts.clone(),
+        engine.compute_layout(
+            root,
+            size(
+                AvailableSpace::Definite(px(180.0)),
+                AvailableSpace::MaxContent,
+            ),
+            window,
+            app,
         );
-        cx.update(|window, app| {
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(first_width as f32)),
-                    AvailableSpace::MaxContent,
-                ),
-                window,
-                app,
-            );
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(second_width as f32)),
-                    AvailableSpace::MaxContent,
-                ),
-                window,
-                app,
-            );
-            engine.compute_layout(
-                root,
-                size(
-                    AvailableSpace::Definite(px(first_width as f32)),
-                    AvailableSpace::MaxContent,
-                ),
-                window,
-                app,
-            );
-            assert_eq!(
-                engine.layout_bounds(root, window.scale_factor()).size,
-                size(px(first_width as f32), px(height as f32))
-            );
-        });
-
-        assert_eq!(
-            hydrated_artifacts.borrow().as_slice(),
-            [
-                GeneratedTextHydration {
-                    label: 0,
-                    key_index,
-                    width: first_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index,
-                    width: first_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index,
-                    width: second_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index,
-                    width: first_width,
-                    height,
-                },
-            ]
-        );
-    })
-    .settings(hegel_settings(64))
-    .run();
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2997,7 +2917,12 @@ fn window_transact_discards_failed_text_prepaint_state(cx: &mut TestAppContext) 
         ) -> Self::PrepaintState {
             let transient: Result<(), ()> = window.transact(|window| {
                 let mut transient = Drawable::new(SharedString::from("transient"));
-                transient.layout_as_root(bounds.size.into(), window, cx);
+                transient.layout_as_root(
+                    bounds.size.into(),
+                    RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+                    window,
+                    cx,
+                );
                 window.with_absolute_element_offset(bounds.origin, |window| {
                     transient.prepaint(window, cx)
                 });
@@ -3007,7 +2932,12 @@ fn window_transact_discards_failed_text_prepaint_state(cx: &mut TestAppContext) 
             assert_eq!(transient, Err(()));
 
             let mut committed = Drawable::new(SharedString::from("committed"));
-            committed.layout_as_root(bounds.size.into(), window, cx);
+            committed.layout_as_root(
+                bounds.size.into(),
+                RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+                window,
+                cx,
+            );
             window.with_absolute_element_offset(bounds.origin, |window| {
                 committed.prepaint(window, cx)
             });
@@ -3604,30 +3534,14 @@ fn exact_canvas_sibling_recomputes_after_sidebar_subtree_change() {
 }
 
 #[test]
-fn repeated_root_layout_recompute_is_allowed() {
+#[should_panic(expected = "retained layout root should be solved at most once per frame")]
+fn repeated_root_layout_recompute_panics() {
     let mut engine = LayoutEngine::new();
     let child = request_full_leaf(&mut engine);
     let root = request_full_container(&mut engine, &[child]);
 
     compute_layout_without_measure(&mut engine, root, 0.0, 100.0);
-    let child_node = engine.retained_node_token_for_tests(child);
-    assert_eq!(
-        engine
-            .retained_node_layout_bounds_for_tests(child_node, 1.0)
-            .size,
-        size(px(0.0), px(100.0))
-    );
-
-    let root_node = compute_layout_without_measure(&mut engine, root, 800.0, 100.0);
-
-    assert_eq!(retained_node_size(&engine, root_node), size(800.0, 100.0));
-    assert_eq!(retained_node_size(&engine, child_node), size(800.0, 100.0));
-    assert_eq!(
-        engine
-            .retained_node_layout_bounds_for_tests(child_node, 1.0)
-            .size,
-        size(px(800.0), px(100.0))
-    );
+    compute_layout_without_measure(&mut engine, root, 800.0, 100.0);
 }
 
 #[test]

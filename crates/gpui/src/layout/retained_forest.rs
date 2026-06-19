@@ -5,10 +5,13 @@
 //! and caching; callers may request layout, compute roots, and read bounds, but
 //! cannot see or mutate Taffy nodes directly.
 
-use super::{AvailableSpace, EXPECT_MESSAGE, LayoutId, RetainedLayoutRootId};
+use super::{
+    AvailableSpace, EXPECT_MESSAGE, LayoutId, RetainedLayoutRootId, RetainedLayoutRootSite,
+};
 mod bounds_cache;
 mod committed;
 mod frame;
+mod geometry;
 mod measurement;
 mod root_slots;
 mod roots;
@@ -28,6 +31,7 @@ use bounds_cache::{BoundsCache, BoundsCacheCheckpoint};
 use collections::FxHashSet;
 use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
 use frame::{FrameIntents, FrameIntentsCheckpoint};
+use geometry::{GeometryStore, GeometryStoreCheckpoint};
 pub(crate) use measurement::PureSizeMeasure;
 use measurement::{
     CurrentMeasurement, LayoutMeasureContext, MeasuredLayoutKind, MeasuredLayoutResult,
@@ -211,6 +215,7 @@ pub(super) struct RetainedLayoutForest {
     roots: RootRegistry,
     frame: FrameIntents,
     measurements: MeasurementStore,
+    geometry: GeometryStore,
     committed: CommittedLayoutState,
     bounds: BoundsCache,
     root_slots: RootSlots,
@@ -227,6 +232,7 @@ pub(super) struct RetainedLayoutForestCheckpoint {
     roots: RootRegistryCheckpoint,
     frame: FrameIntentsCheckpoint,
     measurements: MeasurementStoreCheckpoint,
+    geometry: GeometryStoreCheckpoint,
     committed: CommittedLayoutCheckpoint,
     bounds: BoundsCacheCheckpoint,
     root_slots: RootSlotsCheckpoint,
@@ -686,6 +692,7 @@ impl RetainedLayoutForest {
             roots: RootRegistry::new(),
             frame: FrameIntents::new(),
             measurements: MeasurementStore::new(),
+            geometry: GeometryStore::new(),
             committed: CommittedLayoutState::new(),
             bounds: BoundsCache::new(),
             root_slots: RootSlots::new(),
@@ -698,6 +705,7 @@ impl RetainedLayoutForest {
     pub(super) fn begin_frame(&mut self) {
         self.roots.begin_frame();
         self.measurements.begin_frame();
+        self.geometry.begin_frame();
         self.subtree_probe.begin_frame();
         self.work.begin_frame();
     }
@@ -709,6 +717,7 @@ impl RetainedLayoutForest {
             roots: self.roots.checkpoint(),
             frame: self.frame.checkpoint(),
             measurements: self.measurements.checkpoint(),
+            geometry: self.geometry.checkpoint(),
             committed: self.committed.checkpoint(),
             bounds: self.bounds.checkpoint(),
             root_slots: self.root_slots.checkpoint(),
@@ -724,6 +733,7 @@ impl RetainedLayoutForest {
         self.frame.rollback_to_checkpoint(checkpoint.frame);
         self.measurements
             .rollback_to_checkpoint(checkpoint.measurements);
+        self.geometry.rollback_to_checkpoint(checkpoint.geometry);
         self.committed.rollback_to_checkpoint(checkpoint.committed);
         self.bounds.rollback_to_checkpoint(checkpoint.bounds);
         self.root_slots
@@ -739,10 +749,12 @@ impl RetainedLayoutForest {
     /// using root order as an implicit retention key.
     pub(super) fn retained_root_id(
         &mut self,
+        root_site: RetainedLayoutRootSite,
         global_id: Option<&GlobalElementId>,
         element_id_stack: &[ElementId],
     ) -> RetainedLayoutRootId {
-        self.roots.retained_root_id(global_id, element_id_stack)
+        self.roots
+            .retained_root_id(root_site, global_id, element_id_stack)
     }
 
     /// Promote successfully computed current roots and sweep everything else.
@@ -758,6 +770,7 @@ impl RetainedLayoutForest {
         }
 
         self.root_slots.promote_current_roots();
+        self.geometry.finish_frame();
         self.frame.clear();
         self.measurements.finish_frame();
         self.committed.clear();
@@ -953,11 +966,20 @@ impl RetainedLayoutForest {
         self.taffy.parent(node_id)
     }
 
-    fn layout(&self, node_id: NodeId) -> &Layout {
-        self.taffy.layout(node_id).expect(EXPECT_MESSAGE)
+    fn geometry_layout(&self, node_id: NodeId) -> Layout {
+        self.geometry.layout(node_id).unwrap_or_else(|| {
+            panic!(
+                "retained layout geometry should be captured before reading node {:?}",
+                node_id
+            )
+        })
     }
 
-    fn try_layout(&self, node_id: NodeId) -> Option<Layout> {
+    fn try_geometry_layout(&self, node_id: NodeId) -> Option<Layout> {
+        self.geometry.layout(node_id)
+    }
+
+    fn try_solver_layout(&self, node_id: NodeId) -> Option<Layout> {
         self.taffy.layout(node_id).ok().cloned()
     }
 
@@ -976,11 +998,15 @@ impl RetainedLayoutForest {
         cx: &mut App,
     ) -> ComputeLayoutWork {
         let node_id = self.commit_root_layout(root_id, id);
-
+        assert!(
+            !self.geometry.has_solved_root(root_id),
+            "retained layout root should be solved at most once per frame"
+        );
         let repeated_root = !self.bounds.mark_computed(node_id);
-        if repeated_root {
-            self.invalidate_cached_bounds_for_subtree(node_id);
-        }
+        assert!(
+            !repeated_root,
+            "retained layout node should not be computed through multiple roots in one frame"
+        );
 
         let taffy_available_space = scale_available_space_for_taffy(available_space, scale_factor);
 
@@ -992,7 +1018,6 @@ impl RetainedLayoutForest {
         }
 
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
-
         let compute_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
             node_id,
@@ -1005,11 +1030,26 @@ impl RetainedLayoutForest {
         let compute_layout_duration = compute_start.elapsed();
         self.subtree_probe.record_compute(subtree_compute_recorder);
 
+        {
+            let Self {
+                taffy, geometry, ..
+            } = self;
+            geometry.capture_from_solver(
+                root_id,
+                node_id,
+                available_space,
+                scale_factor,
+                |node_id| taffy.layout(node_id).expect(EXPECT_MESSAGE).clone(),
+                |node_id| taffy.children(node_id).expect(EXPECT_MESSAGE),
+            );
+        }
+
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
-            let layout = self.layout(node_id);
+            let layout = self.geometry_layout(node_id);
+            let solver_layout = self.try_solver_layout(node_id);
             eprintln!(
-                "gpui retained_layout compute_finish layout_id={} node_id={:?} repeated_root={} root_layout={:?}",
-                id.0, node_id, repeated_root, layout
+                "gpui retained_layout compute_finish layout_id={} node_id={:?} repeated_root={} root_layout={:?} solver_layout={:?}",
+                id.0, node_id, repeated_root, layout, solver_layout
             );
         }
 
@@ -1043,14 +1083,23 @@ impl RetainedLayoutForest {
         let trace_targeted_zero_bounds =
             retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0));
         if has_zero_size && (trace_targeted_zero_bounds || should_trace_retained_zero_bounds()) {
-            let layout = self.try_layout(node_id);
+            let layout = self.try_geometry_layout(node_id);
+            let solver_layout = self.try_solver_layout(node_id);
             let parent = self.parent(node_id);
-            let parent_layout = parent.and_then(|parent| self.try_layout(parent));
+            let parent_layout = parent.and_then(|parent| self.try_geometry_layout(parent));
             let children = self.children(node_id);
             let style = self.try_style(node_id);
             eprintln!(
-                "gpui retained_layout zero_bounds layout_id={} node_id={:?} bounds={:?} layout={:?} parent={:?} parent_layout={:?} children={:?} style={:?}",
-                id.0, node_id, bounds, layout, parent, parent_layout, children, style
+                "gpui retained_layout zero_bounds layout_id={} node_id={:?} bounds={:?} geometry_layout={:?} solver_layout={:?} parent={:?} parent_geometry_layout={:?} children={:?} style={:?}",
+                id.0,
+                node_id,
+                bounds,
+                layout,
+                solver_layout,
+                parent,
+                parent_layout,
+                children,
+                style
             );
             let mut depth = 0;
             let mut ancestor = Some(node_id);
@@ -1058,18 +1107,20 @@ impl RetainedLayoutForest {
                 let ancestor_layout_id = self
                     .committed_layout_id_for_node(ancestor_node_id)
                     .map(|layout_id| layout_id.0);
-                let ancestor_layout = self.try_layout(ancestor_node_id);
+                let ancestor_layout = self.try_geometry_layout(ancestor_node_id);
+                let ancestor_solver_layout = self.try_solver_layout(ancestor_node_id);
                 let ancestor_parent = self.parent(ancestor_node_id);
                 let ancestor_children = self.children(ancestor_node_id);
                 let ancestor_style = self.try_style(ancestor_node_id);
                 eprintln!(
-                    "gpui retained_layout zero_bounds_ancestor requested_layout_id={} depth={} layout_id={:?} node_id={:?} parent={:?} layout={:?} children={:?} style={:?}",
+                    "gpui retained_layout zero_bounds_ancestor requested_layout_id={} depth={} layout_id={:?} node_id={:?} parent={:?} geometry_layout={:?} solver_layout={:?} children={:?} style={:?}",
                     id.0,
                     depth,
                     ancestor_layout_id,
                     ancestor_node_id,
                     ancestor_parent,
                     ancestor_layout,
+                    ancestor_solver_layout,
                     ancestor_children,
                     ancestor_style
                 );
@@ -1083,19 +1134,24 @@ impl RetainedLayoutForest {
         bounds
     }
 
-    fn invalidate_cached_bounds_for_subtree(&mut self, node_id: NodeId) {
-        let Self { taffy, bounds, .. } = self;
-        bounds.invalidate_subtree(node_id, |node_id| {
-            taffy.children(node_id).expect(EXPECT_MESSAGE)
-        });
-    }
-
     fn layout_bounds_for_node(&mut self, node_id: NodeId, scale_factor: f32) -> Bounds<Pixels> {
-        let Self { taffy, bounds, .. } = self;
+        let Self {
+            taffy,
+            geometry,
+            bounds,
+            ..
+        } = self;
         bounds.layout_bounds_for_node(
             node_id,
             scale_factor,
-            |node_id| taffy.layout(node_id).expect(EXPECT_MESSAGE).clone(),
+            |node_id| {
+                geometry.layout(node_id).unwrap_or_else(|| {
+                    panic!(
+                        "retained layout geometry should be captured before reading bounds for {:?}",
+                        node_id
+                    )
+                })
+            },
             |node_id| taffy.parent(node_id),
         )
     }
@@ -1158,7 +1214,7 @@ impl RetainedLayoutForest {
                     let callback_kind = compute_measurements
                         .borrow()
                         .callback_kind(node_id)
-                        .expect("measured layout mirror node should have a current measurement");
+                        .expect("measured Taffy node should have a current measurement");
                     subtree_compute_recorder
                         .borrow_mut()
                         .record_measured_callback(node_id, callback_kind);
@@ -1175,6 +1231,7 @@ impl RetainedLayoutForest {
                 },
             )
             .expect(EXPECT_MESSAGE);
+
         (measured_layout_calls, measured_layout_duration)
     }
 
@@ -1321,7 +1378,7 @@ impl RetainedLayoutForest {
         &self,
         node_id: NodeId,
     ) -> RetainedLayoutProjectionForTests {
-        let layout = self.taffy.layout(node_id).expect(EXPECT_MESSAGE);
+        let layout = self.geometry_layout(node_id);
         RetainedLayoutProjectionForTests {
             location: layout.location.into(),
             size: layout.size.into(),
@@ -1335,11 +1392,7 @@ impl RetainedLayoutForest {
 
     #[cfg(test)]
     pub(super) fn retained_node_size_for_tests(&self, token: RetainedNodeToken) -> Size<f32> {
-        self.taffy
-            .layout(token.0)
-            .expect(EXPECT_MESSAGE)
-            .size
-            .into()
+        self.geometry_layout(token.0).size.into()
     }
 
     #[cfg(test)]
@@ -1386,9 +1439,14 @@ impl RetainedLayoutForest {
         available_space: Size<AvailableSpace>,
     ) -> RetainedNodeToken {
         let root_node = self.commit_root_layout(root_id, id);
-        if !self.bounds.mark_computed(root_node) {
-            self.invalidate_cached_bounds_for_subtree(root_node);
-        }
+        assert!(
+            !self.geometry.has_solved_root(root_id),
+            "retained layout root should be solved at most once per frame"
+        );
+        assert!(
+            self.bounds.mark_computed(root_node),
+            "retained layout node should not be computed through multiple roots in one frame"
+        );
         self.taffy
             .compute_layout_with_measure(
                 root_node,
@@ -1396,6 +1454,19 @@ impl RetainedLayoutForest {
                 |_known_dimensions, _available_space, _id, _node_context, _style| TaffySize::ZERO,
             )
             .expect(EXPECT_MESSAGE);
+        {
+            let Self {
+                taffy, geometry, ..
+            } = self;
+            geometry.capture_from_solver(
+                root_id,
+                root_node,
+                available_space,
+                1.0,
+                |node_id| taffy.layout(node_id).expect(EXPECT_MESSAGE).clone(),
+                |node_id| taffy.children(node_id).expect(EXPECT_MESSAGE),
+            );
+        }
         RetainedNodeToken(root_node)
     }
 
@@ -1613,7 +1684,7 @@ impl RetainedLayoutForest {
         target_layout_ids: Option<&[usize]>,
     ) {
         let retained_node_id = self.committed_node(id);
-        let retained_layout = self.taffy.layout(retained_node_id).expect(EXPECT_MESSAGE);
+        let retained_layout = self.geometry_layout(retained_node_id);
         let fresh_layout = fresh_taffy.layout(fresh_node_id).expect(EXPECT_MESSAGE);
         let layouts_match = retained_layout.location == fresh_layout.location
             && retained_layout.size == fresh_layout.size;
@@ -1643,7 +1714,7 @@ impl RetainedLayoutForest {
                     id,
                     retained_node_id,
                     fresh_node_id,
-                    retained_layout,
+                    &retained_layout,
                     fresh_layout,
                     path,
                 ));
@@ -1655,13 +1726,13 @@ impl RetainedLayoutForest {
                 id,
                 retained_node_id,
                 fresh_node_id,
-                retained_layout,
+                &retained_layout,
                 fresh_layout,
                 path,
             ));
         }
 
-        if layouts_match && Self::layout_has_zero_size(retained_layout) {
+        if layouts_match && Self::layout_has_zero_size(&retained_layout) {
             comparison.summary.equal_zero_nodes += 1;
             if comparison.equal_zero.is_none() {
                 comparison.equal_zero = Some(self.fresh_layout_comparison_line(
@@ -1669,7 +1740,7 @@ impl RetainedLayoutForest {
                     id,
                     retained_node_id,
                     fresh_node_id,
-                    retained_layout,
+                    &retained_layout,
                     fresh_layout,
                     path,
                 ));

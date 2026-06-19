@@ -8,30 +8,41 @@ use crate::{ElementId, GlobalElementId};
 use collections::FxHashMap;
 use std::sync::Arc;
 
-use super::super::RetainedLayoutRootId;
+use super::super::{RetainedLayoutRootId, RetainedLayoutRootSite};
 
 /// Allocates stable retained ids for root compute sites.
 pub(super) struct RootRegistry {
     root_ids: FxHashMap<RetainedLayoutRootKey, RetainedLayoutRootId>,
-    root_occurrences: FxHashMap<Arc<[ElementId]>, u64>,
+    root_occurrences: FxHashMap<AnonymousRootOccurrenceKey, u64>,
     next_root_id: u64,
 }
 
 /// Transaction checkpoint for root identity state.
 pub(super) struct RootRegistryCheckpoint {
     root_ids: FxHashMap<RetainedLayoutRootKey, RetainedLayoutRootId>,
-    root_occurrences: FxHashMap<Arc<[ElementId]>, u64>,
+    root_occurrences: FxHashMap<AnonymousRootOccurrenceKey, u64>,
     next_root_id: u64,
 }
 
 /// Private matching key for retained root reuse.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum RetainedLayoutRootKey {
-    Global(GlobalElementId),
+    Global {
+        root_site: RetainedLayoutRootSite,
+        global_id: GlobalElementId,
+    },
     Anonymous {
+        root_site: RetainedLayoutRootSite,
         element_id_stack: Arc<[ElementId]>,
         occurrence: u64,
     },
+}
+
+/// Per-frame anonymous root occurrence counter key.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AnonymousRootOccurrenceKey {
+    root_site: RetainedLayoutRootSite,
+    element_id_stack: Arc<[ElementId]>,
 }
 
 impl RootRegistry {
@@ -63,18 +74,24 @@ impl RootRegistry {
 
     pub(super) fn retained_root_id(
         &mut self,
+        root_site: RetainedLayoutRootSite,
         global_id: Option<&GlobalElementId>,
         element_id_stack: &[ElementId],
     ) -> RetainedLayoutRootId {
         let key = if let Some(global_id) = global_id {
-            RetainedLayoutRootKey::Global(global_id.clone())
+            RetainedLayoutRootKey::Global {
+                root_site,
+                global_id: global_id.clone(),
+            }
         } else {
             let element_id_stack: Arc<[ElementId]> = Arc::from(element_id_stack);
-            let occurrence = self
-                .root_occurrences
-                .entry(element_id_stack.clone())
-                .or_default();
+            let occurrence_key = AnonymousRootOccurrenceKey {
+                root_site,
+                element_id_stack: element_id_stack.clone(),
+            };
+            let occurrence = self.root_occurrences.entry(occurrence_key).or_default();
             let key = RetainedLayoutRootKey::Anonymous {
+                root_site,
                 element_id_stack,
                 occurrence: *occurrence,
             };

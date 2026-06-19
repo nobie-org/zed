@@ -5,7 +5,8 @@ use crate::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
-    WindowHandle, WindowOptions, app::GpuiMode, window::ElementArenaScope,
+    WindowHandle, WindowOptions, app::GpuiMode, layout::RetainedLayoutRootSite,
+    window::ElementArenaScope,
 };
 use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
@@ -856,6 +857,7 @@ impl VisualTestContext {
     }
 
     /// Draw an element to the window. Useful for simulating events or actions
+    #[track_caller]
     pub fn draw<E>(
         &mut self,
         origin: Point<Pixels>,
@@ -870,7 +872,12 @@ impl VisualTestContext {
 
             window.invalidator.set_phase(DrawPhase::Prepaint);
             let mut element = Drawable::new(f(window, cx));
-            element.layout_as_root(space.into(), window, cx);
+            element.layout_as_root(
+                space.into(),
+                RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+                window,
+                cx,
+            );
             window.with_absolute_element_offset(origin, |window| element.prepaint(window, cx));
 
             window.invalidator.set_phase(DrawPhase::Paint);

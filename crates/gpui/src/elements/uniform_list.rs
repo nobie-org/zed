@@ -70,6 +70,7 @@ pub struct UniformList {
 
 /// Frame state used by the [UniformList].
 pub struct UniformListFrameState {
+    item_size: Size<Pixels>,
     items: SmallVec<[AnyElement; 32]>,
     decorations: SmallVec<[AnyElement; 2]>,
 }
@@ -309,6 +310,7 @@ impl Element for UniformList {
         (
             layout_id,
             UniformListFrameState {
+                item_size,
                 items: SmallVec::new(),
                 decorations: SmallVec::new(),
             },
@@ -343,7 +345,7 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = self.measure_item(None, window, cx);
+        let longest_item_size = frame_state.item_size;
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {

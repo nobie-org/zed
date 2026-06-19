@@ -34,7 +34,9 @@
 use crate::{
     App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
     InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    layout::RetainedLayoutRootId, util::FluentBuilder, window::with_element_arena,
+    layout::{RetainedLayoutRootId, RetainedLayoutRootSite},
+    util::FluentBuilder,
+    window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -314,6 +316,7 @@ trait ElementObject {
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
+        root_site: RetainedLayoutRootSite,
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels>;
@@ -505,6 +508,7 @@ impl<E: Element> Drawable<E> {
     pub(crate) fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
+        root_site: RetainedLayoutRootSite,
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels> {
@@ -522,6 +526,7 @@ impl<E: Element> Drawable<E> {
                 let retained_root_id = window.compute_layout_as_root(
                     layout_id,
                     global_id.as_ref(),
+                    root_site,
                     available_space,
                     cx,
                 );
@@ -543,9 +548,10 @@ impl<E: Element> Drawable<E> {
                 available_space: prev_available_space,
                 request_layout,
             } => {
-                if available_space != prev_available_space {
-                    window.compute_layout_in_root(layout_id, retained_root_id, available_space, cx);
-                }
+                assert_eq!(
+                    available_space, prev_available_space,
+                    "cannot compute one layout root with two available-space values in one frame"
+                );
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
                     retained_root_id,
@@ -591,10 +597,11 @@ where
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
+        root_site: RetainedLayoutRootSite,
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels> {
-        Drawable::layout_as_root(self, available_space, window, cx)
+        Drawable::layout_as_root(self, available_space, root_site, window, cx)
     }
 }
 
@@ -643,13 +650,19 @@ impl AnyElement {
     }
 
     /// Performs layout for this element within the given available space and returns its size.
+    #[track_caller]
     pub fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels> {
-        self.0.layout_as_root(available_space, window, cx)
+        self.0.layout_as_root(
+            available_space,
+            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            window,
+            cx,
+        )
     }
 
     /// Prepaints this element at the given absolute origin.
@@ -665,6 +678,7 @@ impl AnyElement {
 
     /// Performs layout on this element in the available space, then prepaints it at the given absolute origin.
     /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
+    #[track_caller]
     pub fn prepaint_as_root(
         &mut self,
         origin: Point<Pixels>,

@@ -2,7 +2,7 @@
 //!
 //! Taffy stores node-local layout results. GPUI needs snapped absolute bounds
 //! and unrounded absolute origins for paint, hit testing, and descendant bounds
-//! queries. This cache owns those derived facts and their invalidation.
+//! queries. This cache owns those derived facts for the current frame.
 
 use crate::{Bounds, Pixels, Point, Size};
 use collections::{FxHashMap, FxHashSet};
@@ -58,19 +58,6 @@ impl BoundsCache {
 
     pub(super) fn mark_computed(&mut self, node_id: NodeId) -> bool {
         self.computed_layouts.insert(node_id)
-    }
-
-    pub(super) fn invalidate_subtree(
-        &mut self,
-        node_id: NodeId,
-        mut children: impl FnMut(NodeId) -> Vec<NodeId>,
-    ) {
-        self.scratch_space.push(node_id);
-        while let Some(node_id) = self.scratch_space.pop() {
-            self.absolute_layout_bounds.remove(&node_id);
-            self.absolute_outer_origins.remove(&node_id);
-            self.scratch_space.extend(children(node_id));
-        }
     }
 
     pub(super) fn layout_bounds_for_node(

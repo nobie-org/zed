@@ -81,6 +81,23 @@ fn request_full_leaf(engine: &mut LayoutEngine) -> LayoutId {
     request_full_container(engine, &[])
 }
 
+fn compute_stable_test_root(
+    cx: &mut VisualTestContext,
+    engine: &mut LayoutEngine,
+    root: LayoutId,
+    available_space: Size<AvailableSpace>,
+) {
+    cx.update(|window, app| {
+        engine.compute_retained_layout(
+            root,
+            RetainedLayoutRootId::new(0),
+            available_space,
+            window,
+            app,
+        );
+    });
+}
+
 fn request_full_block_leaf(engine: &mut LayoutEngine) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Block;
@@ -786,6 +803,22 @@ impl GeneratedTree {
         }
     }
 
+    fn text_count(&self) -> u64 {
+        match self {
+            Self::Unmeasured { children, .. } => children.iter().map(Self::text_count).sum(),
+            Self::Text { .. } => 1,
+            Self::PureSize { .. } | Self::Opaque { .. } => 0,
+        }
+    }
+
+    fn contains_opaque(&self) -> bool {
+        match self {
+            Self::Unmeasured { children, .. } => children.iter().any(Self::contains_opaque),
+            Self::PureSize { .. } | Self::Text { .. } => false,
+            Self::Opaque { .. } => true,
+        }
+    }
+
     fn retained_occurrence_matches_intent(&self, current: &Self) -> bool {
         match (self, current) {
             (
@@ -817,7 +850,18 @@ impl GeneratedTree {
                     height: right_height,
                 },
             ) => left_width == right_width && left_height == right_height,
-            (Self::Text { .. }, Self::Text { .. }) => false,
+            (
+                Self::Text {
+                    key_index: left_key,
+                    width: left_width,
+                    height: left_height,
+                },
+                Self::Text {
+                    key_index: right_key,
+                    width: right_width,
+                    height: right_height,
+                },
+            ) => left_key == right_key && left_width == right_width && left_height == right_height,
             _ => false,
         }
     }
@@ -827,6 +871,7 @@ impl GeneratedTree {
             (self, current),
             (Self::Unmeasured { .. }, Self::Unmeasured { .. })
                 | (Self::PureSize { .. }, Self::PureSize { .. })
+                | (Self::Text { .. }, Self::Text { .. })
         )
     }
 }
@@ -1028,6 +1073,28 @@ fn expected_mutations(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn add_expected_snapshot_work(
+    expected: &mut RetainedForestMutationSample,
+    previous: &[GeneratedTree],
+    current: &[GeneratedTree],
+) {
+    for index in 0..current.len() {
+        match (previous.get(index), current.get(index)) {
+            (Some(previous), Some(current))
+                if previous.retained_occurrence_matches_intent(current)
+                    && !current.contains_opaque() =>
+            {
+                expected.snapshot_hits += 1;
+                expected.snapshot_text_artifact_replays += current.text_count();
+            }
+            _ => {
+                expected.snapshot_misses += 1;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 trait ExpectedMutationCountsExt {
     fn add_commit(&mut self, previous: &GeneratedTree, current: &GeneratedTree) -> bool;
     fn add_fresh_tree(&mut self, current: &GeneratedTree);
@@ -1220,17 +1287,15 @@ fn compute_generated_text_root(
     root: LayoutId,
     available_width: u16,
 ) {
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(
-                AvailableSpace::Definite(px(available_width as f32)),
-                AvailableSpace::MaxContent,
-            ),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        engine,
+        root,
+        size(
+            AvailableSpace::Definite(px(available_width as f32)),
+            AvailableSpace::MaxContent,
+        ),
+    );
 }
 
 fn request_row(engine: &mut LayoutEngine, widths: &[f32]) -> LayoutId {
@@ -1338,7 +1403,8 @@ fn generated_retained_commit_matches_fresh_and_expected_mutation_counts(cx: &mut
                 retained_layout_bounds_trees(&mut fresh, &fresh_roots, 1.0)
             );
 
-            let expected = expected_mutations(&previous_roots, &frame.roots);
+            let mut expected = expected_mutations(&previous_roots, &frame.roots);
+            add_expected_snapshot_work(&mut expected, &previous_roots, &frame.roots);
             retained.finish_frame();
             assert_eq!(retained.retained_mutation_sample_for_tests(), expected);
 
@@ -1469,7 +1535,7 @@ fn same_frame_root_recompute_panics(cx: &mut TestAppContext) {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_text_exact_repeat_remeasures_under_stock_taffy(cx: &mut TestAppContext) {
+fn generated_text_exact_repeat_hydrates_from_root_snapshot(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
         let key_index = draw_u8(&tc, 0, 3);
@@ -1490,6 +1556,7 @@ fn generated_text_exact_repeat_remeasures_under_stock_taffy(cx: &mut TestAppCont
         );
         compute_generated_text_root(cx, &mut engine, root, width);
         engine.finish_frame();
+        engine.reset_retained_mutation_sample_for_tests();
 
         let root = request_input_sensitive_text_measured(
             &mut engine,
@@ -1502,8 +1569,16 @@ fn generated_text_exact_repeat_remeasures_under_stock_taffy(cx: &mut TestAppCont
         );
         compute_generated_text_root(cx, &mut engine, root, width);
 
-        assert_eq!(measure_invocations.get(), 2);
-        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+        assert_eq!(measure_invocations.get(), 1);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+        assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 0);
+        assert_eq!(engine.retained_mutation_sample_for_tests().snapshot_hits, 1);
+        assert_eq!(
+            engine
+                .retained_mutation_sample_for_tests()
+                .snapshot_text_artifact_replays,
+            1
+        );
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
@@ -1551,6 +1626,7 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
         );
         compute_generated_text_root(cx, &mut engine, root, first_width);
         engine.finish_frame();
+        engine.reset_retained_mutation_sample_for_tests();
 
         let root = request_input_sensitive_text_measured(
             &mut engine,
@@ -1565,6 +1641,11 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
 
         assert_eq!(measure_invocations.get(), 2);
         assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+        assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
+        assert_eq!(
+            engine.retained_mutation_sample_for_tests().snapshot_misses,
+            1
+        );
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
@@ -1732,6 +1813,7 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
         );
         compute_generated_text_root(cx, &mut engine, root, width);
         engine.finish_frame();
+        engine.reset_retained_mutation_sample_for_tests();
 
         let retry_root = request_input_sensitive_text_measured(
             &mut engine,
@@ -1756,6 +1838,7 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
         engine.rollback_to_checkpoint(checkpoint);
         compute_generated_text_root(cx, &mut engine, retry_root, width);
         engine.finish_frame();
+        engine.reset_retained_mutation_sample_for_tests();
 
         let repeat_root = request_input_sensitive_text_measured(
             &mut engine,
@@ -1768,8 +1851,16 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
         );
         compute_generated_text_root(cx, &mut engine, repeat_root, width);
 
-        assert_eq!(measure_invocations.get(), 4);
-        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+        assert_eq!(measure_invocations.get(), 2);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+        assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 0);
+        assert_eq!(engine.retained_mutation_sample_for_tests().snapshot_hits, 1);
+        assert_eq!(
+            engine
+                .retained_mutation_sample_for_tests()
+                .snapshot_text_artifact_replays,
+            1
+        );
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
             [
@@ -2445,25 +2536,21 @@ fn unchanged_pure_size_measure_reuses_taffy_cache(cx: &mut TestAppContext) {
     let mut engine = LayoutEngine::new();
 
     let root = request_pure_list_measured(&mut engine, 10.0, 20.0);
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
     engine.finish_frame();
 
     let root = request_pure_list_measured(&mut engine, 10.0, 20.0);
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
 
     assert_eq!(
         engine.layout_work_sample(),
@@ -2473,16 +2560,18 @@ fn unchanged_pure_size_measure_reuses_taffy_cache(cx: &mut TestAppContext) {
             measured_layout_node_requests: 1,
             child_edges: 0,
             compute_layout_calls: 1,
+            solver_compute_layout_calls: 0,
             measured_layout_calls: 0,
             compute_layout_duration: engine.layout_work_sample().compute_layout_duration,
             measured_layout_duration: Duration::default(),
             ..LayoutWorkSample::default()
         }
     );
+    assert_eq!(engine.retained_mutation_sample_for_tests().snapshot_hits, 1);
 }
 
 #[gpui::test]
-fn unchanged_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppContext) {
+fn unchanged_text_measure_replays_root_snapshot(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2496,14 +2585,12 @@ fn unchanged_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppContext) 
         measure_invocations.clone(),
         hydrations.clone(),
     );
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
     engine.finish_frame();
 
     let root = request_text_measured(
@@ -2513,21 +2600,27 @@ fn unchanged_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppContext) 
         measure_invocations.clone(),
         hydrations.clone(),
     );
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (2, 2));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 2));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 0);
+    assert_eq!(engine.retained_mutation_sample_for_tests().snapshot_hits, 1);
+    assert_eq!(
+        engine
+            .retained_mutation_sample_for_tests()
+            .snapshot_text_artifact_replays,
+        1
+    );
 }
 
 #[gpui::test]
-fn unchanged_nested_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppContext) {
+fn unchanged_nested_text_measure_replays_root_snapshot(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
@@ -2542,14 +2635,12 @@ fn unchanged_nested_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppCo
         hydrations.clone(),
     );
     let root = request_container(&mut engine, &[text]);
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
     engine.finish_frame();
 
     measure_invocations.set(0);
@@ -2563,26 +2654,23 @@ fn unchanged_nested_text_measure_remeasures_under_stock_taffy(cx: &mut TestAppCo
         hydrations.clone(),
     );
     let root = request_container(&mut engine, &[text]);
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
 
     assert_intent_committed_exactly(&engine, root);
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            creates: 1,
-            removes: 1,
-            child_list_updates: 1,
-            context_clears: 1,
+            reuses: 2,
+            snapshot_hits: 1,
+            snapshot_text_artifact_replays: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2641,12 +2729,9 @@ fn changed_unmeasured_sibling_remeasures_text_child(cx: &mut TestAppContext) {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
-            creates: 1,
-            removes: 1,
-            child_list_updates: 1,
-            context_clears: 1,
+            reuses: 3,
             style_updates: 1,
+            snapshot_misses: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2712,19 +2797,16 @@ fn changed_unmeasured_sibling_remeasures_nested_text_child(cx: &mut TestAppConte
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            creates: 1,
-            removes: 1,
-            child_list_updates: 1,
-            context_clears: 1,
+            reuses: 4,
             style_updates: 1,
+            snapshot_misses: 1,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[test]
-fn same_text_measure_key_with_changed_taffy_style_builds_fresh_text_node() {
+fn same_text_measure_key_with_changed_taffy_style_reuses_text_node() {
     let key = text_measure_key("hello");
     let mut engine = LayoutEngine::new();
     let text = request_text_measured_with_style(
@@ -2746,13 +2828,12 @@ fn same_text_measure_key_with_changed_taffy_style_builds_fresh_text_node() {
     let second_node = engine.commit_layout(text);
     assert_intent_committed_exactly(&engine, text);
 
-    assert_ne!(second_node, first_node);
+    assert_eq!(second_node, first_node);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            creates: 1,
-            removes: 1,
-            context_clears: 1,
+            reuses: 1,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2840,14 +2921,12 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
         measure_invocations.clone(),
         hydrations.clone(),
     );
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
     engine.finish_frame();
 
     let root = request_text_measured(
@@ -2858,26 +2937,30 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
         hydrations.clone(),
     );
     let checkpoint = engine.checkpoint();
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
     engine.rollback_to_checkpoint(checkpoint);
-    cx.update(|window, app| {
-        engine.compute_layout(
-            root,
-            size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-            window,
-            app,
-        );
-    });
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (3, 3));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 3));
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 0);
+    assert_eq!(engine.retained_mutation_sample_for_tests().snapshot_hits, 1);
+    assert_eq!(
+        engine
+            .retained_mutation_sample_for_tests()
+            .snapshot_text_artifact_replays,
+        1
+    );
 }
 
 #[gpui::test]
@@ -3045,6 +3128,7 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
             creates: 1,
             context_clears: 1,
             removes: 1,
+            snapshot_misses: 1,
             ..RetainedForestMutationSample::default()
         }
     );

@@ -447,6 +447,7 @@ fn work_state_checkpoint_and_finish_return_complete_frame_counts(_cx: &mut TestA
                     child_list_updates: 0,
                     measured_context_clears: 0,
                     removes: removes as u64,
+                    ..RetainedLayoutWork::default()
                 },
                 RetainedLayoutMissWork::default(),
             )

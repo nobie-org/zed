@@ -15,6 +15,7 @@ mod geometry;
 mod measurement;
 mod root_slots;
 mod roots;
+mod snapshots;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod state_tests;
 mod subtree_probe;
@@ -28,7 +29,7 @@ use crate::{
     },
 };
 use bounds_cache::{BoundsCache, BoundsCacheCheckpoint};
-use collections::FxHashSet;
+use collections::{FxHashMap, FxHashSet};
 use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
 use frame::{FrameIntents, FrameIntentsCheckpoint};
 use geometry::{GeometryStore, GeometryStoreCheckpoint};
@@ -39,6 +40,7 @@ use measurement::{
 };
 use root_slots::{RootSlots, RootSlotsCheckpoint};
 use roots::{RootRegistry, RootRegistryCheckpoint};
+use snapshots::{RootSnapshotStore, RootSnapshotStoreCheckpoint};
 use stacksafe::StackSafe;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -137,6 +139,7 @@ struct RetainedLayoutCommit {
 /// Work observed while committing and computing one root layout.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ComputeLayoutWork {
+    pub(super) solver_compute_layout_calls: u64,
     pub(super) measured_layout_calls: u64,
     pub(super) compute_layout_duration: Duration,
     pub(super) measured_layout_duration: Duration,
@@ -229,6 +232,7 @@ pub(super) struct RetainedLayoutForest {
     committed: CommittedLayoutState,
     bounds: BoundsCache,
     root_slots: RootSlots,
+    snapshots: RootSnapshotStore,
     subtree_probe: SubtreeProbe,
     work: RetainedWorkState,
 }
@@ -246,6 +250,7 @@ pub(super) struct RetainedLayoutForestCheckpoint {
     committed: CommittedLayoutCheckpoint,
     bounds: BoundsCacheCheckpoint,
     root_slots: RootSlotsCheckpoint,
+    snapshots: RootSnapshotStoreCheckpoint,
     subtree_probe: SubtreeProbeCheckpoint,
     work: RetainedWorkCheckpoint,
 }
@@ -706,6 +711,7 @@ impl RetainedLayoutForest {
             committed: CommittedLayoutState::new(),
             bounds: BoundsCache::new(),
             root_slots: RootSlots::new(),
+            snapshots: RootSnapshotStore::new(),
             subtree_probe: SubtreeProbe::new(),
             work: RetainedWorkState::new(),
         }
@@ -731,6 +737,7 @@ impl RetainedLayoutForest {
             committed: self.committed.checkpoint(),
             bounds: self.bounds.checkpoint(),
             root_slots: self.root_slots.checkpoint(),
+            snapshots: self.snapshots.checkpoint(),
             subtree_probe: self.subtree_probe.checkpoint(),
             work: self.work.checkpoint(),
         }
@@ -748,6 +755,7 @@ impl RetainedLayoutForest {
         self.bounds.rollback_to_checkpoint(checkpoint.bounds);
         self.root_slots
             .rollback_to_checkpoint(checkpoint.root_slots);
+        self.snapshots.rollback_to_checkpoint(checkpoint.snapshots);
         self.subtree_probe
             .rollback_to_checkpoint(checkpoint.subtree_probe);
         self.work.rollback_to_checkpoint(checkpoint.work);
@@ -779,7 +787,9 @@ impl RetainedLayoutForest {
             self.remove_retained_subtree(retained_root);
         }
 
+        let current_root_ids = self.root_slots.current_root_ids();
         self.root_slots.promote_current_roots();
+        self.snapshots.retain_roots(current_root_ids);
         self.geometry.finish_frame();
         self.frame.clear();
         self.measurements.finish_frame();
@@ -1018,6 +1028,7 @@ impl RetainedLayoutForest {
             "retained layout node should not be computed through multiple roots in one frame"
         );
 
+        let retained_root = self.root_slots.current_root(root_id).clone();
         let taffy_available_space = scale_available_space_for_taffy(available_space, scale_factor);
 
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
@@ -1027,8 +1038,50 @@ impl RetainedLayoutForest {
             );
         }
 
-        let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
         let compute_start = std::time::Instant::now();
+        if let Some(snapshot) =
+            self.snapshots
+                .replay_for(root_id, &retained_root, available_space, scale_factor)
+        {
+            self.geometry.capture_from_snapshot(
+                root_id,
+                node_id,
+                available_space,
+                scale_factor,
+                &snapshot.layouts,
+            );
+            let replayed_text_artifacts = self
+                .measurements
+                .hydrate_text_artifacts(&snapshot.text_artifacts);
+            let compute_layout_duration = compute_start.elapsed();
+            self.work.record_snapshot_hit(replayed_text_artifacts);
+
+            return ComputeLayoutWork {
+                solver_compute_layout_calls: 0,
+                measured_layout_calls: 0,
+                compute_layout_duration,
+                measured_layout_duration: Duration::default(),
+                fresh_layout_comparison: if retained_layout_fresh_compare_enabled() {
+                    let target_layout_ids = retained_layout_trace_layout_ids().map(Vec::as_slice);
+                    Some(self.trace_retained_fresh_layout_comparison(
+                        id,
+                        node_id,
+                        taffy_available_space,
+                        scale_factor,
+                        window,
+                        cx,
+                        target_layout_ids,
+                    ))
+                } else {
+                    None
+                },
+            };
+        }
+
+        self.work.record_snapshot_miss();
+        self.dirty_retained_text_layout_slots(&retained_root);
+
+        let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
             node_id,
             taffy_available_space,
@@ -1063,7 +1116,19 @@ impl RetainedLayoutForest {
             );
         }
 
+        let snapshot_layouts = self.snapshot_layouts_for_occurrence(&retained_root);
+        let text_artifacts = self.measurements.current_text_artifacts();
+        self.snapshots.store(
+            root_id,
+            &retained_root,
+            available_space,
+            scale_factor,
+            snapshot_layouts,
+            text_artifacts,
+        );
+
         let work = ComputeLayoutWork {
+            solver_compute_layout_calls: 1,
             measured_layout_calls,
             compute_layout_duration,
             measured_layout_duration,
@@ -2348,6 +2413,9 @@ impl RetainedLayoutForest {
                 Some(MeasuredLayoutKind::PureSize(previous)),
                 MeasuredLayoutKind::PureSize(current),
             ) => previous == current,
+            (Some(MeasuredLayoutKind::Text(previous)), MeasuredLayoutKind::Text(current)) => {
+                previous == current
+            }
             _ => false,
         }
     }
@@ -2474,6 +2542,49 @@ impl RetainedLayoutForest {
             .expect(EXPECT_MESSAGE);
         for child in &retained_node.children {
             self.dirty_retained_layout_slots(child);
+        }
+    }
+
+    /// Dirty retained text nodes before a snapshot miss compute.
+    ///
+    /// Text callbacks hydrate GPUI paint/hit-test artifacts. If an exact root
+    /// snapshot is unavailable, reused text nodes must be forced through the
+    /// stock Taffy measurement path instead of relying on an internal cache hit
+    /// that may skip the callback.
+    fn dirty_retained_text_layout_slots(&mut self, retained_node: &RetainedLayoutOccurrence) {
+        if matches!(
+            retained_node.facts.measured_kind.as_ref(),
+            Some(MeasuredLayoutKind::Text(_))
+        ) {
+            self.taffy
+                .mark_dirty(retained_node.node_id)
+                .expect(EXPECT_MESSAGE);
+        }
+        for child in &retained_node.children {
+            self.dirty_retained_text_layout_slots(child);
+        }
+    }
+
+    fn snapshot_layouts_for_occurrence(
+        &self,
+        retained_node: &RetainedLayoutOccurrence,
+    ) -> FxHashMap<NodeId, Layout> {
+        let mut layouts = FxHashMap::default();
+        self.collect_snapshot_layouts(retained_node, &mut layouts);
+        layouts
+    }
+
+    fn collect_snapshot_layouts(
+        &self,
+        retained_node: &RetainedLayoutOccurrence,
+        layouts: &mut FxHashMap<NodeId, Layout>,
+    ) {
+        layouts.insert(
+            retained_node.node_id,
+            self.geometry_layout(retained_node.node_id),
+        );
+        for child in &retained_node.children {
+            self.collect_snapshot_layouts(child, layouts);
         }
     }
 

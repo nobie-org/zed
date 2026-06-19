@@ -21,6 +21,8 @@ pub struct LayoutWorkSample {
     pub child_edges: u64,
     /// Root layout computations requested for the draw.
     pub compute_layout_calls: u64,
+    /// Root layout computations that invoked the private Taffy solver.
+    pub solver_compute_layout_calls: u64,
     /// Measured layout callbacks invoked by the retained layout engine.
     pub measured_layout_calls: u64,
     /// Wall time spent computing root layouts.
@@ -39,6 +41,12 @@ pub struct LayoutWorkSample {
     pub retained_layout_measured_context_clears: u64,
     /// Retained layout occurrences removed while sweeping old subtrees.
     pub retained_layout_removes: u64,
+    /// Legal root layouts published from an exact GPUI-owned snapshot.
+    pub retained_layout_snapshot_hits: u64,
+    /// Legal root layouts that missed the exact snapshot path and invoked Taffy.
+    pub retained_layout_snapshot_misses: u64,
+    /// Text artifacts replayed from exact root snapshots into current hydrators.
+    pub retained_layout_snapshot_text_artifact_replays: u64,
     /// Retained occurrence matches missed because no previous occurrence was available.
     pub retained_layout_miss_no_previous: u64,
     /// Retained occurrence matches missed because style changed.
@@ -77,6 +85,9 @@ impl LayoutWorkSample {
         self.retained_layout_child_list_updates = work.child_list_updates;
         self.retained_layout_measured_context_clears = work.measured_context_clears;
         self.retained_layout_removes = work.removes;
+        self.retained_layout_snapshot_hits = work.snapshot_hits;
+        self.retained_layout_snapshot_misses = work.snapshot_misses;
+        self.retained_layout_snapshot_text_artifact_replays = work.snapshot_text_artifact_replays;
         self.retained_layout_miss_no_previous = misses.no_previous;
         self.retained_layout_miss_style = misses.style;
         self.retained_layout_miss_kind = misses.kind;

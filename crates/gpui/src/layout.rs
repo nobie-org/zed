@@ -343,6 +343,7 @@ impl LayoutEngine {
         let compute_work =
             self.forest
                 .compute_layout(root_id, id, available_space, scale_factor, window, cx);
+        self.layout_work.solver_compute_layout_calls += compute_work.solver_compute_layout_calls;
         self.layout_work.compute_layout_duration += compute_work.compute_layout_duration;
         self.layout_work.measured_layout_calls += compute_work.measured_layout_calls;
         self.layout_work.measured_layout_duration += compute_work.measured_layout_duration;

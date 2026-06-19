@@ -79,10 +79,12 @@ fn layout_work_sample_counts_compute_and_measure() {
             measured_layout_node_requests: 1,
             child_edges: 0,
             compute_layout_calls: 1,
+            solver_compute_layout_calls: 1,
             measured_layout_calls: 1,
             compute_layout_duration: sample.compute_layout_duration,
             measured_layout_duration: sample.measured_layout_duration,
             retained_layout_creates: 1,
+            retained_layout_snapshot_misses: 1,
             retained_layout_miss_no_previous: 1,
             ..LayoutWorkSample::default()
         }

@@ -252,12 +252,14 @@ pub(super) enum MeasurementCallbackKind {
 pub(super) struct MeasurementStore {
     producer_contexts: Vec<Option<LayoutMeasureContext>>,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
+    current_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
 }
 
 /// Transaction checkpoint for current-frame measurement producers and mappings.
 pub(super) struct MeasurementStoreCheckpoint {
     producer_contexts_len: usize,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
+    current_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
 }
 
 impl MeasurementStore {
@@ -265,22 +267,26 @@ impl MeasurementStore {
         Self {
             producer_contexts: Vec::new(),
             current_measurements: FxHashMap::default(),
+            current_text_artifacts: FxHashMap::default(),
         }
     }
 
     pub(super) fn begin_frame(&mut self) {
         self.current_measurements.clear();
+        self.current_text_artifacts.clear();
     }
 
     pub(super) fn finish_frame(&mut self) {
         self.producer_contexts.clear();
         self.current_measurements.clear();
+        self.current_text_artifacts.clear();
     }
 
     pub(super) fn checkpoint(&self) -> MeasurementStoreCheckpoint {
         MeasurementStoreCheckpoint {
             producer_contexts_len: self.producer_contexts.len(),
             current_measurements: self.current_measurements.clone(),
+            current_text_artifacts: self.current_text_artifacts.clone(),
         }
     }
 
@@ -288,6 +294,7 @@ impl MeasurementStore {
         self.producer_contexts
             .truncate(checkpoint.producer_contexts_len);
         self.current_measurements = checkpoint.current_measurements;
+        self.current_text_artifacts = checkpoint.current_text_artifacts;
     }
 
     pub(super) fn push_producer_context(&mut self, measure_context: LayoutMeasureContext) -> usize {
@@ -313,7 +320,42 @@ impl MeasurementStore {
     }
 
     pub(super) fn compute_state(&mut self) -> ComputeMeasurementState<'_> {
-        ComputeMeasurementState::new(&mut self.producer_contexts, &mut self.current_measurements)
+        ComputeMeasurementState::new(
+            &mut self.producer_contexts,
+            &mut self.current_measurements,
+            &mut self.current_text_artifacts,
+        )
+    }
+
+    pub(super) fn current_text_artifacts(&self) -> FxHashMap<NodeId, TextLayoutArtifact> {
+        self.current_text_artifacts.clone()
+    }
+
+    pub(super) fn hydrate_text_artifacts(
+        &self,
+        artifacts: &FxHashMap<NodeId, TextLayoutArtifact>,
+    ) -> u64 {
+        let mut hydrated = 0;
+        for (node_id, artifact) in artifacts {
+            let Some(CurrentMeasurement::Text { key, measure }) =
+                self.current_measurements.get(node_id)
+            else {
+                panic!("snapshot text artifact should correspond to a current text measured node");
+            };
+            assert_eq!(
+                artifact.key(),
+                key,
+                "snapshot text artifact should match the current text measure key"
+            );
+            let hydrate = self.producer_contexts[*measure]
+                .as_ref()
+                .and_then(|measure| measure.text_hydrator.as_ref())
+                .map(Rc::clone)
+                .expect("text measured layout should have a current hydrator");
+            hydrate(artifact);
+            hydrated += 1;
+        }
+        hydrated
     }
 }
 
@@ -327,16 +369,19 @@ impl MeasurementStore {
 pub(super) struct ComputeMeasurementState<'a> {
     producer_contexts: &'a mut Vec<Option<LayoutMeasureContext>>,
     current_measurements: &'a mut FxHashMap<NodeId, CurrentMeasurement>,
+    current_text_artifacts: &'a mut FxHashMap<NodeId, TextLayoutArtifact>,
 }
 
 impl<'a> ComputeMeasurementState<'a> {
     pub(super) fn new(
         producer_contexts: &'a mut Vec<Option<LayoutMeasureContext>>,
         current_measurements: &'a mut FxHashMap<NodeId, CurrentMeasurement>,
+        current_text_artifacts: &'a mut FxHashMap<NodeId, TextLayoutArtifact>,
     ) -> Self {
         Self {
             producer_contexts,
             current_measurements,
+            current_text_artifacts,
         }
     }
 
@@ -397,6 +442,7 @@ impl<'a> ComputeMeasurementState<'a> {
                 );
                 let size = artifact.size();
                 self.hydrate_text_node(node_id, &artifact);
+                self.current_text_artifacts.insert(node_id, artifact);
                 size
             }
         }

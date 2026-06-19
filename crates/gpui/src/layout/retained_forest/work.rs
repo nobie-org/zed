@@ -13,6 +13,9 @@ pub(in crate::layout) struct RetainedLayoutWork {
     pub(in crate::layout) child_list_updates: u64,
     pub(in crate::layout) measured_context_clears: u64,
     pub(in crate::layout) removes: u64,
+    pub(in crate::layout) snapshot_hits: u64,
+    pub(in crate::layout) snapshot_misses: u64,
+    pub(in crate::layout) snapshot_text_artifact_replays: u64,
 }
 
 /// Counts why a retained occurrence could not be reused.
@@ -36,6 +39,9 @@ pub(in crate::layout) struct RetainedForestMutationSample {
     pub(in crate::layout) child_list_updates: u64,
     pub(in crate::layout) context_clears: u64,
     pub(in crate::layout) removes: u64,
+    pub(in crate::layout) snapshot_hits: u64,
+    pub(in crate::layout) snapshot_misses: u64,
+    pub(in crate::layout) snapshot_text_artifact_replays: u64,
 }
 
 /// Mutable retained-layout accounting for the current frame.
@@ -138,6 +144,10 @@ impl RetainedWorkState {
                 measured_context_clears: self.work.measured_context_clears
                     - snapshot.work.measured_context_clears,
                 removes: self.work.removes - snapshot.work.removes,
+                snapshot_hits: self.work.snapshot_hits - snapshot.work.snapshot_hits,
+                snapshot_misses: self.work.snapshot_misses - snapshot.work.snapshot_misses,
+                snapshot_text_artifact_replays: self.work.snapshot_text_artifact_replays
+                    - snapshot.work.snapshot_text_artifact_replays,
             },
             miss_work: RetainedLayoutMissWork {
                 no_previous: self.miss_work.no_previous - snapshot.miss_work.no_previous,
@@ -214,6 +224,25 @@ impl RetainedWorkState {
         #[cfg(test)]
         {
             self.mutation_sample_for_tests.removes += 1;
+        }
+    }
+
+    pub(super) fn record_snapshot_hit(&mut self, text_artifact_replays: u64) {
+        self.work.snapshot_hits += 1;
+        self.work.snapshot_text_artifact_replays += text_artifact_replays;
+        #[cfg(test)]
+        {
+            self.mutation_sample_for_tests.snapshot_hits += 1;
+            self.mutation_sample_for_tests
+                .snapshot_text_artifact_replays += text_artifact_replays;
+        }
+    }
+
+    pub(super) fn record_snapshot_miss(&mut self) {
+        self.work.snapshot_misses += 1;
+        #[cfg(test)]
+        {
+            self.mutation_sample_for_tests.snapshot_misses += 1;
         }
     }
 

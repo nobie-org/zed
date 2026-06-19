@@ -125,6 +125,32 @@ impl GeometryStore {
         }
     }
 
+    pub(super) fn capture_from_snapshot(
+        &mut self,
+        root_id: RetainedLayoutRootId,
+        root_node: NodeId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        layouts: &FxHashMap<NodeId, Layout>,
+    ) {
+        let solved_root = SolvedRoot::new(root_node, available_space, scale_factor);
+        if let Some(previous) = self.solved_roots.insert(root_id, solved_root) {
+            assert_eq!(
+                previous, solved_root,
+                "retained layout root should be solved at most once per frame"
+            );
+            return;
+        }
+
+        assert!(
+            layouts.contains_key(&root_node),
+            "snapshot geometry should include the retained root node"
+        );
+        for (node_id, layout) in layouts {
+            self.current_layouts.insert(*node_id, layout.clone());
+        }
+    }
+
     pub(super) fn layout(&self, node_id: NodeId) -> Option<Layout> {
         self.current_layouts.get(&node_id).cloned()
     }

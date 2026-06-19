@@ -59,6 +59,16 @@ impl RootSlots {
         self.current_roots.contains_key(&root_id)
     }
 
+    pub(super) fn current_root(&self, root_id: RetainedLayoutRootId) -> &RetainedLayoutOccurrence {
+        self.current_roots
+            .get(&root_id)
+            .expect("retained root should be current after commit")
+    }
+
+    pub(super) fn current_root_ids(&self) -> Vec<RetainedLayoutRootId> {
+        self.current_roots.keys().copied().collect()
+    }
+
     pub(super) fn take_retained_root(
         &mut self,
         root_id: RetainedLayoutRootId,

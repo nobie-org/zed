@@ -78,7 +78,6 @@ fn select_emoji_font(
 }
 
 const SMOOTH_SVG_SCALE: usize = 2;
-const SVG_ALPHA_MASK_SCALE: usize = 8;
 
 /// When rendering SVGs, we supersample them before uploading or displaying the result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = SMOOTH_SVG_SCALE as f32;
@@ -264,7 +263,7 @@ impl SvgRenderer {
 }
 
 fn supersampled_size(size: Size<DevicePixels>) -> Size<DevicePixels> {
-    size.map(|value| DevicePixels(value.0 * SVG_ALPHA_MASK_SCALE as i32))
+    size.map(|value| DevicePixels(value.0 * SMOOTH_SVG_SCALE as i32))
 }
 
 fn downsample_alpha_mask(pixmap: &Pixmap, size: Size<DevicePixels>) -> Vec<u8> {
@@ -272,18 +271,18 @@ fn downsample_alpha_mask(pixmap: &Pixmap, size: Size<DevicePixels>) -> Vec<u8> {
     let height = size.height.0 as usize;
     let source_width = pixmap.width() as usize;
     let pixels = pixmap.pixels();
-    let samples = (SVG_ALPHA_MASK_SCALE * SVG_ALPHA_MASK_SCALE) as u32;
+    let samples = (SMOOTH_SVG_SCALE * SMOOTH_SVG_SCALE) as u32;
     let rounding = samples / 2;
 
     let mut alpha_mask = Vec::with_capacity(width * height);
     for y in 0..height {
         for x in 0..width {
             let mut alpha = 0u32;
-            for sample_y in 0..SVG_ALPHA_MASK_SCALE {
-                let source_y = y * SVG_ALPHA_MASK_SCALE + sample_y;
+            for sample_y in 0..SMOOTH_SVG_SCALE {
+                let source_y = y * SMOOTH_SVG_SCALE + sample_y;
                 let row_start = source_y * source_width;
-                for sample_x in 0..SVG_ALPHA_MASK_SCALE {
-                    let source_x = x * SVG_ALPHA_MASK_SCALE + sample_x;
+                for sample_x in 0..SMOOTH_SVG_SCALE {
+                    let source_x = x * SMOOTH_SVG_SCALE + sample_x;
                     alpha += pixels[row_start + source_x].alpha() as u32;
                 }
             }
@@ -390,7 +389,7 @@ mod tests {
 
     #[test]
     fn downsample_alpha_mask_averages_supersample_blocks() {
-        let scale = SVG_ALPHA_MASK_SCALE;
+        let scale = SMOOTH_SVG_SCALE;
         let mut pixmap = Pixmap::new((2 * scale) as u32, (2 * scale) as u32).unwrap();
         let block_bases = [[0, 10], [100, 110]];
 

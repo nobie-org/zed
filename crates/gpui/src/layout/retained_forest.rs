@@ -1067,6 +1067,7 @@ impl RetainedLayoutForest {
                 |node_id| taffy.children(node_id).expect(EXPECT_MESSAGE),
             );
         }
+        self.measurements.hydrate_registered_text_artifact_replays();
 
         if retained_layout_detail_trace_enabled() && trace_layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -2162,8 +2163,19 @@ impl RetainedLayoutForest {
                 .any(|(index, child_node_id)| {
                     *child_node_id != previous_child_node_ids.get(index).copied()
                 });
-        let child_layout_context_changed =
-            parent_layout_context_changed || style_changed || child_list_will_change;
+        let child_subtree_layout_context_will_change =
+            children.iter().enumerate().any(|(index, child)| {
+                match exact_previous_children[index].as_ref() {
+                    Some(previous_child) => {
+                        self.retained_occurrence_will_change_layout_context(*child, previous_child)
+                    }
+                    None => true,
+                }
+            });
+        let child_layout_context_changed = parent_layout_context_changed
+            || style_changed
+            || child_list_will_change
+            || child_subtree_layout_context_will_change;
 
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
@@ -2360,18 +2372,13 @@ impl RetainedLayoutForest {
 
         let style_changed = previous_style != style;
         let measured_kind_changed = previous_measured_kind.as_ref() != Some(&measured_kind);
-        let text_measurement_needs_hydration =
-            matches!(&measured_kind, MeasuredLayoutKind::Text(_));
         if style_changed {
             self.taffy
                 .set_style(node_id, style.clone())
                 .expect(EXPECT_MESSAGE);
             self.work.record_style_update();
         }
-        if measured_kind_changed
-            || text_measurement_needs_hydration
-            || parent_layout_context_changed
-        {
+        if measured_kind_changed || parent_layout_context_changed {
             self.mark_taffy_node_dirty(node_id);
         }
 
@@ -2379,6 +2386,12 @@ impl RetainedLayoutForest {
             node_id,
             Self::current_measurement(measured_kind.clone(), measure),
         );
+        if !style_changed && !measured_kind_changed && !parent_layout_context_changed {
+            if let MeasuredLayoutKind::Text(measure_key) = &measured_kind {
+                self.measurements
+                    .register_unchanged_text_artifact_replay(node_id, measure_key);
+            }
+        }
 
         let retained_node = RetainedLayoutOccurrence {
             node_id,
@@ -2395,6 +2408,38 @@ impl RetainedLayoutForest {
         RetainedLayoutCommit {
             occurrence: retained_node,
             layout_context_changed,
+        }
+    }
+
+    /// Return whether committing this occurrence may change the layout question seen by siblings.
+    ///
+    /// Parent algorithms can ask siblings sizing questions before final layout.
+    /// If one child will change, exact siblings need a refreshed Taffy cache path
+    /// so stock Taffy publishes descendant geometry for the current solve rather
+    /// than leaving slots from an earlier sizing probe.
+    fn retained_occurrence_will_change_layout_context(
+        &self,
+        id: LayoutId,
+        previous: &RetainedLayoutOccurrence,
+    ) -> bool {
+        let intent = self.intent(id);
+        if previous.facts.style != intent.style {
+            return true;
+        }
+
+        match &intent.kind {
+            LayoutIntentKind::Unmeasured { .. } => {
+                !self.retained_occurrence_matches_intent(id, previous)
+            }
+            LayoutIntentKind::Measured { measured_kind, .. } => {
+                previous.facts.kind != RetainedLayoutKind::Measured
+                    || !previous.children.is_empty()
+                    || !Self::measured_kinds_compatible(
+                        previous.facts.measured_kind.as_ref(),
+                        measured_kind,
+                    )
+                    || previous.facts.measured_kind.as_ref() != Some(measured_kind)
+            }
         }
     }
 

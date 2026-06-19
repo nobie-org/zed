@@ -255,6 +255,8 @@ pub(super) struct MeasurementStore {
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
     current_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
     current_text_artifact_queries: FxHashSet<TextArtifactCacheKey>,
+    current_text_artifact_replays: FxHashMap<NodeId, TextMeasureKey>,
+    retained_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
     text_artifact_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
 }
 
@@ -264,6 +266,8 @@ pub(super) struct MeasurementStoreCheckpoint {
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
     current_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
     current_text_artifact_queries: FxHashSet<TextArtifactCacheKey>,
+    current_text_artifact_replays: FxHashMap<NodeId, TextMeasureKey>,
+    retained_text_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
     text_artifact_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
 }
 
@@ -274,6 +278,8 @@ impl MeasurementStore {
             current_measurements: FxHashMap::default(),
             current_text_artifacts: FxHashMap::default(),
             current_text_artifact_queries: FxHashSet::default(),
+            current_text_artifact_replays: FxHashMap::default(),
+            retained_text_artifacts: FxHashMap::default(),
             text_artifact_cache: FxHashMap::default(),
         }
     }
@@ -282,14 +288,17 @@ impl MeasurementStore {
         self.current_measurements.clear();
         self.current_text_artifacts.clear();
         self.current_text_artifact_queries.clear();
+        self.current_text_artifact_replays.clear();
     }
 
     pub(super) fn finish_frame(&mut self) {
         self.retain_current_text_artifacts();
+        self.retain_current_text_artifacts_by_node();
         self.producer_contexts.clear();
         self.current_measurements.clear();
         self.current_text_artifacts.clear();
         self.current_text_artifact_queries.clear();
+        self.current_text_artifact_replays.clear();
     }
 
     pub(super) fn checkpoint(&self) -> MeasurementStoreCheckpoint {
@@ -298,6 +307,8 @@ impl MeasurementStore {
             current_measurements: self.current_measurements.clone(),
             current_text_artifacts: self.current_text_artifacts.clone(),
             current_text_artifact_queries: self.current_text_artifact_queries.clone(),
+            current_text_artifact_replays: self.current_text_artifact_replays.clone(),
+            retained_text_artifacts: self.retained_text_artifacts.clone(),
             text_artifact_cache: self.text_artifact_cache.clone(),
         }
     }
@@ -308,6 +319,8 @@ impl MeasurementStore {
         self.current_measurements = checkpoint.current_measurements;
         self.current_text_artifacts = checkpoint.current_text_artifacts;
         self.current_text_artifact_queries = checkpoint.current_text_artifact_queries;
+        self.current_text_artifact_replays = checkpoint.current_text_artifact_replays;
+        self.retained_text_artifacts = checkpoint.retained_text_artifacts;
         self.text_artifact_cache = checkpoint.text_artifact_cache;
     }
 
@@ -333,6 +346,48 @@ impl MeasurementStore {
         self.current_measurements.get(&node_id)
     }
 
+    /// Register that an unchanged text node may replay its previous artifact after the solve.
+    ///
+    /// The caller may only register a retained text node when the retained
+    /// occurrence, text key, style, and incoming layout context are unchanged.
+    /// This does not hydrate during commit: commit only records the current
+    /// retained-tree fact. After stock Taffy solves, GPUI replays the artifact only
+    /// if Taffy skipped the text callback and therefore did not already produce a
+    /// current artifact.
+    pub(super) fn register_unchanged_text_artifact_replay(
+        &mut self,
+        node_id: NodeId,
+        expected_key: &TextMeasureKey,
+    ) {
+        self.current_text_artifact_replays
+            .insert(node_id, expected_key.clone());
+    }
+
+    /// Hydrate text nodes whose retained artifact remains valid after a solve.
+    ///
+    /// Taffy may or may not invoke a measured callback. GPUI therefore performs
+    /// text artifact hydration as a forest-owned post-solve step. Nodes that
+    /// Taffy measured already have `current_text_artifacts`; unchanged retained
+    /// nodes that Taffy skipped are hydrated here from the previous frame.
+    pub(super) fn hydrate_registered_text_artifact_replays(&mut self) {
+        let replay_candidates = std::mem::take(&mut self.current_text_artifact_replays);
+        for (node_id, expected_key) in replay_candidates {
+            if self.current_text_artifacts.contains_key(&node_id) {
+                continue;
+            }
+            let Some(artifact) = self.retained_text_artifacts.get(&node_id).cloned() else {
+                continue;
+            };
+            assert_eq!(
+                artifact.key(),
+                &expected_key,
+                "retained text artifact should match the current text measure key"
+            );
+            self.hydrate_text_node(node_id, &artifact);
+            self.current_text_artifacts.insert(node_id, artifact);
+        }
+    }
+
     pub(super) fn compute_state(&mut self) -> ComputeMeasurementState<'_> {
         ComputeMeasurementState::new(
             &mut self.producer_contexts,
@@ -347,6 +402,41 @@ impl MeasurementStore {
         let current_text_artifact_queries = &self.current_text_artifact_queries;
         self.text_artifact_cache
             .retain(|artifact_key, _| current_text_artifact_queries.contains(artifact_key));
+    }
+
+    fn retain_current_text_artifacts_by_node(&mut self) {
+        let current_text_nodes = self
+            .current_measurements
+            .iter()
+            .filter_map(|(node_id, measurement)| {
+                matches!(measurement, CurrentMeasurement::Text { .. }).then_some(*node_id)
+            })
+            .collect::<FxHashSet<_>>();
+        self.retained_text_artifacts
+            .retain(|node_id, _| current_text_nodes.contains(node_id));
+        for (node_id, artifact) in &self.current_text_artifacts {
+            self.retained_text_artifacts
+                .insert(*node_id, artifact.clone());
+        }
+    }
+
+    fn hydrate_text_node(&mut self, node_id: NodeId, artifact: &TextLayoutArtifact) {
+        let Some(CurrentMeasurement::Text { key, measure }) =
+            self.current_measurements.get_mut(&node_id)
+        else {
+            return;
+        };
+        assert_eq!(
+            artifact.key(),
+            key,
+            "hydrated text artifact should match the current text measure key"
+        );
+        let hydrate = self.producer_contexts[*measure]
+            .as_ref()
+            .and_then(|measure| measure.text_hydrator.as_ref())
+            .map(Rc::clone)
+            .expect("text measured layout should have a hydrator");
+        hydrate(artifact);
     }
 }
 

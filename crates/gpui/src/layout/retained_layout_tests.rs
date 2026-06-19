@@ -803,14 +803,6 @@ impl GeneratedTree {
         }
     }
 
-    fn text_count(&self) -> u64 {
-        match self {
-            Self::Unmeasured { children, .. } => children.iter().map(Self::text_count).sum(),
-            Self::Text { .. } => 1,
-            Self::PureSize { .. } | Self::Opaque { .. } => 0,
-        }
-    }
-
     fn retained_occurrence_matches_intent(&self, current: &Self) -> bool {
         match (self, current) {
             (
@@ -1230,10 +1222,6 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
             (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
             | (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => {
                 self.reuses += 1;
-                let text_measurement_needs_hydration = matches!(
-                    (previous, current),
-                    (GeneratedTree::Text { .. }, GeneratedTree::Text { .. })
-                );
                 let measured_kind_changed = match (previous, current) {
                     (
                         GeneratedTree::PureSize {
@@ -1245,13 +1233,25 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                             height: current_height,
                         },
                     ) => previous_width != current_width || previous_height != current_height,
-                    (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => true,
+                    (
+                        GeneratedTree::Text {
+                            key_index: previous_key,
+                            width: previous_width,
+                            height: previous_height,
+                        },
+                        GeneratedTree::Text {
+                            key_index: current_key,
+                            width: current_width,
+                            height: current_height,
+                        },
+                    ) => {
+                        previous_key != current_key
+                            || previous_width != current_width
+                            || previous_height != current_height
+                    }
                     _ => false,
                 };
-                if parent_layout_context_changed
-                    || measured_kind_changed
-                    || text_measurement_needs_hydration
-                {
+                if parent_layout_context_changed || measured_kind_changed {
                     self.dirty_marks += 1;
                 }
                 ExpectedCommitResult {
@@ -1288,7 +1288,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
         self.dirty_marks += if parent_layout_context_changed {
             current.node_count()
         } else {
-            current.text_count()
+            0
         };
         ExpectedCommitResult {
             retained_same_node: true,
@@ -1801,7 +1801,7 @@ fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext
         compute_generated_text_root(cx, &mut engine, root, width);
 
         assert_eq!(measure_invocations.get(), 1);
-        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
         assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
@@ -2072,7 +2072,7 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
         compute_generated_text_root(cx, &mut engine, repeat_root, width);
 
         assert_eq!(measure_invocations.get(), 2);
-        assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+        assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
         assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
         assert_eq!(
             hydrated_artifacts.borrow().as_slice(),
@@ -2169,7 +2169,7 @@ fn changed_unmeasured_child_reuses_position_and_updates_style() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 1,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2279,7 +2279,7 @@ fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
         RetainedForestMutationSample {
             reuses: 5,
             style_updates: 1,
-            dirty_marks: 2,
+            dirty_marks: 5,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2485,7 +2485,7 @@ fn compatible_same_position_child_change_dirties_parent_and_matches_fresh_layout
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 1,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2539,7 +2539,7 @@ fn same_position_exact_child_is_not_stolen_by_changed_equal_sibling() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 1,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2736,7 +2736,7 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 1,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -2981,7 +2981,7 @@ fn unchanged_text_measure_hydrates_from_query_cache(cx: &mut TestAppContext) {
     );
 
     assert_eq!((measure_invocations.get(), hydrations.get()), (1, 2));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
 }
 
@@ -3029,13 +3029,12 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
 
     assert_intent_committed_exactly(&engine, root);
     assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 2,
-            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3096,7 +3095,7 @@ fn changed_unmeasured_sibling_hydrates_stable_text_from_query_cache(cx: &mut Tes
         RetainedForestMutationSample {
             reuses: 3,
             style_updates: 1,
-            dirty_marks: 2,
+            dirty_marks: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3166,7 +3165,7 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_from_query_cache(
         RetainedForestMutationSample {
             reuses: 4,
             style_updates: 1,
-            dirty_marks: 2,
+            dirty_marks: 4,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3254,7 +3253,7 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 4,
-            dirty_marks: 3,
+            dirty_marks: 4,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3289,7 +3288,6 @@ fn same_text_measure_key_with_changed_taffy_style_reuses_text_node() {
         RetainedForestMutationSample {
             reuses: 1,
             style_updates: 1,
-            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3408,7 +3406,7 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
     );
 
     assert_eq!((measure_invocations.get(), hydrations.get()), (1, 3));
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
 }
 
@@ -3999,7 +3997,7 @@ fn changed_flex_ancestor_updates_canvas_subtree_and_matches_fresh_layout() {
         RetainedForestMutationSample {
             reuses: 7,
             style_updates: 1,
-            dirty_marks: 2,
+            dirty_marks: 7,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4140,7 +4138,7 @@ fn reused_canvas_panel_inside_chrome_shell_after_sidebar_resize_matches_fresh_la
         RetainedForestMutationSample {
             reuses: 14,
             style_updates: 1,
-            dirty_marks: 5,
+            dirty_marks: 14,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4211,6 +4209,124 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
             reuses: 14,
             style_updates: 1,
             dirty_marks: 14,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+}
+
+#[gpui::test]
+fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut TestAppContext) {
+    fn request_frame(
+        engine: &mut LayoutEngine,
+        measure_invocations: Rc<Cell<usize>>,
+        hydrations: Rc<Cell<usize>>,
+    ) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
+        request_canvas_like_chrome_frame_with_sidebar(engine, |engine| {
+            let text = request_text_measured(
+                engine,
+                text_measure_key("debug text"),
+                size(px(120.0), px(20.0)),
+                measure_invocations,
+                hydrations,
+            );
+
+            let mut style = Style::default();
+            style.display = Display::Block;
+            style.size.width =
+                Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(480.0))));
+            style.size.height = Length::Definite(DefiniteLength::Fraction(1.0));
+            engine.request_layout(style, px(16.0), 1.0, &[text])
+        })
+    }
+
+    let cx = cx.add_empty_window();
+    let mut retained = LayoutEngine::new();
+    let measure_invocations = Rc::new(Cell::new(0));
+    let hydrations = Rc::new(Cell::new(0));
+    let (root, _panel, _flex_child, _canvas_host, _canvas) = request_frame(
+        &mut retained,
+        measure_invocations.clone(),
+        hydrations.clone(),
+    );
+    compute_stable_test_root(
+        cx,
+        &mut retained,
+        root,
+        size(
+            AvailableSpace::Definite(px(2200.0)),
+            AvailableSpace::Definite(px(1520.0)),
+        ),
+    );
+    retained.finish_frame();
+
+    measure_invocations.set(0);
+    hydrations.set(0);
+    retained.reset_retained_mutation_sample_for_tests();
+    let (root, panel, flex_child, canvas_host, canvas) = request_frame(
+        &mut retained,
+        measure_invocations.clone(),
+        hydrations.clone(),
+    );
+    compute_stable_test_root(
+        cx,
+        &mut retained,
+        root,
+        size(
+            AvailableSpace::Definite(px(2200.0)),
+            AvailableSpace::Definite(px(1520.0)),
+        ),
+    );
+    let retained_root = retained.retained_node_token_for_tests(root);
+    let retained_panel = retained.retained_node_token_for_tests(panel);
+    let retained_flex_child = retained.retained_node_token_for_tests(flex_child);
+    let retained_canvas_host = retained.retained_node_token_for_tests(canvas_host);
+    let retained_canvas = retained.retained_node_token_for_tests(canvas);
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_measure_invocations = Rc::new(Cell::new(0));
+    let fresh_hydrations = Rc::new(Cell::new(0));
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_frame(&mut fresh, fresh_measure_invocations, fresh_hydrations);
+    compute_stable_test_root(
+        cx,
+        &mut fresh,
+        root,
+        size(
+            AvailableSpace::Definite(px(2200.0)),
+            AvailableSpace::Definite(px(1520.0)),
+        ),
+    );
+    let fresh_root = fresh.retained_node_token_for_tests(root);
+    let fresh_panel = fresh.retained_node_token_for_tests(panel);
+    let fresh_flex_child = fresh.retained_node_token_for_tests(flex_child);
+    let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
+    let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
+
+    assert_intent_committed_exactly(&retained, root);
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root),
+        retained_layout_projection(&fresh, fresh_root)
+    );
+    assert_eq!(
+        (
+            retained_node_size(&retained, retained_panel),
+            retained_node_size(&retained, retained_flex_child),
+            retained_node_size(&retained, retained_canvas_host),
+            retained_node_size(&retained, retained_canvas),
+        ),
+        (
+            retained_node_size(&fresh, fresh_panel),
+            retained_node_size(&fresh, fresh_flex_child),
+            retained_node_size(&fresh, fresh_canvas_host),
+            retained_node_size(&fresh, fresh_canvas),
+        )
+    );
+    assert!(retained_node_size(&retained, retained_canvas).height > 0.0);
+    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 15,
             ..RetainedForestMutationSample::default()
         }
     );

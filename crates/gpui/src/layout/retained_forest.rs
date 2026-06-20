@@ -391,10 +391,6 @@ impl RetainedLayoutForest {
         self.geometry.layout(node_id)
     }
 
-    fn try_solver_layout(&self, node_id: SolverNodeId) -> Option<SolverLayout> {
-        self.solver.layout(node_id)
-    }
-
     fn try_style(&self, node_id: SolverNodeId) -> Option<SolverStyle> {
         self.solver.style(node_id)
     }
@@ -475,8 +471,7 @@ impl RetainedLayoutForest {
                 node_id,
                 available_space,
                 scale_factor,
-                |node_id| solver.layout(node_id).expect(EXPECT_MESSAGE),
-                |node_id| solver.children(node_id),
+                solver.capture_layout_tree(node_id),
             );
         }
         self.measurements
@@ -484,10 +479,9 @@ impl RetainedLayoutForest {
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
-            let solver_layout = self.try_solver_layout(node_id);
             eprintln!(
-                "gpui retained_layout compute_finish layout_id={} node_id={:?} root_layout={:?} solver_layout={:?}",
-                id.0, node_id, layout, solver_layout
+                "gpui retained_layout compute_finish layout_id={} node_id={:?} root_layout={:?}",
+                id.0, node_id, layout
             );
         }
 
@@ -523,22 +517,13 @@ impl RetainedLayoutForest {
             trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0));
         if has_zero_size && (trace_targeted_zero_bounds || trace::should_trace_zero_bounds()) {
             let layout = self.try_geometry_layout(node_id);
-            let solver_layout = self.try_solver_layout(node_id);
             let parent = self.parent(node_id);
             let parent_layout = parent.and_then(|parent| self.try_geometry_layout(parent));
             let children = self.children(node_id);
             let style = self.try_style(node_id);
             eprintln!(
-                "gpui retained_layout zero_bounds layout_id={} node_id={:?} bounds={:?} geometry_layout={:?} solver_layout={:?} parent={:?} parent_geometry_layout={:?} children={:?} style={:?}",
-                id.0,
-                node_id,
-                bounds,
-                layout,
-                solver_layout,
-                parent,
-                parent_layout,
-                children,
-                style
+                "gpui retained_layout zero_bounds layout_id={} node_id={:?} bounds={:?} geometry_layout={:?} parent={:?} parent_geometry_layout={:?} children={:?} style={:?}",
+                id.0, node_id, bounds, layout, parent, parent_layout, children, style
             );
             let mut depth = 0;
             let mut ancestor = Some(node_id);
@@ -547,19 +532,17 @@ impl RetainedLayoutForest {
                     .committed_layout_id_for_node(ancestor_node_id)
                     .map(|layout_id| layout_id.0);
                 let ancestor_layout = self.try_geometry_layout(ancestor_node_id);
-                let ancestor_solver_layout = self.try_solver_layout(ancestor_node_id);
                 let ancestor_parent = self.parent(ancestor_node_id);
                 let ancestor_children = self.children(ancestor_node_id);
                 let ancestor_style = self.try_style(ancestor_node_id);
                 eprintln!(
-                    "gpui retained_layout zero_bounds_ancestor requested_layout_id={} depth={} layout_id={:?} node_id={:?} parent={:?} geometry_layout={:?} solver_layout={:?} children={:?} style={:?}",
+                    "gpui retained_layout zero_bounds_ancestor requested_layout_id={} depth={} layout_id={:?} node_id={:?} parent={:?} geometry_layout={:?} children={:?} style={:?}",
                     id.0,
                     depth,
                     ancestor_layout_id,
                     ancestor_node_id,
                     ancestor_parent,
                     ancestor_layout,
-                    ancestor_solver_layout,
                     ancestor_children,
                     ancestor_style
                 );
@@ -912,8 +895,7 @@ impl RetainedLayoutForest {
                 root_node,
                 available_space,
                 scale_factor,
-                |node_id| solver.layout(node_id).expect(EXPECT_MESSAGE),
-                |node_id| solver.children(node_id),
+                solver.capture_layout_tree(root_node),
             );
         }
         RetainedNodeToken(root_node)

@@ -239,8 +239,28 @@ impl SolverBackend for SolverBackendImpl {
             .collect()
     }
 
-    fn layout(&self, node_id: SolverNodeId) -> Option<SolverLayout> {
-        self.taffy.layout(node_id.0.0).ok().copied().map(Into::into)
+    fn capture_layout_tree(&self, root: SolverNodeId) -> Vec<(SolverNodeId, SolverLayout)> {
+        let mut layouts = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node_id) = stack.pop() {
+            let layout = self
+                .taffy
+                .layout(node_id.0.0)
+                .expect(EXPECT_MESSAGE)
+                .to_owned()
+                .into();
+            layouts.push((node_id, layout));
+            stack.extend(
+                self.taffy
+                    .children(node_id.0.0)
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter()
+                    .map(|child| SolverNodeId(BackendNodeId(child))),
+            );
+        }
+
+        layouts
     }
 
     fn style(&self, node_id: SolverNodeId) -> Option<SolverStyle> {

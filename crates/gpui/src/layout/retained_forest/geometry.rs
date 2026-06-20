@@ -134,8 +134,7 @@ impl GeometryStore {
         root_node: SolverNodeId,
         available_space: Size<AvailableSpace>,
         scale_factor: f32,
-        mut layout: impl FnMut(SolverNodeId) -> SolverLayout,
-        mut children: impl FnMut(SolverNodeId) -> Vec<SolverNodeId>,
+        layouts: impl IntoIterator<Item = (SolverNodeId, SolverLayout)>,
     ) {
         assert_eq!(
             self.solved_roots.get(&root_id),
@@ -143,12 +142,18 @@ impl GeometryStore {
             "retained layout geometry should be captured only for the scheduled root solve"
         );
 
-        let mut stack = vec![root_node];
-
-        while let Some(node_id) = stack.pop() {
-            self.current_layouts.insert(node_id, layout(node_id));
-            stack.extend(children(node_id));
+        let mut captured_root = false;
+        for (node_id, layout) in layouts {
+            captured_root |= node_id == root_node;
+            assert!(
+                self.current_layouts.insert(node_id, layout).is_none(),
+                "retained layout geometry snapshot should contain each solver node once"
+            );
         }
+        assert!(
+            captured_root,
+            "retained layout geometry snapshot should include the solved root"
+        );
     }
 
     pub(super) fn layout(&self, node_id: SolverNodeId) -> Option<SolverLayout> {

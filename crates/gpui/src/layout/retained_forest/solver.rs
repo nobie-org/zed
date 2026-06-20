@@ -168,7 +168,7 @@ trait SolverBackend: Clone {
     fn mark_dirty(&mut self, node_id: SolverNodeId);
     fn parent(&self, node_id: SolverNodeId) -> Option<SolverNodeId>;
     fn children(&self, node_id: SolverNodeId) -> Vec<SolverNodeId>;
-    fn layout(&self, node_id: SolverNodeId) -> Option<SolverLayout>;
+    fn capture_layout_tree(&self, root: SolverNodeId) -> Vec<(SolverNodeId, SolverLayout)>;
     fn style(&self, node_id: SolverNodeId) -> Option<SolverStyle>;
     fn has_measure_context(&self, node_id: SolverNodeId) -> bool;
     fn compute_layout_with_measure_and_cache_events(
@@ -232,8 +232,16 @@ impl LayoutSolver {
         self.backend.children(node_id)
     }
 
-    pub(super) fn layout(&self, node_id: SolverNodeId) -> Option<SolverLayout> {
-        self.backend.layout(node_id)
+    /// Copy all layout output for a just-solved legal root out of the solver.
+    ///
+    /// The returned values are a snapshot. Callers do not get per-node access
+    /// to the solver's mutable layout slots, so solver history cannot become
+    /// GPUI-visible geometry authority.
+    pub(super) fn capture_layout_tree(
+        &self,
+        root: SolverNodeId,
+    ) -> Vec<(SolverNodeId, SolverLayout)> {
+        self.backend.capture_layout_tree(root)
     }
 
     pub(super) fn style(&self, node_id: SolverNodeId) -> Option<SolverStyle> {

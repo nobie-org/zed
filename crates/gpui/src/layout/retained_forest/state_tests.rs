@@ -350,26 +350,30 @@ fn bounds_cache_checkpoint_restores_cached_absolute_bounds(_cx: &mut TestAppCont
             |_node_id, _has_measure_context, _query| size(0.0, 0.0),
             |_| {},
         );
+        let layouts = solver
+            .capture_layout_tree(root)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
 
         let mut cache = BoundsCache::new();
         let first = cache.layout_bounds_for_node(
             child,
             scale_factor,
-            |node_id| solver.layout(node_id).unwrap(),
+            |node_id| layouts[&node_id],
             |node_id| solver.parent(node_id),
         );
         let checkpoint = cache.checkpoint();
         let _ = cache.layout_bounds_for_node(
             root,
             scale_factor,
-            |node_id| solver.layout(node_id).unwrap(),
+            |node_id| layouts[&node_id],
             |node_id| solver.parent(node_id),
         );
         cache.rollback_to_checkpoint(checkpoint);
         let second = cache.layout_bounds_for_node(
             child,
             scale_factor,
-            |node_id| solver.layout(node_id).unwrap(),
+            |node_id| layouts[&node_id],
             |node_id| solver.parent(node_id),
         );
 

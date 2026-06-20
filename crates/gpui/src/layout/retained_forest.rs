@@ -1615,7 +1615,7 @@ impl RetainedLayoutForest {
             .flatten()?;
         let previous_child = previous_children.get_mut(previous_index)?;
         let candidate = previous_child.as_ref()?;
-        if self.retained_occurrence_can_host_semantic_intent(child, candidate) {
+        if self.retained_occurrence_can_preserve_unique_semantic_intent(child, candidate) {
             return previous_child.take();
         }
         None
@@ -1766,7 +1766,7 @@ impl RetainedLayoutForest {
     }
 
     /// Return whether a unique semantic identity may preserve mirror identity.
-    fn retained_occurrence_can_host_semantic_intent(
+    fn retained_occurrence_can_preserve_unique_semantic_intent(
         &self,
         id: LayoutId,
         previous: &RetainedLayoutOccurrence,

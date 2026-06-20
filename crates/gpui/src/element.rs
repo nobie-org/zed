@@ -726,6 +726,25 @@ impl AnyElement {
         )
     }
 
+    /// Measures this element in an isolated scratch layout engine and returns its size.
+    ///
+    /// This consumes the element so a caller cannot later prepaint it with
+    /// layout ids from the scratch solve. Use `layout_as_root` for detached
+    /// roots that will be prepainted or painted in the current frame.
+    #[track_caller]
+    pub fn measure_as_root(
+        mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        let root_site = RetainedLayoutRootSite::caller(core::panic::Location::caller());
+        window.with_scratch_layout_engine(cx, |window, cx| {
+            self.0
+                .layout_as_root(available_space, root_site, window, cx)
+        })
+    }
+
     /// Prepaints this element at the given absolute origin.
     /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
     pub fn prepaint_at(

@@ -4462,6 +4462,23 @@ impl Window {
         self.compute_layout_in_root(retained_root, available_space, cx);
     }
 
+    pub(crate) fn with_scratch_layout_engine<R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut App) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+
+        let retained_layout_engine = self.layout_engine.take().unwrap();
+        self.layout_engine = Some(LayoutEngine::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, cx)));
+        self.layout_engine = Some(retained_layout_engine);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn compute_layout_in_root(
         &mut self,
         root: RetainedLayoutRoot,
@@ -6547,9 +6564,10 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+    use super::DrawPhase;
     use crate::{
-        AppContext as _, Context, IntoElement, ParentElement as _, Render, TestAppContext, Window,
-        div, px, size,
+        AppContext as _, Context, IntoElement, ParentElement as _, Render, Style, TestAppContext,
+        Window, div, px, size,
     };
     use std::ops::Deref as _;
 
@@ -6628,5 +6646,38 @@ mod tests {
         assert_eq!(second_sample.measured_layout_node_requests, 0);
         assert_eq!(second_sample.child_edges, 2);
         assert_eq!(second_sample.compute_layout_calls, 1);
+    }
+
+    #[test]
+    fn scratch_layout_engine_restores_retained_engine_after_panic() {
+        let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(|_, _| crate::Empty);
+
+        let (panicked, retained_sample) = test_app
+            .update_window(*window.deref(), |_, window, cx| {
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+                window.layout_engine.as_mut().unwrap().begin_frame();
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    window.with_scratch_layout_engine(cx, |window, cx| {
+                        let _ = window.request_layout(Style::default(), [], cx);
+                        panic!("scratch layout probe");
+                    });
+                }));
+
+                window.invalidator.set_phase(DrawPhase::None);
+                (
+                    result.is_err(),
+                    window.layout_engine.as_mut().unwrap().finish_frame(),
+                )
+            })
+            .unwrap();
+
+        assert!(panicked);
+        assert_eq!(retained_sample.layout_node_requests, 0);
+        assert_eq!(retained_sample.measured_layout_node_requests, 0);
+        assert_eq!(retained_sample.child_edges, 0);
+        assert_eq!(retained_sample.compute_layout_calls, 0);
+        assert_eq!(retained_sample.solver_compute_layout_calls, 0);
     }
 }

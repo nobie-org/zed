@@ -2810,6 +2810,52 @@ fn unique_global_id_reorder_preserves_semantic_child_node() {
 }
 
 #[test]
+fn duplicate_global_id_is_not_semantic_identity() {
+    let mut engine = LayoutEngine::new();
+    let first_a = request_keyed_leaf(&mut engine, 1, 10.0);
+    let first_b = request_keyed_leaf(&mut engine, 1, 20.0);
+    let first_root = request_flex_container(&mut engine, &[first_a, first_b]);
+    let first_root_node = engine.commit_layout(first_root);
+    let first_child_nodes = engine.retained_child_tokens_for_tests(first_root_node);
+    engine.finish_frame();
+
+    engine.reset_retained_mutation_sample_for_tests();
+    let second = request_keyed_leaf(&mut engine, 1, 20.0);
+    let second_root = request_flex_container(&mut engine, &[second]);
+    let second_root_node = engine.commit_layout(second_root);
+    assert_intent_committed_exactly(&engine, second_root);
+    let second_child = engine.retained_node_token_for_tests(second);
+
+    assert_eq!(second_root_node, first_root_node);
+    assert_eq!(
+        second_child, first_child_nodes[1],
+        "duplicate semantic ids are ignored; only the exact previous subtree may be reused"
+    );
+    assert_ne!(
+        second_child, first_child_nodes[0],
+        "duplicate semantic ids must not preserve the same-key changed sibling as history"
+    );
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 2,
+            child_list_updates: 1,
+            removes: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_child = request_keyed_leaf(&mut fresh, 1, 20.0);
+    let fresh_root = request_flex_container(&mut fresh, &[fresh_child]);
+    let fresh_root_node = fresh.commit_layout(fresh_root);
+    assert_eq!(
+        retained_layout_shape(&engine, second_root_node),
+        retained_layout_shape(&fresh, fresh_root_node)
+    );
+}
+
+#[test]
 fn changed_measured_child_is_not_an_exact_reordered_match() {
     let mut engine = LayoutEngine::new();
     let first_unmeasured = request_leaf(&mut engine, 0.0);

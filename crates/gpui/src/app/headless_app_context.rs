@@ -10,7 +10,7 @@
 
 use crate::{
     AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor, Bounds,
-    Context, Entity, EntityId, ForegroundExecutor, Global, Pixels, PlatformHeadlessRenderer,
+    Context, Entity, EntityId, ForegroundExecutor, Global, Pixels, PlatformTestWindowRenderer,
     PlatformTextSystem, Render, Reservation, Size, Task, TestDispatcher, TestPlatform, TextSystem,
     Window, WindowBounds, WindowHandle, WindowOptions,
     app::{GpuiBorrow, GpuiMode},
@@ -32,7 +32,7 @@ use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
 /// let mut cx = HeadlessAppContext::with_platform(
 ///     text_system,
 ///     Arc::new(Assets),
-///     || gpui_platform::current_headless_renderer(),
+///     || gpui_platform::current_test_window_renderer(),
 /// );
 /// ```
 pub struct HeadlessAppContext {
@@ -65,7 +65,7 @@ impl HeadlessAppContext {
     pub fn with_platform(
         platform_text_system: Arc<dyn PlatformTextSystem>,
         asset_source: Arc<dyn AssetSource>,
-        renderer_factory: impl Fn() -> Option<Box<dyn PlatformHeadlessRenderer>> + 'static,
+        renderer_factory: impl Fn() -> Option<Box<dyn PlatformTestWindowRenderer>> + 'static,
     ) -> Self {
         let seed = std::env::var("SEED")
             .ok()
@@ -77,7 +77,7 @@ impl HeadlessAppContext {
         let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
 
-        let renderer_factory: Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>> =
+        let renderer_factory: Box<dyn Fn() -> Option<Box<dyn PlatformTestWindowRenderer>>> =
             Box::new(renderer_factory);
         let platform = TestPlatform::with_platform(
             background_executor.clone(),
@@ -167,7 +167,11 @@ impl HeadlessAppContext {
     /// returns `Some` via [`HeadlessAppContext::with_platform`].
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         let mut app = self.app.borrow_mut();
-        app.update_window(window, |_, window, _| window.render_to_image())?
+        app.update_window(window, |_, window, cx| {
+            let capture = window.draw_present_and_capture_immediately(cx)?;
+            RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
+                .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
+        })?
     }
 
     /// Returns the text system.

@@ -12,13 +12,13 @@ use crate::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
-    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point,
+    Replay, ResizeEdge, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point,
     prelude::*,
     px, rems,
     scene::{LogicalVisualPlan, RenderGroupInput},
@@ -1023,6 +1023,7 @@ pub struct Window {
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
+    titlebar_traffic_light_position: Option<Point<Pixels>>,
     throttle_inactive_frame_rate: Rc<Cell<bool>>,
     throttle_under_thermal_pressure: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
@@ -1304,6 +1305,10 @@ impl Window {
         } = options;
 
         let window_bounds = window_bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let titlebar_traffic_light_position = titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.traffic_light_position);
+
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -1673,6 +1678,7 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
+            titlebar_traffic_light_position,
             throttle_inactive_frame_rate,
             throttle_under_thermal_pressure,
             hovered,
@@ -1848,10 +1854,9 @@ impl Window {
     /// capture state.
     pub fn draw_present_and_capture_immediately(&mut self, cx: &mut App) -> Result<SceneCapture> {
         let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
+        self.platform_window.request_frame_capture();
         self.present();
-        let capture = self
-            .platform_window
-            .capture_scene(&self.rendered_frame.scene);
+        let capture = self.platform_window.capture_presented_frame();
         arena_clear_needed.clear();
         self.complete_frame();
         capture
@@ -2255,15 +2260,6 @@ impl Window {
         self.platform_window.bounds()
     }
 
-    /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing where we want
-    /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
-        self.platform_window
-            .render_to_image(&self.rendered_frame.scene)
-    }
-
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -2301,6 +2297,12 @@ impl Window {
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// Returns the configured traffic-light position for this window's
+    /// transparent titlebar, when the window was opened with one.
+    pub fn titlebar_traffic_light_position(&self) -> Option<Point<Pixels>> {
+        self.titlebar_traffic_light_position
     }
 
     /// Returns whether this window's request-frame closure throttles to
@@ -4102,9 +4104,9 @@ impl Window {
 
         let params = RenderSvgParams {
             path,
-            size: bounds.size.map(|pixels| {
-                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
-            }),
+            size: bounds
+                .size
+                .map(|pixels| DevicePixels::from(pixels.0.ceil() as i32)),
         };
 
         let Some(tile) =
@@ -4123,13 +4125,10 @@ impl Window {
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
-                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
-                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                    ScaledPixels(tile.bounds.size.width.0 as f32 / 2.),
+                    ScaledPixels(tile.bounds.size.height.0 as f32 / 2.),
                 ),
-            size: tile
-                .bounds
-                .size
-                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
+            size: tile.bounds.size.map(|value| ScaledPixels(value.0 as f32)),
         };
         let final_bounds = svg_bounds
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))

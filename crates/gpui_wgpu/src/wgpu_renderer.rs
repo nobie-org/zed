@@ -1,8 +1,6 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, Size,
     get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
@@ -10,8 +8,11 @@ use gpui::{
         RenderGroupPhysicalPlanKind, Scene, Shadow, SubpixelSprite, SurfaceSilhouetteSpriteData,
         Underline,
     },
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point,
+    RenderGroupShadowMode, ScaledPixels, SceneCapture, SceneCaptureBackend, Size,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES,
 };
-use log::warn;
+use log::{info, warn};
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
@@ -22,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 #[derive(Clone)]
-pub struct WgpuHeadlessContextParts {
+pub struct WgpuTestWindowContextParts {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
@@ -31,13 +32,13 @@ pub struct WgpuHeadlessContextParts {
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
 thread_local! {
-    static ACTIVE_HEADLESS_WGPU_CONTEXT: RefCell<Option<WgpuHeadlessContextParts>> =
+    static ACTIVE_TEST_WINDOW_WGPU_CONTEXT: RefCell<Option<WgpuTestWindowContextParts>> =
         const { RefCell::new(None) };
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-pub fn clone_active_headless_wgpu_context() -> Option<WgpuHeadlessContextParts> {
-    ACTIVE_HEADLESS_WGPU_CONTEXT.with(|context| context.borrow().clone())
+pub fn clone_active_test_window_wgpu_context() -> Option<WgpuTestWindowContextParts> {
+    ACTIVE_TEST_WINDOW_WGPU_CONTEXT.with(|context| context.borrow().clone())
 }
 
 #[repr(C)]
@@ -75,10 +76,9 @@ struct SurfaceParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GammaParams {
     gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
-    _pad: u32,
+    _pad: [u32; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +165,7 @@ struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
+    instances_with_backdrop: wgpu::BindGroupLayout,
     group_composite: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
 }
@@ -176,8 +177,8 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    /// `None` for a headless offscreen renderer (visual-regression capture),
-    /// which renders to its own offscreen texture and never presents to a window.
+    /// `None` for a test-window renderer, which still uses the same presentation
+    /// texture path but has no platform surface to transfer into.
     surface: Option<wgpu::Surface<'static>>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
@@ -231,6 +232,10 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    capture_next_frame: bool,
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    presentation_capture: Option<Result<SceneCapture, String>>,
     /// Measured render-group resource counts from the most recent scene encode.
     last_render_group_counters: Option<RenderGroupBackendCounters>,
 }
@@ -340,32 +345,34 @@ impl WgpuRenderer {
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        // A headless renderer (visual-regression capture) has no surface: it
-        // renders into its own offscreen texture and never presents. To keep
-        // capture byte-identical across backends (macOS Metal vs Linux
-        // Vulkan/lavapipe) it pins a fixed format and opaque alpha instead of
-        // negotiating capabilities with a surface.
-        let (surface_format, transparent_alpha_mode, opaque_alpha_mode, present_mode) =
-            if let Some(surface) = surface.as_ref() {
-                let surface_caps = surface.get_capabilities(&context.adapter);
-                let preferred_formats = [
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                ];
-                let surface_format = preferred_formats
-                    .iter()
-                    .find(|f| surface_caps.formats.contains(f))
-                    .copied()
-                    .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-                    .or_else(|| surface_caps.formats.first().copied())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Surface reports no supported texture formats for adapter {:?}",
-                            context.adapter.get_info().name
-                        )
-                    })?;
+        // A test-window renderer has no platform surface, but it still uses
+        // the same presentation texture path as windowed wgpu rendering.
+        let (
+            surface_format,
+            transparent_alpha_mode,
+            opaque_alpha_mode,
+            present_mode,
+            surface_usage,
+        ) = if let Some(surface) = surface.as_ref() {
+            let surface_caps = surface.get_capabilities(&context.adapter);
+            let preferred_formats = [
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba8Unorm,
+            ];
+            let surface_format = preferred_formats
+                .iter()
+                .find(|f| surface_caps.formats.contains(f))
+                .copied()
+                .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+                .or_else(|| surface_caps.formats.first().copied())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Surface reports no supported texture formats for adapter {:?}",
+                        context.adapter.get_info().name
+                    )
+                })?;
 
-                let pick_alpha_mode = |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
+            let pick_alpha_mode = |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
                     preferences
                         .iter()
                         .find(|p| surface_caps.alpha_modes.contains(p))
@@ -379,45 +386,49 @@ impl WgpuRenderer {
                         })
                 };
 
-                let transparent_alpha_mode = pick_alpha_mode(&[
-                    wgpu::CompositeAlphaMode::PreMultiplied,
-                    wgpu::CompositeAlphaMode::Inherit,
-                ])?;
-                let opaque_alpha_mode = pick_alpha_mode(&[
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::CompositeAlphaMode::Inherit,
-                ])?;
-                let present_mode = config
-                    .preferred_present_mode
-                    .filter(|mode| surface_caps.present_modes.contains(mode))
-                    .unwrap_or(wgpu::PresentMode::Fifo);
-                (
-                    surface_format,
-                    transparent_alpha_mode,
-                    opaque_alpha_mode,
-                    present_mode,
-                )
-            } else {
-                // Headless capture renders into an `Rgba32Float` target so all
-                // alpha compositing accumulates at full f32 precision. An 8-bit
-                // `Unorm` target re-quantizes after *every* blend, and that
-                // per-blend rounding is backend-defined: Metal and Vulkan/lavapipe
-                // round it differently, producing ±1 LSB cross-platform drift at
-                // every anti-aliased/blended edge. A 16-bit float target removes
-                // most of that but the blend itself is only specified to "at
-                // least f16" precision, so a backend that blends in a wider
-                // intermediate still differs by ±1 LSB. f32 is the widest blend
-                // precision, so both backends round identically. Quantization to
-                // 8-bit happens once, deterministically on the CPU, in
-                // `render_scene_to_image`. Requires `FLOAT32_BLENDABLE` (asserted
-                // in `WgpuContext::new_headless`).
-                (
-                    wgpu::TextureFormat::Rgba32Float,
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::PresentMode::Fifo,
-                )
-            };
+            let transparent_alpha_mode = pick_alpha_mode(&[
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::Inherit,
+            ])?;
+            let opaque_alpha_mode = pick_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Inherit,
+            ])?;
+            let present_mode = config
+                .preferred_present_mode
+                .filter(|mode| surface_caps.present_modes.contains(mode))
+                .unwrap_or(wgpu::PresentMode::Fifo);
+            if !surface_caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
+                anyhow::bail!(
+                    "Surface for adapter {:?} does not support COPY_DST, which is required so \
+                     headed wgpu presentation is a byte copy from the same renderer-owned \
+                     presentation texture captured by test windows.",
+                    context.adapter.get_info().name
+                );
+            }
+            let mut surface_usage =
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST;
+            if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                surface_usage |= wgpu::TextureUsages::COPY_SRC;
+            }
+            (
+                surface_format,
+                transparent_alpha_mode,
+                opaque_alpha_mode,
+                present_mode,
+                surface_usage,
+            )
+        } else {
+            // Headless test windows render into the same 8-bit presentation
+            // format preferred by windowed wgpu surfaces.
+            (
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::PresentMode::Fifo,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            )
+        };
 
         let alpha_mode = if config.transparent {
             transparent_alpha_mode
@@ -442,7 +453,7 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -458,23 +469,20 @@ impl WgpuRenderer {
         }
 
         let queue = Arc::clone(&context.queue);
-        let dual_source_blending = if surface.is_some() {
-            context.supports_dual_source_blending()
-        } else {
-            // Headless capture paints grayscale monochrome glyphs only
-            // (TestWindow reports subpixel rendering unsupported), so the
-            // subpixel pipeline and its adapter-dependence are dropped.
-            false
-        };
-
-        let rendering_params = if surface.is_some() {
-            RenderingParameters::new(&context.adapter, surface_format)
-        } else {
-            // Fixed sample count (no MSAA): MSAA sample positions are
-            // backend-defined, and the render-parity contract forbids relying on
-            // backend-defined behavior for cross-platform byte-identity.
-            RenderingParameters::headless()
-        };
+        let dual_source_blending = context.supports_dual_source_blending();
+        let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
+        info!(
+            "Initialized wgpu renderer: backend={:?}, surface_present={}, surface_format={:?}, \
+             alpha_mode={:?}, path_sample_count={}, dual_source_blending={}, \
+             color_texture_format={:?}",
+            context.adapter.get_info().backend,
+            surface.is_some(),
+            surface_format,
+            alpha_mode,
+            rendering_params.path_sample_count,
+            dual_source_blending,
+            context.color_texture_format(),
+        );
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
         let pipelines = Self::create_pipelines(
             &device,
@@ -592,7 +600,7 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
-        let surface_configured = surface.is_some();
+        let surface_configured = true;
         let resources = WgpuResources {
             device,
             queue,
@@ -638,15 +646,19 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured,
             needs_redraw: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+            capture_next_frame: false,
+            #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+            presentation_capture: None,
             last_render_group_counters: None,
         })
     }
 
-    /// Build a surfaceless renderer for headless offscreen capture (visual
-    /// regression). `initial_size` only sizes the first allocation;
-    /// [`render_scene_to_image`](Self::render_scene_to_image) resizes per capture.
+    /// Build a renderer for test-window presentation capture.
+    /// `initial_size` only sizes the first allocation;
+    /// [`draw_presented_frame_to_image`](Self::draw_presented_frame_to_image) resizes per capture.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn new_headless(
+    pub fn new_for_test_window(
         context: &WgpuContext,
         initial_size: Size<DevicePixels>,
     ) -> anyhow::Result<Self> {
@@ -665,23 +677,24 @@ impl WgpuRenderer {
         )
     }
 
-    /// Render `scene` to an offscreen texture at `size` and read it back as an
-    /// RGBA image. The single canonical headless capture path: deterministic and
-    /// byte-identical across backends (macOS Metal, Linux Vulkan/lavapipe).
+    /// Draw `scene` through the shared presentation texture path at `size` and
+    /// return the captured presented pixels.
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    pub fn render_scene_to_image(
+    pub fn draw_presented_frame_to_capture(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
-    ) -> anyhow::Result<image::RgbaImage> {
+    ) -> anyhow::Result<SceneCapture> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            anyhow::bail!("invalid headless capture size: {size:?}");
+            anyhow::bail!("invalid test-window capture size: {size:?}");
         }
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
         let max = self.max_texture_size;
         if width > max || height > max {
-            anyhow::bail!("headless capture size {width}x{height} exceeds max texture dim {max}");
+            anyhow::bail!(
+                "test-window capture size {width}x{height} exceeds max texture dim {max}"
+            );
         }
 
         // Size the globals viewport and intermediate path textures to this capture.
@@ -693,133 +706,49 @@ impl WgpuRenderer {
             }
         }
 
-        self.atlas.before_frame();
-        self.ensure_intermediate_textures();
-
-        let format = self.surface_config.format;
-        let target_texture = self
-            .resources()
-            .device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("headless_capture_target"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-        let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        if !self.encode_scene_to_view(scene, Some(&target_texture), true, &target_view) {
-            anyhow::bail!("headless scene encode failed");
+        self.request_frame_capture();
+        if !self.draw(scene) {
+            self.capture_next_frame = false;
+            anyhow::bail!("presentation scene draw failed");
         }
 
-        // Copy the rendered texture into a CPU-readable buffer with rows padded
-        // to COPY_BYTES_PER_ROW_ALIGNMENT, then read back, un-pad, and quantize
-        // to 8-bit RGBA.
-        let bytes_per_pixel: u32 = match format {
-            wgpu::TextureFormat::Rgba32Float => 16,
-            wgpu::TextureFormat::Rgba16Float => 8,
-            wgpu::TextureFormat::Rgba8Unorm
-            | wgpu::TextureFormat::Rgba8UnormSrgb
-            | wgpu::TextureFormat::Bgra8Unorm
-            | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
-            other => anyhow::bail!("unsupported headless capture format {other:?}"),
-        };
-        let unpadded_bytes_per_row = width * bytes_per_pixel;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
-        let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+        self.take_presented_capture()
+    }
 
-        let read_buffer = self
-            .resources()
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("headless_capture_readback"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+    /// Capture the next frame produced by [`draw`](Self::draw).
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn request_frame_capture(&mut self) {
+        self.presentation_capture = None;
+        self.capture_next_frame = true;
+    }
 
-        let mut encoder =
-            self.resources()
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("headless_capture_copy"),
-                });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &read_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        read_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-        self.resources()
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| anyhow::anyhow!("headless capture device poll failed: {e:?}"))?;
-        receiver
-            .recv()
-            .map_err(|_| anyhow::anyhow!("headless capture map channel disconnected"))?
-            .map_err(|e| anyhow::anyhow!("headless capture buffer map failed: {e:?}"))?;
-
-        if let Some(error) = self.last_error.lock().unwrap().take() {
-            anyhow::bail!("GPU error during headless scene encode: {error}");
-        }
-
-        let row = unpadded_bytes_per_row as usize;
-        let padded = padded_bytes_per_row as usize;
-        let mut raw = vec![0u8; row * height as usize];
-        {
-            let mapped = read_buffer.slice(..).get_mapped_range();
-            for y in 0..height as usize {
-                let src = y * padded;
-                let dst = y * row;
-                raw[dst..dst + row].copy_from_slice(&mapped[src..src + row]);
+    /// Return the capture produced by the most recent requested draw.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn take_presented_capture(&mut self) -> anyhow::Result<SceneCapture> {
+        match self.presentation_capture.take() {
+            Some(Ok(capture)) => Ok(capture),
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None => {
+                self.capture_next_frame = false;
+                anyhow::bail!("draw completed without a presentation capture")
             }
         }
-        read_buffer.unmap();
+    }
 
-        // Quantize the captured texels to 8-bit RGBA with a single deterministic
-        // CPU rounding step. For the float capture target this is the *only*
-        // quantization, so the result never depends on backend-defined 8-bit
-        // blend rounding (Metal vs Vulkan/lavapipe).
-        let rgba = quantize_headless_capture_to_rgba8(&raw, format)?;
-        image::RgbaImage::from_raw(width, height, rgba)
-            .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from headless capture"))
+    /// Draw `scene` through the shared presentation texture path at `size` and read
+    /// the presented target back as an RGBA image.
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    pub fn draw_presented_frame_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        let capture = self.draw_presented_frame_to_capture(scene, size)?;
+        let width_px = capture.width_px;
+        let height_px = capture.height_px;
+        let rgba = capture.rgba;
+        image::RgbaImage::from_raw(width_px, height_px, rgba)
+            .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presentation capture"))
     }
 
     fn create_bind_group_layouts(device: &wgpu::Device) -> WgpuBindGroupLayouts {
@@ -894,6 +823,40 @@ impl WgpuRenderer {
                 ],
             });
 
+        let instances_with_backdrop =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("instances_with_backdrop_layout"),
+                entries: &[
+                    storage_buffer_entry(0),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
         let unfiltered_texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -962,6 +925,7 @@ impl WgpuRenderer {
             globals,
             instances,
             instances_with_texture,
+            instances_with_backdrop,
             group_composite,
             surfaces,
         }
@@ -1082,11 +1046,15 @@ impl WgpuRenderer {
         let quads = create_pipeline(
             "quads",
             "vs_quad",
-            "fs_quad",
+            "fs_quad_composite",
             &layouts.globals,
-            &layouts.instances,
+            &layouts.instances_with_backdrop,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
             1,
             &shader_module,
         );
@@ -1096,9 +1064,13 @@ impl WgpuRenderer {
             "vs_shadow",
             "fs_shadow",
             &layouts.globals,
-            &layouts.instances,
+            &layouts.instances_with_backdrop,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
             1,
             &shader_module,
         );
@@ -1197,9 +1169,13 @@ impl WgpuRenderer {
             "vs_mono_sprite",
             "fs_mono_sprite",
             &layouts.globals,
-            &layouts.instances_with_texture,
+            &layouts.instances_with_backdrop,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
             1,
             &shader_module,
         );
@@ -1448,8 +1424,8 @@ impl WgpuRenderer {
         &self.atlas
     }
 
-    /// The wgpu backend of the adapter this renderer drives. Used by the
-    /// headless capture path to report which backend produced a screenshot.
+    /// The wgpu backend of the adapter this renderer drives. Used by presented
+    /// frame capture to report which backend produced a screenshot.
     pub fn adapter_backend(&self) -> wgpu::Backend {
         self.adapter_info.backend
     }
@@ -1506,59 +1482,239 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let current = match self.resources().surface.as_ref() {
-            Some(surface) => surface.get_current_texture(),
-            // A headless renderer has no surface; it captures via
-            // `render_scene_to_image` and `draw()` is never called on it.
-            None => return false,
-        };
-        let frame = match current {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                if let Some(surface) = resources.surface.as_ref() {
-                    surface.configure(&resources.device, &surface_config);
+        let frame = if self.resources().surface.is_some() {
+            let current = self
+                .resources()
+                .surface
+                .as_ref()
+                .expect("surface checked above")
+                .get_current_texture();
+            match current {
+                wgpu::CurrentSurfaceTexture::Success(frame) => Some(frame),
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    // Textures must be destroyed before the surface can be reconfigured.
+                    drop(frame);
+                    let surface_config = self.surface_config.clone();
+                    let resources = self.resources_mut();
+                    if let Some(surface) = resources.surface.as_ref() {
+                        surface.configure(&resources.device, &surface_config);
+                    }
+                    return false;
                 }
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                if let Some(surface) = resources.surface.as_ref() {
-                    surface.configure(&resources.device, &surface_config);
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                    let surface_config = self.surface_config.clone();
+                    let resources = self.resources_mut();
+                    if let Some(surface) = resources.surface.as_ref() {
+                        surface.configure(&resources.device, &surface_config);
+                    }
+                    return false;
                 }
-                return false;
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    *self.last_error.lock().unwrap() =
+                        Some("Surface texture validation error".to_string());
+                    return false;
+                }
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                *self.last_error.lock().unwrap() =
-                    Some("Surface texture validation error".to_string());
-                return false;
-            }
+        } else {
+            None
         };
 
-        // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
 
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let (presentation_texture, presentation_view) = self.create_presentation_texture();
+        let encoded =
+            self.encode_scene_to_view(scene, Some(&presentation_texture), true, &presentation_view);
+        #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+        if self.capture_next_frame {
+            self.presentation_capture = Some(if !encoded {
+                Err("presentation encode failed".to_string())
+            } else {
+                self.read_presentation_texture(
+                    &presentation_texture,
+                    self.surface_config.width,
+                    self.surface_config.height,
+                    self.surface_config.format,
+                )
+                .map(|rgba| SceneCapture {
+                    rgba,
+                    width_px: self.surface_config.width,
+                    height_px: self.surface_config.height,
+                    backend: scene_capture_backend(self.adapter_info.backend),
+                })
+                .map_err(|err| err.to_string())
+            });
+            self.capture_next_frame = false;
+        }
 
-        let encoded = self.encode_scene_to_view(
-            scene,
-            Some(&frame.texture),
-            self.surface_config
-                .usage
-                .contains(wgpu::TextureUsages::COPY_SRC),
-            &frame_view,
+        if let Some(frame) = frame {
+            let presented = encoded
+                && self.copy_presentation_texture_to_surface(&presentation_texture, &frame.texture);
+            if presented {
+                frame.present();
+            }
+            encoded && presented
+        } else {
+            encoded
+        }
+    }
+
+    fn create_presentation_texture(&self) -> (wgpu::Texture, wgpu::TextureView) {
+        let resources = self.resources();
+        let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("presentation_target"),
+            size: wgpu::Extent3d {
+                width: self.surface_config.width.max(1),
+                height: self.surface_config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    fn copy_presentation_texture_to_surface(
+        &self,
+        presentation_texture: &wgpu::Texture,
+        surface_texture: &wgpu::Texture,
+    ) -> bool {
+        let resources = self.resources();
+        let mut encoder =
+            resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("presentation_copy_encoder"),
+                });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: presentation_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: surface_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.surface_config.width.max(1),
+                height: self.surface_config.height.max(1),
+                depth_or_array_layers: 1,
+            },
         );
-        frame.present();
-        encoded
+        resources.queue.submit(std::iter::once(encoder.finish()));
+        true
+    }
+
+    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
+    fn read_presentation_texture(
+        &self,
+        target_texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> anyhow::Result<Vec<u8>> {
+        let bytes_per_pixel: u32 = match format {
+            wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb => 4,
+            other => anyhow::bail!("unsupported presentation capture format {other:?}"),
+        };
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+
+        let read_buffer = self
+            .resources()
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("presentation_readback"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("presentation_readback_copy"),
+                });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: target_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        read_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.resources()
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| anyhow::anyhow!("presentation device poll failed: {e:?}"))?;
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("presentation map channel disconnected"))?
+            .map_err(|e| anyhow::anyhow!("presentation buffer map failed: {e:?}"))?;
+
+        if let Some(error) = self.last_error.lock().unwrap().take() {
+            anyhow::bail!("GPU error during presentation encode: {error}");
+        }
+
+        let row = unpadded_bytes_per_row as usize;
+        let padded = padded_bytes_per_row as usize;
+        let mut raw = vec![0u8; row * height as usize];
+        {
+            let mapped = read_buffer.slice(..).get_mapped_range();
+            for y in 0..height as usize {
+                let src = y * padded;
+                let dst = y * row;
+                raw[dst..dst + row].copy_from_slice(&mapped[src..src + row]);
+            }
+        }
+        read_buffer.unmap();
+
+        presentation_capture_to_rgba8(&raw, format)
     }
 
     /// Returns the measured render-group resource counts from the most recent
@@ -1570,9 +1726,9 @@ impl WgpuRenderer {
     }
 
     /// Encode `scene` into `target_view` and submit it (does **not** present).
-    /// Shared by the windowed `draw` path (target = surface texture; caller
-    /// presents) and the headless `render_scene_to_image` path (target =
-    /// offscreen texture; caller reads it back). Callers must run
+    /// Shared by headed, headless, and regression rendering. The caller supplies
+    /// the presentation texture view and decides whether to transfer it to a
+    /// platform surface or read it back. Callers must run
     /// `before_frame`/`ensure_intermediate_textures` and set `surface_config`
     /// width/height before calling. Returns whether a frame was encoded.
     fn encode_scene_to_view(
@@ -1584,10 +1740,9 @@ impl WgpuRenderer {
     ) -> bool {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
             subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
             is_bgr: self.is_bgr as u32,
-            _pad: 0,
+            _pad: [0; 2],
         };
 
         let globals = GlobalParams {
@@ -1643,7 +1798,7 @@ impl WgpuRenderer {
                     });
             let mut retained_textures = Vec::new();
 
-            let needs_root_intermediate = scene.requires_backdrop_effects() && !target_can_copy;
+            let needs_root_intermediate = !target_can_copy;
             let overflow = if needs_root_intermediate {
                 let (root_texture, root_view) = self.create_group_intermediate();
                 let encoded_root = self.encode_scene_batches_to_view(
@@ -1739,10 +1894,69 @@ impl WgpuRenderer {
         for batch in scene.batches() {
             let ok = match batch {
                 PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(&scene.quads[range], instance_offset, &mut pass)
+                    let quads = &scene.quads[range];
+                    if quads.is_empty() {
+                        continue;
+                    }
+
+                    drop(pass);
+
+                    let did_draw = self.draw_quads(
+                        quads,
+                        target_texture,
+                        target_can_copy,
+                        target_view,
+                        encoder,
+                        instance_offset,
+                        retained_textures,
+                    );
+
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("scene_pass_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+
+                    did_draw
                 }
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(&scene.shadows[range], instance_offset, &mut pass)
+                    drop(pass);
+
+                    let did_draw = self.draw_shadows(
+                        &scene.shadows[range],
+                        target_texture,
+                        target_can_copy,
+                        target_view,
+                        encoder,
+                        instance_offset,
+                        retained_textures,
+                    );
+
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("scene_pass_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+
+                    did_draw
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
@@ -1778,13 +1992,37 @@ impl WgpuRenderer {
                 PrimitiveBatch::Underlines(range) => {
                     self.draw_underlines(&scene.underlines[range], instance_offset, &mut pass)
                 }
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                    drop(pass);
+
+                    let did_draw = self.draw_monochrome_sprites(
                         &scene.monochrome_sprites[range],
                         texture_id,
+                        target_texture,
+                        target_can_copy,
+                        target_view,
+                        encoder,
                         instance_offset,
-                        &mut pass,
-                    ),
+                        retained_textures,
+                    );
+
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("scene_pass_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+
+                    did_draw
+                }
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => self
                     .draw_subpixel_sprites(
                         &scene.subpixel_sprites[range],
@@ -1846,33 +2084,159 @@ impl WgpuRenderer {
     fn draw_quads(
         &self,
         quads: &[Quad],
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
+        retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
-        let data = unsafe { Self::instance_bytes(quads) };
-        self.draw_instances(
-            data,
-            quads.len() as u32,
-            &self.resources().pipelines.quads,
-            instance_offset,
-            pass,
-        )
+        let Some(target_texture) = target_texture else {
+            *self.last_error.lock().unwrap() =
+                Some("Quad compositing has no readable target texture".into());
+            return false;
+        };
+        if !target_can_copy {
+            *self.last_error.lock().unwrap() =
+                Some("Quad compositing needs COPY_SRC support for the target texture".into());
+            return false;
+        }
+
+        for quad in quads {
+            let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width.max(1),
+                    height: self.surface_config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quad_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(quad)) };
+            let drew = self.draw_instances_with_texture_and_backdrop(
+                data,
+                1,
+                &backdrop_view,
+                &backdrop_view,
+                &self.resources().pipelines.quads,
+                instance_offset,
+                &mut pass,
+            );
+            drop(pass);
+            retained_textures.push(backdrop_texture);
+            if !drew {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_shadows(
         &self,
         shadows: &[Shadow],
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
+        retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
-        let data = unsafe { Self::instance_bytes(shadows) };
-        self.draw_instances(
-            data,
-            shadows.len() as u32,
-            &self.resources().pipelines.shadows,
-            instance_offset,
-            pass,
-        )
+        if shadows.is_empty() {
+            return true;
+        }
+
+        let Some(target_texture) = target_texture else {
+            *self.last_error.lock().unwrap() =
+                Some("Shadow compositing has no readable target texture".into());
+            return false;
+        };
+        if !target_can_copy {
+            *self.last_error.lock().unwrap() =
+                Some("Shadow compositing needs COPY_SRC support for the target texture".into());
+            return false;
+        }
+
+        for shadow in shadows {
+            let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width.max(1),
+                    height: self.surface_config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(shadow)) };
+            let drew = self.draw_instances_with_texture_and_backdrop(
+                data,
+                1,
+                &backdrop_view,
+                &backdrop_view,
+                &self.resources().pipelines.shadows,
+                instance_offset,
+                &mut pass,
+            );
+            drop(pass);
+            retained_textures.push(backdrop_texture);
+            if !drew {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_underlines(
@@ -1895,19 +2259,85 @@ impl WgpuRenderer {
         &self,
         sprites: &[MonochromeSprite],
         texture_id: AtlasTextureId,
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
+        retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
+        if sprites.is_empty() {
+            return true;
+        }
+
+        let Some(target_texture) = target_texture else {
+            *self.last_error.lock().unwrap() =
+                Some("Monochrome sprite compositing has no readable target texture".into());
+            return false;
+        };
+        if !target_can_copy {
+            *self.last_error.lock().unwrap() = Some(
+                "Monochrome sprite compositing needs COPY_SRC support for the target texture"
+                    .into(),
+            );
+            return false;
+        }
+
         let tex_info = self.atlas.get_texture_info(texture_id);
-        let data = unsafe { Self::instance_bytes(sprites) };
-        self.draw_instances_with_texture(
-            data,
-            sprites.len() as u32,
-            &tex_info.view,
-            &self.resources().pipelines.mono_sprites,
-            instance_offset,
-            pass,
-        )
+        for sprite in sprites {
+            let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width.max(1),
+                    height: self.surface_config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("monochrome_sprite_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(sprite)) };
+            let drew = self.draw_instances_with_texture_and_backdrop(
+                data,
+                1,
+                &tex_info.view,
+                &backdrop_view,
+                &self.resources().pipelines.mono_sprites,
+                instance_offset,
+                &mut pass,
+            );
+            drop(pass);
+            retained_textures.push(backdrop_texture);
+            if !drew {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_subpixel_sprites(
@@ -1955,9 +2385,9 @@ impl WgpuRenderer {
     }
 
     #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-    fn register_active_headless_wgpu_context(context: &WgpuContext) {
-        ACTIVE_HEADLESS_WGPU_CONTEXT.with(|active| {
-            *active.borrow_mut() = Some(WgpuHeadlessContextParts {
+    fn register_active_test_window_wgpu_context(context: &WgpuContext) {
+        ACTIVE_TEST_WINDOW_WGPU_CONTEXT.with(|active| {
+            *active.borrow_mut() = Some(WgpuTestWindowContextParts {
                 instance: context.instance.clone(),
                 adapter: context.adapter.clone(),
                 device: (*context.device).clone(),
@@ -2073,6 +2503,54 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn draw_instances_with_texture_and_backdrop(
+        &self,
+        data: &[u8],
+        instance_count: u32,
+        texture_view: &wgpu::TextureView,
+        backdrop_view: &wgpu::TextureView,
+        pipeline: &wgpu::RenderPipeline,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        if instance_count == 0 {
+            return true;
+        }
+        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
+            return false;
+        };
+        let resources = self.resources();
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &resources.bind_group_layouts.instances_with_backdrop,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.instance_binding(offset, size),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(backdrop_view),
+                    },
+                ],
+            });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &bind_group, &[]);
+        pass.draw(0..4, 0..instance_count);
+        true
     }
 
     fn draw_instances_with_texture_and_sampler(
@@ -3336,7 +3814,6 @@ fn create_surface(
 struct RenderingParameters {
     path_sample_count: u32,
     gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
 }
 
@@ -3351,16 +3828,6 @@ impl RenderingParameters {
         Self::from_env(path_sample_count)
     }
 
-    /// Deterministic parameters for headless offscreen capture. Forces
-    /// `path_sample_count = 1`: MSAA sample positions are backend-defined, and
-    /// the render-parity contract forbids relying on backend-defined behavior,
-    /// so cross-platform byte-identity (macOS Metal vs Linux Vulkan/lavapipe)
-    /// requires single-sampled path rasterization. Gamma/contrast use the same
-    /// env-driven defaults as the windowed path.
-    fn headless() -> Self {
-        Self::from_env(1)
-    }
-
     fn from_env(path_sample_count: u32) -> Self {
         use std::env;
 
@@ -3371,12 +3838,6 @@ impl RenderingParameters {
             .clamp(1.0, 2.2);
         let gamma_ratios = get_gamma_correction_ratios(gamma);
 
-        let grayscale_enhanced_contrast = env::var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0_f32)
-            .max(0.0);
-
         let subpixel_enhanced_contrast = env::var("ZED_FONTS_SUBPIXEL_ENHANCED_CONTRAST")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3386,49 +3847,20 @@ impl RenderingParameters {
         Self {
             path_sample_count,
             gamma_ratios,
-            grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
         }
     }
 }
 
-/// Convert tightly packed captured texels (no row padding) to 8-bit RGBA,
-/// quantizing the float capture target with a single deterministic round so the
-/// readback is byte-identical across GPU backends. 8-bit `Unorm` inputs are
-/// already quantized and pass through (with a BGRA→RGBA swizzle when needed).
+/// Convert tightly packed captured presentation texels (no row padding) to
+/// RGBA. 8-bit `Unorm` inputs are already quantized and pass through, with a
+/// BGRA→RGBA swizzle when needed.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-fn quantize_headless_capture_to_rgba8(
+fn presentation_capture_to_rgba8(
     raw: &[u8],
     format: wgpu::TextureFormat,
 ) -> anyhow::Result<Vec<u8>> {
     match format {
-        wgpu::TextureFormat::Rgba32Float => {
-            let mut out = Vec::with_capacity(raw.len() / 4);
-            for texel in raw.chunks_exact(16) {
-                for channel in 0..4 {
-                    let base = channel * 4;
-                    let value = f32::from_le_bytes([
-                        texel[base],
-                        texel[base + 1],
-                        texel[base + 2],
-                        texel[base + 3],
-                    ]);
-                    out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
-                }
-            }
-            Ok(out)
-        }
-        wgpu::TextureFormat::Rgba16Float => {
-            let mut out = Vec::with_capacity(raw.len() / 2);
-            for texel in raw.chunks_exact(8) {
-                for channel in 0..4 {
-                    let bits = u16::from_le_bytes([texel[channel * 2], texel[channel * 2 + 1]]);
-                    let value = half_bits_to_f32(bits);
-                    out.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
-                }
-            }
-            Ok(out)
-        }
         wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(raw.to_vec()),
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
             let mut out = raw.to_vec();
@@ -3437,65 +3869,41 @@ fn quantize_headless_capture_to_rgba8(
             }
             Ok(out)
         }
-        other => anyhow::bail!("unsupported headless capture format {other:?}"),
+        other => anyhow::bail!("unsupported presentation capture format {other:?}"),
     }
 }
 
-/// Decode an IEEE 754 binary16 (half) bit pattern to `f32` using only integer
-/// arithmetic and `f32::from_bits`. Deterministic and identical across
-/// platforms — no transcendental or `powi` dependence.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-fn half_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits as u32) & 0x8000) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x3ff) as u32;
-    if exponent == 0 {
-        if mantissa == 0 {
-            // Signed zero.
-            return f32::from_bits(sign);
-        }
-        // Subnormal half: normalize into a normal f32.
-        let mut exp = -1i32;
-        let mut mant = mantissa;
-        loop {
-            exp += 1;
-            mant <<= 1;
-            if mant & 0x400 != 0 {
-                break;
-            }
-        }
-        let f32_exponent = (127 - 15 - exp) as u32;
-        f32::from_bits(sign | (f32_exponent << 23) | ((mant & 0x3ff) << 13))
-    } else if exponent == 0x1f {
-        // Inf / NaN.
-        f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13))
-    } else {
-        let f32_exponent = exponent + (127 - 15);
-        f32::from_bits(sign | (f32_exponent << 23) | (mantissa << 13))
+fn scene_capture_backend(backend: wgpu::Backend) -> SceneCaptureBackend {
+    match backend {
+        wgpu::Backend::Metal => SceneCaptureBackend::Metal,
+        wgpu::Backend::Vulkan => SceneCaptureBackend::Vulkan,
+        wgpu::Backend::Dx12 => SceneCaptureBackend::Dx12,
+        wgpu::Backend::Gl => SceneCaptureBackend::Gl,
+        _ => SceneCaptureBackend::Other,
     }
 }
 
-/// Headless renderer for visual-regression capture: renders a GPUI scene to an
-/// offscreen wgpu texture and reads it back as RGBA. This is the single canonical
-/// cross-platform headless capture backend (macOS Metal, Linux Vulkan/lavapipe),
-/// wired into `gpui_platform::current_headless_renderer`.
+/// Renderer for test-window presentation capture. It renders a GPUI scene
+/// through the same wgpu presentation texture path used by surfaced windows and
+/// reads that texture back as RGBA.
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-pub struct WgpuHeadlessRenderer {
+pub struct WgpuTestWindowRenderer {
     renderer: WgpuRenderer,
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-impl WgpuHeadlessRenderer {
+impl WgpuTestWindowRenderer {
     pub fn new() -> anyhow::Result<Self> {
-        let context = WgpuContext::new_headless()?;
-        let renderer = WgpuRenderer::new_headless(
+        let context = WgpuContext::new_for_test_window()?;
+        let renderer = WgpuRenderer::new_for_test_window(
             &context,
             Size {
                 width: DevicePixels(1),
                 height: DevicePixels(1),
             },
         )?;
-        WgpuRenderer::register_active_headless_wgpu_context(&context);
+        WgpuRenderer::register_active_test_window_wgpu_context(&context);
         Ok(Self { renderer })
     }
 
@@ -3506,26 +3914,16 @@ impl WgpuHeadlessRenderer {
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
-impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
-    fn render_scene_to_image(
+impl gpui::PlatformTestWindowRenderer for WgpuTestWindowRenderer {
+    fn draw_presented_frame(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
-    ) -> anyhow::Result<image::RgbaImage> {
-        self.renderer.render_scene_to_image(scene, size)
+    ) -> anyhow::Result<gpui::SceneCapture> {
+        self.renderer.draw_presented_frame_to_capture(scene, size)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
-    }
-
-    fn capture_backend(&self) -> gpui::SceneCaptureBackend {
-        match self.renderer.adapter_backend() {
-            wgpu::Backend::Metal => gpui::SceneCaptureBackend::Metal,
-            wgpu::Backend::Vulkan => gpui::SceneCaptureBackend::Vulkan,
-            wgpu::Backend::Dx12 => gpui::SceneCaptureBackend::Dx12,
-            wgpu::Backend::Gl => gpui::SceneCaptureBackend::Gl,
-            _ => gpui::SceneCaptureBackend::Other,
-        }
     }
 }

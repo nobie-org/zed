@@ -48,8 +48,6 @@ use font_kit::{
     properties::{Properties as FontKitProperties, Style as FontKitStyle, Weight as FontKitWeight},
 };
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
-use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
 #[cfg(all(target_os = "macos", feature = "font-kit"))]
@@ -696,8 +694,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
-    fn capture_scene(&self, _scene: &Scene) -> Result<SceneCapture> {
-        anyhow::bail!("scene capture is not implemented for this platform window")
+    fn request_frame_capture(&self) {}
+    fn capture_presented_frame(&self) -> Result<SceneCapture> {
+        anyhow::bail!("presented-frame capture is not implemented for this platform window")
     }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
@@ -759,14 +758,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
     }
-
-    /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing where we want
-    /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
-        anyhow::bail!("render_to_image not implemented for this platform")
-    }
 }
 
 /// GPU backend that produced a [`SceneCapture`].
@@ -793,6 +784,7 @@ pub enum SceneCaptureBackend {
 }
 
 /// CPU-readable capture of a rendered GPUI scene.
+#[derive(Clone)]
 pub struct SceneCapture {
     /// Pixels encoded as RGBA8 in row-major order.
     pub rgba: Vec<u8>,
@@ -804,21 +796,18 @@ pub struct SceneCapture {
     pub backend: SceneCaptureBackend,
 }
 
-/// A renderer for headless windows that can produce real rendered output.
+/// A renderer for test windows that can draw and capture the presented output.
 #[cfg(any(test, feature = "test-support"))]
-pub trait PlatformHeadlessRenderer {
-    /// Render a scene and return the result as an RGBA image.
-    fn render_scene_to_image(
+pub trait PlatformTestWindowRenderer {
+    /// Draw a scene at `size` and return the captured presented pixels.
+    fn draw_presented_frame(
         &mut self,
         scene: &Scene,
         size: Size<DevicePixels>,
-    ) -> Result<RgbaImage>;
+    ) -> Result<SceneCapture>;
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
-
-    /// The GPU backend this renderer captures through.
-    fn capture_backend(&self) -> SceneCaptureBackend;
 }
 
 /// Type alias for runnables with metadata.

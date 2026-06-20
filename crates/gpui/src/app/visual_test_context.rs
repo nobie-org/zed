@@ -376,13 +376,15 @@ impl VisualTestAppContext {
         }
     }
 
-    /// Captures a screenshot of the specified window using direct texture capture.
-    ///
-    /// This renders the scene to a Metal texture and reads the pixels directly,
-    /// which does not require the window to be visible on screen.
+    /// Captures a screenshot of the specified window from the frame presented by
+    /// GPUI's normal window draw path.
     #[cfg(any(test, feature = "test-support"))]
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
-        self.update_window(window, |_, window, _cx| window.render_to_image())?
+        self.update_window(window, |_, window, cx| {
+            let capture = window.draw_present_and_capture_immediately(cx)?;
+            RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
+                .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
+        })?
     }
 
     /// Waits for animations to complete by waiting a couple of frames.

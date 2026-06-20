@@ -60,23 +60,23 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
-/// Returns the canonical headless offscreen renderer for visual-regression
-/// capture. This is a single cross-platform wgpu renderer (Metal on macOS,
-/// Vulkan/lavapipe on Linux) so baselines are byte-identical across platforms
-/// and assertable on Linux CI. There is no per-platform fallback: a missing
-/// headless GPU adapter is an environment misconfiguration and fails loudly.
+/// Returns the current test-window renderer for screenshots. macOS delegates to
+/// the same renderer choice used by headed windows; non-macOS native platforms
+/// use the wgpu renderer's shared presentation texture path without a platform
+/// surface. There is no silent fallback: a missing native test renderer is an
+/// environment misconfiguration and fails loudly.
 #[cfg(feature = "test-support")]
-pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
+pub fn current_test_window_renderer() -> Option<Box<dyn gpui::PlatformTestWindowRenderer>> {
     #[cfg(target_os = "macos")]
     {
-        gpui_macos::metal_renderer::current_headless_renderer()
+        gpui_macos::metal_renderer::current_test_window_renderer()
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
     {
-        match gpui_wgpu::WgpuHeadlessRenderer::new() {
+        match gpui_wgpu::WgpuTestWindowRenderer::new() {
             Ok(renderer) => Some(Box::new(renderer)),
-            Err(error) => panic!("failed to create headless wgpu renderer: {error:#}"),
+            Err(error) => panic!("failed to create test-window wgpu renderer: {error:#}"),
         }
     }
 
@@ -86,13 +86,13 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
     }
 }
 
-/// Returns the canonical headless text system for visual-regression capture: a
+/// Returns the text system used by test-window screenshot capture. This is a
 /// cross-platform swash text system ([`gpui_wgpu::CosmicTextSystem`]) with no
 /// system fonts. Glyphs are byte-identical across platforms once the app
 /// registers its embedded fonts (e.g. Inter) via `App::text_system().add_fonts`;
 /// the fallback family name only matters before those fonts are registered.
 #[cfg(feature = "test-support")]
-pub fn current_headless_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
+pub fn current_test_window_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
     #[cfg(not(target_family = "wasm"))]
     {
         std::sync::Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
@@ -102,7 +102,7 @@ pub fn current_headless_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSy
 
     #[cfg(target_family = "wasm")]
     {
-        unimplemented!("headless text system is not available on wasm")
+        unimplemented!("test-window text system is not available on wasm")
     }
 }
 

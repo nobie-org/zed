@@ -1,13 +1,11 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformInputSimulator,
-    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, SceneCapture, Size,
-    TestPlatform, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams,
+    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformInputSimulator, PlatformTestWindowRenderer, PlatformWindow,
+    Point, PromptButton, RequestFrameOptions, Scene, SceneCapture, Size, TestPlatform, TileId,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
-use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
@@ -25,7 +23,7 @@ pub(crate) struct TestWindowState {
     platform: Weak<TestPlatform>,
     // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
-    renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
+    renderer: Option<Box<dyn PlatformTestWindowRenderer>>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
@@ -35,6 +33,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    presented_capture: Option<Result<SceneCapture, String>>,
 }
 
 #[derive(Clone)]
@@ -62,7 +61,7 @@ impl TestWindow {
         params: WindowParams,
         platform: Weak<TestPlatform>,
         display: Rc<dyn PlatformDisplay>,
-        renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
+        renderer: Option<Box<dyn PlatformTestWindowRenderer>>,
     ) -> Self {
         let sprite_atlas: Arc<dyn PlatformAtlas> = match &renderer {
             Some(r) => r.sprite_atlas(),
@@ -87,7 +86,21 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            presented_capture: None,
         })))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn draw_presented_frame_to_capture(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
+        let mut state = self.0.lock();
+        let size = state.bounds.size;
+        if let Some(renderer) = &mut state.renderer {
+            let scale_factor = 2.0;
+            let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
+            renderer.draw_presented_frame(scene, device_size)
+        } else {
+            anyhow::bail!("test-window draw not available: no test-window renderer configured")
+        }
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -307,42 +320,24 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, _scene: &Scene) {}
+    fn draw(&self, scene: &Scene) {
+        let capture = self
+            .draw_presented_frame_to_capture(scene)
+            .map_err(|err| err.to_string());
+        self.0.lock().presented_capture = Some(capture);
+    }
 
-    fn capture_scene(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
-        let image = self.render_to_image(scene)?;
-        let width_px = image.width();
-        let height_px = image.height();
-        let backend = {
-            let state = self.0.lock();
-            let renderer = state.renderer.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("capture_scene not available: no HeadlessRenderer configured")
-            })?;
-            renderer.capture_backend()
-        };
-        Ok(SceneCapture {
-            rgba: image.into_raw(),
-            width_px,
-            height_px,
-            backend,
-        })
+    fn capture_presented_frame(&self) -> anyhow::Result<SceneCapture> {
+        let mut state = self.0.lock();
+        match state.presented_capture.take() {
+            Some(Ok(capture)) => Ok(capture),
+            Some(Err(error)) => anyhow::bail!("{error}"),
+            None => anyhow::bail!("capture_presented_frame called before draw presented a frame"),
+        }
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
-        let mut state = self.0.lock();
-        let size = state.bounds.size;
-        if let Some(renderer) = &mut state.renderer {
-            let scale_factor = 2.0;
-            let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
-            renderer.render_scene_to_image(scene, device_size)
-        } else {
-            anyhow::bail!("render_to_image not available: no HeadlessRenderer configured")
-        }
     }
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {

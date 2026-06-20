@@ -1978,10 +1978,10 @@ float4 srgb_to_oklab(float4 color) {
   float s_ = pow(s, 1.0/3.0);
 
   return float4(
-   	0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-   	1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-   	0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
-   	color.a
+    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+    color.a
   );
 }
 
@@ -1996,9 +1996,9 @@ float4 oklab_to_srgb(float4 color) {
   float s = s_ * s_ * s_;
 
   float3 linear_rgb = float3(
-   	4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
-   	-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-   	-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
   );
 
   // Convert linear sRGB to non-linear sRGB
@@ -2178,6 +2178,28 @@ float4 over(float4 below, float4 above) {
   return result;
 }
 
+float gradient_dither(float2 position) {
+  uint x = uint(floor(position.x));
+  uint y = uint(floor(position.y));
+  uint h = x * 0x1f123bb5u + y * 0x05491333u + 0x9e3779b9u;
+  h = h ^ (h >> 16u);
+  h = h * 0x7feb352du;
+  h = h ^ (h >> 15u);
+  h = h * 0x846ca68bu;
+  h = h ^ (h >> 16u);
+  uint r1 = h & 0xffu;
+
+  h = h + 0x9e3779b9u;
+  h = h ^ (h >> 16u);
+  h = h * 0x7feb352du;
+  h = h ^ (h >> 15u);
+  h = h * 0x846ca68bu;
+  h = h ^ (h >> 16u);
+  uint r2 = h & 0xffu;
+
+  return (float(r1 + r2) - 255.0) / 255.0;
+}
+
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,
                                      Hsla color0, Hsla color1) {
   GradientColor out;
@@ -2257,15 +2279,8 @@ float4 fill_color(Background background,
         }
       }
 
-      // Dither to reduce banding in gradients (especially dark/alpha).
-      // Triangular-distributed noise breaks up 8-bit quantization steps.
-      // ±2/255 for RGB (enough for dark-on-dark compositing),
-      // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
       {
-        float2 seed = position * 0.6180339887; // golden ratio spread
-        float r1 = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-        float r2 = fract(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
-        float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
+        float tri = gradient_dither(position);
         color.rgb += tri * 2.0 / 255.0;
         color.a   += tri * 3.0 / 255.0;
       }
@@ -2292,14 +2307,14 @@ float4 fill_color(Background background,
         // checkerboard
         float size = background.gradient_angle_or_pattern_height;
         float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
-        
+
         float x_index = floor(relative_position.x / size);
         float y_index = floor(relative_position.y / size);
         float should_be_colored = fmod(x_index + y_index, 2.0);
-        
+
         color = solid_color;
         color.a *= saturate(should_be_colored);
-        break; 
+        break;
     }
   }
 

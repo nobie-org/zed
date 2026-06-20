@@ -77,8 +77,10 @@ fn select_emoji_font(
     None
 }
 
-/// When rendering SVGs, we render them at twice the size to get a higher-quality result.
-pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
+const SMOOTH_SVG_SCALE: usize = 2;
+
+/// When rendering SVGs, we supersample them before uploading or displaying the result.
+pub const SMOOTH_SVG_SCALE_FACTOR: f32 = SMOOTH_SVG_SCALE as f32;
 
 #[derive(Clone, PartialEq, Hash, Eq)]
 #[expect(missing_docs)]
@@ -202,20 +204,15 @@ impl SvgRenderer {
         anyhow::ensure!(!params.size.is_zero(), "can't render at a zero size");
 
         let render_pixmap = |bytes| {
-            let pixmap = self.render_pixmap(bytes, SvgSize::Size(params.size))?;
+            let supersampled_size = supersampled_size(params.size);
+            let pixmap = self.render_pixmap(bytes, SvgSize::Size(supersampled_size))?;
 
-            // Convert the pixmap's pixels into an alpha mask.
-            let size = Size::new(
-                DevicePixels(pixmap.width() as i32),
-                DevicePixels(pixmap.height() as i32),
-            );
-            let alpha_mask = pixmap
-                .pixels()
-                .iter()
-                .map(|p| p.alpha())
-                .collect::<Vec<_>>();
+            debug_assert_eq!(pixmap.width(), supersampled_size.width.0 as u32);
+            debug_assert_eq!(pixmap.height(), supersampled_size.height.0 as u32);
 
-            Ok(Some((size, alpha_mask)))
+            let alpha_mask = downsample_alpha_mask(&pixmap, params.size);
+
+            Ok(Some((params.size, alpha_mask)))
         };
 
         if let Some(bytes) = bytes {
@@ -230,24 +227,70 @@ impl SvgRenderer {
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
         let svg_size = tree.size();
-        let scale = match size {
-            SvgSize::Size(size) => size.width.0 as f32 / svg_size.width(),
-            SvgSize::ScaleFactor(scale) => scale,
+        let (width, height, scale_x, scale_y) = match size {
+            SvgSize::Size(size) => {
+                if size.width.0 <= 0 || size.height.0 <= 0 {
+                    return Err(usvg::Error::InvalidSize);
+                }
+
+                let width = size.width.0 as u32;
+                let height = size.height.0 as u32;
+                (
+                    width,
+                    height,
+                    width as f32 / svg_size.width(),
+                    height as f32 / svg_size.height(),
+                )
+            }
+            SvgSize::ScaleFactor(scale) => (
+                (svg_size.width() * scale) as u32,
+                (svg_size.height() * scale) as u32,
+                scale,
+                scale,
+            ),
         };
 
         // Render the SVG to a pixmap with the specified width and height.
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(
-            (svg_size.width() * scale) as u32,
-            (svg_size.height() * scale) as u32,
-        )
-        .ok_or(usvg::Error::InvalidSize)?;
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(width, height).ok_or(usvg::Error::InvalidSize)?;
 
-        let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+        let transform = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
 
         resvg::render(&tree, transform, &mut pixmap.as_mut());
 
         Ok(pixmap)
     }
+}
+
+fn supersampled_size(size: Size<DevicePixels>) -> Size<DevicePixels> {
+    size.map(|value| DevicePixels(value.0 * SMOOTH_SVG_SCALE as i32))
+}
+
+fn downsample_alpha_mask(pixmap: &Pixmap, size: Size<DevicePixels>) -> Vec<u8> {
+    let width = size.width.0 as usize;
+    let height = size.height.0 as usize;
+    let source_width = pixmap.width() as usize;
+    let pixels = pixmap.pixels();
+    let samples = (SMOOTH_SVG_SCALE * SMOOTH_SVG_SCALE) as u32;
+    let rounding = samples / 2;
+
+    let mut alpha_mask = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            let mut alpha = 0u32;
+            for sample_y in 0..SMOOTH_SVG_SCALE {
+                let source_y = y * SMOOTH_SVG_SCALE + sample_y;
+                let row_start = source_y * source_width;
+                for sample_x in 0..SMOOTH_SVG_SCALE {
+                    let source_x = x * SMOOTH_SVG_SCALE + sample_x;
+                    alpha += pixels[row_start + source_x].alpha() as u32;
+                }
+            }
+            alpha_mask.push(((alpha + rounding) / samples) as u8);
+        }
+    }
+
+    alpha_mask
 }
 
 fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
@@ -342,6 +385,56 @@ mod tests {
                 s
             );
         }
+    }
+
+    #[test]
+    fn downsample_alpha_mask_averages_supersample_blocks() {
+        let scale = SMOOTH_SVG_SCALE;
+        let mut pixmap = Pixmap::new((2 * scale) as u32, (2 * scale) as u32).unwrap();
+        let block_bases = [[0, 10], [100, 110]];
+
+        for block_y in 0..2 {
+            for block_x in 0..2 {
+                let base = block_bases[block_y][block_x];
+                for sample_y in 0..scale {
+                    for sample_x in 0..scale {
+                        let x = block_x * scale + sample_x;
+                        let y = block_y * scale + sample_y;
+                        let alpha = base + sample_y * scale + sample_x;
+                        pixmap.pixels_mut()[y * 2 * scale + x] =
+                            resvg::tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, alpha as u8)
+                                .unwrap();
+                    }
+                }
+            }
+        }
+
+        let mask = downsample_alpha_mask(&pixmap, Size::new(DevicePixels(2), DevicePixels(2)));
+
+        let samples = (scale * scale) as u32;
+        let rounded_average_offset = ((samples - 1) * samples / 2 + samples / 2) / samples;
+        assert_eq!(
+            mask,
+            vec![
+                rounded_average_offset as u8,
+                (10 + rounded_average_offset) as u8,
+                (100 + rounded_average_offset) as u8,
+                (110 + rounded_average_offset) as u8,
+            ]
+        );
+    }
+
+    #[test]
+    fn svg_size_renders_exact_requested_pixmap_size() {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let pixmap = renderer
+            .render_pixmap(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="7" height="5" viewBox="0 0 7 5"><rect width="7" height="5" fill="black"/></svg>"#,
+                SvgSize::Size(Size::new(DevicePixels(23), DevicePixels(19))),
+            )
+            .unwrap();
+
+        assert_eq!((pixmap.width(), pixmap.height()), (23, 19));
     }
 
     #[test]

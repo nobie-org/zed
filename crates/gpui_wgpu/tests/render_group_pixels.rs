@@ -6,17 +6,17 @@ use std::sync::Arc;
 use gpui::{
     AtlasKey, AtlasTile, Background, BorderStyle, Bounds, CompositeBlendMode, CompositeEffect,
     ContentMask, Corners, DerivedStage, DevicePixels, Edges, Glow, GroupShape, Hsla, ImageId,
-    LumaThreshold, Pixels, PlatformAtlas, PlatformHeadlessRenderer, RenderGroupShadowMode,
+    LumaThreshold, Pixels, PlatformAtlas, PlatformTestWindowRenderer, RenderGroupShadowMode,
     RenderImageParams, RenderSvgParams, ScaledPixels, SurfacePrimitive, SurfaceSilhouette, point,
     px, rgba,
     scene_protocol::{
         LogicalVisualPlan, MonochromeSprite, PaintGroup, Path, PolychromeSprite, Quad,
         RenderGroupBackendCounters, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
-        Scene, TransformationMatrix,
+        Scene, Shadow, TransformationMatrix,
     },
     size, transparent_black,
 };
-use gpui_wgpu::WgpuHeadlessRenderer;
+use gpui_wgpu::WgpuTestWindowRenderer;
 use image::RgbaImage;
 
 const IMAGE_SIZE: i32 = 32;
@@ -58,6 +58,22 @@ fn quad(order: u32, bounds: Bounds<ScaledPixels>, background: impl Into<Backgrou
         border_color: transparent_black(),
         corner_radii: Corners::all(sp(0.)),
         border_widths: Edges::all(sp(0.)),
+    }
+}
+
+fn shadow(
+    order: u32,
+    bounds: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    color: Hsla,
+) -> Shadow {
+    Shadow {
+        order,
+        blur_radius: sp(0.),
+        bounds,
+        corner_radii,
+        content_mask: mask(),
+        color,
     }
 }
 
@@ -155,20 +171,22 @@ fn finished_scene(primitives: impl IntoIterator<Item = Quad>) -> Scene {
 }
 
 fn render(scene: &Scene) -> RgbaImage {
-    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
-    renderer
-        .render_scene_to_image(
-            scene,
-            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-        )
-        .expect("render scene")
+    let mut renderer = WgpuTestWindowRenderer::new().expect("create test-window renderer");
+    capture_to_image(
+        renderer
+            .draw_presented_frame(
+                scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render scene"),
+    )
 }
 
-/// Render `scene` headlessly and return the backend's measured render-group counters.
+/// Render `scene` through the test-window path and return the backend's measured render-group counters.
 fn backend_counters(scene: &Scene) -> RenderGroupBackendCounters {
-    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    let mut renderer = WgpuTestWindowRenderer::new().expect("create test-window renderer");
     renderer
-        .render_scene_to_image(
+        .draw_presented_frame(
             scene,
             size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
         )
@@ -224,6 +242,27 @@ fn identity_render_group_matches_inline_rendering() {
     let grouped_image = render(&grouped);
 
     assert_eq!(grouped_image.as_raw(), inline_image.as_raw());
+}
+
+#[test]
+fn zero_blur_shadow_matches_hard_quad_coverage() {
+    let bounds = rect(8., 8., 16., 16.);
+    let corner_radii = Corners::all(sp(4.));
+
+    let mut shadow_scene = Scene::default();
+    shadow_scene.insert_primitive(quad(0, viewport(), black()));
+    shadow_scene.insert_primitive(shadow(1, bounds, corner_radii, red()));
+    shadow_scene.finish();
+
+    let mut quad_scene = Scene::default();
+    quad_scene.insert_primitive(quad(0, viewport(), black()));
+    quad_scene.insert_primitive(Quad {
+        corner_radii,
+        ..quad(1, bounds, red())
+    });
+    quad_scene.finish();
+
+    assert_eq!(render(&shadow_scene).as_raw(), render(&quad_scene).as_raw());
 }
 
 // --- M2b: measured backend render-group counters match the planner ---
@@ -1973,18 +2012,25 @@ fn render_group_hard_light_blend_mode_applies_at_group_boundary() {
 
 /// Render a scene that needs atlas-backed sprites: the build closure receives the
 /// renderer's sprite atlas so it can insert tiles before the scene is rendered.
-/// `render_scene_to_image` calls `atlas.before_frame()`, which flushes the staged
+/// `draw_presented_frame` calls `atlas.before_frame()`, which flushes the staged
 /// tile uploads before the draw, so the injected pixels are on the GPU.
 fn render_with_atlas(build: impl FnOnce(&Arc<dyn PlatformAtlas>) -> Scene) -> RgbaImage {
-    let mut renderer = WgpuHeadlessRenderer::new().expect("create headless renderer");
+    let mut renderer = WgpuTestWindowRenderer::new().expect("create test-window renderer");
     let atlas = renderer.sprite_atlas().clone();
     let scene = build(&atlas);
-    renderer
-        .render_scene_to_image(
-            &scene,
-            size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
-        )
-        .expect("render scene")
+    capture_to_image(
+        renderer
+            .draw_presented_frame(
+                &scene,
+                size(DevicePixels(IMAGE_SIZE), DevicePixels(IMAGE_SIZE)),
+            )
+            .expect("render scene"),
+    )
+}
+
+fn capture_to_image(capture: gpui::SceneCapture) -> RgbaImage {
+    RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
+        .expect("captured RGBA dimensions match buffer")
 }
 
 /// Allocate and upload a `side`x`side` monochrome tile whose every texel has the

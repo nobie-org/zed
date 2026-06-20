@@ -792,7 +792,7 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             PATH_SAMPLE_COUNT,
         )?;
-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
+        let path_sprites_pipeline_state = build_premultiplied_alpha_pipeline_state(
             &device,
             &library,
             "path_sprites",
@@ -800,7 +800,7 @@ impl MetalRenderer {
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         )?;
-        let group_sprites_pipeline_state = build_path_sprite_pipeline_state(
+        let group_sprites_pipeline_state = build_premultiplied_alpha_pipeline_state(
             &device,
             &library,
             "group_sprites",
@@ -3096,7 +3096,7 @@ fn build_pipeline_state(
         })
 }
 
-fn build_path_sprite_pipeline_state(
+fn build_premultiplied_alpha_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
     label: &'static str,

@@ -1,15 +1,16 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, SceneCapture,
-    SceneCaptureBackend, Size, get_gamma_correction_ratios, point,
+    get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
         PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
         RenderGroupPhysicalPlanKind, Scene, Shadow, SubpixelSprite, SurfaceSilhouetteSpriteData,
         Underline,
     },
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point,
+    RenderGroupShadowMode, ScaledPixels, SceneCapture, SceneCaptureBackend, Size,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES,
 };
 use log::{info, warn};
 #[cfg(not(target_family = "wasm"))]
@@ -164,6 +165,7 @@ struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
+    instances_with_backdrop: wgpu::BindGroupLayout,
     group_composite: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
 }
@@ -821,6 +823,40 @@ impl WgpuRenderer {
                 ],
             });
 
+        let instances_with_backdrop =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("instances_with_backdrop_layout"),
+                entries: &[
+                    storage_buffer_entry(0),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
         let unfiltered_texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -889,6 +925,7 @@ impl WgpuRenderer {
             globals,
             instances,
             instances_with_texture,
+            instances_with_backdrop,
             group_composite,
             surfaces,
         }
@@ -1009,11 +1046,15 @@ impl WgpuRenderer {
         let quads = create_pipeline(
             "quads",
             "vs_quad",
-            "fs_quad",
+            "fs_quad_composite",
             &layouts.globals,
-            &layouts.instances,
+            &layouts.instances_with_backdrop,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
             1,
             &shader_module,
         );
@@ -1023,9 +1064,13 @@ impl WgpuRenderer {
             "vs_shadow",
             "fs_shadow",
             &layouts.globals,
-            &layouts.instances,
+            &layouts.instances_with_backdrop,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
             1,
             &shader_module,
         );
@@ -1124,9 +1169,13 @@ impl WgpuRenderer {
             "vs_mono_sprite",
             "fs_mono_sprite",
             &layouts.globals,
-            &layouts.instances_with_texture,
+            &layouts.instances_with_backdrop,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target.clone())],
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
             1,
             &shader_module,
         );
@@ -1749,7 +1798,7 @@ impl WgpuRenderer {
                     });
             let mut retained_textures = Vec::new();
 
-            let needs_root_intermediate = scene.requires_backdrop_effects() && !target_can_copy;
+            let needs_root_intermediate = !target_can_copy;
             let overflow = if needs_root_intermediate {
                 let (root_texture, root_view) = self.create_group_intermediate();
                 let encoded_root = self.encode_scene_batches_to_view(
@@ -1845,10 +1894,69 @@ impl WgpuRenderer {
         for batch in scene.batches() {
             let ok = match batch {
                 PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(&scene.quads[range], instance_offset, &mut pass)
+                    let quads = &scene.quads[range];
+                    if quads.is_empty() {
+                        continue;
+                    }
+
+                    drop(pass);
+
+                    let did_draw = self.draw_quads(
+                        quads,
+                        target_texture,
+                        target_can_copy,
+                        target_view,
+                        encoder,
+                        instance_offset,
+                        retained_textures,
+                    );
+
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("scene_pass_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+
+                    did_draw
                 }
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(&scene.shadows[range], instance_offset, &mut pass)
+                    drop(pass);
+
+                    let did_draw = self.draw_shadows(
+                        &scene.shadows[range],
+                        target_texture,
+                        target_can_copy,
+                        target_view,
+                        encoder,
+                        instance_offset,
+                        retained_textures,
+                    );
+
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("scene_pass_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+
+                    did_draw
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
@@ -1884,13 +1992,37 @@ impl WgpuRenderer {
                 PrimitiveBatch::Underlines(range) => {
                     self.draw_underlines(&scene.underlines[range], instance_offset, &mut pass)
                 }
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                    drop(pass);
+
+                    let did_draw = self.draw_monochrome_sprites(
                         &scene.monochrome_sprites[range],
                         texture_id,
+                        target_texture,
+                        target_can_copy,
+                        target_view,
+                        encoder,
                         instance_offset,
-                        &mut pass,
-                    ),
+                        retained_textures,
+                    );
+
+                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("scene_pass_continued"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+
+                    did_draw
+                }
                 PrimitiveBatch::SubpixelSprites { texture_id, range } => self
                     .draw_subpixel_sprites(
                         &scene.subpixel_sprites[range],
@@ -1952,33 +2084,153 @@ impl WgpuRenderer {
     fn draw_quads(
         &self,
         quads: &[Quad],
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
+        retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
-        let data = unsafe { Self::instance_bytes(quads) };
-        self.draw_instances(
-            data,
-            quads.len() as u32,
-            &self.resources().pipelines.quads,
-            instance_offset,
-            pass,
-        )
+        let Some(target_texture) = target_texture else {
+            *self.last_error.lock().unwrap() =
+                Some("Quad compositing has no readable target texture".into());
+            return false;
+        };
+        if !target_can_copy {
+            *self.last_error.lock().unwrap() =
+                Some("Quad compositing needs COPY_SRC support for the target texture".into());
+            return false;
+        }
+
+        for quad in quads {
+            let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width.max(1),
+                    height: self.surface_config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("quad_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(quad)) };
+            let drew = self.draw_instances_with_texture_and_backdrop(
+                data,
+                1,
+                &backdrop_view,
+                &backdrop_view,
+                &self.resources().pipelines.quads,
+                instance_offset,
+                &mut pass,
+            );
+            drop(pass);
+            retained_textures.push(backdrop_texture);
+            if !drew {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_shadows(
         &self,
         shadows: &[Shadow],
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
+        retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
+        if shadows.is_empty() {
+            return true;
+        }
+
+        let Some(target_texture) = target_texture else {
+            *self.last_error.lock().unwrap() =
+                Some("Shadow compositing has no readable target texture".into());
+            return false;
+        };
+        if !target_can_copy {
+            *self.last_error.lock().unwrap() =
+                Some("Shadow compositing needs COPY_SRC support for the target texture".into());
+            return false;
+        }
+
+        let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: target_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &backdrop_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.surface_config.width.max(1),
+                height: self.surface_config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shadow_composite_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
         let data = unsafe { Self::instance_bytes(shadows) };
-        self.draw_instances(
+        let drew = self.draw_instances_with_texture_and_backdrop(
             data,
             shadows.len() as u32,
+            &backdrop_view,
+            &backdrop_view,
             &self.resources().pipelines.shadows,
             instance_offset,
-            pass,
-        )
+            &mut pass,
+        );
+        drop(pass);
+        retained_textures.push(backdrop_texture);
+        drew
     }
 
     fn draw_underlines(
@@ -2001,19 +2253,75 @@ impl WgpuRenderer {
         &self,
         sprites: &[MonochromeSprite],
         texture_id: AtlasTextureId,
+        target_texture: Option<&wgpu::Texture>,
+        target_can_copy: bool,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
         instance_offset: &mut u64,
-        pass: &mut wgpu::RenderPass<'_>,
+        retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
+        let Some(target_texture) = target_texture else {
+            *self.last_error.lock().unwrap() =
+                Some("Monochrome sprite compositing has no readable target texture".into());
+            return false;
+        };
+        if !target_can_copy {
+            *self.last_error.lock().unwrap() = Some(
+                "Monochrome sprite compositing needs COPY_SRC support for the target texture"
+                    .into(),
+            );
+            return false;
+        }
+
         let tex_info = self.atlas.get_texture_info(texture_id);
+        let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: target_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &backdrop_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.surface_config.width.max(1),
+                height: self.surface_config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("monochrome_sprite_composite_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
         let data = unsafe { Self::instance_bytes(sprites) };
-        self.draw_instances_with_texture(
+        let drew = self.draw_instances_with_texture_and_backdrop(
             data,
             sprites.len() as u32,
             &tex_info.view,
+            &backdrop_view,
             &self.resources().pipelines.mono_sprites,
             instance_offset,
-            pass,
-        )
+            &mut pass,
+        );
+        drop(pass);
+        retained_textures.push(backdrop_texture);
+        drew
     }
 
     fn draw_subpixel_sprites(
@@ -2179,6 +2487,54 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn draw_instances_with_texture_and_backdrop(
+        &self,
+        data: &[u8],
+        instance_count: u32,
+        texture_view: &wgpu::TextureView,
+        backdrop_view: &wgpu::TextureView,
+        pipeline: &wgpu::RenderPipeline,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        if instance_count == 0 {
+            return true;
+        }
+        let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, data) else {
+            return false;
+        };
+        let resources = self.resources();
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &resources.bind_group_layouts.instances_with_backdrop,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.instance_binding(offset, size),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(backdrop_view),
+                    },
+                ],
+            });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &bind_group, &[]);
+        pass.draw(0..4, 0..instance_count);
+        true
     }
 
     fn draw_instances_with_texture_and_sampler(

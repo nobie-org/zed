@@ -578,8 +578,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     return out;
 }
 
-@fragment
-fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+fn quad_source_color(input: QuadVarying) -> vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
@@ -601,7 +600,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return background_color;
     }
 
     let size = quad.bounds.size;
@@ -667,7 +666,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return background_color;
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -906,7 +905,32 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return vec4<f32>(color.rgb, color.a * saturate(antialias_threshold - outer_sdf));
+}
+
+@fragment
+fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    return blend_color(quad_source_color(input), 1.0);
+}
+
+@fragment
+fn fs_quad_composite(input: QuadVarying) -> @location(0) vec4<f32> {
+    let source = blend_color(quad_source_color(input), 1.0);
+    if (source.a <= 0.0) {
+        discard;
+    }
+    if (source.a >= 1.0) {
+        return source;
+    }
+
+    let backdrop = textureLoad(t_backdrop, vec2<i32>(input.position.xy), 0);
+    let straight_rgb = source.rgb * source.a + backdrop.rgb * (1.0 - source.a);
+    let premultiplied_rgb = source.rgb + backdrop.rgb * (1.0 - source.a);
+    let rgb = select(straight_rgb, premultiplied_rgb, globals.premultiplied_alpha != 0u);
+    return quantize_unorm8(vec4<f32>(
+        rgb,
+        source.a + backdrop.a * (1.0 - source.a),
+    ));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1007,7 +1031,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
 fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        discard;
     }
 
     let shadow = b_shadows[input.shadow_id];
@@ -1039,7 +1063,19 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         }
     }
 
-    return blend_color(input.color, alpha);
+    let source = blend_color(input.color, alpha);
+    if (source.a <= 0.0) {
+        discard;
+    }
+
+    let backdrop = textureLoad(t_backdrop, vec2<i32>(input.position.xy), 0);
+    let straight_rgb = source.rgb * source.a + backdrop.rgb * (1.0 - source.a);
+    let premultiplied_rgb = source.rgb + backdrop.rgb * (1.0 - source.a);
+    let rgb = select(straight_rgb, premultiplied_rgb, globals.premultiplied_alpha != 0u);
+    return quantize_unorm8(vec4<f32>(
+        rgb,
+        source.a + backdrop.a * (1.0 - source.a),
+    ));
 }
 
 // --- path rasterization --- //
@@ -2074,16 +2110,29 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     return out;
 }
 
+fn quantize_unorm8(color: vec4<f32>) -> vec4<f32> {
+    return floor(clamp(color, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0 + vec4<f32>(0.5)) / 255.0;
+}
+
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let sample = textureLoad(t_sprite, vec2<i32>(input.tile_position * atlas_size), 0).r;
 
-    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        discard;
     }
 
-    return blend_color(input.color, sample);
+    let coverage = input.color.a * sample;
+    if (coverage <= 0.0) {
+        discard;
+    }
+
+    let backdrop = textureLoad(t_backdrop, vec2<i32>(input.position.xy), 0);
+    return quantize_unorm8(vec4<f32>(
+        input.color.rgb * coverage + backdrop.rgb * (1.0 - coverage),
+        coverage + backdrop.a * (1.0 - coverage),
+    ));
 }
 
 // --- polychrome sprites --- //

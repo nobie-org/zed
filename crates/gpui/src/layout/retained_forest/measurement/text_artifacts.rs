@@ -9,7 +9,7 @@ use collections::{FxHashMap, FxHashSet};
 /// artifact validity facts GPUI can prove in the current solve: exact
 /// query-keyed artifacts observed from callbacks or passive solver cache events,
 /// plus subtree artifact bundles selected by a current final-layout cache
-/// observation.
+/// observation whose current text-descendant signature matches exactly.
 pub(super) struct TextArtifactStore {
     current_artifacts: FxHashMap<SolverNodeId, TextLayoutArtifact>,
     current_query_artifacts: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
@@ -195,7 +195,11 @@ impl TextArtifactStore {
         text_descendants: &[SolverNodeId],
         mut current_text_key: impl FnMut(SolverNodeId) -> Option<TextMeasureKey>,
     ) {
-        let Some(cache_key) = TextSubtreeCacheKey::from_final_layout_entry(entry) else {
+        let Some(cache_key) =
+            TextSubtreeCacheKey::from_final_layout_entry(entry, text_descendants, |node_id| {
+                current_text_key(node_id)
+            })
+        else {
             return;
         };
         let Some(artifacts) = self.subtree_cache.get(&cache_key).cloned() else {
@@ -251,14 +255,18 @@ impl TextArtifactStore {
         text_descendants: &[SolverNodeId],
         mut current_text_key: impl FnMut(SolverNodeId) -> Option<TextMeasureKey>,
     ) {
-        let Some(cache_key) = TextSubtreeCacheKey::from_final_layout_entry(entry) else {
+        let Some(cache_key) =
+            TextSubtreeCacheKey::from_final_layout_entry(entry, text_descendants, |node_id| {
+                current_text_key(node_id)
+            })
+        else {
             return;
         };
 
         let mut artifacts = Vec::with_capacity(text_descendants.len());
         for node_id in text_descendants {
-            let current_key = current_text_key(*node_id).unwrap_or_else(|| {
-                panic!("text descendant should have a current text measurement")
+            let current_key = cache_key.text_key_for(*node_id).unwrap_or_else(|| {
+                panic!("text subtree cache key should cover every text descendant")
             });
             let Some(artifact) = self.current_artifacts.get(node_id) else {
                 self.subtree_cache.remove(&cache_key);
@@ -331,14 +339,41 @@ impl PendingTextArtifactQuery {
 pub(super) struct TextSubtreeCacheKey {
     node_id: SolverNodeId,
     entry_id: SolverCacheEntryId,
+    text_descendants: Vec<TextSubtreeDescendantKey>,
 }
 
 impl TextSubtreeCacheKey {
-    fn from_final_layout_entry(entry: SolverCacheEntry) -> Option<Self> {
-        entry.is_perform_layout().then_some(Self {
+    fn from_final_layout_entry(
+        entry: SolverCacheEntry,
+        text_descendants: &[SolverNodeId],
+        mut current_text_key: impl FnMut(SolverNodeId) -> Option<TextMeasureKey>,
+    ) -> Option<Self> {
+        if !entry.is_perform_layout() {
+            return None;
+        }
+        let mut descendant_keys = Vec::with_capacity(text_descendants.len());
+        for node_id in text_descendants {
+            let text_key = current_text_key(*node_id).unwrap_or_else(|| {
+                panic!("text subtree cache descendant should have a current text measurement")
+            });
+            descendant_keys.push(TextSubtreeDescendantKey {
+                node_id: *node_id,
+                text_key,
+            });
+        }
+
+        Some(Self {
             node_id: entry.node_id(),
             entry_id: entry.entry_id(),
+            text_descendants: descendant_keys,
         })
+    }
+
+    fn text_key_for(&self, node_id: SolverNodeId) -> Option<TextMeasureKey> {
+        self.text_descendants
+            .iter()
+            .find(|descendant| descendant.node_id == node_id)
+            .map(|descendant| descendant.text_key.clone())
     }
 }
 
@@ -347,6 +382,12 @@ struct TextSubtreeArtifact {
     node_id: SolverNodeId,
     text_key: TextMeasureKey,
     artifact: TextLayoutArtifact,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TextSubtreeDescendantKey {
+    node_id: SolverNodeId,
+    text_key: TextMeasureKey,
 }
 
 /// Exact validity key for a text artifact observed through the solver.

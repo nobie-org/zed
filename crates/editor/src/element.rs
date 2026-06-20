@@ -2366,7 +2366,7 @@ impl EditorElement {
                     (line_height - crease_toggle_size.height) / 2.,
                 );
                 let origin = gutter_hitbox.origin + position + centering_offset;
-                crease_toggle.prepaint_as_root(origin, available_space, window, cx);
+                crease_toggle.prepaint_at(origin, window, cx);
             }
         }
     }
@@ -2380,7 +2380,7 @@ impl EditorElement {
         for (expand_toggle, origin) in expand_toggles.iter_mut().flatten() {
             let available_space = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
             expand_toggle.layout_as_root(available_space, window, cx);
-            expand_toggle.prepaint_as_root(*origin, available_space, window, cx);
+            expand_toggle.prepaint_at(*origin, window, cx);
         }
     }
 
@@ -2421,7 +2421,7 @@ impl EditorElement {
                 );
                 let centering_offset = point(px(0.), (line_height - size.height) / 2.);
                 let origin = content_origin + position + centering_offset;
-                element.prepaint_as_root(origin, available_space, window, cx);
+                element.prepaint_at(origin, window, cx);
                 Some(CreaseTrailerLayout {
                     element,
                     bounds: Bounds::new(origin, size),
@@ -2779,12 +2779,7 @@ impl EditorElement {
 
         let absolute_offset = gpui::point(start_x, start_y);
         button.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
-        button.prepaint_as_root(
-            absolute_offset,
-            gpui::AvailableSpace::min_size(),
-            window,
-            cx,
-        );
+        button.prepaint_at(absolute_offset, window, cx);
         Some(button)
     }
 
@@ -2868,7 +2863,7 @@ impl EditorElement {
         let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
         let bounds = Bounds::new(absolute_offset, size);
 
-        element.prepaint_as_root(absolute_offset, AvailableSpace::min_size(), window, cx);
+        element.prepaint_at(absolute_offset, window, cx);
 
         Some(InlineBlameLayout {
             element,
@@ -8150,12 +8145,7 @@ impl Gutter<'_> {
         );
         y += (self.line_height - indicator_size.height) / 2.;
 
-        button.prepaint_as_root(
-            self.hitbox.origin + point(x, y),
-            available_space,
-            window,
-            cx,
-        );
+        button.prepaint_at(self.hitbox.origin + point(x, y), window, cx);
         button
     }
 }

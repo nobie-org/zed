@@ -1518,13 +1518,19 @@ impl RetainedLayoutForest {
         let unique_previous_global_ids = Self::unique_previous_child_global_ids(previous_children);
 
         for (index, child) in children.iter().enumerate() {
-            let Some(previous_child) = previous_children.get_mut(index) else {
+            let Some(candidate) = previous_children
+                .get(index)
+                .and_then(|previous_child| previous_child.as_ref())
+            else {
                 continue;
             };
-            let Some(candidate) = previous_child.as_ref() else {
-                continue;
-            };
-            if self.retained_occurrence_is_exact_current_intent(*child, candidate) {
+            let should_preserve = self
+                .retained_occurrence_is_exact_current_intent(*child, candidate)
+                && self.same_slot_exact_match_is_unambiguous(*child, children, previous_children);
+            if should_preserve {
+                let previous_child = previous_children
+                    .get_mut(index)
+                    .expect("previous child index should exist after immutable lookup");
                 assigned[index] = previous_child.take();
             }
         }
@@ -1543,11 +1549,22 @@ impl RetainedLayoutForest {
 
         for (index, child) in children.iter().enumerate() {
             if assigned[index].is_none() {
-                assigned[index] = self.take_exact_previous_child(*child, previous_children);
+                assigned[index] =
+                    self.take_unique_exact_previous_child(*child, children, previous_children);
             }
         }
 
         assigned
+    }
+
+    fn same_slot_exact_match_is_unambiguous(
+        &self,
+        child: LayoutId,
+        current_children: &[LayoutId],
+        previous_children: &[Option<RetainedLayoutOccurrence>],
+    ) -> bool {
+        self.current_exact_child_count(child, current_children)
+            == self.previous_exact_child_count(child, previous_children)
     }
 
     /// Find unique current child identities. Duplicates are not semantic proof.
@@ -1618,21 +1635,87 @@ impl RetainedLayoutForest {
         None
     }
 
-    /// Remove one exact previous child match from the available sibling set.
-    fn take_exact_previous_child(
+    /// Remove the only exact previous child match from the available sibling set.
+    fn take_unique_exact_previous_child(
         &self,
         child: LayoutId,
+        current_children: &[LayoutId],
         previous_children: &mut [Option<RetainedLayoutOccurrence>],
     ) -> Option<RetainedLayoutOccurrence> {
-        for previous_child in previous_children {
+        if self.current_exact_child_count(child, current_children) != 1 {
+            return None;
+        }
+
+        let mut matched_index = None;
+        for (index, previous_child) in previous_children.iter().enumerate() {
             let Some(candidate) = previous_child.as_ref() else {
                 continue;
             };
             if self.retained_occurrence_is_exact_current_intent(child, candidate) {
-                return previous_child.take();
+                if matched_index.is_some() {
+                    return None;
+                }
+                matched_index = Some(index);
             }
         }
-        None
+        previous_children.get_mut(matched_index?)?.take()
+    }
+
+    fn current_exact_child_count(&self, child: LayoutId, current_children: &[LayoutId]) -> usize {
+        current_children
+            .iter()
+            .filter(|candidate| self.current_intent_subtrees_are_exact(child, **candidate))
+            .count()
+    }
+
+    fn previous_exact_child_count(
+        &self,
+        child: LayoutId,
+        previous_children: &[Option<RetainedLayoutOccurrence>],
+    ) -> usize {
+        previous_children
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|candidate| self.retained_occurrence_is_exact_current_intent(child, candidate))
+            .count()
+    }
+
+    fn current_intent_subtrees_are_exact(&self, left: LayoutId, right: LayoutId) -> bool {
+        let left_intent = self.intent(left);
+        let right_intent = self.intent(right);
+        if left_intent.global_id != right_intent.global_id {
+            return false;
+        }
+        if left_intent.style != right_intent.style {
+            return false;
+        }
+        if left_intent.artifact_policy != right_intent.artifact_policy {
+            return false;
+        }
+
+        match (&left_intent.kind, &right_intent.kind) {
+            (
+                LayoutIntentKind::Unmeasured {
+                    children: left_children,
+                },
+                LayoutIntentKind::Unmeasured {
+                    children: right_children,
+                },
+            ) => {
+                left_children.len() == right_children.len()
+                    && left_children
+                        .iter()
+                        .zip(right_children)
+                        .all(|(left_child, right_child)| {
+                            self.current_intent_subtrees_are_exact(*left_child, *right_child)
+                        })
+            }
+            (
+                LayoutIntentKind::Measured(left_measured),
+                LayoutIntentKind::Measured(right_measured),
+            ) => left_measured == right_measured,
+            _ => false,
+        }
     }
 
     /// Commit a measured intent and register its current-frame producer.

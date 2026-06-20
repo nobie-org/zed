@@ -932,6 +932,26 @@ impl GeneratedTree {
             _ => false,
         }
     }
+
+    fn exact_child_count(child: &Self, children: &[Self]) -> usize {
+        children
+            .iter()
+            .filter(|candidate| child.retained_occurrence_is_exact_current_intent(candidate))
+            .count()
+    }
+
+    fn exact_unused_previous_child_count(
+        child: &Self,
+        previous_children: &[Self],
+        previous_used: &[bool],
+    ) -> usize {
+        previous_children
+            .iter()
+            .zip(previous_used)
+            .filter(|(_, used)| !**used)
+            .filter(|(candidate, _)| candidate.retained_occurrence_is_exact_current_intent(child))
+            .count()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1179,6 +1199,11 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     if let Some(previous_child) = previous_children.get(current_index) {
                         if previous_child.retained_occurrence_is_exact_current_intent(current_child)
+                            && GeneratedTree::exact_child_count(current_child, current_children)
+                                == GeneratedTree::exact_child_count(
+                                    current_child,
+                                    previous_children,
+                                )
                         {
                             previous_used[current_index] = true;
                             assigned_previous_indices[current_index] = Some(current_index);
@@ -1188,6 +1213,15 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
 
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     if assigned_previous_indices[current_index].is_some() {
+                        continue;
+                    }
+                    if GeneratedTree::exact_child_count(current_child, current_children) != 1
+                        || GeneratedTree::exact_unused_previous_child_count(
+                            current_child,
+                            previous_children,
+                            &previous_used,
+                        ) != 1
+                    {
                         continue;
                     }
                     let matching_previous_index =
@@ -3446,7 +3480,7 @@ fn grid_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
 }
 
 #[test]
-fn duplicate_exact_children_reuse_at_most_one_previous_node() {
+fn duplicate_same_slot_exact_child_rebuilds_when_sibling_count_changes() {
     let mut engine = LayoutEngine::new();
     let left = request_leaf(&mut engine, 10.0);
     let right = request_leaf(&mut engine, 10.0);
@@ -3462,7 +3496,10 @@ fn duplicate_exact_children_reuse_at_most_one_previous_node() {
     assert_intent_committed_exactly(&engine, second_root);
 
     let child_node = engine.retained_node_token_for_tests(child);
-    assert!(first_child_nodes.contains(&child_node));
+    assert!(
+        !first_child_nodes.contains(&child_node),
+        "duplicate anonymous exact siblings are not identity proof when the sibling count changes"
+    );
     assert_eq!(
         engine.retained_child_tokens_for_tests(second_root_node),
         vec![child_node]
@@ -3474,9 +3511,10 @@ fn duplicate_exact_children_reuse_at_most_one_previous_node() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
+            creates: 1,
+            reuses: 1,
             child_list_updates: 1,
-            removes: 1,
+            removes: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3489,6 +3527,56 @@ fn duplicate_exact_children_reuse_at_most_one_previous_node() {
     assert_eq!(
         engine.retained_child_tokens_for_tests(second_root_node),
         vec![child_node]
+    );
+}
+
+#[test]
+fn moved_duplicate_exact_child_rebuilds_instead_of_using_sibling_order() {
+    let mut retained = LayoutEngine::new();
+    let changed_slot = request_leaf(&mut retained, 20.0);
+    let duplicate_left = request_leaf(&mut retained, 10.0);
+    let duplicate_right = request_leaf(&mut retained, 10.0);
+    let first_root = request_container(
+        &mut retained,
+        &[changed_slot, duplicate_left, duplicate_right],
+    );
+    let first_root_node = retained.commit_layout(first_root);
+    let first_duplicate_nodes = [
+        retained.retained_node_token_for_tests(duplicate_left),
+        retained.retained_node_token_for_tests(duplicate_right),
+    ];
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let child = request_leaf(&mut retained, 10.0);
+    let second_root = request_container(&mut retained, &[child]);
+    let second_root_node = retained.commit_layout(second_root);
+    assert_intent_committed_exactly(&retained, second_root);
+    let child_node = retained.retained_node_token_for_tests(child);
+
+    assert_eq!(second_root_node, first_root_node);
+    assert!(
+        !first_duplicate_nodes.contains(&child_node),
+        "duplicate anonymous exact siblings are not identity proof"
+    );
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            creates: 1,
+            reuses: 1,
+            child_list_updates: 1,
+            removes: 3,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_child = request_leaf(&mut fresh, 10.0);
+    let fresh_root = request_container(&mut fresh, &[fresh_child]);
+    let fresh_root_node = fresh.commit_layout(fresh_root);
+    assert_eq!(
+        retained_layout_shape(&retained, second_root_node),
+        retained_layout_shape(&fresh, fresh_root_node)
     );
 }
 

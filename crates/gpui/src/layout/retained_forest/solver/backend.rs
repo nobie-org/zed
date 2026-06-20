@@ -9,8 +9,8 @@ use super::super::super::{AvailableSpace, EXPECT_MESSAGE};
 use super::super::measurement::NodeContext;
 use super::{
     FreshSolverNodeId, SolverBackend, SolverCacheClear, SolverCacheEntry, SolverCacheEntryId,
-    SolverCacheEntryTraceDetails, SolverCacheEvent, SolverLayout, SolverMeasureQuery, SolverNodeId,
-    SolverStyle,
+    SolverCacheEntryTraceDetails, SolverCacheEvent, SolverLayout, SolverMeasureObservation,
+    SolverMeasureQuery, SolverNodeId, SolverStyle,
 };
 use crate::{
     AbsoluteLength, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size, Style, point,
@@ -20,11 +20,11 @@ use crate::{
 use std::fmt::{self, Debug};
 use std::ops::Range;
 use taffy::{
-    LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, TaffyTree,
+    LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutMeasureObservation, TaffyTree,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
     prelude::{TaffyGridLine, TaffyGridSpan, max_content, min_content},
     style::AvailableSpace as TaffyAvailableSpace,
-    tree::{Layout as TaffyLayout, NodeId, RunMode},
+    tree::{Layout as TaffyLayout, NodeId},
 };
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -104,36 +104,6 @@ impl BackendCacheEntry {
         SolverCacheEntryId(BackendCacheEntryId(self.0.entry_id()))
     }
 
-    pub(super) fn is_compute_size(&self) -> bool {
-        self.0.requested_input().run_mode == RunMode::ComputeSize
-    }
-
-    pub(super) fn is_perform_layout(&self) -> bool {
-        self.0.requested_input().run_mode == RunMode::PerformLayout
-    }
-
-    pub(super) fn known_dimensions(&self, scale_factor: f32) -> Size<Option<Pixels>> {
-        let input = self.0.requested_input();
-        size(
-            input
-                .known_dimensions
-                .width
-                .map(|value| Pixels(value / scale_factor)),
-            input
-                .known_dimensions
-                .height
-                .map(|value| Pixels(value / scale_factor)),
-        )
-    }
-
-    pub(super) fn available_space(&self, scale_factor: f32) -> Size<AvailableSpace> {
-        let input = self.0.requested_input();
-        size(
-            available_space_from_taffy(input.available_space.width, scale_factor),
-            available_space_from_taffy(input.available_space.height, scale_factor),
-        )
-    }
-
     pub(super) fn trace_details(&self) -> SolverCacheEntryTraceDetails {
         let input = self.0.requested_input();
         let output = self.0.returned_output();
@@ -159,6 +129,35 @@ impl BackendCacheEntry {
                 TaffyAvailableSpace::Definite(height) if height <= 0.0
             ),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct BackendMeasureObservation(LayoutMeasureObservation);
+
+impl BackendMeasureObservation {
+    pub(super) fn node_id(&self) -> SolverNodeId {
+        SolverNodeId(BackendNodeId(self.0.node_id()))
+    }
+
+    pub(super) fn known_dimensions(&self, scale_factor: f32) -> Size<Option<Pixels>> {
+        size(
+            self.0
+                .known_dimensions()
+                .width
+                .map(|value| Pixels(value / scale_factor)),
+            self.0
+                .known_dimensions()
+                .height
+                .map(|value| Pixels(value / scale_factor)),
+        )
+    }
+
+    pub(super) fn available_space(&self, scale_factor: f32) -> Size<AvailableSpace> {
+        size(
+            available_space_from_taffy(self.0.available_space().width, scale_factor),
+            available_space_from_taffy(self.0.available_space().height, scale_factor),
+        )
     }
 }
 
@@ -419,6 +418,9 @@ fn solver_cache_event_from_taffy(event: LayoutCacheEvent) -> Option<SolverCacheE
         LayoutCacheEvent::Cleared(clear) => {
             SolverCacheEvent::Cleared(SolverCacheClear(BackendCacheClear(clear.node_id())))
         }
+        LayoutCacheEvent::Measure(observation) => SolverCacheEvent::Measure(
+            SolverMeasureObservation(BackendMeasureObservation(observation)),
+        ),
         _ => return None,
     })
 }

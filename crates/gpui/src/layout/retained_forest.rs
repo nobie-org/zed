@@ -35,9 +35,7 @@ use frame::{FrameIntents, FrameIntentsCheckpoint};
 use geometry::{GeometryStore, GeometryStoreCheckpoint};
 pub(super) use measurement::MeasuredLayoutRequest;
 pub(crate) use measurement::PureSizeMeasure;
-use measurement::{
-    MeasuredLayoutFacts, MeasurementSolveObserver, MeasurementStore, MeasurementStoreCheckpoint,
-};
+use measurement::{MeasuredLayoutFacts, MeasurementStore, MeasurementStoreCheckpoint};
 use occurrence::{RetainedLayoutOccurrence, RetainedLayoutOccurrenceKind};
 use root_slots::{RootSlots, RootSlotsCheckpoint};
 use roots::{RootRegistry, RootRegistryCheckpoint};
@@ -412,7 +410,6 @@ impl RetainedLayoutForest {
                 id.0, node_id, available_space
             );
         }
-
         let measurement_solve_observer = {
             let Self {
                 solver,
@@ -453,7 +450,6 @@ impl RetainedLayoutForest {
             window,
             cx,
             &mut subtree_compute_recorder,
-            &measurement_solve_observer,
             &mut cache_event_tracer,
         );
         let compute_layout_duration = compute_start.elapsed();
@@ -587,7 +583,6 @@ impl RetainedLayoutForest {
         window: &mut Window,
         cx: &mut App,
         subtree_compute_recorder: &mut SubtreeProbeComputeRecorder,
-        measurement_solve_observer: &MeasurementSolveObserver,
         cache_event_tracer: &mut CacheEventTracer,
     ) -> (u64, std::time::Duration) {
         let mut measured_layout_calls = 0;
@@ -640,7 +635,7 @@ impl RetainedLayoutForest {
                 cache_event_tracer.record(event);
                 compute_measurements
                     .borrow_mut()
-                    .observe_layout_cache_event(event, scale_factor, measurement_solve_observer);
+                    .observe_layout_cache_event(event, scale_factor);
             },
         );
 

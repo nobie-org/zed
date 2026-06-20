@@ -10,7 +10,7 @@ mod text_artifacts;
 
 use super::super::LayoutId;
 use super::AvailableSpace;
-use super::solver::{SolverCacheEntry, SolverCacheEvent, SolverNodeId};
+use super::solver::{SolverCacheEvent, SolverMeasureObservation, SolverNodeId};
 use crate::{App, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size};
 use collections::FxHashMap;
 use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
@@ -442,31 +442,19 @@ pub(super) struct MeasurementStoreCheckpoint {
     text_artifacts: TextArtifactStoreCheckpoint,
 }
 
-/// Measurement-owned observation table for one legal solver root solve.
+/// Measurement-owned artifact obligation table for one legal solver root solve.
 ///
-/// Solver cache events name a node. This table maps that node to the current
-/// measured descendants whose paint/hit-test artifacts may be selected by the
-/// event. Keeping it here prevents the retained forest root from knowing which
-/// measured-node kind produces artifacts.
+/// This records which measured nodes in the solved root require a current
+/// artifact before prepaint. Cache events may satisfy those obligations only
+/// when they report the exact measured-node query; container subtree hits are
+/// not artifact proof.
 pub(super) struct MeasurementSolveObserver {
-    artifact_descendants_by_node: FxHashMap<SolverNodeId, Vec<SolverNodeId>>,
     root_artifact_descendants: Vec<SolverNodeId>,
 }
 
 impl MeasurementSolveObserver {
     fn root_artifact_descendants(&self) -> &[SolverNodeId] {
         &self.root_artifact_descendants
-    }
-
-    fn artifact_descendants_for_event(&self, event: SolverCacheEvent) -> &[SolverNodeId] {
-        let event_node_id = match event {
-            SolverCacheEvent::Hit(entry) | SolverCacheEvent::Stored(entry) => entry.node_id(),
-            SolverCacheEvent::Cleared(clear) => clear.node_id(),
-        };
-        self.artifact_descendants_by_node
-            .get(&event_node_id)
-            .map(Vec::as_slice)
-            .expect("solver cache event node should belong to the current layout root")
     }
 }
 
@@ -608,15 +596,9 @@ impl MeasurementStore {
         mut children: impl FnMut(SolverNodeId) -> Vec<SolverNodeId>,
         mut can_produce_artifacts: impl FnMut(SolverNodeId) -> bool,
     ) -> MeasurementSolveObserver {
-        let mut artifact_descendants_by_node = FxHashMap::default();
-        let root_artifact_descendants = self.collect_artifact_descendants(
-            root,
-            &mut children,
-            &mut can_produce_artifacts,
-            &mut artifact_descendants_by_node,
-        );
+        let root_artifact_descendants =
+            self.collect_artifact_descendants(root, &mut children, &mut can_produce_artifacts);
         MeasurementSolveObserver {
-            artifact_descendants_by_node,
             root_artifact_descendants,
         }
     }
@@ -626,13 +608,8 @@ impl MeasurementStore {
         node_id: SolverNodeId,
         children: &mut impl FnMut(SolverNodeId) -> Vec<SolverNodeId>,
         can_produce_artifacts: &mut impl FnMut(SolverNodeId) -> bool,
-        descendants_by_node: &mut FxHashMap<SolverNodeId, Vec<SolverNodeId>>,
     ) -> Vec<SolverNodeId> {
         if !can_produce_artifacts(node_id) {
-            for child in children(node_id) {
-                Self::collect_artifact_ineligible_descendants(child, children, descendants_by_node);
-            }
-            descendants_by_node.insert(node_id, Vec::new());
             return Vec::new();
         }
 
@@ -646,23 +623,10 @@ impl MeasurementStore {
                 child,
                 children,
                 can_produce_artifacts,
-                descendants_by_node,
             ));
         }
 
-        descendants_by_node.insert(node_id, descendants.clone());
         descendants
-    }
-
-    fn collect_artifact_ineligible_descendants(
-        node_id: SolverNodeId,
-        children: &mut impl FnMut(SolverNodeId) -> Vec<SolverNodeId>,
-        descendants_by_node: &mut FxHashMap<SolverNodeId, Vec<SolverNodeId>>,
-    ) {
-        for child in children(node_id) {
-            Self::collect_artifact_ineligible_descendants(child, children, descendants_by_node);
-        }
-        descendants_by_node.insert(node_id, Vec::new());
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -708,14 +672,6 @@ impl MeasurementStore {
             }
             self.hydrate_text_query_from_current_producer(query, window, cx);
         }
-
-        let current_measurements = &self.current_measurements;
-        self.text_artifacts.flush_pending_subtree_stores(|node_id| {
-            match current_measurements.get(&node_id) {
-                Some(CurrentMeasurement::Text { key, .. }) => Some(key.clone()),
-                _ => None,
-            }
-        });
 
         self.assert_solved_root_text_artifacts_selected(observer);
 
@@ -929,42 +885,32 @@ impl<'a> ComputeMeasurementState<'a> {
         &mut self,
         event: SolverCacheEvent,
         scale_factor: f32,
-        observer: &MeasurementSolveObserver,
     ) {
-        let text_descendants = observer.artifact_descendants_for_event(event);
         match event {
-            SolverCacheEvent::Hit(entry) => {
-                self.record_text_artifact_for_cache_entry_hit(entry, scale_factor);
-                self.record_text_artifacts_for_subtree_cache_hit(entry, text_descendants);
+            SolverCacheEvent::Measure(observation) => {
+                self.record_text_artifact_for_measure_observation(observation, scale_factor);
             }
-            SolverCacheEvent::Stored(entry) => {
-                self.store_text_artifact_for_cache_entry(entry, scale_factor);
-                self.text_artifacts
-                    .push_pending_subtree_store(entry, text_descendants);
-            }
-            SolverCacheEvent::Cleared(clear) => {
-                self.text_artifacts
-                    .clear_subtree_cache_entry(clear.node_id());
-            }
+            SolverCacheEvent::Hit(_) | SolverCacheEvent::Stored(_) => {}
+            SolverCacheEvent::Cleared(_) => {}
         }
     }
 
-    fn record_text_artifact_for_cache_entry_hit(
+    fn record_text_artifact_for_measure_observation(
         &mut self,
-        entry: SolverCacheEntry,
+        observation: SolverMeasureObservation,
         scale_factor: f32,
     ) {
-        if !entry.is_compute_size() {
-            return;
-        }
-        let node_id = entry.node_id();
+        let node_id = observation.node_id();
         let Some(CurrentMeasurement::Text { key, .. }) = self.current_measurements.get(&node_id)
         else {
             return;
         };
         let key = key.clone();
-        let pending_query =
-            PendingTextArtifactQuery::from_solver_entry(node_id, key.clone(), entry, scale_factor);
+        let pending_query = PendingTextArtifactQuery::from_solver_measure_observation(
+            key.clone(),
+            observation,
+            scale_factor,
+        );
         let query_key = pending_query.cache_key();
         let Some(artifact) = self.text_artifacts.artifact_for_query(&query_key) else {
             self.text_artifacts.push_pending_query(pending_query);
@@ -973,53 +919,10 @@ impl<'a> ComputeMeasurementState<'a> {
         assert_eq!(
             artifact.key(),
             &key,
-            "solver cache-hit text artifact should match the current text measure key"
+            "solver measure observation text artifact should match the current text measure key"
         );
         text_artifact_matches_query(&artifact, &pending_query);
         self.record_text_artifact_for_query(node_id, query_key, &artifact);
-    }
-
-    fn store_text_artifact_for_cache_entry(&mut self, entry: SolverCacheEntry, scale_factor: f32) {
-        if !entry.is_compute_size() {
-            return;
-        }
-        let node_id = entry.node_id();
-        let Some(CurrentMeasurement::Text { key, .. }) = self.current_measurements.get(&node_id)
-        else {
-            return;
-        };
-        let key = key.clone();
-        let query_key =
-            TextArtifactCacheKey::from_solver_entry(node_id, key.clone(), entry, scale_factor);
-        let Some(artifact) = self.text_artifacts.current_artifact_for_query(&query_key) else {
-            // The solver may store final-layout entries for a measured text node
-            // whose paint artifact came from a different current query. That
-            // is not exact query proof, so GPUI must not persist it under this
-            // query key. A later hit for this query will hydrate explicitly.
-            return;
-        };
-        assert_eq!(
-            artifact.key(),
-            &key,
-            "stored solver cache-event text artifact should match the current text measure key"
-        );
-        self.record_text_artifact_for_query(node_id, query_key.clone(), &artifact);
-        self.text_artifacts.cache_artifact(query_key, artifact);
-    }
-
-    fn record_text_artifacts_for_subtree_cache_hit(
-        &mut self,
-        entry: SolverCacheEntry,
-        text_descendants: &[SolverNodeId],
-    ) {
-        let current_measurements = &self.current_measurements;
-        self.text_artifacts
-            .hydrate_from_subtree_cache_hit(entry, text_descendants, |node_id| {
-                match current_measurements.get(&node_id) {
-                    Some(CurrentMeasurement::Text { key, .. }) => Some(key.clone()),
-                    _ => None,
-                }
-            });
     }
 
     fn record_text_artifact_for_query(

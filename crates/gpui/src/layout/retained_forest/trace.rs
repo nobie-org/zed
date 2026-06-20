@@ -42,6 +42,7 @@ impl CacheEventTracer {
                     );
                 }
             }
+            SolverCacheEvent::Measure(_) => {}
         }
     }
 
@@ -54,10 +55,11 @@ impl CacheEventTracer {
         }
 
         let details = entry.trace_details();
-        if !(details.has_zero_output
-            || details.has_zero_known_dimension
-            || details.has_zero_parent_dimension
-            || details.has_zero_available_space)
+        if !should_trace_all_cache_events()
+            && !(details.has_zero_output
+                || details.has_zero_known_dimension
+                || details.has_zero_parent_dimension
+                || details.has_zero_available_space)
         {
             return;
         }
@@ -140,16 +142,18 @@ pub(super) fn should_trace_zero_bounds() -> bool {
 fn trace_layout_ids() -> Option<&'static Vec<usize>> {
     static LAYOUT_IDS: OnceLock<Option<Vec<usize>>> = OnceLock::new();
     LAYOUT_IDS
-        .get_or_init(|| {
-            let layout_ids = std::env::var("GPUI_TRACE_RETAINED_LAYOUT_IDS").ok()?;
-            Some(
-                layout_ids
-                    .split(',')
-                    .filter_map(|layout_id| layout_id.trim().parse().ok())
-                    .collect(),
-            )
-        })
+        .get_or_init(|| parse_layout_ids_env("GPUI_TRACE_RETAINED_LAYOUT_IDS"))
         .as_ref()
+}
+
+fn parse_layout_ids_env(name: &str) -> Option<Vec<usize>> {
+    let layout_ids = std::env::var(name).ok()?;
+    Some(
+        layout_ids
+            .split(',')
+            .filter_map(|layout_id| layout_id.trim().parse().ok())
+            .collect(),
+    )
 }
 
 fn zero_bounds_trace_limit() -> Option<usize> {
@@ -172,4 +176,10 @@ fn mutation_trace_limit() -> Option<usize> {
         }
         value.parse::<usize>().ok().or(Some(256))
     })
+}
+
+fn should_trace_all_cache_events() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("GPUI_TRACE_RETAINED_LAYOUT_CACHE_EVENTS_ALL").is_some())
 }

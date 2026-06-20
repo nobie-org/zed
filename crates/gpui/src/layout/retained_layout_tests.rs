@@ -257,6 +257,26 @@ fn request_keyed_growing_flex_row_container(
     request_keyed_layout(engine, key, style, children)
 }
 
+fn request_keyed_gapped_growing_flex_row_container(
+    engine: &mut LayoutEngine,
+    key: u64,
+    gap: f32,
+    children: &[LayoutId],
+) -> LayoutId {
+    let mut style = Style::default();
+    style.display = Display::Flex;
+    style.flex_direction = FlexDirection::Row;
+    style.min_size.width =
+        Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.0))));
+    style.min_size.height =
+        Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.0))));
+    style.gap.width = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(gap)));
+    style.gap.height = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(gap)));
+    style.flex_grow = 1.0;
+    style.flex_shrink = 1.0;
+    request_keyed_layout(engine, key, style, children)
+}
+
 fn request_keyed_growing_flex_column_container(
     engine: &mut LayoutEngine,
     key: u64,
@@ -361,6 +381,14 @@ fn request_canvas_like_chrome_frame_with_sidebar(
     engine: &mut LayoutEngine,
     request_sidebar: impl FnOnce(&mut LayoutEngine) -> LayoutId,
 ) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
+    request_canvas_like_chrome_frame_with_sidebar_and_gap(engine, request_sidebar, 0.0)
+}
+
+fn request_canvas_like_chrome_frame_with_sidebar_and_gap(
+    engine: &mut LayoutEngine,
+    request_sidebar: impl FnOnce(&mut LayoutEngine) -> LayoutId,
+    content_gap: f32,
+) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
     let canvas = request_keyed_full_block_leaf(engine, 12_001);
     let overlay = request_keyed_absolute_leaf(engine, 12_002);
     let canvas_host =
@@ -369,7 +397,12 @@ fn request_canvas_like_chrome_frame_with_sidebar(
     let header = request_keyed_fixed_height_leaf(engine, 12_005, 70.0);
     let panel = request_keyed_live_panel_container(engine, 12_006, &[header, flex_child]);
     let sidebar = request_sidebar(engine);
-    let content_row = request_keyed_growing_flex_row_container(engine, 12_007, &[panel, sidebar]);
+    let content_row = request_keyed_gapped_growing_flex_row_container(
+        engine,
+        12_007,
+        content_gap,
+        &[panel, sidebar],
+    );
     let padded_row =
         request_keyed_padded_growing_flex_row_container(engine, 12_008, &[content_row]);
     let footer = request_keyed_fixed_height_leaf(engine, 12_009, 98.0);
@@ -5111,6 +5144,191 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
             style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
+    );
+}
+
+#[test]
+fn reused_canvas_panel_after_scaled_sidebar_resize_matches_fresh_layout() {
+    let mut retained = LayoutEngine::new();
+    let (root, _panel, _flex_child, _canvas_host, _canvas) =
+        request_canvas_like_chrome_frame(&mut retained, 0.0);
+    compute_layout_without_measure_with_scale(&mut retained, root, 1100.0, 760.0, 2.0);
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame(&mut retained, 480.0);
+    let retained_root =
+        compute_layout_without_measure_with_scale(&mut retained, root, 1100.0, 760.0, 2.0);
+    let retained_panel = retained.retained_node_token_for_tests(panel);
+    let retained_flex_child = retained.retained_node_token_for_tests(flex_child);
+    let retained_canvas_host = retained.retained_node_token_for_tests(canvas_host);
+    let retained_canvas = retained.retained_node_token_for_tests(canvas);
+
+    let mut fresh = LayoutEngine::new();
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame(&mut fresh, 480.0);
+    let fresh_root =
+        compute_layout_without_measure_with_scale(&mut fresh, root, 1100.0, 760.0, 2.0);
+    let fresh_panel = fresh.retained_node_token_for_tests(panel);
+    let fresh_flex_child = fresh.retained_node_token_for_tests(flex_child);
+    let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
+    let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
+
+    assert_intent_committed_exactly(&retained, root);
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root),
+        retained_layout_projection(&fresh, fresh_root)
+    );
+    assert_eq!(
+        (
+            retained_node_size(&retained, retained_panel),
+            retained_node_size(&retained, retained_flex_child),
+            retained_node_size(&retained, retained_canvas_host),
+            retained_node_size(&retained, retained_canvas),
+        ),
+        (
+            retained_node_size(&fresh, fresh_panel),
+            retained_node_size(&fresh, fresh_flex_child),
+            retained_node_size(&fresh, fresh_canvas_host),
+            retained_node_size(&fresh, fresh_canvas),
+        )
+    );
+    assert_eq!(
+        (
+            retained_node_size(&retained, retained_canvas_host),
+            retained_node_size(&retained, retained_canvas),
+        ),
+        (size(1676.0, 1143.0), size(1676.0, 1143.0))
+    );
+}
+
+#[test]
+fn reused_canvas_panel_after_scaled_gapped_sidebar_resize_matches_fresh_layout() {
+    let mut retained = LayoutEngine::new();
+    let (root, _panel, _flex_child, _canvas_host, _canvas) =
+        request_canvas_like_chrome_frame_with_sidebar_and_gap(
+            &mut retained,
+            |engine| request_keyed_fixed_width_sidebar(engine, 12_014, 0.0),
+            21.0,
+        );
+    compute_layout_without_measure_with_scale(&mut retained, root, 1100.0, 760.0, 2.0);
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame_with_sidebar_and_gap(
+            &mut retained,
+            |engine| request_keyed_fixed_width_sidebar(engine, 12_014, 480.0),
+            21.0,
+        );
+    let retained_root =
+        compute_layout_without_measure_with_scale(&mut retained, root, 1100.0, 760.0, 2.0);
+    let retained_panel = retained.retained_node_token_for_tests(panel);
+    let retained_flex_child = retained.retained_node_token_for_tests(flex_child);
+    let retained_canvas_host = retained.retained_node_token_for_tests(canvas_host);
+    let retained_canvas = retained.retained_node_token_for_tests(canvas);
+
+    let mut fresh = LayoutEngine::new();
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame_with_sidebar_and_gap(
+            &mut fresh,
+            |engine| request_keyed_fixed_width_sidebar(engine, 12_014, 480.0),
+            21.0,
+        );
+    let fresh_root =
+        compute_layout_without_measure_with_scale(&mut fresh, root, 1100.0, 760.0, 2.0);
+    let fresh_panel = fresh.retained_node_token_for_tests(panel);
+    let fresh_flex_child = fresh.retained_node_token_for_tests(flex_child);
+    let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
+    let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
+
+    assert_intent_committed_exactly(&retained, root);
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root),
+        retained_layout_projection(&fresh, fresh_root)
+    );
+    assert_eq!(
+        (
+            retained_node_size(&retained, retained_panel),
+            retained_node_size(&retained, retained_flex_child),
+            retained_node_size(&retained, retained_canvas_host),
+            retained_node_size(&retained, retained_canvas),
+        ),
+        (
+            retained_node_size(&fresh, fresh_panel),
+            retained_node_size(&fresh, fresh_flex_child),
+            retained_node_size(&fresh, fresh_canvas_host),
+            retained_node_size(&fresh, fresh_canvas),
+        )
+    );
+    assert_eq!(
+        (
+            retained_node_size(&retained, retained_canvas_host),
+            retained_node_size(&retained, retained_canvas),
+        ),
+        (size(1655.0, 1143.0), size(1655.0, 1143.0))
+    );
+}
+
+#[test]
+fn reused_canvas_panel_after_scaled_root_width_resize_matches_fresh_layout() {
+    let mut retained = LayoutEngine::new();
+    let (root, _panel, _flex_child, _canvas_host, _canvas) =
+        request_canvas_like_chrome_frame_with_sidebar_and_gap(
+            &mut retained,
+            |engine| request_keyed_fixed_width_sidebar(engine, 12_014, 480.0),
+            21.0,
+        );
+    compute_layout_without_measure_with_scale(&mut retained, root, 459.0, 608.5, 2.0);
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame_with_sidebar_and_gap(
+            &mut retained,
+            |engine| request_keyed_fixed_width_sidebar(engine, 12_014, 480.0),
+            21.0,
+        );
+    let retained_root =
+        compute_layout_without_measure_with_scale(&mut retained, root, 1100.0, 760.0, 2.0);
+    let retained_panel = retained.retained_node_token_for_tests(panel);
+    let retained_flex_child = retained.retained_node_token_for_tests(flex_child);
+    let retained_canvas_host = retained.retained_node_token_for_tests(canvas_host);
+    let retained_canvas = retained.retained_node_token_for_tests(canvas);
+
+    let mut fresh = LayoutEngine::new();
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame_with_sidebar_and_gap(
+            &mut fresh,
+            |engine| request_keyed_fixed_width_sidebar(engine, 12_014, 480.0),
+            21.0,
+        );
+    let fresh_root =
+        compute_layout_without_measure_with_scale(&mut fresh, root, 1100.0, 760.0, 2.0);
+    let fresh_panel = fresh.retained_node_token_for_tests(panel);
+    let fresh_flex_child = fresh.retained_node_token_for_tests(flex_child);
+    let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
+    let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
+
+    assert_intent_committed_exactly(&retained, root);
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root),
+        retained_layout_projection(&fresh, fresh_root)
+    );
+    assert_eq!(
+        (
+            retained_node_size(&retained, retained_panel),
+            retained_node_size(&retained, retained_flex_child),
+            retained_node_size(&retained, retained_canvas_host),
+            retained_node_size(&retained, retained_canvas),
+        ),
+        (
+            retained_node_size(&fresh, fresh_panel),
+            retained_node_size(&fresh, fresh_flex_child),
+            retained_node_size(&fresh, fresh_canvas_host),
+            retained_node_size(&fresh, fresh_canvas),
+        )
     );
 }
 

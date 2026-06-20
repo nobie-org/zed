@@ -77,6 +77,7 @@ pub(super) enum SolverCacheEvent {
     Hit(SolverCacheEntry),
     Stored(SolverCacheEntry),
     Cleared(SolverCacheClear),
+    Measure(SolverMeasureObservation),
 }
 
 /// Passive observation that the solver cleared one node's cache.
@@ -96,26 +97,6 @@ pub(super) struct SolverCacheEntry(backend::BackendCacheEntry);
 impl SolverCacheEntry {
     pub(super) fn node_id(&self) -> SolverNodeId {
         self.0.node_id()
-    }
-
-    pub(super) fn entry_id(&self) -> SolverCacheEntryId {
-        self.0.entry_id()
-    }
-
-    pub(super) fn is_compute_size(&self) -> bool {
-        self.0.is_compute_size()
-    }
-
-    pub(super) fn is_perform_layout(&self) -> bool {
-        self.0.is_perform_layout()
-    }
-
-    pub(super) fn known_dimensions(&self, scale_factor: f32) -> Size<Option<Pixels>> {
-        self.0.known_dimensions(scale_factor)
-    }
-
-    pub(super) fn available_space(&self, scale_factor: f32) -> Size<AvailableSpace> {
-        self.0.available_space(scale_factor)
     }
 
     pub(super) fn trace_details(&self) -> SolverCacheEntryTraceDetails {
@@ -144,6 +125,27 @@ pub(super) struct SolverCacheEntryTraceDetails {
 pub(super) struct SolverMeasureQuery {
     pub(super) known_dimensions: Size<Option<Pixels>>,
     pub(super) available_space: Size<AvailableSpace>,
+}
+
+/// Passive observation that the solver used one exact measured-node result.
+///
+/// The observation can come from a real measure callback or from the solver
+/// replaying a cached measured query/result. It is not a dirtying signal and it
+/// does not change solver behavior.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SolverMeasureObservation(backend::BackendMeasureObservation);
+
+impl SolverMeasureObservation {
+    pub(super) fn node_id(&self) -> SolverNodeId {
+        self.0.node_id()
+    }
+
+    pub(super) fn query(&self, scale_factor: f32) -> SolverMeasureQuery {
+        SolverMeasureQuery {
+            known_dimensions: self.0.known_dimensions(scale_factor),
+            available_space: self.0.available_space(scale_factor),
+        }
+    }
 }
 
 /// Private layout solver facade used by the retained forest.

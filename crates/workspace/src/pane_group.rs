@@ -1364,8 +1364,7 @@ mod element {
                 };
 
                 bounding_boxes.push(Some(child_bounds));
-                child.layout_as_root(child_size.into(), window, cx);
-                child.prepaint_at(origin, window, cx);
+                child.prepaint_as_root(origin, child_size.into(), window, cx);
 
                 origin = origin.apply_along(self.axis, |val| val + child_size.along(self.axis));
 

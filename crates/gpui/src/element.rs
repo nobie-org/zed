@@ -32,8 +32,8 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
-    InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
+    App, ArenaBox, AvailableSpace, Bounds, ContentMask, Context, DispatchNodeId, ElementId,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
     layout::RetainedLayoutRootSite, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
@@ -669,6 +669,51 @@ where
 /// A dynamically typed element that can be used to store any element type.
 pub struct AnyElement(ArenaBox<dyn ElementObject>);
 
+/// A detached root that has been laid out for the current prepaint phase.
+///
+/// This is for placement algorithms that need the solved size of visible detached roots before
+/// choosing their origins. The token owns the element so callers cannot run a retained root solve
+/// and then casually keep using a raw element. Use [`AnyElement::measure_as_root`] for size-only
+/// probes that might not render.
+#[must_use = "a laid-out root should be consumed by `prepaint_at` or `defer` so it is painted"]
+pub struct RootPrepaintElement {
+    element: AnyElement,
+    size: Size<Pixels>,
+}
+
+impl RootPrepaintElement {
+    /// Returns the solved size of this detached root.
+    pub fn size(&self) -> Size<Pixels> {
+        self.size
+    }
+
+    /// Prepaints this laid-out root at the given absolute origin.
+    pub fn prepaint_at(
+        self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (AnyElement, Bounds<Pixels>, Option<FocusHandle>) {
+        let mut element = self.element;
+        let bounds = Bounds::new(origin, self.size);
+        let focus = element.prepaint_at(origin, window, cx);
+        (element, bounds, focus)
+    }
+
+    /// Defers this laid-out root at the given absolute origin.
+    pub fn defer(
+        self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+    ) -> Bounds<Pixels> {
+        let bounds = Bounds::new(origin, self.size);
+        window.defer_draw(self.element, origin, priority, content_mask);
+        bounds
+    }
+}
+
 impl AnyElement {
     pub(crate) fn new<E>(element: E) -> Self
     where
@@ -712,7 +757,7 @@ impl AnyElement {
 
     /// Performs layout for this element within the given available space and returns its size.
     #[track_caller]
-    pub fn layout_as_root(
+    pub(crate) fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
         window: &mut Window,
@@ -729,8 +774,8 @@ impl AnyElement {
     /// Measures this element in an isolated scratch layout engine and returns its size.
     ///
     /// This consumes the element so a caller cannot later prepaint it with
-    /// layout ids from the scratch solve. Use `layout_as_root` for detached
-    /// roots that will be prepainted or painted in the current frame.
+    /// layout ids from the scratch solve. Use [`AnyElement::layout_for_prepaint`]
+    /// for detached roots that will be prepainted or painted in the current frame.
     #[track_caller]
     pub fn measure_as_root(
         mut self,
@@ -743,6 +788,26 @@ impl AnyElement {
             self.0
                 .layout_as_root(available_space, root_site, window, cx)
         })
+    }
+
+    /// Performs root layout for an element that will be prepainted in the current frame.
+    ///
+    /// This consumes the element and returns a must-use token exposing only its solved size and
+    /// visible-root consumption paths. Prefer [`AnyElement::prepaint_as_root_with_origin`] or
+    /// [`AnyElement::defer_as_root_with_origin`] when one element's origin can be computed directly
+    /// from its own solved size.
+    #[track_caller]
+    pub fn layout_for_prepaint(
+        mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RootPrepaintElement {
+        let size = self.layout_as_root(available_space, window, cx);
+        RootPrepaintElement {
+            element: self,
+            size,
+        }
     }
 
     /// Prepaints this element at the given absolute origin.
@@ -768,6 +833,46 @@ impl AnyElement {
     ) -> Option<FocusHandle> {
         self.layout_as_root(available_space, window, cx);
         window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx))
+    }
+
+    /// Performs root layout, derives the element's absolute origin from the solved size, then prepaints it.
+    ///
+    /// Use this when a detached root will be visible in this frame and its placement depends on its
+    /// solved size. Use [`AnyElement::measure_as_root`] for size-only probes that might not render.
+    #[track_caller]
+    pub fn prepaint_as_root_with_origin(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+        origin_for_size: impl FnOnce(Size<Pixels>) -> Point<Pixels>,
+    ) -> (Bounds<Pixels>, Option<FocusHandle>) {
+        let size = self.layout_as_root(available_space, window, cx);
+        let origin = origin_for_size(size);
+        let bounds = Bounds::new(origin, size);
+        let focus = window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx));
+        (bounds, focus)
+    }
+
+    /// Performs root layout, derives the element's absolute origin from the solved size, then defers drawing it.
+    ///
+    /// This consumes the element so callers cannot perform a retained root solve and then decide not
+    /// to paint the same solved element. Use [`AnyElement::measure_as_root`] for size-only probes.
+    #[track_caller]
+    pub fn defer_as_root_with_origin(
+        mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+        origin_for_size: impl FnOnce(Size<Pixels>) -> Point<Pixels>,
+    ) -> Bounds<Pixels> {
+        let size = self.layout_as_root(available_space, window, cx);
+        let origin = origin_for_size(size);
+        let bounds = Bounds::new(origin, size);
+        window.defer_draw(self, origin, priority, content_mask);
+        bounds
     }
 }
 

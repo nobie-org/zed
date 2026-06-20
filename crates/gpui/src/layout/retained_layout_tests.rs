@@ -3513,6 +3513,35 @@ fn grid_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
 }
 
 #[test]
+fn duplicate_same_slot_exact_children_reuse_on_exact_repeat() {
+    let mut engine = LayoutEngine::new();
+    let left = request_leaf(&mut engine, 10.0);
+    let right = request_leaf(&mut engine, 10.0);
+    let first_root = request_container(&mut engine, &[left, right]);
+    let first_root_node = engine.commit_layout(first_root);
+    let first_child_nodes = engine.retained_child_tokens_for_tests(first_root_node);
+    engine.finish_frame();
+
+    engine.reset_retained_mutation_sample_for_tests();
+    let left = request_leaf(&mut engine, 10.0);
+    let right = request_leaf(&mut engine, 10.0);
+    let second_root = request_container(&mut engine, &[left, right]);
+    let second_root_node = engine.commit_layout(second_root);
+    assert_intent_committed_exactly(&engine, second_root);
+    let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
+
+    assert_eq!(second_root_node, first_root_node);
+    assert_eq!(second_child_nodes, first_child_nodes);
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 3,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+}
+
+#[test]
 fn duplicate_same_slot_exact_child_rebuilds_when_sibling_count_changes() {
     let mut engine = LayoutEngine::new();
     let left = request_leaf(&mut engine, 10.0);

@@ -1512,20 +1512,30 @@ impl RetainedLayoutForest {
         let unique_current_global_ids = self.unique_current_child_global_ids(children);
         let unique_previous_global_ids = Self::unique_previous_child_global_ids(previous_children);
 
-        for (index, child) in children.iter().enumerate() {
-            let Some(candidate) = previous_children
-                .get(index)
-                .and_then(|previous_child| previous_child.as_ref())
-            else {
-                continue;
-            };
-            let should_preserve = self
-                .retained_occurrence_is_exact_current_intent(*child, candidate)
-                && self.same_slot_exact_match_is_unambiguous(*child, children, previous_children);
+        let same_slot_exact_matches = children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                let Some(candidate) = previous_children
+                    .get(index)
+                    .and_then(|previous_child| previous_child.as_ref())
+                else {
+                    return false;
+                };
+                self.retained_occurrence_is_exact_current_intent(*child, candidate)
+                    && self.same_slot_exact_match_is_unambiguous(
+                        *child,
+                        children,
+                        previous_children,
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        for (index, should_preserve) in same_slot_exact_matches.into_iter().enumerate() {
             if should_preserve {
                 let previous_child = previous_children
                     .get_mut(index)
-                    .expect("previous child index should exist after immutable lookup");
+                    .expect("previous child index should exist after same-slot lookup");
                 assigned[index] = previous_child.take();
             }
         }

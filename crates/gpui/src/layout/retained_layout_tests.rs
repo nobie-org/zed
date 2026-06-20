@@ -2936,6 +2936,61 @@ fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
 }
 
 #[test]
+fn semantic_reuse_updates_changed_descendant_geometry_without_child_list_mutation() {
+    let mut retained = LayoutEngine::new();
+    let stable_grandchild = request_leaf(&mut retained, 10.0);
+    let changing_grandchild = request_keyed_leaf(&mut retained, 23_001, 20.0);
+    let changed_child = request_keyed_layout(
+        &mut retained,
+        23_002,
+        Style::default(),
+        &[stable_grandchild, changing_grandchild],
+    );
+    let first_root = request_flex_container(&mut retained, &[changed_child]);
+    compute_layout_without_measure(&mut retained, first_root, 300.0, 100.0);
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let stable_grandchild = request_leaf(&mut retained, 10.0);
+    let changing_grandchild = request_keyed_leaf(&mut retained, 23_001, 80.0);
+    let changed_child = request_keyed_layout(
+        &mut retained,
+        23_002,
+        Style::default(),
+        &[stable_grandchild, changing_grandchild],
+    );
+    let second_root = request_flex_container(&mut retained, &[changed_child]);
+    let retained_root_node =
+        compute_layout_without_measure(&mut retained, second_root, 300.0, 100.0);
+    assert_intent_committed_exactly(&retained, second_root);
+
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 4,
+            style_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+
+    let mut fresh = LayoutEngine::new();
+    let stable_grandchild = request_leaf(&mut fresh, 10.0);
+    let changing_grandchild = request_leaf(&mut fresh, 80.0);
+    let changed_child = request_container(&mut fresh, &[stable_grandchild, changing_grandchild]);
+    let fresh_root = request_flex_container(&mut fresh, &[changed_child]);
+    let fresh_root_node = compute_layout_without_measure(&mut fresh, fresh_root, 300.0, 100.0);
+
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root_node),
+        retained_layout_projection(&fresh, fresh_root_node)
+    );
+    assert_eq!(
+        retained_layout_bounds_tree(&mut retained, retained_root_node, 1.0),
+        retained_layout_bounds_tree(&mut fresh, fresh_root_node, 1.0)
+    );
+}
+
+#[test]
 fn rollback_discards_failed_transaction_root_slots() {
     let mut engine = LayoutEngine::new();
     let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);

@@ -49,7 +49,7 @@ type TextHydrator = Rc<dyn Fn(&TextLayoutArtifact)>;
 ///
 /// Text measured nodes also carry a hydrator that installs an artifact into the
 /// current element state when the current compute invokes the text producer.
-pub(super) struct LayoutMeasureContext {
+pub(in crate::layout) struct LayoutMeasureContext {
     pub(super) measure: NodeMeasureFn,
     pub(super) text_hydrator: Option<TextHydrator>,
 }
@@ -77,10 +77,15 @@ impl MeasuredLayoutResult {
 ///
 /// The retained forest treats this as a generic measured node. This type owns
 /// the distinction between opaque producers, pure size facts, and text artifact
-/// hydration so retained tree code does not need text-specific constructors.
-pub(in crate::layout) struct MeasuredLayoutRequest {
-    facts: MeasuredLayoutFacts,
-    context: Option<LayoutMeasureContext>,
+/// hydration so retained tree code cannot construct impossible combinations such
+/// as a pure-size node with a callback or a text node without a producer.
+pub(in crate::layout) enum MeasuredLayoutRequest {
+    Opaque(LayoutMeasureContext),
+    PureSize(PureSizeMeasure),
+    Text {
+        key: TextMeasureKey,
+        context: LayoutMeasureContext,
+    },
 }
 
 impl MeasuredLayoutRequest {
@@ -93,29 +98,23 @@ impl MeasuredLayoutRequest {
         ) -> Size<Pixels>
         + 'static,
     ) -> Self {
-        Self {
-            facts: MeasuredLayoutFacts::opaque(),
-            context: Some(LayoutMeasureContext {
-                measure: StackSafe::new(Box::new(
-                    move |known_dimensions, available_space, window, cx| {
-                        MeasuredLayoutResult::Size(measure(
-                            known_dimensions,
-                            available_space,
-                            window,
-                            cx,
-                        ))
-                    },
-                )),
-                text_hydrator: None,
-            }),
-        }
+        Self::Opaque(LayoutMeasureContext {
+            measure: StackSafe::new(Box::new(
+                move |known_dimensions, available_space, window, cx| {
+                    MeasuredLayoutResult::Size(measure(
+                        known_dimensions,
+                        available_space,
+                        window,
+                        cx,
+                    ))
+                },
+            )),
+            text_hydrator: None,
+        })
     }
 
     pub(in crate::layout) fn pure_size(measure: PureSizeMeasure) -> Self {
-        Self {
-            facts: MeasuredLayoutFacts::pure_size(measure),
-            context: None,
-        }
+        Self::PureSize(measure)
     }
 
     pub(in crate::layout) fn text(
@@ -129,9 +128,9 @@ impl MeasuredLayoutRequest {
         ) -> TextLayoutArtifact
         + 'static,
     ) -> Self {
-        Self {
-            facts: MeasuredLayoutFacts::text(measure_key),
-            context: Some(LayoutMeasureContext {
+        Self::Text {
+            key: measure_key,
+            context: LayoutMeasureContext {
                 measure: StackSafe::new(Box::new(
                     move |known_dimensions, available_space, window, cx| {
                         MeasuredLayoutResult::Text(measure(
@@ -143,12 +142,8 @@ impl MeasuredLayoutRequest {
                     },
                 )),
                 text_hydrator: Some(Rc::new(hydrate)),
-            }),
+            },
         }
-    }
-
-    fn into_parts(self) -> (MeasuredLayoutFacts, Option<LayoutMeasureContext>) {
-        (self.facts, self.context)
     }
 }
 
@@ -519,29 +514,27 @@ impl MeasurementStore {
         &mut self,
         request: MeasuredLayoutRequest,
     ) -> RegisteredMeasuredLayout {
-        let (facts, context) = request.into_parts();
-        let measurement = match facts.0.clone() {
-            MeasuredLayoutFactsRepr::Opaque => {
-                let producer = self
-                    .producers
-                    .push(context.expect("opaque measured layout request should have a producer"));
-                CurrentMeasurement::Opaque(producer)
+        let (facts, measurement) = match request {
+            MeasuredLayoutRequest::Opaque(context) => {
+                let producer = self.producers.push(context);
+                (
+                    MeasuredLayoutFacts::opaque(),
+                    CurrentMeasurement::Opaque(producer),
+                )
             }
-            MeasuredLayoutFactsRepr::PureSize(measure) => {
-                assert!(
-                    context.is_none(),
-                    "pure-size measured layout request should not have a producer"
-                );
-                CurrentMeasurement::PureSize(measure)
-            }
-            MeasuredLayoutFactsRepr::Text(key) => {
-                let producer = self
-                    .producers
-                    .push(context.expect("text measured layout request should have a producer"));
-                CurrentMeasurement::Text {
-                    key,
-                    measure: producer,
-                }
+            MeasuredLayoutRequest::PureSize(measure) => (
+                MeasuredLayoutFacts::pure_size(measure.clone()),
+                CurrentMeasurement::PureSize(measure),
+            ),
+            MeasuredLayoutRequest::Text { key, context } => {
+                let producer = self.producers.push(context);
+                (
+                    MeasuredLayoutFacts::text(key.clone()),
+                    CurrentMeasurement::Text {
+                        key,
+                        measure: producer,
+                    },
+                )
             }
         };
         RegisteredMeasuredLayout { facts, measurement }

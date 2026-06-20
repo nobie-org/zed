@@ -11,8 +11,9 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintGroup, Path,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderGroupDrawObservation,
+    RenderGroupDrawOutcome, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
     SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
     TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
@@ -993,6 +994,7 @@ pub struct Window {
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
     last_layout_work_sample: Option<LayoutWorkSample>,
+    last_render_group_draw_observation: Option<RenderGroupDrawObservation>,
     next_layout_work_draw_index: u64,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
@@ -1649,6 +1651,7 @@ impl Window {
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
             last_layout_work_sample: None,
+            last_render_group_draw_observation: None,
             next_layout_work_draw_index: 0,
             root: None,
             element_id_stack: SmallVec::default(),
@@ -2866,7 +2869,14 @@ impl Window {
         );
         crate::nobie_platform_trace::set_current_draw_id(draw_id);
         crate::nobie_platform_trace::set_current_present_id(present_id);
-        self.platform_window.draw(&self.rendered_frame.scene);
+        let render_group_draw_outcome = self.platform_window.draw(&self.rendered_frame.scene);
+        if let RenderGroupDrawOutcome::Completed { backend_totals } = render_group_draw_outcome {
+            self.last_render_group_draw_observation = Some(
+                self.rendered_frame
+                    .scene
+                    .render_group_draw_observation(draw_id, backend_totals),
+            );
+        }
         crate::nobie_platform_trace::clear_current_present_id();
         crate::nobie_platform_trace::clear_current_draw_id();
         #[cfg(feature = "input-latency-histogram")]
@@ -4350,6 +4360,11 @@ impl Window {
     /// Returns the layout work sample for the most recently completed draw.
     pub fn last_layout_work_sample(&self) -> Option<LayoutWorkSample> {
         self.last_layout_work_sample
+    }
+
+    /// Returns the render-group work observation for the most recently completed draw.
+    pub fn last_render_group_draw_observation(&self) -> Option<&RenderGroupDrawObservation> {
+        self.last_render_group_draw_observation.as_ref()
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by

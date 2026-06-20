@@ -52,10 +52,12 @@ pub mod scene_protocol {
         MAX_SURFACE_SILHOUETTE_PRIMITIVES, MonochromeSprite, PaintGroup, PaintSurface,
         PaintSurfaceSource, Path, PathId, PathVertex, PathVertex_ScaledPixels,
         PhysicalRenderGroupPlan, PolychromeSprite, Primitive, PrimitiveBatch, Quad,
-        RenderGroupBackendCounters, RenderGroupDependencies, RenderGroupInput,
-        RenderGroupLimitUnit, RenderGroupPhysicalPlanKind, RenderGroupPlanningRejection,
-        RenderGroupPlanningRejectionReason, RenderGroupRejectedEffect, RenderGroupRequirements,
-        RenderGroupShadowMode, RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters,
+        RenderGroupBackendCounters, RenderGroupBackendTotals, RenderGroupDependencies,
+        RenderGroupDrawObservation, RenderGroupDrawOutcome, RenderGroupInput, RenderGroupLimitUnit,
+        RenderGroupObservation, RenderGroupObservationIdentity, RenderGroupPhysicalPlanKind,
+        RenderGroupPlanningRejection, RenderGroupPlanningRejectionReason,
+        RenderGroupRejectedEffect, RenderGroupRequirements, RenderGroupShadowMode,
+        RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters, RenderGroupStableIdentity,
         RenderGroupSupportCounters, Scene, SemanticRenderGroupSpec, Shadow, SubpixelSprite,
         SurfaceSilhouetteSpriteData, TransformationMatrix, Underline,
     };
@@ -67,13 +69,14 @@ pub mod scene_protocol {
 pub mod render_group_diagnostics {
     pub use crate::scene::{
         LogicalVisualPlan, PhysicalRenderGroupPlan, RenderGroupBackendCounters,
-        RenderGroupCapabilityProbe, RenderGroupCapabilityRejectionReason,
+        RenderGroupBackendTotals, RenderGroupCapabilityProbe, RenderGroupCapabilityRejectionReason,
         RenderGroupCapabilityReport, RenderGroupCapabilityStatus, RenderGroupDependencies,
-        RenderGroupInput, RenderGroupLimitUnit, RenderGroupPhysicalPlanKind,
+        RenderGroupDrawObservation, RenderGroupDrawOutcome, RenderGroupInput, RenderGroupLimitUnit,
+        RenderGroupObservation, RenderGroupObservationIdentity, RenderGroupPhysicalPlanKind,
         RenderGroupPlanningRejection, RenderGroupPlanningRejectionReason,
         RenderGroupRejectedEffect, RenderGroupRequirements, RenderGroupShadowMode,
-        RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters, RenderGroupSupportCounters,
-        SemanticRenderGroupSpec,
+        RenderGroupShadowModeCounters, RenderGroupShadowSourceCounters, RenderGroupStableIdentity,
+        RenderGroupSupportCounters, SemanticRenderGroupSpec,
     };
 }
 mod shared_uri;
@@ -147,7 +150,8 @@ pub use scene::{
     CompositeEffect, CompositeProcessedContentGlow, CompositeShadow, CompositeSurfaceShadow,
     ContentLayer, ContentStage, DerivedLayer, DerivedStage, GlassLens, GlassSurface, Glow,
     GroupShape, GroupShapeKind, LumaThreshold, MAX_SURFACE_SILHOUETTE_PRIMITIVES, Path,
-    ProcessedContentDerivedLayer, RenderGroupShadowMode, RenderGroupShadowModeCounters,
+    ProcessedContentDerivedLayer, RenderGroupBackendTotals, RenderGroupDrawObservation,
+    RenderGroupDrawOutcome, RenderGroupShadowMode, RenderGroupShadowModeCounters,
     RenderGroupShadowSourceCounters, SourceColorFilter, SourceMaskBlurOrder, SourceToneOp,
     SurfacePrimitive, SurfaceSilhouette, SurfaceSilhouetteError, TransformationMatrix,
 };

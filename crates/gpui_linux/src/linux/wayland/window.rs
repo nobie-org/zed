@@ -32,10 +32,10 @@ use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Size, Tiling, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px, scene_protocol::Scene,
-    size,
+    PromptButton, PromptLevel, RenderGroupBackendTotals, RenderGroupDrawOutcome,
+    RequestFrameOptions, ResizeEdge, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
+    layer_shell::LayerShellNotSupportedError, px, scene_protocol::Scene, size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
@@ -1376,7 +1376,7 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome {
         let mut state = self.borrow_mut();
 
         if state.renderer.device_lost() {
@@ -1398,13 +1398,26 @@ impl PlatformWindow for WaylandWindow {
             }
 
             state.force_render_after_recovery = true;
-            return;
+            return RenderGroupDrawOutcome::NotCompleted;
         }
 
-        state.renderer_presented = state.renderer.draw(scene);
+        let draw_completed = state.renderer.draw(scene);
+        state.renderer_presented = draw_completed;
 
         if state.renderer.needs_redraw() {
             state.force_render_after_recovery = true;
+        }
+
+        if draw_completed {
+            RenderGroupDrawOutcome::Completed {
+                backend_totals: state
+                    .renderer
+                    .render_group_backend_counters()
+                    .map(RenderGroupBackendTotals::Measured)
+                    .unwrap_or(RenderGroupBackendTotals::Unknown),
+            }
+        } else {
+            RenderGroupDrawOutcome::NotCompleted
         }
     }
 

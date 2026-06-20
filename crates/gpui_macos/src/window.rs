@@ -1685,9 +1685,9 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> gpui::RenderGroupDrawOutcome {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        this.renderer.draw(scene)
     }
 
     fn request_frame_capture(&self) {

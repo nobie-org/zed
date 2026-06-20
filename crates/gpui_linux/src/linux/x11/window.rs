@@ -5,9 +5,10 @@ use crate::linux::X11ClientStatePtr;
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, px, scene_protocol::Scene,
+    Point, PromptButton, PromptLevel, RenderGroupBackendTotals, RenderGroupDrawOutcome,
+    RequestFrameOptions, ResizeEdge, ScaledPixels, Size, Tiling, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowKind,
+    WindowParams, px, scene_protocol::Scene,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1658,7 +1659,7 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome {
         let mut inner = self.0.state.borrow_mut();
 
         if inner.renderer.device_lost() {
@@ -1678,13 +1679,25 @@ impl PlatformWindow for X11Window {
             }
 
             inner.force_render_after_recovery = true;
-            return;
+            return RenderGroupDrawOutcome::NotCompleted;
         }
 
-        inner.renderer.draw(scene);
+        let draw_completed = inner.renderer.draw(scene);
 
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
+        }
+
+        if draw_completed {
+            RenderGroupDrawOutcome::Completed {
+                backend_totals: inner
+                    .renderer
+                    .render_group_backend_counters()
+                    .map(RenderGroupBackendTotals::Measured)
+                    .unwrap_or(RenderGroupBackendTotals::Unknown),
+            }
+        } else {
+            RenderGroupDrawOutcome::NotCompleted
         }
     }
 

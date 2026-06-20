@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -11,7 +12,8 @@ use gpui::{
     MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, ScaledPixels, Size, Surface, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
-        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters, Scene, Shadow,
+        PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
+        RenderGroupBackendTotals, RenderGroupDrawOutcome, Scene, Shadow,
         SurfaceSilhouetteSpriteData, Underline,
     },
     size,
@@ -491,11 +493,20 @@ impl Renderer {
         }
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, scene: &Scene) -> RenderGroupDrawOutcome {
         match self {
             Self::Metal(renderer) => renderer.draw(scene),
             Self::Wgpu { renderer, .. } => {
-                let _ = renderer.draw(scene);
+                if renderer.draw(scene) {
+                    RenderGroupDrawOutcome::Completed {
+                        backend_totals: renderer
+                            .render_group_backend_counters()
+                            .map(RenderGroupBackendTotals::Measured)
+                            .unwrap_or(RenderGroupBackendTotals::Unknown),
+                    }
+                } else {
+                    RenderGroupDrawOutcome::NotCompleted
+                }
             }
         }
     }
@@ -1036,7 +1047,7 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, scene: &Scene) -> RenderGroupDrawOutcome {
         let trace_enabled = nobie_platform_trace::enabled();
         let metal_draw_id = if trace_enabled {
             nobie_platform_trace::next_metal_draw_id()
@@ -1078,7 +1089,7 @@ impl MetalRenderer {
                         Some(Err("draw() called without a platform layer".to_string()));
                     self.capture_next_frame = false;
                 }
-                return;
+                return RenderGroupDrawOutcome::NotCompleted;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -1123,7 +1134,7 @@ impl MetalRenderer {
                 self.presented_capture = Some(Err("failed to retrieve next drawable".to_string()));
                 self.capture_next_frame = false;
             }
-            return;
+            return RenderGroupDrawOutcome::NotCompleted;
         };
 
         loop {
@@ -1285,7 +1296,12 @@ impl MetalRenderer {
                             ),
                         );
                     }
-                    return;
+                    return RenderGroupDrawOutcome::Completed {
+                        backend_totals: self
+                            .render_group_backend_counters()
+                            .map(RenderGroupBackendTotals::Measured)
+                            .unwrap_or(RenderGroupBackendTotals::Unknown),
+                    };
                 }
                 Err(err @ MetalRenderError::InstanceBufferExceeded { .. }) => {
                     // Designed growth path, not a failure: the frame is
@@ -1340,10 +1356,11 @@ impl MetalRenderer {
                             ),
                         );
                     }
-                    return;
+                    return RenderGroupDrawOutcome::NotCompleted;
                 }
             }
         }
+        RenderGroupDrawOutcome::NotCompleted
     }
 
     /// Draws the test-window presented frame into a renderer-owned BGRA8 target

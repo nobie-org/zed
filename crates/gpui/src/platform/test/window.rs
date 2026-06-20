@@ -2,8 +2,9 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformInputSimulator, PlatformTestWindowRenderer, PlatformWindow,
-    Point, PromptButton, RequestFrameOptions, Scene, SceneCapture, Size, TestPlatform, TileId,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    Point, PromptButton, RenderGroupBackendTotals, RenderGroupDrawOutcome,
+    RequestFrameOptions, Scene, SceneCapture, Size, TestPlatform, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;
@@ -320,11 +321,14 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome {
         let capture = self
             .draw_presented_frame_to_capture(scene)
             .map_err(|err| err.to_string());
         self.0.lock().presented_capture = Some(capture);
+        RenderGroupDrawOutcome::Completed {
+            backend_totals: RenderGroupBackendTotals::Unknown,
+        }
     }
 
     fn capture_presented_frame(&self) -> anyhow::Result<SceneCapture> {

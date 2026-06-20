@@ -24,7 +24,7 @@ mod subtree_probe;
 mod trace;
 mod work;
 use crate::{
-    App, Bounds, ElementId, GlobalElementId, Pixels, Size, Style, Window, size,
+    App, Bounds, GlobalElementId, Pixels, Size, Style, Window, size,
     util::{ceil_to_device_pixel, round_half_toward_zero},
 };
 use bounds_cache::{BoundsCache, BoundsCacheCheckpoint};
@@ -203,7 +203,6 @@ impl RetainedLayoutForest {
 
     /// Reset frame-local inputs while keeping retained roots available.
     pub(super) fn begin_frame(&mut self) {
-        self.roots.begin_frame();
         self.measurements.begin_frame();
         self.geometry.begin_frame();
         self.subtree_probe.begin_frame();
@@ -251,10 +250,8 @@ impl RetainedLayoutForest {
         &mut self,
         root_site: RetainedLayoutRootSite,
         global_id: Option<&GlobalElementId>,
-        element_id_stack: &[ElementId],
     ) -> RetainedLayoutRootId {
-        self.roots
-            .retained_root_id(root_site, global_id, element_id_stack)
+        self.roots.retained_root_id(root_site, global_id)
     }
 
     /// Promote successfully computed current roots and sweep everything else.

@@ -3037,6 +3037,90 @@ fn semantic_reuse_updates_changed_descendant_geometry_without_child_list_mutatio
 }
 
 #[test]
+fn hovered_swatch_style_change_reuses_appearance_subtree_and_stable_siblings() {
+    fn request_appearance_swatch_panel(
+        engine: &mut LayoutEngine,
+        hovered_swatch_width: f32,
+    ) -> (LayoutId, LayoutId, LayoutId, Vec<LayoutId>) {
+        let swatches = (0..5)
+            .map(|index| {
+                let width = if index == 2 {
+                    hovered_swatch_width
+                } else {
+                    24.0
+                };
+                request_keyed_leaf(engine, 31_100 + index, width)
+            })
+            .collect::<Vec<_>>();
+        let mut swatch_row_style = Style::default();
+        swatch_row_style.display = Display::Flex;
+        swatch_row_style.flex_direction = FlexDirection::Row;
+        let swatch_row = request_keyed_layout(engine, 31_010, swatch_row_style, &swatches);
+        let appearance_panel =
+            request_keyed_layout(engine, 31_001, Style::default(), &[swatch_row]);
+        let root = request_container(engine, &[appearance_panel]);
+        (root, appearance_panel, swatch_row, swatches)
+    }
+
+    let mut retained = LayoutEngine::new();
+    let (first_root, first_panel, first_swatch_row, first_swatches) =
+        request_appearance_swatch_panel(&mut retained, 24.0);
+    let first_root_node = compute_layout_without_measure(&mut retained, first_root, 320.0, 100.0);
+    let first_panel_node = retained.retained_node_token_for_tests(first_panel);
+    let first_swatch_row_node = retained.retained_node_token_for_tests(first_swatch_row);
+    let first_swatch_nodes = first_swatches
+        .iter()
+        .map(|swatch| retained.retained_node_token_for_tests(*swatch))
+        .collect::<Vec<_>>();
+    retained.finish_frame();
+
+    retained.reset_retained_mutation_sample_for_tests();
+    let (second_root, second_panel, second_swatch_row, second_swatches) =
+        request_appearance_swatch_panel(&mut retained, 32.0);
+    let retained_root_node =
+        compute_layout_without_measure(&mut retained, second_root, 320.0, 100.0);
+    assert_intent_committed_exactly(&retained, second_root);
+
+    assert_eq!(retained_root_node, first_root_node);
+    assert_eq!(
+        retained.retained_node_token_for_tests(second_panel),
+        first_panel_node
+    );
+    assert_eq!(
+        retained.retained_node_token_for_tests(second_swatch_row),
+        first_swatch_row_node
+    );
+    assert_eq!(
+        second_swatches
+            .iter()
+            .map(|swatch| retained.retained_node_token_for_tests(*swatch))
+            .collect::<Vec<_>>(),
+        first_swatch_nodes
+    );
+    assert_eq!(
+        retained.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 8,
+            style_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+
+    let mut fresh = LayoutEngine::new();
+    let (fresh_root, _, _, _) = request_appearance_swatch_panel(&mut fresh, 32.0);
+    let fresh_root_node = compute_layout_without_measure(&mut fresh, fresh_root, 320.0, 100.0);
+
+    assert_eq!(
+        retained_layout_projection(&retained, retained_root_node),
+        retained_layout_projection(&fresh, fresh_root_node)
+    );
+    assert_eq!(
+        retained_layout_bounds_tree(&mut retained, retained_root_node, 1.0),
+        retained_layout_bounds_tree(&mut fresh, fresh_root_node, 1.0)
+    );
+}
+
+#[test]
 fn rollback_discards_failed_transaction_root_slots() {
     let mut engine = LayoutEngine::new();
     let root = request_row(&mut engine, &[10.0, 20.0, 30.0]);

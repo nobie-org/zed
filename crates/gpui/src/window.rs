@@ -4457,7 +4457,6 @@ impl Window {
             root.layout_id(),
             root.root_site(),
             root.global_id(),
-            &self.element_id_stack,
         );
         self.compute_layout_in_root(retained_root, available_space, cx);
     }

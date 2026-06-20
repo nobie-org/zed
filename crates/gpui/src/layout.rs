@@ -5,8 +5,7 @@
 //! mirror. This module is the only facade GPUI code should use for layout.
 
 use crate::{
-    App, Bounds, ElementId, GlobalElementId, Pixels, Size, Style, TextLayoutArtifact,
-    TextMeasureKey, Window,
+    App, Bounds, GlobalElementId, Pixels, Size, Style, TextLayoutArtifact, TextMeasureKey, Window,
 };
 use core::panic::Location;
 use stacksafe::stacksafe;
@@ -150,19 +149,16 @@ impl LayoutEngine {
 
     /// Allocate or look up a retained root id for a root compute site.
     ///
-    /// A global id is authoritative when present. Anonymous roots are scoped by
-    /// their element id stack plus per-frame occurrence, which keeps repeated
-    /// anonymous roots from aliasing the same retained solver node.
+    /// A global id is authoritative when present. Anonymous roots are scratch
+    /// roots: without explicit identity, there is no cross-frame retained root
+    /// identity to look up.
     pub(crate) fn retained_root(
         &mut self,
         layout_id: LayoutId,
         root_site: RetainedLayoutRootSite,
         global_id: Option<&GlobalElementId>,
-        element_id_stack: &[ElementId],
     ) -> RetainedLayoutRoot {
-        let id = self
-            .forest
-            .retained_root_id(root_site, global_id, element_id_stack);
+        let id = self.forest.retained_root_id(root_site, global_id);
         RetainedLayoutRoot { id, layout_id }
     }
 

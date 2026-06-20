@@ -35,17 +35,6 @@ fn draw_usize(tc: &hegel::TestCase, min: usize, max: usize) -> usize {
     )
 }
 
-fn draw_element_stack(tc: &hegel::TestCase) -> Vec<u8> {
-    tc.draw(generators::vecs(generators::integers::<u8>().min_value(0).max_value(4)).max_size(4))
-}
-
-fn element_stack(ids: &[u8]) -> Vec<ElementId> {
-    ids.iter()
-        .copied()
-        .map(|id| ElementId::Integer(id.into()))
-        .collect()
-}
-
 fn global_id(id: u8) -> GlobalElementId {
     GlobalElementId(Arc::from([ElementId::Integer(id.into())]))
 }
@@ -94,15 +83,7 @@ fn producer_context(width: f32, height: f32) -> LayoutMeasureContext {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ModelRootKey {
-    Global {
-        site: u8,
-        id: u8,
-    },
-    Anonymous {
-        site: u8,
-        stack: Vec<u8>,
-        occurrence: u64,
-    },
+    Global { site: u8, id: u8 },
 }
 
 fn root_site(site: u8) -> RetainedLayoutRootSite {
@@ -134,8 +115,6 @@ fn root_registry_matches_generated_identity_model(_cx: &mut TestAppContext) {
 
         let frame_count = draw_usize(&tc, 1, 8);
         for _ in 0..frame_count {
-            registry.begin_frame();
-            let mut anonymous_occurrences = HashMap::<(u8, Vec<u8>), u64>::new();
             let request_count = draw_usize(&tc, 0, 10);
             let mut actual = Vec::new();
             let mut expected = Vec::new();
@@ -143,35 +122,25 @@ fn root_registry_matches_generated_identity_model(_cx: &mut TestAppContext) {
             for _ in 0..request_count {
                 let site = draw_u8(&tc, 0, 2);
                 let root_site = root_site(site);
-                let stack_key = draw_element_stack(&tc);
-                let stack = element_stack(&stack_key);
                 let use_global = tc.draw(generators::booleans());
-                let model_key = if use_global {
+                if use_global {
                     let id = draw_u8(&tc, 0, 4);
                     let global = global_id(id);
-                    actual.push(registry.retained_root_id(root_site, Some(&global), &stack));
-                    ModelRootKey::Global { site, id }
-                } else {
-                    actual.push(registry.retained_root_id(root_site, None, &stack));
-                    let occurrence = anonymous_occurrences
-                        .entry((site, stack_key.clone()))
-                        .and_modify(|occurrence| *occurrence += 1)
-                        .or_insert(0);
-                    let key = ModelRootKey::Anonymous {
-                        site,
-                        stack: stack_key,
-                        occurrence: *occurrence,
-                    };
-                    *occurrence += 1;
-                    key
-                };
+                    actual.push(registry.retained_root_id(root_site, Some(&global)));
 
-                let root_id = *model.entry(model_key).or_insert_with(|| {
-                    let root_id = RetainedLayoutRootId::new(next_root_id);
+                    let root_id = *model
+                        .entry(ModelRootKey::Global { site, id })
+                        .or_insert_with(|| {
+                            let root_id = RetainedLayoutRootId::new(next_root_id);
+                            next_root_id += 1;
+                            root_id
+                        });
+                    expected.push(root_id);
+                } else {
+                    actual.push(registry.retained_root_id(root_site, None));
+                    expected.push(RetainedLayoutRootId::new(next_root_id));
                     next_root_id += 1;
-                    root_id
-                });
-                expected.push(root_id);
+                }
             }
 
             assert_eq!(actual, expected);

@@ -1,7 +1,7 @@
 //! GPUI's retained layout facade.
 //!
 //! Callers produce current-frame layout intents through `LayoutEngine`; the
-//! retained forest owns the cross-frame layout nodes and the private Taffy
+//! retained forest owns the cross-frame layout nodes and the private solver
 //! mirror. This module is the only facade GPUI code should use for layout.
 
 use crate::{
@@ -19,7 +19,9 @@ use retained_forest::{
     FreshLayoutComparisonSummary, RetainedForestMutationSample, RetainedLayoutProjectionForTests,
     RetainedLayoutShapeForTests, RetainedNodeToken,
 };
-use retained_forest::{RetainedLayoutForest, RetainedLayoutForestCheckpoint};
+use retained_forest::{
+    MeasuredLayoutRequest, RetainedLayoutForest, RetainedLayoutForestCheckpoint,
+};
 pub use telemetry::LayoutWorkSample;
 #[cfg(any(test, feature = "test-support"))]
 pub use telemetry::RetainedSubtreeWorkSample;
@@ -28,7 +30,7 @@ pub use telemetry::RetainedSubtreeWorkSample;
 ///
 /// `LayoutEngine` accepts current-frame layout requests, delegates retained
 /// ownership to `RetainedLayoutForest`, and accumulates frame-local work
-/// telemetry. It intentionally exposes `LayoutId` and bounds, not Taffy node
+/// telemetry. It intentionally exposes `LayoutId` and bounds, not solver node
 /// handles, so callers cannot mutate or depend on the mirror directly.
 pub(crate) struct LayoutEngine {
     forest: RetainedLayoutForest,
@@ -55,7 +57,7 @@ impl RetainedLayoutRootSite {
 /// Retained-layout execution policy.
 ///
 /// `Retained` is the production path. `Immediate` rebuilds the forest and its
-/// private Taffy mirror at the start of every frame, which gives GPUI a
+/// private solver mirror at the start of every frame, which gives GPUI a
 /// same-user-code baseline for debugging and correctness oracles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayoutEngineMode {
@@ -67,7 +69,7 @@ impl LayoutEngineMode {
     fn from_env() -> Self {
         if let Ok(mode) = std::env::var("GPUI_LAYOUT_MODE") {
             match mode.to_ascii_lowercase().as_str() {
-                "immediate" | "fresh" | "fresh-taffy" => return Self::Immediate,
+                "immediate" | "fresh" => return Self::Immediate,
                 _ => {}
             }
         }
@@ -86,7 +88,7 @@ impl LayoutEngineMode {
 /// created by deferred/prepaint work. The forest uses this id to decide which
 /// retained root may be reused; root order alone is not a correctness proof.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RetainedLayoutRootId(u64);
+struct RetainedLayoutRootId(u64);
 
 impl RetainedLayoutRootId {
     fn new(id: u64) -> Self {
@@ -94,17 +96,27 @@ impl RetainedLayoutRootId {
     }
 }
 
+/// One-shot authority to solve one retained layout root.
+///
+/// The token binds root identity to the `LayoutId` that created it and is
+/// consumed by `compute_retained_layout`, so callers cannot freely recombine
+/// arbitrary layout ids and retained root ids.
+pub(crate) struct RetainedLayoutRoot {
+    id: RetainedLayoutRootId,
+    layout_id: LayoutId,
+}
+
 /// Exact retained-layout rollback point for retryable GPUI transactions.
 ///
 /// `Window::transact` may speculatively run prepaint/layout and then abandon
-/// it. The checkpoint must include both GPUI retained state and the Taffy
+/// it. The checkpoint must include both GPUI retained state and the solver
 /// mirror, otherwise a failed attempt can poison a later successful frame.
 pub(crate) struct LayoutCheckpoint {
     forest: RetainedLayoutForestCheckpoint,
     layout_work: LayoutWorkSample,
 }
 
-const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
+const EXPECT_MESSAGE: &str = "we should avoid layout solver errors by construction if possible";
 
 impl LayoutEngine {
     /// Create an empty retained layout engine.
@@ -140,15 +152,18 @@ impl LayoutEngine {
     ///
     /// A global id is authoritative when present. Anonymous roots are scoped by
     /// their element id stack plus per-frame occurrence, which keeps repeated
-    /// anonymous roots from aliasing the same retained Taffy node.
-    pub(crate) fn retained_root_id(
+    /// anonymous roots from aliasing the same retained solver node.
+    pub(crate) fn retained_root(
         &mut self,
+        layout_id: LayoutId,
         root_site: RetainedLayoutRootSite,
         global_id: Option<&GlobalElementId>,
         element_id_stack: &[ElementId],
-    ) -> RetainedLayoutRootId {
-        self.forest
-            .retained_root_id(root_site, global_id, element_id_stack)
+    ) -> RetainedLayoutRoot {
+        let id = self
+            .forest
+            .retained_root_id(root_site, global_id, element_id_stack);
+        RetainedLayoutRoot { id, layout_id }
     }
 
     /// Snapshot all retained layout state affected by speculative layout.
@@ -210,10 +225,12 @@ impl LayoutEngine {
         self.request_layout_with_global_id(None, style, rem_size, scale_factor, children)
     }
 
-    /// Record an unmeasured current-frame layout intent with observation identity.
+    /// Record an unmeasured current-frame layout intent with optional semantic identity.
     ///
-    /// `global_id` is used only for retained-layout diagnostics. It is not a
-    /// retention key and cannot change which occurrence owns a Taffy node.
+    /// `global_id` is a candidate retention key, not proof by itself. The
+    /// retained forest may use it only when the id is unique among both current
+    /// and previous siblings; duplicate or missing ids fall back to exact
+    /// subtree matching or fresh construction.
     pub(crate) fn request_layout_with_global_id(
         &mut self,
         global_id: Option<&GlobalElementId>,
@@ -249,13 +266,17 @@ impl LayoutEngine {
         + 'static,
     ) -> LayoutId {
         self.layout_work.measured_layout_node_requests += 1;
-        self.forest
-            .request_opaque_measured_layout(style, rem_size, scale_factor, measure)
+        self.forest.request_measured_layout(
+            style,
+            rem_size,
+            scale_factor,
+            MeasuredLayoutRequest::opaque(measure),
+        )
     }
 
     /// Record a measured layout intent whose size computation is explicit data.
     ///
-    /// The `PureSizeMeasure` value is layout-visible and comparable, so Taffy can
+    /// The `PureSizeMeasure` value is layout-visible and comparable, so the solver can
     /// reuse measurement cache when the retained node and measure input are both
     /// unchanged.
     pub(crate) fn request_pure_measured_layout(
@@ -266,17 +287,22 @@ impl LayoutEngine {
         measure: PureSizeMeasure,
     ) -> LayoutId {
         self.layout_work.measured_layout_node_requests += 1;
-        self.forest
-            .request_pure_measured_layout(style, rem_size, scale_factor, measure)
+        self.forest.request_measured_layout(
+            style,
+            rem_size,
+            scale_factor,
+            MeasuredLayoutRequest::pure_size(measure),
+        )
     }
 
     /// Record a text measured layout intent with explicit artifact hydration.
     ///
     /// GPUI needs the shaped text artifact for paint and hit testing. The
     /// retained forest never replays an artifact from `TextMeasureKey` alone:
-    /// it hydrates from the current callback, from an exact query-keyed artifact
-    /// selected by passive Taffy cache observation, or from an unchanged-node
-    /// retained artifact whose root layout context is proven unchanged.
+    /// it hydrates from the current callback, an exact query-keyed cache
+    /// observation, or a current solver final-layout cache observation that
+    /// selects a validated artifact bundle for the solved subtree. Retained node
+    /// identity and old solve context are never artifact proof.
     pub(crate) fn request_text_measured_layout(
         &mut self,
         style: Style,
@@ -293,13 +319,11 @@ impl LayoutEngine {
         + 'static,
     ) -> LayoutId {
         self.layout_work.measured_layout_node_requests += 1;
-        self.forest.request_text_measured_layout(
+        self.forest.request_measured_layout(
             style,
             rem_size,
             scale_factor,
-            measure_key,
-            hydrate,
-            measure,
+            MeasuredLayoutRequest::text(measure_key, hydrate, measure),
         )
     }
 
@@ -329,6 +353,17 @@ impl LayoutEngine {
     /// Compute a root with explicit retained identity.
     #[stacksafe]
     pub(crate) fn compute_retained_layout(
+        &mut self,
+        root: RetainedLayoutRoot,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.compute_layout_in_root(root.layout_id, root.id, available_space, window, cx);
+    }
+
+    #[cfg(test)]
+    fn compute_retained_layout_for_tests(
         &mut self,
         id: LayoutId,
         root_id: RetainedLayoutRootId,
@@ -386,13 +421,13 @@ impl LayoutEngine {
     //
     // Pixel snapping is done in two phases:
     //
-    //  1. Pre-layout metric snapping. Before Taffy computes layout, all
-    //     authored absolute lengths are rounded in `to_taffy`. This
+    //  1. Pre-layout metric snapping. Before the solver computes layout, all
+    //     authored absolute lengths are rounded during style lowering. This
     //     includes borders, padding, gaps, and explicit sizes.
     //     Custom-measured leaf nodes have their measured sizes rounded up
     //     to integer device-pixel lengths.
     //
-    //  2. Post-layout edge snapping. After Taffy resolves the tree, layout
+    //  2. Post-layout edge snapping. After the solver resolves the tree, layout
     //     relationships such as flex shares, grid tracks, percentages, and
     //     centering can produce new fractional edge positions. Boxes now
     //     have edges in absolute coordinates, and snapping must decide

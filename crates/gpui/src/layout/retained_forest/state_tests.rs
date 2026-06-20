@@ -1,28 +1,23 @@
 use super::super::{LayoutId, RetainedLayoutRootId, RetainedLayoutRootSite};
 use super::{
-    LayoutIntent, LayoutIntentKind, RetainedLayoutFacts, RetainedLayoutKind,
-    RetainedLayoutOccurrence,
     bounds_cache::BoundsCache,
     committed::CommittedLayoutState,
+    facts::{LayoutArtifactPolicy, LayoutIntent, LayoutIntentKind},
     frame::FrameIntents,
     measurement::{
-        CurrentMeasurement, LayoutMeasureContext, MeasuredLayoutKind, MeasuredLayoutResult,
-        MeasurementStore, NodeContext, PureSizeMeasure,
+        CurrentMeasurement, LayoutMeasureContext, MeasuredLayoutFacts, MeasuredLayoutResult,
+        MeasurementStore, PureSizeMeasure,
     },
+    occurrence::{RetainedLayoutOccurrence, RetainedLayoutOccurrenceKind},
     root_slots::RootSlots,
     roots::RootRegistry,
+    solver::{LayoutSolver, SolverNodeId, SolverStyle},
     work::{RetainedLayoutMissWork, RetainedLayoutWork, RetainedWorkState},
 };
 use crate::{Bounds, ElementId, GlobalElementId, Pixels, Size, TestAppContext, px, size};
 use hegel::generators;
 use stacksafe::StackSafe;
 use std::{collections::HashMap, sync::Arc};
-use taffy::{
-    TaffyTree,
-    geometry::Size as TaffySize,
-    style::{AvailableSpace as TaffyAvailableSpace, Dimension, Style as TaffyStyle},
-    tree::NodeId,
-};
 
 fn hegel_settings(test_cases: u64) -> hegel::Settings {
     hegel::Settings::new().test_cases(test_cases)
@@ -58,36 +53,33 @@ fn global_id(id: u8) -> GlobalElementId {
 fn unmeasured_intent(children: Vec<LayoutId>) -> LayoutIntent {
     LayoutIntent {
         global_id: None,
-        style: TaffyStyle::default(),
+        style: SolverStyle::default(),
+        artifact_policy: LayoutArtifactPolicy::CanProduceArtifacts,
         kind: LayoutIntentKind::Unmeasured { children },
     }
 }
 
-fn measured_intent(measured_kind: MeasuredLayoutKind) -> LayoutIntent {
+fn measured_intent(measured_facts: MeasuredLayoutFacts) -> LayoutIntent {
     LayoutIntent {
         global_id: None,
-        style: TaffyStyle::default(),
-        kind: LayoutIntentKind::Measured {
-            measure: None,
-            measured_kind,
-        },
+        style: SolverStyle::default(),
+        artifact_policy: LayoutArtifactPolicy::CanProduceArtifacts,
+        kind: LayoutIntentKind::Measured(measured_facts),
     }
 }
 
-fn new_test_node(taffy: &mut TaffyTree<NodeContext>) -> NodeId {
-    taffy.new_leaf(TaffyStyle::default()).unwrap()
+fn new_test_node(solver: &mut LayoutSolver) -> SolverNodeId {
+    solver.new_leaf(SolverStyle::default())
 }
 
-fn occurrence(node_id: NodeId) -> RetainedLayoutOccurrence {
+fn occurrence(node_id: SolverNodeId) -> RetainedLayoutOccurrence {
     RetainedLayoutOccurrence {
         node_id,
         identity: None,
-        facts: RetainedLayoutFacts {
-            style: TaffyStyle::default(),
-            kind: RetainedLayoutKind::Unmeasured,
-            measured_kind: None,
+        style: SolverStyle::default(),
+        kind: RetainedLayoutOccurrenceKind::Unmeasured {
+            children: Vec::new(),
         },
-        children: Vec::new(),
     }
 }
 
@@ -97,16 +89,6 @@ fn producer_context(width: f32, height: f32) -> LayoutMeasureContext {
             MeasuredLayoutResult::Size(size(px(width), px(height)))
         })),
         text_hydrator: None,
-    }
-}
-
-fn sized_style(width: f32, height: f32) -> TaffyStyle {
-    TaffyStyle {
-        size: TaffySize {
-            width: Dimension::length(width),
-            height: Dimension::length(height),
-        },
-        ..TaffyStyle::default()
     }
 }
 
@@ -215,7 +197,7 @@ fn frame_intents_checkpoint_restores_exact_intent_log(_cx: &mut TestAppContext) 
 
         let checkpoint = frame.checkpoint();
         for _ in 0..after_count {
-            let _ = frame.push_intent(measured_intent(MeasuredLayoutKind::Opaque));
+            let _ = frame.push_intent(measured_intent(MeasuredLayoutFacts::opaque()));
         }
         frame.rollback_to_checkpoint(checkpoint);
 
@@ -242,9 +224,9 @@ fn measurement_store_checkpoint_restores_producers_and_current_measurements(
     _cx: &mut TestAppContext,
 ) {
     hegel::Hegel::new(|tc| {
-        let mut taffy = TaffyTree::<NodeContext>::new();
-        let first_node = new_test_node(&mut taffy);
-        let second_node = new_test_node(&mut taffy);
+        let mut solver = LayoutSolver::new();
+        let first_node = new_test_node(&mut solver);
+        let second_node = new_test_node(&mut solver);
         let before_contexts = draw_usize(&tc, 0, 8);
         let after_contexts = draw_usize(&tc, 0, 8);
         let width = draw_u8(&tc, 1, 64) as f32;
@@ -253,14 +235,14 @@ fn measurement_store_checkpoint_restores_producers_and_current_measurements(
         let mut store = MeasurementStore::new();
 
         for index in 0..before_contexts {
-            let actual = store.push_producer_context(producer_context(index as f32, 1.0));
+            let actual = store.push_producer_context_for_tests(producer_context(index as f32, 1.0));
             assert_eq!(actual, index);
         }
         store.insert_current_measurement(first_node, CurrentMeasurement::PureSize(measure.clone()));
 
         let checkpoint = store.checkpoint();
         for index in 0..after_contexts {
-            let _ = store.push_producer_context(producer_context(index as f32, 2.0));
+            let _ = store.push_producer_context_for_tests(producer_context(index as f32, 2.0));
         }
         store.insert_current_measurement(second_node, CurrentMeasurement::Opaque(before_contexts));
         store.rollback_to_checkpoint(checkpoint);
@@ -270,7 +252,7 @@ fn measurement_store_checkpoint_restores_producers_and_current_measurements(
             Some(CurrentMeasurement::PureSize(measure))
         );
         assert_eq!(store.current_measurement(second_node).cloned(), None);
-        let next = store.push_producer_context(producer_context(3.0, 4.0));
+        let next = store.push_producer_context_for_tests(producer_context(3.0, 4.0));
         assert_eq!(next, before_contexts);
     })
     .settings(hegel_settings(128))
@@ -280,23 +262,23 @@ fn measurement_store_checkpoint_restores_producers_and_current_measurements(
 #[gpui::test]
 fn committed_layout_state_checkpoint_restores_unique_current_mapping(_cx: &mut TestAppContext) {
     hegel::Hegel::new(|tc| {
-        let mut taffy = TaffyTree::<NodeContext>::new();
+        let mut solver = LayoutSolver::new();
         let before_count = draw_usize(&tc, 0, 12);
         let after_count = draw_usize(&tc, 0, 12);
         let mut state = CommittedLayoutState::new();
         let mut before = Vec::new();
 
         for index in 0..before_count {
-            let node = new_test_node(&mut taffy);
-            state.mark_taffy_node_committed(node);
+            let node = new_test_node(&mut solver);
+            state.mark_solver_node_committed(node);
             state.insert(LayoutId(index), node);
             before.push((LayoutId(index), node));
         }
 
         let checkpoint = state.checkpoint();
         for index in before_count..(before_count + after_count) {
-            let node = new_test_node(&mut taffy);
-            state.mark_taffy_node_committed(node);
+            let node = new_test_node(&mut solver);
+            state.mark_solver_node_committed(node);
             state.insert(LayoutId(index), node);
         }
         state.rollback_to_checkpoint(checkpoint);
@@ -312,8 +294,8 @@ fn committed_layout_state_checkpoint_restores_unique_current_mapping(_cx: &mut T
                 .collect::<Vec<_>>()
         );
         assert_eq!(state.try_node(LayoutId(before_count)), None);
-        let next_node = new_test_node(&mut taffy);
-        state.mark_taffy_node_committed(next_node);
+        let next_node = new_test_node(&mut solver);
+        state.mark_solver_node_committed(next_node);
         state.insert(LayoutId(before_count), next_node);
         assert_eq!(state.try_node(LayoutId(before_count)), Some(next_node));
     })
@@ -324,13 +306,13 @@ fn committed_layout_state_checkpoint_restores_unique_current_mapping(_cx: &mut T
 #[gpui::test]
 fn root_slots_checkpoint_restores_current_roots_and_detached_removals(_cx: &mut TestAppContext) {
     hegel::Hegel::new(|tc| {
-        let mut taffy = TaffyTree::<NodeContext>::new();
+        let mut solver = LayoutSolver::new();
         let root_a = RetainedLayoutRootId::new(draw_u8(&tc, 0, 10).into());
         let root_b = RetainedLayoutRootId::new((draw_u8(&tc, 11, 20)).into());
-        let occurrence_a = occurrence(new_test_node(&mut taffy));
-        let detached_a = occurrence(new_test_node(&mut taffy));
-        let occurrence_b = occurrence(new_test_node(&mut taffy));
-        let detached_b = occurrence(new_test_node(&mut taffy));
+        let occurrence_a = occurrence(new_test_node(&mut solver));
+        let detached_a = occurrence(new_test_node(&mut solver));
+        let occurrence_b = occurrence(new_test_node(&mut solver));
+        let detached_b = occurrence(new_test_node(&mut solver));
         let mut slots = RootSlots::new();
 
         slots.insert_current_root(root_a, occurrence_a.clone());
@@ -355,42 +337,40 @@ fn bounds_cache_checkpoint_restores_cached_absolute_bounds(_cx: &mut TestAppCont
         let width = draw_u8(&tc, 0, 200) as f32;
         let height = draw_u8(&tc, 0, 200) as f32;
         let scale_factor = draw_u8(&tc, 1, 4) as f32;
-        let mut taffy = TaffyTree::<NodeContext>::new();
-        taffy.disable_rounding();
-        let child = taffy.new_leaf(sized_style(width, height)).unwrap();
-        let root = taffy
-            .new_with_children(TaffyStyle::default(), &[child])
-            .unwrap();
-        taffy
-            .compute_layout(
-                root,
-                TaffySize {
-                    width: TaffyAvailableSpace::Definite(width.max(1.0)),
-                    height: TaffyAvailableSpace::Definite(height.max(1.0)),
-                },
-            )
-            .unwrap();
+        let mut solver = LayoutSolver::new();
+        let child = solver.new_leaf(SolverStyle::test_with_size(width, height));
+        let root = solver.new_with_children(SolverStyle::default(), &[child]);
+        solver.compute_layout_with_measure_and_cache_events(
+            root,
+            size(
+                super::super::AvailableSpace::Definite(px(width.max(1.0))),
+                super::super::AvailableSpace::Definite(px(height.max(1.0))),
+            ),
+            1.0,
+            |_node_id, _has_measure_context, _query| size(0.0, 0.0),
+            |_| {},
+        );
 
         let mut cache = BoundsCache::new();
         let first = cache.layout_bounds_for_node(
             child,
             scale_factor,
-            |node_id| *taffy.layout(node_id).unwrap(),
-            |node_id| taffy.parent(node_id),
+            |node_id| solver.layout(node_id).unwrap(),
+            |node_id| solver.parent(node_id),
         );
         let checkpoint = cache.checkpoint();
         let _ = cache.layout_bounds_for_node(
             root,
             scale_factor,
-            |node_id| *taffy.layout(node_id).unwrap(),
-            |node_id| taffy.parent(node_id),
+            |node_id| solver.layout(node_id).unwrap(),
+            |node_id| solver.parent(node_id),
         );
         cache.rollback_to_checkpoint(checkpoint);
         let second = cache.layout_bounds_for_node(
             child,
             scale_factor,
-            |node_id| *taffy.layout(node_id).unwrap(),
-            |node_id| taffy.parent(node_id),
+            |node_id| solver.layout(node_id).unwrap(),
+            |node_id| solver.parent(node_id),
         );
 
         assert_eq!(second, first);

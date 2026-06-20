@@ -1,22 +1,22 @@
 //! Subtree-scoped retained-layout proof instrumentation.
 //!
 //! This module is private to the retained forest because it needs to name
-//! Taffy mirror nodes. Its samples expose only GPUI-facing identity strings,
+//! private solver mirror nodes. Its samples expose only GPUI-facing identity strings,
 //! layout ids, node counts, and typed retained-forest work counters.
 
 use super::super::LayoutId;
 use super::super::telemetry::RetainedSubtreeWorkSample;
-use super::measurement::MeasurementCallbackKind;
+use super::measurement::MeasuredCallbackTelemetry;
+use super::solver::SolverNodeId;
 use super::work::RetainedWorkDelta;
 use crate::GlobalElementId;
 use collections::FxHashSet;
 use std::sync::OnceLock;
-use taffy::tree::NodeId;
 
 #[derive(Clone)]
 struct ActiveSubtree {
     sample_index: usize,
-    node_ids: FxHashSet<NodeId>,
+    node_ids: FxHashSet<SolverNodeId>,
 }
 
 /// Private subtree probe state for the current frame.
@@ -48,7 +48,7 @@ pub(super) struct SubtreeProbeComputeRecorder {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SubtreeProbeComputeDelta {
     measured_callbacks: u64,
-    conservative_text_measured_callbacks: u64,
+    no_work_exempt_measured_callbacks: u64,
 }
 
 impl SubtreeProbe {
@@ -99,7 +99,7 @@ impl SubtreeProbe {
         &mut self,
         global_id: String,
         layout_id: LayoutId,
-        node_ids: Vec<NodeId>,
+        node_ids: Vec<SolverNodeId>,
         work_delta: RetainedWorkDelta,
     ) {
         if node_ids.is_empty() {
@@ -137,7 +137,7 @@ impl SubtreeProbe {
             if let Some(sample) = self.frame_samples.get_mut(sample_index) {
                 sample.measured_callbacks += delta.measured_callbacks;
                 sample.conservative_text_measured_callbacks +=
-                    delta.conservative_text_measured_callbacks;
+                    delta.no_work_exempt_measured_callbacks;
             }
         }
     }
@@ -209,20 +209,20 @@ impl SubtreeProbeComputeRecorder {
 
     pub(super) fn record_measured_callback(
         &mut self,
-        node_id: NodeId,
-        kind: MeasurementCallbackKind,
+        node_id: SolverNodeId,
+        telemetry: MeasuredCallbackTelemetry,
     ) {
         self.record_node(node_id, |delta| {
             delta.measured_callbacks += 1;
-            if kind == MeasurementCallbackKind::Text {
-                delta.conservative_text_measured_callbacks += 1;
+            if telemetry.is_no_work_exempt() {
+                delta.no_work_exempt_measured_callbacks += 1;
             }
         });
     }
 
     fn record_node(
         &mut self,
-        node_id: NodeId,
+        node_id: SolverNodeId,
         mut record: impl FnMut(&mut SubtreeProbeComputeDelta),
     ) {
         for active in &self.active_subtrees {

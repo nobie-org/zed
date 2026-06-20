@@ -4,7 +4,7 @@ use super::LayoutMeasureContext;
 ///
 /// These callbacks are frame-local effects. They are not retained layout facts,
 /// so the registry only owns producer slots and rollback length; comparable
-/// measurement identity stays in `MeasuredLayoutKind`.
+/// measurement identity stays in `MeasuredLayoutFacts`.
 pub(super) struct ProducerRegistry {
     contexts: Vec<Option<LayoutMeasureContext>>,
 }

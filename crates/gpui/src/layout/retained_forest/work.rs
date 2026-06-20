@@ -22,7 +22,7 @@ pub(in crate::layout) struct RetainedLayoutMissWork {
     pub(in crate::layout) no_previous: u64,
     pub(in crate::layout) style: u64,
     pub(in crate::layout) kind: u64,
-    pub(in crate::layout) measured_kind: u64,
+    pub(in crate::layout) measured_facts: u64,
     pub(in crate::layout) child_count: u64,
     pub(in crate::layout) child_subtree: u64,
     pub(in crate::layout) no_exact_child: u64,
@@ -70,7 +70,7 @@ impl RetainedWorkDelta {
         self.miss_work.no_previous
             + self.miss_work.style
             + self.miss_work.kind
-            + self.miss_work.measured_kind
+            + self.miss_work.measured_facts
             + self.miss_work.child_count
             + self.miss_work.child_subtree
             + self.miss_work.no_exact_child
@@ -146,7 +146,7 @@ impl RetainedWorkState {
                 no_previous: self.miss_work.no_previous - snapshot.miss_work.no_previous,
                 style: self.miss_work.style - snapshot.miss_work.style,
                 kind: self.miss_work.kind - snapshot.miss_work.kind,
-                measured_kind: self.miss_work.measured_kind - snapshot.miss_work.measured_kind,
+                measured_facts: self.miss_work.measured_facts - snapshot.miss_work.measured_facts,
                 child_count: self.miss_work.child_count - snapshot.miss_work.child_count,
                 child_subtree: self.miss_work.child_subtree - snapshot.miss_work.child_subtree,
                 no_exact_child: self.miss_work.no_exact_child - snapshot.miss_work.no_exact_child,
@@ -232,8 +232,8 @@ impl RetainedWorkState {
         self.miss_work.no_previous += 1;
     }
 
-    pub(super) fn record_measured_kind_miss(&mut self) {
-        self.miss_work.measured_kind += 1;
+    pub(super) fn record_measured_facts_miss(&mut self) {
+        self.miss_work.measured_facts += 1;
     }
 
     #[cfg(test)]

@@ -4,7 +4,7 @@
 //! identity and are truncated on transaction rollback.
 
 use super::super::LayoutId;
-use super::LayoutIntent;
+use super::facts::LayoutIntent;
 
 /// Owns the current-frame layout intent log and measured producer slots.
 pub(super) struct FrameIntents {

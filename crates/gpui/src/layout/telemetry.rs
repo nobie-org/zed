@@ -10,7 +10,7 @@ use std::time::Duration;
 /// Retained-layout work observed for one explicitly identified subtree.
 ///
 /// This is a GPUI-facing diagnostic sample. The retained forest may use private
-/// Taffy mirror nodes to attribute work internally, but exported samples expose
+/// solver mirror nodes to attribute work internally, but exported samples expose
 /// only element identity strings, layout ids, node counts, and typed retained
 /// work counters.
 #[non_exhaustive]
@@ -38,7 +38,10 @@ pub struct RetainedSubtreeWorkSample {
     pub mirror_measured_context_clears: u64,
     /// Measured callbacks attributed to nodes inside this subtree.
     pub measured_callbacks: u64,
-    /// Text measured callbacks attributed to conservative text fallback.
+    /// Measured callbacks that the measurement owner excludes from `no_work_total`.
+    ///
+    /// The field keeps its historical name for existing diagnostics. The
+    /// retained subtree probe no longer decides this from text identity.
     pub conservative_text_measured_callbacks: u64,
 }
 
@@ -72,7 +75,7 @@ pub struct LayoutWorkSample {
     pub child_edges: u64,
     /// Root layout computations requested for the draw.
     pub compute_layout_calls: u64,
-    /// Root layout computations that invoked the private Taffy solver.
+    /// Root layout computations that invoked the private solver.
     pub solver_compute_layout_calls: u64,
     /// Measured layout callbacks invoked by the retained layout engine.
     pub measured_layout_calls: u64,
@@ -100,7 +103,11 @@ pub struct LayoutWorkSample {
     pub retained_layout_miss_style: u64,
     /// Retained occurrence matches missed because node kind changed.
     pub retained_layout_miss_kind: u64,
-    /// Retained measured occurrence matches missed because the measured key or kind changed.
+    /// Retained measured occurrence matches missed because measured facts changed.
+    ///
+    /// This field keeps the historical telemetry name. The retained forest
+    /// records the miss as a measured-facts miss internally, but callers should
+    /// not need to track that implementation wording.
     pub retained_layout_miss_measured_kind: u64,
     /// Retained occurrence matches missed because child count changed.
     pub retained_layout_miss_child_count: u64,
@@ -136,7 +143,7 @@ impl LayoutWorkSample {
         self.retained_layout_miss_no_previous = misses.no_previous;
         self.retained_layout_miss_style = misses.style;
         self.retained_layout_miss_kind = misses.kind;
-        self.retained_layout_miss_measured_kind = misses.measured_kind;
+        self.retained_layout_miss_measured_kind = misses.measured_facts;
         self.retained_layout_miss_child_count = misses.child_count;
         self.retained_layout_miss_child_subtree = misses.child_subtree;
         self.retained_layout_miss_no_exact_child = misses.no_exact_child;

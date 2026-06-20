@@ -6,7 +6,7 @@
 //! cleanup path.
 
 use super::super::RetainedLayoutRootId;
-use super::RetainedLayoutOccurrence;
+use super::occurrence::RetainedLayoutOccurrence;
 use collections::FxHashMap;
 use std::mem;
 

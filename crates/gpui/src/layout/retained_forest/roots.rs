@@ -1,6 +1,6 @@
 //! Root identity registry for the retained layout forest.
 //!
-//! Retained roots are GPUI site identities, not Taffy concepts. This module
+//! Retained roots are GPUI site identities, not solver concepts. This module
 //! owns the keying and duplicate-occurrence accounting needed to keep anonymous
 //! roots from aliasing a retained mirror node.
 

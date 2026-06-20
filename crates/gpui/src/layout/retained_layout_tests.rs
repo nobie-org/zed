@@ -104,7 +104,7 @@ fn compute_stable_test_root(
     available_space: Size<AvailableSpace>,
 ) {
     cx.update(|window, app| {
-        engine.compute_retained_layout(
+        engine.compute_retained_layout_for_tests(
             root,
             RetainedLayoutRootId::new(0),
             available_space,
@@ -114,40 +114,69 @@ fn compute_stable_test_root(
     });
 }
 
-fn request_full_block_leaf(engine: &mut LayoutEngine) -> LayoutId {
+fn request_keyed_layout(
+    engine: &mut LayoutEngine,
+    key: u64,
+    style: Style,
+    children: &[LayoutId],
+) -> LayoutId {
+    let global_id = test_global_id(key);
+    engine.request_layout_with_global_id(Some(&global_id), style, px(16.0), 1.0, children)
+}
+
+fn request_keyed_full_block_leaf(engine: &mut LayoutEngine, key: u64) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Block;
     style.size = Size::full();
-    engine.request_layout(style, px(16.0), 1.0, &[])
+    request_keyed_layout(engine, key, style, &[])
 }
 
-fn request_fixed_height_leaf(engine: &mut LayoutEngine, height: f32) -> LayoutId {
+fn request_keyed_absolute_leaf(engine: &mut LayoutEngine, key: u64) -> LayoutId {
+    let mut style = Style::default();
+    style.display = Display::Block;
+    style.position = Position::Absolute;
+    request_keyed_layout(engine, key, style, &[])
+}
+
+fn request_keyed_fixed_height_leaf(engine: &mut LayoutEngine, key: u64, height: f32) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Block;
     style.size.height =
         Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(height))));
-    engine.request_layout(style, px(16.0), 1.0, &[])
+    request_keyed_layout(engine, key, style, &[])
 }
 
-fn request_flex_column_container(engine: &mut LayoutEngine, children: &[LayoutId]) -> LayoutId {
+fn request_keyed_flex_column_container(
+    engine: &mut LayoutEngine,
+    key: u64,
+    children: &[LayoutId],
+) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Flex;
     style.flex_direction = FlexDirection::Column;
     style.size = Size::full();
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_growing_block_container(engine: &mut LayoutEngine, children: &[LayoutId]) -> LayoutId {
+fn request_keyed_growing_block_container(
+    engine: &mut LayoutEngine,
+    key: u64,
+    children: &[LayoutId],
+) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Block;
     style.min_size.height =
         Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.0))));
     style.flex_grow = 1.0;
     style.flex_shrink = 1.0;
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_live_panel_container(engine: &mut LayoutEngine, children: &[LayoutId]) -> LayoutId {
+fn request_keyed_live_panel_container(
+    engine: &mut LayoutEngine,
+    key: u64,
+    children: &[LayoutId],
+) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Flex;
     style.flex_direction = FlexDirection::Column;
@@ -157,11 +186,12 @@ fn request_live_panel_container(engine: &mut LayoutEngine, children: &[LayoutId]
     style.border_widths.bottom = AbsoluteLength::Pixels(px(2.0));
     style.flex_grow = 1.0;
     style.flex_shrink = 1.0;
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_full_growing_hidden_block_container(
+fn request_keyed_full_growing_hidden_block_container(
     engine: &mut LayoutEngine,
+    key: u64,
     children: &[LayoutId],
 ) -> LayoutId {
     let mut style = Style::default();
@@ -170,84 +200,49 @@ fn request_full_growing_hidden_block_container(
     style.flex_grow = 1.0;
     style.flex_shrink = 1.0;
     style.overflow = point(Overflow::Hidden, Overflow::Hidden);
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_absolute_leaf(engine: &mut LayoutEngine) -> LayoutId {
-    let mut style = Style::default();
-    style.display = Display::Block;
-    style.position = Position::Absolute;
-    engine.request_layout(style, px(16.0), 1.0, &[])
-}
-
-fn request_canvas_like_flex_frame(
-    engine: &mut LayoutEngine,
-    header_height: f32,
-) -> (LayoutId, LayoutId, LayoutId, LayoutId) {
-    let canvas = request_full_block_leaf(engine);
-    let overlay = request_absolute_leaf(engine);
-    let canvas_host = request_full_growing_hidden_block_container(engine, &[canvas, overlay]);
-    let flex_child = request_growing_block_container(engine, &[canvas_host]);
-    let header = request_fixed_height_leaf(engine, header_height);
-    let panel = request_live_panel_container(engine, &[header, flex_child]);
-    let root = request_flex_column_container(engine, &[panel]);
-    (root, flex_child, canvas_host, canvas)
-}
-
-fn request_fixed_width_sidebar(engine: &mut LayoutEngine, width: f32) -> LayoutId {
+fn request_keyed_fixed_width_sidebar(engine: &mut LayoutEngine, key: u64, width: f32) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Block;
     style.size.width =
         Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(width))));
     style.size.height = Length::Definite(DefiniteLength::Fraction(1.0));
-    engine.request_layout(style, px(16.0), 1.0, &[])
+    request_keyed_layout(engine, key, style, &[])
 }
 
-fn request_fixed_width_sidebar_with_content(
+fn request_keyed_fixed_width_sidebar_with_content(
     engine: &mut LayoutEngine,
+    key: u64,
+    content_key: u64,
     width: f32,
     content_height: f32,
 ) -> LayoutId {
-    let content = request_fixed_height_leaf(engine, content_height);
+    let content = request_keyed_fixed_height_leaf(engine, content_key, content_height);
     let mut style = Style::default();
     style.display = Display::Block;
     style.size.width =
         Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(width))));
     style.size.height = Length::Definite(DefiniteLength::Fraction(1.0));
-    engine.request_layout(style, px(16.0), 1.0, &[content])
+    request_keyed_layout(engine, key, style, &[content])
 }
 
-fn request_flex_row_root(engine: &mut LayoutEngine, children: &[LayoutId]) -> LayoutId {
+fn request_keyed_flex_row_root(
+    engine: &mut LayoutEngine,
+    key: u64,
+    children: &[LayoutId],
+) -> LayoutId {
     let mut style = Style::default();
     style.display = Display::Flex;
     style.flex_direction = FlexDirection::Row;
     style.size = Size::full();
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_canvas_like_workspace_row(
+fn request_keyed_growing_flex_row_container(
     engine: &mut LayoutEngine,
-    header_height: f32,
-    sidebar_width: Option<f32>,
-) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
-    let canvas = request_full_block_leaf(engine);
-    let overlay = request_absolute_leaf(engine);
-    let canvas_host = request_full_growing_hidden_block_container(engine, &[canvas, overlay]);
-    let flex_child = request_growing_block_container(engine, &[canvas_host]);
-    let header = request_fixed_height_leaf(engine, header_height);
-    let panel = request_live_panel_container(engine, &[header, flex_child]);
-    let root = match sidebar_width {
-        Some(sidebar_width) => {
-            let sidebar = request_fixed_width_sidebar(engine, sidebar_width);
-            request_flex_row_root(engine, &[panel, sidebar])
-        }
-        None => request_flex_row_root(engine, &[panel]),
-    };
-    (root, panel, flex_child, canvas_host, canvas)
-}
-
-fn request_growing_flex_row_container(
-    engine: &mut LayoutEngine,
+    key: u64,
     children: &[LayoutId],
 ) -> LayoutId {
     let mut style = Style::default();
@@ -259,11 +254,12 @@ fn request_growing_flex_row_container(
         Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.0))));
     style.flex_grow = 1.0;
     style.flex_shrink = 1.0;
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_growing_flex_column_container(
+fn request_keyed_growing_flex_column_container(
     engine: &mut LayoutEngine,
+    key: u64,
     children: &[LayoutId],
 ) -> LayoutId {
     let mut style = Style::default();
@@ -275,11 +271,12 @@ fn request_growing_flex_column_container(
         Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.0))));
     style.flex_grow = 1.0;
     style.flex_shrink = 1.0;
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
 }
 
-fn request_padded_growing_flex_row_container(
+fn request_keyed_padded_growing_flex_row_container(
     engine: &mut LayoutEngine,
+    key: u64,
     children: &[LayoutId],
 ) -> LayoutId {
     let mut style = Style::default();
@@ -295,7 +292,44 @@ fn request_padded_growing_flex_row_container(
     style.padding.bottom = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(21.0)));
     style.flex_grow = 1.0;
     style.flex_shrink = 1.0;
-    engine.request_layout(style, px(16.0), 1.0, children)
+    request_keyed_layout(engine, key, style, children)
+}
+
+fn request_canvas_like_flex_frame(
+    engine: &mut LayoutEngine,
+    header_height: f32,
+) -> (LayoutId, LayoutId, LayoutId, LayoutId) {
+    let canvas = request_keyed_full_block_leaf(engine, 10_001);
+    let overlay = request_keyed_absolute_leaf(engine, 10_002);
+    let canvas_host =
+        request_keyed_full_growing_hidden_block_container(engine, 10_003, &[canvas, overlay]);
+    let flex_child = request_keyed_growing_block_container(engine, 10_004, &[canvas_host]);
+    let header = request_keyed_fixed_height_leaf(engine, 10_005, header_height);
+    let panel = request_keyed_live_panel_container(engine, 10_006, &[header, flex_child]);
+    let root = request_keyed_flex_column_container(engine, 10_007, &[panel]);
+    (root, flex_child, canvas_host, canvas)
+}
+
+fn request_canvas_like_workspace_row(
+    engine: &mut LayoutEngine,
+    header_height: f32,
+    sidebar_width: Option<f32>,
+) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
+    let canvas = request_keyed_full_block_leaf(engine, 11_001);
+    let overlay = request_keyed_absolute_leaf(engine, 11_002);
+    let canvas_host =
+        request_keyed_full_growing_hidden_block_container(engine, 11_003, &[canvas, overlay]);
+    let flex_child = request_keyed_growing_block_container(engine, 11_004, &[canvas_host]);
+    let header = request_keyed_fixed_height_leaf(engine, 11_005, header_height);
+    let panel = request_keyed_live_panel_container(engine, 11_006, &[header, flex_child]);
+    let root = match sidebar_width {
+        Some(sidebar_width) => {
+            let sidebar = request_keyed_fixed_width_sidebar(engine, 11_007, sidebar_width);
+            request_keyed_flex_row_root(engine, 11_008, &[panel, sidebar])
+        }
+        None => request_keyed_flex_row_root(engine, 11_008, &[panel]),
+    };
+    (root, panel, flex_child, canvas_host, canvas)
 }
 
 fn request_canvas_like_chrome_frame(
@@ -303,7 +337,7 @@ fn request_canvas_like_chrome_frame(
     sidebar_width: f32,
 ) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
     request_canvas_like_chrome_frame_with_sidebar(engine, |engine| {
-        request_fixed_width_sidebar(engine, sidebar_width)
+        request_keyed_fixed_width_sidebar(engine, 12_014, sidebar_width)
     })
 }
 
@@ -313,7 +347,13 @@ fn request_canvas_like_chrome_frame_with_sidebar_content(
     sidebar_content_height: f32,
 ) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
     request_canvas_like_chrome_frame_with_sidebar(engine, |engine| {
-        request_fixed_width_sidebar_with_content(engine, sidebar_width, sidebar_content_height)
+        request_keyed_fixed_width_sidebar_with_content(
+            engine,
+            12_014,
+            12_015,
+            sidebar_width,
+            sidebar_content_height,
+        )
     })
 }
 
@@ -321,20 +361,23 @@ fn request_canvas_like_chrome_frame_with_sidebar(
     engine: &mut LayoutEngine,
     request_sidebar: impl FnOnce(&mut LayoutEngine) -> LayoutId,
 ) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
-    let canvas = request_full_block_leaf(engine);
-    let overlay = request_absolute_leaf(engine);
-    let canvas_host = request_full_growing_hidden_block_container(engine, &[canvas, overlay]);
-    let flex_child = request_growing_block_container(engine, &[canvas_host]);
-    let header = request_fixed_height_leaf(engine, 70.0);
-    let panel = request_live_panel_container(engine, &[header, flex_child]);
+    let canvas = request_keyed_full_block_leaf(engine, 12_001);
+    let overlay = request_keyed_absolute_leaf(engine, 12_002);
+    let canvas_host =
+        request_keyed_full_growing_hidden_block_container(engine, 12_003, &[canvas, overlay]);
+    let flex_child = request_keyed_growing_block_container(engine, 12_004, &[canvas_host]);
+    let header = request_keyed_fixed_height_leaf(engine, 12_005, 70.0);
+    let panel = request_keyed_live_panel_container(engine, 12_006, &[header, flex_child]);
     let sidebar = request_sidebar(engine);
-    let content_row = request_growing_flex_row_container(engine, &[panel, sidebar]);
-    let padded_row = request_padded_growing_flex_row_container(engine, &[content_row]);
-    let footer = request_fixed_height_leaf(engine, 98.0);
-    let lower_column = request_growing_flex_column_container(engine, &[padded_row, footer]);
-    let main_row = request_growing_flex_row_container(engine, &[lower_column]);
-    let top_chrome = request_fixed_height_leaf(engine, 156.0);
-    let root = request_flex_column_container(engine, &[top_chrome, main_row]);
+    let content_row = request_keyed_growing_flex_row_container(engine, 12_007, &[panel, sidebar]);
+    let padded_row =
+        request_keyed_padded_growing_flex_row_container(engine, 12_008, &[content_row]);
+    let footer = request_keyed_fixed_height_leaf(engine, 12_009, 98.0);
+    let lower_column =
+        request_keyed_growing_flex_column_container(engine, 12_010, &[padded_row, footer]);
+    let main_row = request_keyed_growing_flex_row_container(engine, 12_011, &[lower_column]);
+    let top_chrome = request_keyed_fixed_height_leaf(engine, 12_012, 156.0);
+    let root = request_keyed_flex_column_container(engine, 12_013, &[top_chrome, main_row]);
     (root, panel, flex_child, canvas_host, canvas)
 }
 
@@ -425,15 +468,39 @@ fn request_text_measured_with_style(
     key: TextMeasureKey,
     size: Size<Pixels>,
 ) -> LayoutId {
-    let artifact = TextLayoutArtifact::for_tests(key.clone(), size);
     engine.request_text_measured_layout(
         style,
         px(16.0),
         1.0,
-        key,
+        key.clone(),
         |_| {},
-        move |_, _, _, _| artifact.clone(),
+        move |known_dimensions, available_space, _, _| {
+            TextLayoutArtifact::for_tests(
+                key.clone(),
+                text_artifact_size_for_query(size, known_dimensions, available_space),
+            )
+        },
     )
+}
+
+fn text_artifact_size_for_query(
+    fallback_size: Size<Pixels>,
+    known_dimensions: Size<Option<Pixels>>,
+    available_space: Size<AvailableSpace>,
+) -> Size<Pixels> {
+    let width = known_dimensions
+        .width
+        .unwrap_or(match available_space.width {
+            AvailableSpace::Definite(width) => fallback_size.width.min(width),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => fallback_size.width,
+        });
+    let height = known_dimensions
+        .height
+        .unwrap_or(match available_space.height {
+            AvailableSpace::Definite(height) => fallback_size.height.min(height),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => fallback_size.height,
+        });
+    size(width, height)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -865,15 +932,6 @@ impl GeneratedTree {
             _ => false,
         }
     }
-
-    fn retained_storage_can_be_reassigned_to_intent(&self, current: &Self) -> bool {
-        matches!(
-            (self, current),
-            (Self::Unmeasured { .. }, Self::Unmeasured { .. })
-                | (Self::PureSize { .. }, Self::PureSize { .. })
-                | (Self::Text { .. }, Self::Text { .. })
-        )
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -913,17 +971,23 @@ fn request_generated_tree(engine: &mut LayoutEngine, tree: &GeneratedTree) -> La
             height,
         } => {
             let key = generated_text_measure_key(*key_index, *width, *height);
-            let artifact = TextLayoutArtifact::for_tests(
-                key.clone(),
-                size(px(*width as f32), px(*height as f32)),
-            );
+            let fallback_size = size(px(*width as f32), px(*height as f32));
             engine.request_text_measured_layout(
                 Style::default(),
                 px(16.0),
                 1.0,
-                key,
+                key.clone(),
                 |_| {},
-                move |_, _, _, _| artifact.clone(),
+                move |known_dimensions, available_space, _, _| {
+                    TextLayoutArtifact::for_tests(
+                        key.clone(),
+                        text_artifact_size_for_query(
+                            fallback_size,
+                            known_dimensions,
+                            available_space,
+                        ),
+                    )
+                },
             )
         }
         GeneratedTree::Opaque { width } => {
@@ -1019,7 +1083,7 @@ fn compute_generated_roots(
             .iter()
             .enumerate()
             .map(|(index, root)| {
-                engine.compute_retained_layout(
+                engine.compute_retained_layout_for_tests(
                     *root,
                     RetainedLayoutRootId::new(index as u64),
                     size(
@@ -1141,21 +1205,6 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     }
                 }
 
-                for (current_index, current_child) in current_children.iter().enumerate() {
-                    if assigned_previous_indices[current_index].is_some() {
-                        continue;
-                    }
-                    if let Some(previous_child) = previous_children.get(current_index) {
-                        if !previous_used[current_index]
-                            && previous_child
-                                .retained_storage_can_be_reassigned_to_intent(current_child)
-                        {
-                            previous_used[current_index] = true;
-                            assigned_previous_indices[current_index] = Some(current_index);
-                        }
-                    }
-                }
-
                 let mut child_list_changed = previous_children.len() != current_children.len();
                 for (current_index, matching_previous_index) in
                     assigned_previous_indices.iter().enumerate()
@@ -1197,7 +1246,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
             (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
             | (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => {
                 self.reuses += 1;
-                let measured_kind_changed = match (previous, current) {
+                let measured_facts_changed = match (previous, current) {
                     (
                         GeneratedTree::PureSize {
                             width: previous_width,
@@ -1226,7 +1275,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     }
                     _ => false,
                 };
-                if measured_kind_changed {
+                if measured_facts_changed {
                     self.dirty_marks += 1;
                 }
                 ExpectedCommitResult {
@@ -1268,12 +1317,11 @@ fn request_text_measured_with_hydration_log(
     hydrations: Rc<Cell<usize>>,
     hydrated_artifacts: Option<Rc<RefCell<Vec<HydratedTextArtifact>>>>,
 ) -> LayoutId {
-    let artifact = TextLayoutArtifact::for_tests(key.clone(), size);
     engine.request_text_measured_layout(
         Style::default(),
         px(16.0),
         1.0,
-        key,
+        key.clone(),
         move |artifact| {
             hydrations.set(hydrations.get() + 1);
             if let Some(hydrated_artifacts) = hydrated_artifacts.as_ref() {
@@ -1283,9 +1331,12 @@ fn request_text_measured_with_hydration_log(
                 });
             }
         },
-        move |_, _, _, _| {
+        move |known_dimensions, available_space, _, _| {
             measure_invocations.set(measure_invocations.get() + 1);
-            artifact.clone()
+            TextLayoutArtifact::for_tests(
+                key.clone(),
+                text_artifact_size_for_query(size, known_dimensions, available_space),
+            )
         },
     )
 }
@@ -1318,17 +1369,20 @@ fn request_input_sensitive_text_measured(
                     height: size.height.0.round() as u16,
                 });
         },
-        move |_, available_space, _, _| {
+        move |known_dimensions, available_space, _, _| {
             measure_invocations.set(measure_invocations.get() + 1);
-            let measured_width = match available_space.width {
-                AvailableSpace::Definite(width) => width,
-                AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                    px(fallback_width as f32)
-                }
-            };
+            let measured_width = known_dimensions
+                .width
+                .unwrap_or(match available_space.width {
+                    AvailableSpace::Definite(width) => width,
+                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                        px(fallback_width as f32)
+                    }
+                });
+            let measured_height = known_dimensions.height.unwrap_or(px(height as f32));
             TextLayoutArtifact::for_tests(
                 measure_key.clone(),
-                size(measured_width, px(height as f32)),
+                size(measured_width, measured_height),
             )
         },
     )
@@ -1367,17 +1421,20 @@ fn request_growing_input_sensitive_text_measured(
                     height: size.height.0.round() as u16,
                 });
         },
-        move |_, available_space, _, _| {
+        move |known_dimensions, available_space, _, _| {
             measure_invocations.set(measure_invocations.get() + 1);
-            let measured_width = match available_space.width {
-                AvailableSpace::Definite(width) => width,
-                AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                    px(fallback_width as f32)
-                }
-            };
+            let measured_width = known_dimensions
+                .width
+                .unwrap_or(match available_space.width {
+                    AvailableSpace::Definite(width) => width,
+                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                        px(fallback_width as f32)
+                    }
+                });
+            let measured_height = known_dimensions.height.unwrap_or(px(height as f32));
             TextLayoutArtifact::for_tests(
                 measure_key.clone(),
-                size(measured_width, px(height as f32)),
+                size(measured_width, measured_height),
             )
         },
     )
@@ -1881,6 +1938,87 @@ fn same_frame_root_recompute_panics(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+#[should_panic(expected = "attached layout requests cannot be computed as detached roots")]
+fn attached_layout_request_cannot_be_solved_as_detached_root(cx: &mut TestAppContext) {
+    struct AttachedThenDetachedRoot;
+
+    impl IntoElement for AttachedThenDetachedRoot {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for AttachedThenDetachedRoot {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            (window.request_layout(Style::default(), [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            let mut element = div().into_any_element();
+            let _attached_layout = element.request_layout(window, cx);
+            element.layout_as_root(
+                size(
+                    AvailableSpace::Definite(px(100.0)),
+                    AvailableSpace::Definite(px(80.0)),
+                ),
+                window,
+                cx,
+            );
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) {
+        }
+    }
+
+    let cx = cx.add_empty_window();
+
+    let _ = cx.draw(
+        point(px(0.0), px(0.0)),
+        size(
+            AvailableSpace::Definite(px(240.0)),
+            AvailableSpace::Definite(px(120.0)),
+        ),
+        |_, _| AttachedThenDetachedRoot,
+    );
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
 fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext) {
@@ -1940,6 +2078,62 @@ fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext
     })
     .settings(hegel_settings(64))
     .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn generated_text_descendant_hydrates_when_parent_final_layout_cache_hits(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let key_index = 0;
+    let fallback_width = 80;
+    let height = 18;
+    let root_width = 120;
+    let measure_invocations = Rc::new(Cell::new(0));
+    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = LayoutEngine::new();
+
+    let text = request_input_sensitive_text_measured(
+        &mut engine,
+        0,
+        key_index,
+        fallback_width,
+        height,
+        measure_invocations.clone(),
+        hydrated_artifacts.clone(),
+    );
+    let root = request_container(&mut engine, &[text]);
+    compute_generated_text_root(cx, &mut engine, root, root_width);
+    engine.finish_frame();
+    let first_hydration = hydrated_artifacts.borrow()[0].clone();
+    measure_invocations.set(0);
+    hydrated_artifacts.borrow_mut().clear();
+
+    let text = request_input_sensitive_text_measured(
+        &mut engine,
+        1,
+        key_index,
+        fallback_width,
+        height,
+        measure_invocations.clone(),
+        hydrated_artifacts.clone(),
+    );
+    let root = request_container(&mut engine, &[text]);
+    compute_generated_text_root(cx, &mut engine, root, root_width);
+
+    assert_eq!(
+        measure_invocations.get(),
+        0,
+        "unchanged text descendant should hydrate from the parent's final-layout cache hit"
+    );
+    assert_eq!(
+        hydrated_artifacts.borrow().as_slice(),
+        [GeneratedTextHydration {
+            label: 1,
+            key_index,
+            width: first_hydration.width,
+            height: first_hydration.height,
+        }]
+    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2229,7 +2423,7 @@ fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut Tes
     assert_eq!(
         retained_hydrated_artifacts.borrow().as_slice(),
         fresh_hydrated_artifacts.borrow().as_slice(),
-        "retained text hydration should match fresh Taffy measurement semantics"
+        "retained text hydration should match fresh solver measurement semantics"
     );
 }
 
@@ -2496,15 +2690,19 @@ fn unchanged_unmeasured_tree_emits_no_retained_mutations_on_second_frame() {
 }
 
 #[test]
-fn changed_unmeasured_child_reassigns_same_slot_storage_and_updates_style() {
+fn changed_keyed_unmeasured_child_updates_retained_node_and_style() {
     let mut engine = LayoutEngine::new();
-    let first_root = request_row(&mut engine, &[10.0, 20.0]);
+    let stable = request_leaf(&mut engine, 10.0);
+    let changing = request_keyed_leaf(&mut engine, 21_001, 20.0);
+    let first_root = request_container(&mut engine, &[stable, changing]);
     let first_root_node = engine.commit_layout(first_root);
     let first_child_nodes = engine.retained_child_tokens_for_tests(first_root_node);
     engine.finish_frame();
 
     engine.reset_retained_mutation_sample_for_tests();
-    let second_root = request_row(&mut engine, &[10.0, 30.0]);
+    let stable = request_leaf(&mut engine, 10.0);
+    let changing = request_keyed_leaf(&mut engine, 21_001, 30.0);
+    let second_root = request_container(&mut engine, &[stable, changing]);
     let second_root_node = engine.commit_layout(second_root);
     assert_intent_committed_exactly(&engine, second_root);
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
@@ -2531,7 +2729,46 @@ fn changed_unmeasured_child_reassigns_same_slot_storage_and_updates_style() {
 }
 
 #[test]
-fn unique_global_id_reorder_preserves_semantic_child_storage() {
+fn changed_unkeyed_same_slot_child_does_not_reuse_old_node() {
+    let mut engine = LayoutEngine::new();
+    let first_child = request_leaf(&mut engine, 10.0);
+    let first_root = request_container(&mut engine, &[first_child]);
+    let first_root_node = engine.commit_layout(first_root);
+    let first_child_nodes = engine.retained_child_tokens_for_tests(first_root_node);
+    engine.finish_frame();
+
+    engine.reset_retained_mutation_sample_for_tests();
+    let second_child = request_leaf(&mut engine, 20.0);
+    let second_root = request_container(&mut engine, &[second_child]);
+    let second_root_node = engine.commit_layout(second_root);
+    assert_intent_committed_exactly(&engine, second_root);
+    let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
+
+    assert_eq!(second_root_node, first_root_node);
+    assert_ne!(second_child_nodes[0], first_child_nodes[0]);
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            creates: 1,
+            reuses: 1,
+            child_list_updates: 1,
+            removes: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_child = request_leaf(&mut fresh, 20.0);
+    let fresh_root = request_container(&mut fresh, &[fresh_child]);
+    let fresh_root_node = fresh.commit_layout(fresh_root);
+    assert_eq!(
+        retained_layout_shape(&engine, second_root_node),
+        retained_layout_shape(&fresh, fresh_root_node)
+    );
+}
+
+#[test]
+fn unique_global_id_reorder_preserves_semantic_child_node() {
     let mut engine = LayoutEngine::new();
     let first_a = request_keyed_leaf(&mut engine, 1, 10.0);
     let first_b = request_keyed_leaf(&mut engine, 2, 20.0);
@@ -2619,8 +2856,13 @@ fn changed_measured_child_is_not_an_exact_reordered_match() {
 fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
     let mut engine = LayoutEngine::new();
     let stable_grandchild = request_leaf(&mut engine, 10.0);
-    let changing_grandchild = request_leaf(&mut engine, 20.0);
-    let changed_child = request_container(&mut engine, &[stable_grandchild, changing_grandchild]);
+    let changing_grandchild = request_keyed_leaf(&mut engine, 22_001, 20.0);
+    let changed_child = request_keyed_layout(
+        &mut engine,
+        22_002,
+        Style::default(),
+        &[stable_grandchild, changing_grandchild],
+    );
     let stable_sibling = request_leaf(&mut engine, 99.0);
     let first_root = request_container(&mut engine, &[changed_child, stable_sibling]);
     let first_root_node = engine.commit_layout(first_root);
@@ -2634,8 +2876,13 @@ fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
 
     engine.reset_retained_mutation_sample_for_tests();
     let stable_grandchild = request_leaf(&mut engine, 10.0);
-    let changing_grandchild = request_leaf(&mut engine, 30.0);
-    let changed_child = request_container(&mut engine, &[stable_grandchild, changing_grandchild]);
+    let changing_grandchild = request_keyed_leaf(&mut engine, 22_001, 30.0);
+    let changed_child = request_keyed_layout(
+        &mut engine,
+        22_002,
+        Style::default(),
+        &[stable_grandchild, changing_grandchild],
+    );
     let stable_sibling = request_leaf(&mut engine, 99.0);
     let second_root = request_container(&mut engine, &[changed_child, stable_sibling]);
     let second_root_node = engine.commit_layout(second_root);
@@ -2822,10 +3069,10 @@ fn retained_layout_recomputes_after_child_delete_from_content_sized_parent() {
 }
 
 #[test]
-fn same_slot_storage_reassignment_updates_style_and_matches_fresh_layout() {
+fn unique_global_id_style_change_updates_retained_node_and_matches_fresh_layout() {
     let mut retained = LayoutEngine::new();
     let stable = request_leaf(&mut retained, 10.0);
-    let changing = request_leaf(&mut retained, 20.0);
+    let changing = request_keyed_leaf(&mut retained, 23_001, 20.0);
     let first_root = request_flex_container(&mut retained, &[stable, changing]);
     let first_root_node = compute_layout_without_measure(&mut retained, first_root, 240.0, 80.0);
     let first_stable_node = retained.retained_node_token_for_tests(stable);
@@ -2834,7 +3081,7 @@ fn same_slot_storage_reassignment_updates_style_and_matches_fresh_layout() {
 
     retained.reset_retained_mutation_sample_for_tests();
     let stable = request_leaf(&mut retained, 10.0);
-    let changing = request_leaf(&mut retained, 30.0);
+    let changing = request_keyed_leaf(&mut retained, 23_001, 30.0);
     let second_root = request_flex_container(&mut retained, &[stable, changing]);
     let retained_stable = stable;
     let retained_changing = changing;
@@ -2875,9 +3122,9 @@ fn same_slot_storage_reassignment_updates_style_and_matches_fresh_layout() {
 }
 
 #[test]
-fn same_position_exact_child_is_not_stolen_by_changed_equal_sibling() {
+fn same_index_exact_child_is_not_stolen_by_changed_equal_sibling() {
     let mut retained = LayoutEngine::new();
-    let changing = request_leaf(&mut retained, 10.0);
+    let changing = request_keyed_leaf(&mut retained, 24_001, 10.0);
     let stable = request_leaf(&mut retained, 99.0);
     let first_root = request_flex_container(&mut retained, &[changing, stable]);
     let first_root_node = compute_layout_without_measure(&mut retained, first_root, 240.0, 80.0);
@@ -2886,7 +3133,7 @@ fn same_position_exact_child_is_not_stolen_by_changed_equal_sibling() {
     retained.finish_frame();
 
     retained.reset_retained_mutation_sample_for_tests();
-    let changing = request_leaf(&mut retained, 99.0);
+    let changing = request_keyed_leaf(&mut retained, 24_001, 99.0);
     let stable = request_leaf(&mut retained, 99.0);
     let second_root = request_flex_container(&mut retained, &[changing, stable]);
     let retained_changing = changing;
@@ -3113,8 +3360,10 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            style_updates: 1,
+            creates: 1,
+            reuses: 2,
+            child_list_updates: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3283,7 +3532,7 @@ fn retained_measured_node_recomputes_when_measure_result_changes(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn unchanged_pure_size_measure_reuses_taffy_cache(cx: &mut TestAppContext) {
+fn unchanged_pure_size_measure_reuses_solver_cache(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let mut engine = LayoutEngine::new();
 
@@ -3471,8 +3720,10 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            style_updates: 1,
+            creates: 1,
+            reuses: 2,
+            child_list_updates: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3540,8 +3791,10 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 4,
-            style_updates: 1,
+            creates: 1,
+            reuses: 3,
+            child_list_updates: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3628,15 +3881,18 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 4,
-            dirty_marks: 1,
+            creates: 1,
+            reuses: 3,
+            child_list_updates: 1,
+            context_clears: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
 }
 
 #[test]
-fn same_text_measure_key_with_changed_taffy_style_reuses_text_node() {
+fn same_text_measure_key_with_changed_solver_style_reuses_text_node() {
     let key = text_measure_key("hello");
     let mut engine = LayoutEngine::new();
     let text = request_text_measured_with_style(

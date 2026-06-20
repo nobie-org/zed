@@ -63,7 +63,8 @@ use uuid::Uuid;
 
 mod prompts;
 
-use crate::layout::{PureSizeMeasure, RetainedLayoutRootId, RetainedLayoutRootSite};
+use crate::element::DetachedLayoutRoot;
+use crate::layout::{PureSizeMeasure, RetainedLayoutRoot};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -4446,34 +4447,31 @@ impl Window {
             )
     }
 
-    pub(crate) fn compute_layout_as_root(
+    pub(crate) fn compute_detached_root_layout(
         &mut self,
-        layout_id: LayoutId,
-        global_id: Option<&GlobalElementId>,
-        root_site: RetainedLayoutRootSite,
+        root: DetachedLayoutRoot<'_>,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
-    ) -> RetainedLayoutRootId {
-        let retained_root_id = self.layout_engine.as_mut().unwrap().retained_root_id(
-            root_site,
-            global_id,
+    ) {
+        let retained_root = self.layout_engine.as_mut().unwrap().retained_root(
+            root.layout_id(),
+            root.root_site(),
+            root.global_id(),
             &self.element_id_stack,
         );
-        self.compute_layout_in_root(layout_id, retained_root_id, available_space, cx);
-        retained_root_id
+        self.compute_layout_in_root(retained_root, available_space, cx);
     }
 
-    pub(crate) fn compute_layout_in_root(
+    fn compute_layout_in_root(
         &mut self,
-        layout_id: LayoutId,
-        root_id: RetainedLayoutRootId,
+        root: RetainedLayoutRoot,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) {
         self.invalidator.debug_assert_prepaint();
 
         let mut layout_engine = self.layout_engine.take().unwrap();
-        layout_engine.compute_retained_layout(layout_id, root_id, available_space, self, cx);
+        layout_engine.compute_retained_layout(root, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
     }
 
@@ -4490,7 +4488,7 @@ impl Window {
     /// Configure retained-layout subtree proof targets for test-support harnesses.
     ///
     /// Targets are suffix-matched against rendered `GlobalElementId` strings.
-    /// The retained forest owns the private Taffy attribution; this method only
+    /// The retained forest owns the private solver attribution; this method only
     /// selects which GPUI-facing subtree samples should be retained for the
     /// next completed draw.
     #[cfg(any(test, feature = "test-support"))]

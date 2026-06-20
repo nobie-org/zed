@@ -34,9 +34,7 @@
 use crate::{
     App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
     InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    layout::{RetainedLayoutRootId, RetainedLayoutRootSite},
-    util::FluentBuilder,
-    window::with_element_arena,
+    layout::RetainedLayoutRootSite, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -322,6 +320,43 @@ trait ElementObject {
     ) -> Size<Pixels>;
 }
 
+/// Capability proving that a layout request belongs to a detached root.
+///
+/// A raw `LayoutId` is not authority to compute an independent root. Only the
+/// `Drawable::layout_as_root` path can construct this token, so ordinary
+/// attached child layout requests cannot be accidentally solved as roots.
+pub(crate) struct DetachedLayoutRoot<'a> {
+    layout_id: LayoutId,
+    root_site: RetainedLayoutRootSite,
+    global_id: Option<&'a GlobalElementId>,
+}
+
+impl<'a> DetachedLayoutRoot<'a> {
+    fn new(
+        layout_id: LayoutId,
+        root_site: RetainedLayoutRootSite,
+        global_id: Option<&'a GlobalElementId>,
+    ) -> Self {
+        Self {
+            layout_id,
+            root_site,
+            global_id,
+        }
+    }
+
+    pub(crate) fn layout_id(&self) -> LayoutId {
+        self.layout_id
+    }
+
+    pub(crate) fn root_site(&self) -> RetainedLayoutRootSite {
+        self.root_site
+    }
+
+    pub(crate) fn global_id(&self) -> Option<&GlobalElementId> {
+        self.global_id
+    }
+}
+
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
 pub struct Drawable<E: Element> {
     /// The drawn element.
@@ -335,13 +370,13 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     Start,
     RequestLayout {
         layout_id: LayoutId,
+        owner: LayoutRequestOwner,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         request_layout: RequestLayoutState,
     },
     LayoutComputed {
         layout_id: LayoutId,
-        retained_root_id: RetainedLayoutRootId,
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         available_space: Size<AvailableSpace>,
@@ -358,6 +393,20 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
     Painted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutRequestOwner {
+    /// The layout intent was requested as a child of another current-frame intent.
+    ///
+    /// It may be committed under its parent root, but it is not legal authority
+    /// for an independent retained-root solve.
+    AttachedChild,
+    /// The layout intent was requested specifically for an independent root solve.
+    ///
+    /// This is used by element probes, tooltips, lists, and other detached
+    /// prepaint roots whose geometry is solved outside a parent element.
+    DetachedRoot,
+}
+
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
 impl<E: Element> Drawable<E> {
     pub(crate) fn new(element: E) -> Self {
@@ -368,6 +417,15 @@ impl<E: Element> Drawable<E> {
     }
 
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
+        self.request_layout_owned_by(LayoutRequestOwner::AttachedChild, window, cx)
+    }
+
+    fn request_layout_owned_by(
+        &mut self,
+        owner: LayoutRequestOwner,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
                 let global_id = self.element.id().map(|element_id| {
@@ -404,6 +462,7 @@ impl<E: Element> Drawable<E> {
 
                 self.phase = ElementDrawPhase::RequestLayout {
                     layout_id,
+                    owner,
                     global_id,
                     inspector_id,
                     request_layout,
@@ -418,6 +477,7 @@ impl<E: Element> Drawable<E> {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
+                owner: _,
                 global_id,
                 inspector_id,
                 mut request_layout,
@@ -513,26 +573,29 @@ impl<E: Element> Drawable<E> {
         cx: &mut App,
     ) -> Size<Pixels> {
         if matches!(&self.phase, ElementDrawPhase::Start) {
-            self.request_layout(window, cx);
+            self.request_layout_owned_by(LayoutRequestOwner::DetachedRoot, window, cx);
         }
 
         let layout_id = match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
+                owner,
                 global_id,
                 inspector_id,
                 request_layout,
             } => {
-                let retained_root_id = window.compute_layout_as_root(
-                    layout_id,
-                    global_id.as_ref(),
-                    root_site,
+                assert_eq!(
+                    owner,
+                    LayoutRequestOwner::DetachedRoot,
+                    "attached layout requests cannot be computed as detached roots"
+                );
+                window.compute_detached_root_layout(
+                    DetachedLayoutRoot::new(layout_id, root_site, global_id.as_ref()),
                     available_space,
                     cx,
                 );
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
-                    retained_root_id,
                     global_id,
                     inspector_id,
                     available_space,
@@ -542,7 +605,6 @@ impl<E: Element> Drawable<E> {
             }
             ElementDrawPhase::LayoutComputed {
                 layout_id,
-                retained_root_id,
                 global_id,
                 inspector_id,
                 available_space: prev_available_space,
@@ -554,7 +616,6 @@ impl<E: Element> Drawable<E> {
                 );
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
-                    retained_root_id,
                     global_id,
                     inspector_id,
                     available_space,

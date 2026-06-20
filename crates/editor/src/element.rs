@@ -4147,18 +4147,20 @@ impl EditorElement {
 
         // Discover the element's content height, then round up to the nearest multiple of line height.
         let preliminary_available_space = size(available_width, AvailableSpace::MinContent);
-        let mut element = render_element(window, cx)?;
-        let preliminary_size = element.layout_as_root(preliminary_available_space, window, cx);
+        let preliminary_size =
+            render_element(window, cx)?.measure_as_root(preliminary_available_space, window, cx);
         let quantized_height = (preliminary_size.height / line_height).ceil() * line_height;
-        let final_available_space;
-        let final_size = if preliminary_size.height == quantized_height {
-            final_available_space = preliminary_available_space;
+        let final_available_space = if preliminary_size.height == quantized_height {
+            preliminary_available_space
+        } else {
+            size(available_width, quantized_height.into())
+        };
+        let final_size = if final_available_space == preliminary_available_space {
             preliminary_size
         } else {
-            element = render_element(window, cx)?;
-            final_available_space = size(available_width, quantized_height.into());
-            element.layout_as_root(final_available_space, window, cx)
+            render_element(window, cx)?.measure_as_root(final_available_space, window, cx)
         };
+        let element = render_element(window, cx)?;
         drop(render_element);
         let x_position = x_position;
         let mut element_height_in_lines = ((final_size.height / line_height).ceil() as u32).max(1);
@@ -10498,13 +10500,13 @@ impl Element for EditorElement {
                                     blame.blame_for_rows(&[row_infos], cx).next()
                                 })
                                 .flatten()?;
-                            let mut element = render_inline_blame_entry(blame_entry, style, cx)?;
+                            let element = render_inline_blame_entry(blame_entry, style, cx)?;
                             let inline_blame_padding =
                                 ProjectSettings::get_global(cx).git.inline_blame.padding as f32
                                     * em_advance;
                             Some(
                                 element
-                                    .layout_as_root(AvailableSpace::min_size(), window, cx)
+                                    .measure_as_root(AvailableSpace::min_size(), window, cx)
                                     .width
                                     + inline_blame_padding,
                             )

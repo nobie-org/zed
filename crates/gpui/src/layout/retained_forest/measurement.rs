@@ -339,8 +339,8 @@ impl MeasuredLayoutFacts {
         )
     }
 
-    pub(super) fn is_opaque(&self) -> bool {
-        matches!(self.0, MeasuredLayoutFactsRepr::Opaque)
+    pub(super) fn supports_fresh_compare(&self) -> bool {
+        !matches!(self.0, MeasuredLayoutFactsRepr::Opaque)
     }
 
     pub(super) fn measure_for_fresh_compare(

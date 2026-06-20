@@ -960,9 +960,9 @@ impl RetainedLayoutForest {
         cx: &mut App,
         target_layout_ids: Option<&[usize]>,
     ) -> FreshLayoutComparisonSummary {
-        if self.intent_subtree_contains_opaque_measurement(root_layout_id) {
+        if !self.intent_subtree_supports_fresh_compare(root_layout_id) {
             eprintln!(
-                "gpui retained_layout fresh_compare_skipped root_layout_id={} retained_root_node_id={:?} available_space={:?} reason=opaque_measured_node",
+                "gpui retained_layout fresh_compare_skipped root_layout_id={} retained_root_node_id={:?} available_space={:?} reason=uncomparable_measured_node",
                 root_layout_id.0, retained_root_node_id, available_space
             );
             return FreshLayoutComparisonSummary::default();
@@ -1078,12 +1078,12 @@ impl RetainedLayoutForest {
         }
     }
 
-    fn intent_subtree_contains_opaque_measurement(&self, id: LayoutId) -> bool {
+    fn intent_subtree_supports_fresh_compare(&self, id: LayoutId) -> bool {
         match &self.intent(id).kind {
             LayoutIntentKind::Unmeasured { children } => children
                 .iter()
-                .any(|child| self.intent_subtree_contains_opaque_measurement(*child)),
-            LayoutIntentKind::Measured(measured) => measured.is_opaque(),
+                .all(|child| self.intent_subtree_supports_fresh_compare(*child)),
+            LayoutIntentKind::Measured(measured) => measured.supports_fresh_compare(),
         }
     }
 

@@ -2183,54 +2183,60 @@ impl WgpuRenderer {
             return false;
         }
 
-        let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: target_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &backdrop_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: self.surface_config.width.max(1),
-                height: self.surface_config.height.max(1),
-                depth_or_array_layers: 1,
-            },
-        );
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shadow_composite_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
+        for shadow in shadows {
+            let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-        let data = unsafe { Self::instance_bytes(shadows) };
-        let drew = self.draw_instances_with_texture_and_backdrop(
-            data,
-            shadows.len() as u32,
-            &backdrop_view,
-            &backdrop_view,
-            &self.resources().pipelines.shadows,
-            instance_offset,
-            &mut pass,
-        );
-        drop(pass);
-        retained_textures.push(backdrop_texture);
-        drew
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width.max(1),
+                    height: self.surface_config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(shadow)) };
+            let drew = self.draw_instances_with_texture_and_backdrop(
+                data,
+                1,
+                &backdrop_view,
+                &backdrop_view,
+                &self.resources().pipelines.shadows,
+                instance_offset,
+                &mut pass,
+            );
+            drop(pass);
+            retained_textures.push(backdrop_texture);
+            if !drew {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_underlines(
@@ -2260,6 +2266,10 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         retained_textures: &mut Vec<wgpu::Texture>,
     ) -> bool {
+        if sprites.is_empty() {
+            return true;
+        }
+
         let Some(target_texture) = target_texture else {
             *self.last_error.lock().unwrap() =
                 Some("Monochrome sprite compositing has no readable target texture".into());
@@ -2274,54 +2284,60 @@ impl WgpuRenderer {
         }
 
         let tex_info = self.atlas.get_texture_info(texture_id);
-        let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: target_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &backdrop_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: self.surface_config.width.max(1),
-                height: self.surface_config.height.max(1),
-                depth_or_array_layers: 1,
-            },
-        );
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("monochrome_sprite_composite_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
+        for sprite in sprites {
+            let (backdrop_texture, backdrop_view) = self.create_group_intermediate();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            ..Default::default()
-        });
-        let data = unsafe { Self::instance_bytes(sprites) };
-        let drew = self.draw_instances_with_texture_and_backdrop(
-            data,
-            sprites.len() as u32,
-            &tex_info.view,
-            &backdrop_view,
-            &self.resources().pipelines.mono_sprites,
-            instance_offset,
-            &mut pass,
-        );
-        drop(pass);
-        retained_textures.push(backdrop_texture);
-        drew
+                wgpu::TexelCopyTextureInfo {
+                    texture: &backdrop_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width.max(1),
+                    height: self.surface_config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("monochrome_sprite_composite_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            let data = unsafe { Self::instance_bytes(std::slice::from_ref(sprite)) };
+            let drew = self.draw_instances_with_texture_and_backdrop(
+                data,
+                1,
+                &tex_info.view,
+                &backdrop_view,
+                &self.resources().pipelines.mono_sprites,
+                instance_offset,
+                &mut pass,
+            );
+            drop(pass);
+            retained_textures.push(backdrop_texture);
+            if !drew {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn draw_subpixel_sprites(

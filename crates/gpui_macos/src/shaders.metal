@@ -1978,10 +1978,10 @@ float4 srgb_to_oklab(float4 color) {
   float s_ = pow(s, 1.0/3.0);
 
   return float4(
-   	0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-   	1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-   	0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
-   	color.a
+    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+    color.a
   );
 }
 
@@ -1996,9 +1996,9 @@ float4 oklab_to_srgb(float4 color) {
   float s = s_ * s_ * s_;
 
   float3 linear_rgb = float3(
-   	4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
-   	-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-   	-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
   );
 
   // Convert linear sRGB to non-linear sRGB
@@ -2307,14 +2307,14 @@ float4 fill_color(Background background,
         // checkerboard
         float size = background.gradient_angle_or_pattern_height;
         float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
-        
+
         float x_index = floor(relative_position.x / size);
         float y_index = floor(relative_position.y / size);
         float should_be_colored = fmod(x_index + y_index, 2.0);
-        
+
         color = solid_color;
         color.a *= saturate(should_be_colored);
-        break; 
+        break;
     }
   }
 

@@ -2989,9 +2989,13 @@ impl Window {
                 log::error!("Unexpectedly absent TooltipRequest");
                 continue;
             };
-            let mut element = tooltip_request.tooltip.view.clone().into_any();
             let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+            let tooltip_size = tooltip_request
+                .tooltip
+                .view
+                .clone()
+                .into_any()
+                .measure_as_root(AvailableSpace::min_size(), self, cx);
 
             let mut tooltip_bounds =
                 Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
@@ -3033,6 +3037,12 @@ impl Window {
                 continue;
             }
 
+            let mut element = tooltip_request.tooltip.view.clone().into_any();
+            let visible_tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+            debug_assert_eq!(
+                visible_tooltip_size, tooltip_size,
+                "tooltip scratch measurement should match the visible tooltip root"
+            );
             self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
                 element.prepaint(window, cx)
             });

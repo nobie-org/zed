@@ -59,13 +59,6 @@ impl RootSlots {
         self.current_roots.contains_key(&root_id)
     }
 
-    pub(super) fn retained_root_node_id(
-        &self,
-        root_id: RetainedLayoutRootId,
-    ) -> Option<taffy::tree::NodeId> {
-        self.retained_roots.get(&root_id).map(|root| root.node_id)
-    }
-
     pub(super) fn take_retained_root(
         &mut self,
         root_id: RetainedLayoutRootId,

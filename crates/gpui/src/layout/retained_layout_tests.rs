@@ -9,6 +9,7 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
@@ -36,6 +37,21 @@ fn length_fraction(percent: u16) -> Length {
 
 fn request_leaf(engine: &mut LayoutEngine, width: f32) -> LayoutId {
     engine.request_layout(style_with_width(width), px(16.0), 1.0, &[])
+}
+
+fn test_global_id(id: u64) -> GlobalElementId {
+    GlobalElementId(Arc::from([ElementId::Integer(id.into())]))
+}
+
+fn request_keyed_leaf(engine: &mut LayoutEngine, key: u64, width: f32) -> LayoutId {
+    let global_id = test_global_id(key);
+    engine.request_layout_with_global_id(
+        Some(&global_id),
+        style_with_width(width),
+        px(16.0),
+        1.0,
+        &[],
+    )
 }
 
 fn request_container(engine: &mut LayoutEngine, children: &[LayoutId]) -> LayoutId {
@@ -803,7 +819,7 @@ impl GeneratedTree {
         }
     }
 
-    fn retained_occurrence_matches_intent(&self, current: &Self) -> bool {
+    fn retained_occurrence_is_exact_current_intent(&self, current: &Self) -> bool {
         match (self, current) {
             (
                 Self::Unmeasured {
@@ -821,7 +837,7 @@ impl GeneratedTree {
                         .iter()
                         .zip(current_children)
                         .all(|(previous, current)| {
-                            previous.retained_occurrence_matches_intent(current)
+                            previous.retained_occurrence_is_exact_current_intent(current)
                         })
             }
             (
@@ -850,7 +866,7 @@ impl GeneratedTree {
         }
     }
 
-    fn retained_occurrence_can_update_intent(&self, current: &Self) -> bool {
+    fn retained_storage_can_be_reassigned_to_intent(&self, current: &Self) -> bool {
         matches!(
             (self, current),
             (Self::Unmeasured { .. }, Self::Unmeasured { .. })
@@ -1073,7 +1089,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
         previous: &GeneratedTree,
         current: &GeneratedTree,
     ) -> ExpectedCommitResult {
-        if previous.retained_occurrence_matches_intent(current) {
+        if previous.retained_occurrence_is_exact_current_intent(current) {
             return self.add_reused_tree(current);
         }
 
@@ -1098,7 +1114,8 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
 
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     if let Some(previous_child) = previous_children.get(current_index) {
-                        if previous_child.retained_occurrence_matches_intent(current_child) {
+                        if previous_child.retained_occurrence_is_exact_current_intent(current_child)
+                        {
                             previous_used[current_index] = true;
                             assigned_previous_indices[current_index] = Some(current_index);
                         }
@@ -1116,7 +1133,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                             .position(|(index, previous_child)| {
                                 !previous_used[index]
                                     && previous_child
-                                        .retained_occurrence_matches_intent(current_child)
+                                        .retained_occurrence_is_exact_current_intent(current_child)
                             });
                     if let Some(index) = matching_previous_index {
                         previous_used[index] = true;
@@ -1130,7 +1147,8 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     }
                     if let Some(previous_child) = previous_children.get(current_index) {
                         if !previous_used[current_index]
-                            && previous_child.retained_occurrence_can_update_intent(current_child)
+                            && previous_child
+                                .retained_storage_can_be_reassigned_to_intent(current_child)
                         {
                             previous_used[current_index] = true;
                             assigned_previous_indices[current_index] = Some(current_index);
@@ -1317,6 +1335,55 @@ fn request_input_sensitive_text_measured(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn request_growing_input_sensitive_text_measured(
+    engine: &mut LayoutEngine,
+    label: u16,
+    key_index: u8,
+    fallback_width: u16,
+    height: u16,
+    measure_invocations: Rc<Cell<usize>>,
+    hydrated_artifacts: Rc<RefCell<Vec<GeneratedTextHydration>>>,
+) -> LayoutId {
+    let key = generated_text_measure_key(key_index, fallback_width, height);
+    let measure_key = key.clone();
+    let mut style = Style::default();
+    style.flex_grow = 1.0;
+    style.flex_shrink = 1.0;
+    style.min_size.width =
+        Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.0))));
+    engine.request_text_measured_layout(
+        style,
+        px(16.0),
+        1.0,
+        key,
+        move |artifact| {
+            let size = artifact.size();
+            hydrated_artifacts
+                .borrow_mut()
+                .push(GeneratedTextHydration {
+                    label,
+                    key_index,
+                    width: size.width.0.round() as u16,
+                    height: size.height.0.round() as u16,
+                });
+        },
+        move |_, available_space, _, _| {
+            measure_invocations.set(measure_invocations.get() + 1);
+            let measured_width = match available_space.width {
+                AvailableSpace::Definite(width) => width,
+                AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                    px(fallback_width as f32)
+                }
+            };
+            TextLayoutArtifact::for_tests(
+                measure_key.clone(),
+                size(measured_width, px(height as f32)),
+            )
+        },
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn compute_generated_text_root(
     cx: &mut VisualTestContext,
     engine: &mut LayoutEngine,
@@ -1403,8 +1470,8 @@ fn assert_intent_committed_exactly(engine: &LayoutEngine, id: LayoutId) {
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
 fn generated_retained_commit_matches_fresh_outputs(cx: &mut TestAppContext) {
-    let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
+        let mut cx = cx.add_empty_window();
         let frames = draw_generated_frames(&tc, true, 1, 5);
         let available_width = draw_u16(&tc, 1, 360);
         let available_height = draw_u16(&tc, 1, 240);
@@ -1466,8 +1533,8 @@ fn generated_retained_commit_matches_fresh_outputs(cx: &mut TestAppContext) {
 fn generated_retained_layout_matches_fresh_across_changing_root_constraints(
     cx: &mut TestAppContext,
 ) {
-    let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
+        let mut cx = cx.add_empty_window();
         let frame = draw_generated_frame(&tc, true, 3);
         let first_width = draw_u16(&tc, 1, 360);
         let first_height = draw_u16(&tc, 1, 240);
@@ -1662,8 +1729,8 @@ fn retained_layout_matches_fresh_with_opaque_leaf_after_same_root_constraint_rep
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
 fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppContext) {
-    let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
+        let mut cx = cx.add_empty_window();
         let frame = draw_generated_frame(&tc, false, 3);
         let available_width = draw_u16(&tc, 1, 360);
         let available_height = draw_u16(&tc, 1, 240);
@@ -1690,8 +1757,8 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
 fn generated_rollback_restores_retained_layout_state_for_next_repeat(cx: &mut TestAppContext) {
-    let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
+        let mut cx = cx.add_empty_window();
         let prefix = draw_generated_frame(&tc, false, 3);
         let real = draw_generated_frame(&tc, false, 3);
         let transient = draw_generated_frame(&tc, true, 3);
@@ -2099,6 +2166,75 @@ fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) 
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
+fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let key_index = 0;
+    let fallback_width = 120;
+    let height = 1;
+    let root_width = 100;
+    let retained_measure_invocations = Rc::new(Cell::new(0));
+    let retained_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = LayoutEngine::new();
+
+    let text = request_growing_input_sensitive_text_measured(
+        &mut engine,
+        0,
+        key_index,
+        fallback_width,
+        height,
+        retained_measure_invocations.clone(),
+        retained_hydrated_artifacts.clone(),
+    );
+    let sibling = request_leaf(&mut engine, 10.0);
+    let root = request_flex_container(&mut engine, &[text, sibling]);
+    compute_generated_text_root(cx, &mut engine, root, root_width);
+    engine.finish_frame();
+    retained_measure_invocations.set(0);
+    retained_hydrated_artifacts.borrow_mut().clear();
+
+    let text = request_growing_input_sensitive_text_measured(
+        &mut engine,
+        1,
+        key_index,
+        fallback_width,
+        height,
+        retained_measure_invocations.clone(),
+        retained_hydrated_artifacts.clone(),
+    );
+    let sibling = request_leaf(&mut engine, 30.0);
+    let root = request_flex_container(&mut engine, &[text, sibling]);
+    compute_generated_text_root(cx, &mut engine, root, root_width);
+
+    let fresh_measure_invocations = Rc::new(Cell::new(0));
+    let fresh_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+    let mut fresh_engine = LayoutEngine::new();
+    let fresh_text = request_growing_input_sensitive_text_measured(
+        &mut fresh_engine,
+        1,
+        key_index,
+        fallback_width,
+        height,
+        fresh_measure_invocations.clone(),
+        fresh_hydrated_artifacts.clone(),
+    );
+    let fresh_sibling = request_leaf(&mut fresh_engine, 30.0);
+    let fresh_root = request_flex_container(&mut fresh_engine, &[fresh_text, fresh_sibling]);
+    compute_generated_text_root(cx, &mut fresh_engine, fresh_root, root_width);
+
+    assert_ne!(
+        fresh_measure_invocations.get(),
+        0,
+        "fresh layout should observe the current-frame text measurement query"
+    );
+    assert_eq!(
+        retained_hydrated_artifacts.borrow().as_slice(),
+        fresh_hydrated_artifacts.borrow().as_slice(),
+        "retained text hydration should match fresh Taffy measurement semantics"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
 fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
     cx: &mut TestAppContext,
 ) {
@@ -2360,7 +2496,7 @@ fn unchanged_unmeasured_tree_emits_no_retained_mutations_on_second_frame() {
 }
 
 #[test]
-fn changed_unmeasured_child_reuses_position_and_updates_style() {
+fn changed_unmeasured_child_reassigns_same_slot_storage_and_updates_style() {
     let mut engine = LayoutEngine::new();
     let first_root = request_row(&mut engine, &[10.0, 20.0]);
     let first_root_node = engine.commit_layout(first_root);
@@ -2387,6 +2523,48 @@ fn changed_unmeasured_child_reuses_position_and_updates_style() {
 
     let mut fresh = LayoutEngine::new();
     let fresh_root = request_row(&mut fresh, &[10.0, 30.0]);
+    let fresh_root_node = fresh.commit_layout(fresh_root);
+    assert_eq!(
+        retained_layout_shape(&engine, second_root_node),
+        retained_layout_shape(&fresh, fresh_root_node)
+    );
+}
+
+#[test]
+fn unique_global_id_reorder_preserves_semantic_child_storage() {
+    let mut engine = LayoutEngine::new();
+    let first_a = request_keyed_leaf(&mut engine, 1, 10.0);
+    let first_b = request_keyed_leaf(&mut engine, 2, 20.0);
+    let first_root = request_flex_container(&mut engine, &[first_a, first_b]);
+    let first_root_node = engine.commit_layout(first_root);
+    let first_child_nodes = engine.retained_child_tokens_for_tests(first_root_node);
+    engine.finish_frame();
+
+    engine.reset_retained_mutation_sample_for_tests();
+    let second_b = request_keyed_leaf(&mut engine, 2, 30.0);
+    let second_a = request_keyed_leaf(&mut engine, 1, 10.0);
+    let second_root = request_flex_container(&mut engine, &[second_b, second_a]);
+    let second_root_node = engine.commit_layout(second_root);
+    assert_intent_committed_exactly(&engine, second_root);
+    let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
+
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 3,
+            style_updates: 1,
+            child_list_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+    assert_eq!(second_root_node, first_root_node);
+    assert_eq!(second_child_nodes[0], first_child_nodes[1]);
+    assert_eq!(second_child_nodes[1], first_child_nodes[0]);
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_b = request_keyed_leaf(&mut fresh, 2, 30.0);
+    let fresh_a = request_keyed_leaf(&mut fresh, 1, 10.0);
+    let fresh_root = request_flex_container(&mut fresh, &[fresh_b, fresh_a]);
     let fresh_root_node = fresh.commit_layout(fresh_root);
     assert_eq!(
         retained_layout_shape(&engine, second_root_node),
@@ -2644,7 +2822,7 @@ fn retained_layout_recomputes_after_child_delete_from_content_sized_parent() {
 }
 
 #[test]
-fn compatible_same_position_child_change_updates_style_and_matches_fresh_layout() {
+fn same_slot_storage_reassignment_updates_style_and_matches_fresh_layout() {
     let mut retained = LayoutEngine::new();
     let stable = request_leaf(&mut retained, 10.0);
     let changing = request_leaf(&mut retained, 20.0);
@@ -4096,7 +4274,7 @@ fn retained_layout_recomputes_when_root_scale_factor_changes() {
 }
 
 #[test]
-fn rollback_discards_transient_root_solve_context() {
+fn rollback_discards_transient_frame_geometry() {
     let mut with_rollback = LayoutEngine::new();
     let child = request_full_leaf(&mut with_rollback);
     let root = request_full_container(&mut with_rollback, &[child]);

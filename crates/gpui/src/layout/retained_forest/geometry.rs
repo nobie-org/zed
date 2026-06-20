@@ -8,7 +8,6 @@
 use super::super::{AvailableSpace, RetainedLayoutRootId};
 use crate::{Size, size};
 use collections::FxHashMap;
-use std::mem;
 use taffy::tree::{Layout, NodeId};
 
 /// Current-frame proof that one retained root was solved exactly once.
@@ -56,14 +55,12 @@ impl From<AvailableSpace> for AvailableSpaceKey {
 /// root may be captured once per frame; a second capture with different inputs
 /// is a lifecycle bug and fails loudly.
 pub(super) struct GeometryStore {
-    retained_solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     current_layouts: FxHashMap<NodeId, Layout>,
 }
 
 /// Transaction checkpoint for retained geometry state.
 pub(super) struct GeometryStoreCheckpoint {
-    retained_solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     solved_roots: FxHashMap<RetainedLayoutRootId, SolvedRoot>,
     current_layouts: FxHashMap<NodeId, Layout>,
 }
@@ -71,7 +68,6 @@ pub(super) struct GeometryStoreCheckpoint {
 impl GeometryStore {
     pub(super) fn new() -> Self {
         Self {
-            retained_solved_roots: FxHashMap::default(),
             solved_roots: FxHashMap::default(),
             current_layouts: FxHashMap::default(),
         }
@@ -84,36 +80,23 @@ impl GeometryStore {
 
     pub(super) fn checkpoint(&self) -> GeometryStoreCheckpoint {
         GeometryStoreCheckpoint {
-            retained_solved_roots: self.retained_solved_roots.clone(),
             solved_roots: self.solved_roots.clone(),
             current_layouts: self.current_layouts.clone(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: GeometryStoreCheckpoint) {
-        self.retained_solved_roots = checkpoint.retained_solved_roots;
         self.solved_roots = checkpoint.solved_roots;
         self.current_layouts = checkpoint.current_layouts;
     }
 
     pub(super) fn finish_frame(&mut self) {
-        self.retained_solved_roots = mem::take(&mut self.solved_roots);
+        self.solved_roots.clear();
         self.current_layouts.clear();
     }
 
     pub(super) fn has_solved_root(&self, root_id: RetainedLayoutRootId) -> bool {
         self.solved_roots.contains_key(&root_id)
-    }
-
-    pub(super) fn retained_root_solve_context_matches(
-        &self,
-        root_id: RetainedLayoutRootId,
-        root_node: NodeId,
-        available_space: Size<AvailableSpace>,
-        scale_factor: f32,
-    ) -> bool {
-        let solved_root = SolvedRoot::new(root_node, available_space, scale_factor);
-        self.retained_solved_roots.get(&root_id) == Some(&solved_root)
     }
 
     pub(super) fn capture_from_solver(

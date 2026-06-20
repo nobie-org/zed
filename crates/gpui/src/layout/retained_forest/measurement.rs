@@ -10,11 +10,11 @@ mod text_artifacts;
 
 use super::{AvailableSpace, snap_measured_size_to_device_pixels};
 use crate::{App, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size};
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashMap;
 use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
 use stacksafe::StackSafe;
 use std::rc::Rc;
-use taffy::{LayoutCacheEntry, LayoutCacheEvent, tree::NodeId};
+use taffy::{LayoutCacheEntry, LayoutCacheEvent, RunMode, tree::NodeId};
 use text_artifacts::{
     PendingTextArtifactQuery, TextArtifactCacheKey, TextArtifactStore, TextArtifactStoreCheckpoint,
 };
@@ -256,7 +256,8 @@ pub(super) enum MeasurementCallbackKind {
 /// artifacts. Taffy's passive cache events may report that it reused a
 /// measurement result, but GPUI treats that only as a query observation. Text
 /// artifacts are reused only through the exact query key GPUI observed from a
-/// callback or cache event; `TextMeasureKey` alone is never enough.
+/// callback or cache event. Retained node identity and `TextMeasureKey` alone
+/// are never artifact proof.
 pub(super) struct MeasurementStore {
     producers: ProducerRegistry,
     current_measurements: FxHashMap<NodeId, CurrentMeasurement>,
@@ -285,14 +286,7 @@ impl MeasurementStore {
     }
 
     pub(super) fn finish_frame(&mut self) {
-        let current_text_nodes = self
-            .current_measurements
-            .iter()
-            .filter_map(|(node_id, measurement)| {
-                matches!(measurement, CurrentMeasurement::Text { .. }).then_some(*node_id)
-            })
-            .collect::<FxHashSet<_>>();
-        self.text_artifacts.finish_frame(&current_text_nodes);
+        self.text_artifacts.finish_frame();
         self.producers.clear();
         self.current_measurements.clear();
     }
@@ -332,52 +326,30 @@ impl MeasurementStore {
         self.current_measurements.get(&node_id)
     }
 
-    /// Register that an unchanged retained text node may replay its artifact after the solve.
-    ///
-    /// This is an artifact-validity proof, not a Taffy cache predicate. The
-    /// forest may call it only when the retained occurrence and current text
-    /// facts are unchanged. If Taffy produces a current artifact during the
-    /// solve, that artifact wins; otherwise GPUI reuses the retained artifact
-    /// for the same node and text key.
-    pub(super) fn register_unchanged_text_artifact_replay(
-        &mut self,
-        node_id: NodeId,
-        expected_key: &TextMeasureKey,
-    ) {
-        self.text_artifacts.register_replay(node_id, expected_key);
-    }
-
     /// Hydrate text nodes from the artifacts selected by the completed solve.
     ///
     /// Taffy may invoke a callback or report a passive cache hit/store event.
-    /// It may also skip an unchanged subtree entirely. Those events are
-    /// artifact producers, not GPUI paint-state side effects. Hydration happens
-    /// once here after the solve.
+    /// Those events are artifact producers, not GPUI paint-state side effects.
+    /// Hydration happens once here after the solve. There is no retained-node
+    /// artifact hydration path; if Taffy skips a text node without reporting an
+    /// exact measurement query, GPUI has no artifact proof for that node.
     pub(super) fn hydrate_text_artifacts_from_completed_solve(
         &mut self,
         scale_factor: f32,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let replay_candidates = self.text_artifacts.take_replay_candidates();
-        for (node_id, expected_key) in replay_candidates {
-            if self.text_artifacts.has_current_artifact(node_id) {
-                continue;
-            }
-            let Some(artifact) = self.text_artifacts.retained_artifact(node_id) else {
-                continue;
-            };
-            assert_eq!(
-                artifact.key(),
-                &expected_key,
-                "retained text artifact should match the current text measure key"
-            );
-            self.text_artifacts
-                .insert_current_artifact(node_id, artifact);
-        }
-
         for query in self.text_artifacts.take_pending_queries() {
-            if self.text_artifacts.has_current_artifact(query.node_id) {
+            let cache_key = query.cache_key();
+            if let Some(artifact) = self.text_artifacts.current_artifact_for_query(&cache_key) {
+                if text_artifact_matches_query(&artifact, &query, scale_factor) {
+                    continue;
+                }
+            }
+            if self
+                .text_artifacts
+                .has_current_paint_artifact(query.node_id)
+            {
                 continue;
             }
             self.hydrate_text_query_from_current_producer(query, scale_factor, window, cx);
@@ -431,11 +403,9 @@ impl MeasurementStore {
             &key,
             "hydrated Taffy cache-hit text artifact should match the current text measure key"
         );
-        assert_eq!(
-            snap_measured_size_to_device_pixels(artifact.size(), scale_factor),
-            query.expected_taffy_size,
-            "hydrated Taffy cache-hit text artifact should match the cached measurement size"
-        );
+        if !text_artifact_matches_query(&artifact, &query, scale_factor) {
+            return;
+        }
 
         let cache_key = query.cache_key();
         self.text_artifacts
@@ -560,8 +530,6 @@ impl<'a> ComputeMeasurementState<'a> {
                 );
                 let size = artifact.size();
                 self.record_text_artifact_for_query(node_id, cache_key.clone(), &artifact);
-                self.text_artifacts
-                    .insert_current_artifact(node_id, artifact.clone());
                 self.text_artifacts.cache_artifact(cache_key, artifact);
                 size
             }
@@ -572,15 +540,21 @@ impl<'a> ComputeMeasurementState<'a> {
         &mut self,
         event: LayoutCacheEvent,
         scale_factor: f32,
+        text_descendants: &[NodeId],
     ) {
         match event {
             LayoutCacheEvent::Hit(entry) => {
-                self.record_text_artifact_for_cache_entry_hit(entry, scale_factor)
+                self.record_text_artifact_for_cache_entry_hit(entry, scale_factor);
+                self.record_text_artifacts_for_subtree_cache_hit(entry);
             }
             LayoutCacheEvent::Stored(entry) => {
-                self.store_text_artifact_for_cache_entry(entry, scale_factor)
+                self.store_text_artifact_for_cache_entry(entry, scale_factor);
+                self.store_text_artifacts_for_subtree_cache_entry(entry, text_descendants);
             }
-            LayoutCacheEvent::Cleared(_) => {}
+            LayoutCacheEvent::Cleared(clear) => {
+                self.text_artifacts
+                    .clear_subtree_cache_entry(clear.node_id());
+            }
             _ => {}
         }
     }
@@ -590,6 +564,9 @@ impl<'a> ComputeMeasurementState<'a> {
         entry: LayoutCacheEntry,
         scale_factor: f32,
     ) {
+        if entry.requested_input().run_mode != RunMode::ComputeSize {
+            return;
+        }
         let node_id = entry.node_id();
         let Some(CurrentMeasurement::Text { key, .. }) = self.current_measurements.get(&node_id)
         else {
@@ -608,21 +585,29 @@ impl<'a> ComputeMeasurementState<'a> {
             &key,
             "Taffy cache-hit text artifact should match the current text measure key"
         );
+        if !text_artifact_matches_query(&artifact, &pending_query, scale_factor) {
+            return;
+        }
         self.record_text_artifact_for_query(node_id, query_key, &artifact);
     }
 
     fn store_text_artifact_for_cache_entry(&mut self, entry: LayoutCacheEntry, scale_factor: f32) {
+        if entry.requested_input().run_mode != RunMode::ComputeSize {
+            return;
+        }
         let node_id = entry.node_id();
         let Some(CurrentMeasurement::Text { key, .. }) = self.current_measurements.get(&node_id)
         else {
             return;
         };
         let key = key.clone();
-        let Some(artifact) = self.text_artifacts.current_artifact(node_id) else {
-            debug_assert!(
-                false,
-                "text cache store should follow a text measurement callback or cache hydration"
-            );
+        let query_key =
+            TextArtifactCacheKey::from_taffy_entry(node_id, key.clone(), entry, scale_factor);
+        let Some(artifact) = self.text_artifacts.current_artifact_for_query(&query_key) else {
+            // Taffy may store final-layout entries for a measured text node
+            // whose paint artifact came from a different current query. That
+            // is not exact query proof, so GPUI must not persist it under this
+            // query key. A later hit for this query will hydrate explicitly.
             return;
         };
         assert_eq!(
@@ -630,10 +615,41 @@ impl<'a> ComputeMeasurementState<'a> {
             &key,
             "stored Taffy cache-event text artifact should match the current text measure key"
         );
-        let query_key =
-            TextArtifactCacheKey::from_taffy_entry(node_id, key.clone(), entry, scale_factor);
+        if snap_measured_size_to_device_pixels(artifact.size(), scale_factor)
+            != entry.returned_output().size.into()
+        {
+            return;
+        }
         self.record_text_artifact_for_query(node_id, query_key.clone(), &artifact);
         self.text_artifacts.cache_artifact(query_key, artifact);
+    }
+
+    fn record_text_artifacts_for_subtree_cache_hit(&mut self, entry: LayoutCacheEntry) {
+        let current_measurements = &self.current_measurements;
+        self.text_artifacts
+            .hydrate_from_subtree_cache_hit(entry, |node_id| {
+                match current_measurements.get(&node_id) {
+                    Some(CurrentMeasurement::Text { key, .. }) => Some(key.clone()),
+                    _ => None,
+                }
+            });
+    }
+
+    fn store_text_artifacts_for_subtree_cache_entry(
+        &mut self,
+        entry: LayoutCacheEntry,
+        text_descendants: &[NodeId],
+    ) {
+        let current_measurements = &self.current_measurements;
+        self.text_artifacts
+            .store_subtree_cache_entry(
+                entry,
+                text_descendants,
+                |node_id| match current_measurements.get(&node_id) {
+                    Some(CurrentMeasurement::Text { key, .. }) => Some(key.clone()),
+                    _ => None,
+                },
+            );
     }
 
     fn record_text_artifact_for_query(
@@ -645,4 +661,17 @@ impl<'a> ComputeMeasurementState<'a> {
         self.text_artifacts
             .record_for_query(node_id, cache_key, artifact);
     }
+}
+
+fn text_artifact_matches_query(
+    artifact: &TextLayoutArtifact,
+    query: &PendingTextArtifactQuery,
+    scale_factor: f32,
+) -> bool {
+    assert_eq!(
+        artifact.key(),
+        &query.text_key,
+        "current text artifact should match the exact Taffy query text key"
+    );
+    snap_measured_size_to_device_pixels(artifact.size(), scale_factor) == query.expected_taffy_size
 }

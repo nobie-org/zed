@@ -1,31 +1,33 @@
 use super::super::AvailableSpace;
 use crate::{Pixels, Size, TextLayoutArtifact, TextMeasureKey, size};
 use collections::{FxHashMap, FxHashSet};
-use taffy::{LayoutCacheEntry, style::AvailableSpace as TaffyAvailableSpace, tree::NodeId};
+use taffy::{
+    LayoutCacheEntry, LayoutCacheEntryId, RunMode, style::AvailableSpace as TaffyAvailableSpace,
+    tree::NodeId,
+};
 
 /// GPUI-owned text artifacts selected for the current layout solve.
 ///
 /// Taffy owns whether a measured callback runs. This store owns only the
 /// artifact validity facts GPUI can prove: exact query-keyed artifacts observed
-/// from callbacks/passive Taffy cache events, plus retained unchanged-node
-/// replays registered by the forest.
+/// from callbacks or passive Taffy cache events.
 pub(super) struct TextArtifactStore {
     current_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
-    current_queries: FxHashSet<TextArtifactCacheKey>,
-    replay_candidates: FxHashMap<NodeId, TextMeasureKey>,
-    retained_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
+    current_query_artifacts: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
+    current_subtree_entries: FxHashSet<TextSubtreeCacheKey>,
     pending_queries: Vec<PendingTextArtifactQuery>,
     query_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
+    subtree_cache: FxHashMap<TextSubtreeCacheKey, Vec<TextSubtreeArtifact>>,
 }
 
 /// Transaction checkpoint for GPUI-owned text artifact validity.
 pub(super) struct TextArtifactStoreCheckpoint {
     current_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
-    current_queries: FxHashSet<TextArtifactCacheKey>,
-    replay_candidates: FxHashMap<NodeId, TextMeasureKey>,
-    retained_artifacts: FxHashMap<NodeId, TextLayoutArtifact>,
+    current_query_artifacts: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
+    current_subtree_entries: FxHashSet<TextSubtreeCacheKey>,
     pending_queries: Vec<PendingTextArtifactQuery>,
     query_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
+    subtree_cache: FxHashMap<TextSubtreeCacheKey, Vec<TextSubtreeArtifact>>,
 }
 
 #[derive(Clone)]
@@ -41,64 +43,48 @@ impl TextArtifactStore {
     pub(super) fn new() -> Self {
         Self {
             current_artifacts: FxHashMap::default(),
-            current_queries: FxHashSet::default(),
-            replay_candidates: FxHashMap::default(),
-            retained_artifacts: FxHashMap::default(),
+            current_query_artifacts: FxHashMap::default(),
+            current_subtree_entries: FxHashSet::default(),
             pending_queries: Vec::new(),
             query_cache: FxHashMap::default(),
+            subtree_cache: FxHashMap::default(),
         }
     }
 
     pub(super) fn begin_frame(&mut self) {
         self.current_artifacts.clear();
-        self.current_queries.clear();
-        self.replay_candidates.clear();
+        self.current_query_artifacts.clear();
+        self.current_subtree_entries.clear();
         self.pending_queries.clear();
     }
 
-    pub(super) fn finish_frame(&mut self, current_text_nodes: &FxHashSet<NodeId>) {
+    pub(super) fn finish_frame(&mut self) {
         self.retain_current_query_cache();
-        self.retain_current_artifacts_by_node(current_text_nodes);
+        self.retain_current_subtree_cache();
         self.current_artifacts.clear();
-        self.current_queries.clear();
-        self.replay_candidates.clear();
+        self.current_query_artifacts.clear();
+        self.current_subtree_entries.clear();
         self.pending_queries.clear();
     }
 
     pub(super) fn checkpoint(&self) -> TextArtifactStoreCheckpoint {
         TextArtifactStoreCheckpoint {
             current_artifacts: self.current_artifacts.clone(),
-            current_queries: self.current_queries.clone(),
-            replay_candidates: self.replay_candidates.clone(),
-            retained_artifacts: self.retained_artifacts.clone(),
+            current_query_artifacts: self.current_query_artifacts.clone(),
+            current_subtree_entries: self.current_subtree_entries.clone(),
             pending_queries: self.pending_queries.clone(),
             query_cache: self.query_cache.clone(),
+            subtree_cache: self.subtree_cache.clone(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: TextArtifactStoreCheckpoint) {
         self.current_artifacts = checkpoint.current_artifacts;
-        self.current_queries = checkpoint.current_queries;
-        self.replay_candidates = checkpoint.replay_candidates;
-        self.retained_artifacts = checkpoint.retained_artifacts;
+        self.current_query_artifacts = checkpoint.current_query_artifacts;
+        self.current_subtree_entries = checkpoint.current_subtree_entries;
         self.pending_queries = checkpoint.pending_queries;
         self.query_cache = checkpoint.query_cache;
-    }
-
-    pub(super) fn register_replay(&mut self, node_id: NodeId, expected_key: &TextMeasureKey) {
-        self.replay_candidates.insert(node_id, expected_key.clone());
-    }
-
-    pub(super) fn take_replay_candidates(&mut self) -> FxHashMap<NodeId, TextMeasureKey> {
-        std::mem::take(&mut self.replay_candidates)
-    }
-
-    pub(super) fn has_current_artifact(&self, node_id: NodeId) -> bool {
-        self.current_artifacts.contains_key(&node_id)
-    }
-
-    pub(super) fn retained_artifact(&self, node_id: NodeId) -> Option<TextLayoutArtifact> {
-        self.retained_artifacts.get(&node_id).cloned()
+        self.subtree_cache = checkpoint.subtree_cache;
     }
 
     pub(super) fn push_pending_query(&mut self, query: PendingTextArtifactQuery) {
@@ -109,12 +95,8 @@ impl TextArtifactStore {
         std::mem::take(&mut self.pending_queries)
     }
 
-    pub(super) fn insert_current_artifact(
-        &mut self,
-        node_id: NodeId,
-        artifact: TextLayoutArtifact,
-    ) {
-        self.current_artifacts.insert(node_id, artifact);
+    pub(super) fn has_current_paint_artifact(&self, node_id: NodeId) -> bool {
+        self.current_artifacts.contains_key(&node_id)
     }
 
     pub(super) fn current_artifacts(&self) -> Vec<(NodeId, TextLayoutArtifact)> {
@@ -124,15 +106,18 @@ impl TextArtifactStore {
             .collect()
     }
 
-    pub(super) fn current_artifact(&self, node_id: NodeId) -> Option<TextLayoutArtifact> {
-        self.current_artifacts.get(&node_id).cloned()
-    }
-
     pub(super) fn artifact_for_query(
         &self,
         cache_key: &TextArtifactCacheKey,
     ) -> Option<TextLayoutArtifact> {
         self.query_cache.get(cache_key).cloned()
+    }
+
+    pub(super) fn current_artifact_for_query(
+        &self,
+        cache_key: &TextArtifactCacheKey,
+    ) -> Option<TextLayoutArtifact> {
+        self.current_query_artifacts.get(cache_key).cloned()
     }
 
     pub(super) fn record_for_query(
@@ -141,7 +126,21 @@ impl TextArtifactStore {
         cache_key: TextArtifactCacheKey,
         artifact: &TextLayoutArtifact,
     ) {
-        if self.current_queries.insert(cache_key) {
+        if let Some(existing) = self
+            .current_query_artifacts
+            .insert(cache_key, artifact.clone())
+        {
+            assert_eq!(
+                existing.key(),
+                artifact.key(),
+                "same text query should not select artifacts for different text facts"
+            );
+            assert_eq!(
+                existing.size(),
+                artifact.size(),
+                "same text query should not select artifacts with different sizes"
+            );
+        } else {
             self.current_artifacts.insert(node_id, artifact.clone());
         }
     }
@@ -154,19 +153,108 @@ impl TextArtifactStore {
         self.query_cache.insert(cache_key, artifact);
     }
 
-    fn retain_current_query_cache(&mut self) {
-        let current_queries = &self.current_queries;
-        self.query_cache
-            .retain(|artifact_key, _| current_queries.contains(artifact_key));
+    pub(super) fn hydrate_from_subtree_cache_hit(
+        &mut self,
+        entry: LayoutCacheEntry,
+        mut current_text_key: impl FnMut(NodeId) -> Option<TextMeasureKey>,
+    ) {
+        let Some(cache_key) = TextSubtreeCacheKey::from_final_layout_entry(entry) else {
+            return;
+        };
+        let Some(artifacts) = self.subtree_cache.get(&cache_key).cloned() else {
+            return;
+        };
+
+        for artifact in artifacts {
+            let current_key = current_text_key(artifact.node_id).unwrap_or_else(|| {
+                panic!(
+                    "Taffy subtree cache-hit text artifact should refer to a current text measurement"
+                )
+            });
+            assert_eq!(
+                artifact.text_key, current_key,
+                "Taffy subtree cache-hit text artifact should match the current text measure key"
+            );
+            assert_eq!(
+                artifact.artifact.key(),
+                &current_key,
+                "Taffy subtree cache-hit artifact should match the current text measure key"
+            );
+            if let Some(existing) = self.current_artifacts.get(&artifact.node_id) {
+                assert_eq!(
+                    existing.key(),
+                    &current_key,
+                    "current text artifact should match the current text measure key"
+                );
+                assert_eq!(
+                    existing.size(),
+                    artifact.artifact.size(),
+                    "current text artifact should match the subtree cache-hit artifact size"
+                );
+            } else {
+                self.current_artifacts
+                    .insert(artifact.node_id, artifact.artifact);
+            }
+        }
+        self.current_subtree_entries.insert(cache_key);
     }
 
-    fn retain_current_artifacts_by_node(&mut self, current_text_nodes: &FxHashSet<NodeId>) {
-        self.retained_artifacts.retain(|node_id, _| {
-            current_text_nodes.contains(node_id) && self.current_artifacts.contains_key(node_id)
-        });
-        for (node_id, artifact) in &self.current_artifacts {
-            self.retained_artifacts.insert(*node_id, artifact.clone());
+    pub(super) fn store_subtree_cache_entry(
+        &mut self,
+        entry: LayoutCacheEntry,
+        text_descendants: &[NodeId],
+        mut current_text_key: impl FnMut(NodeId) -> Option<TextMeasureKey>,
+    ) {
+        let Some(cache_key) = TextSubtreeCacheKey::from_final_layout_entry(entry) else {
+            return;
+        };
+
+        let mut artifacts = Vec::with_capacity(text_descendants.len());
+        for node_id in text_descendants {
+            let current_key = current_text_key(*node_id).unwrap_or_else(|| {
+                panic!("text descendant should have a current text measurement")
+            });
+            let Some(artifact) = self.current_artifacts.get(node_id) else {
+                // Hidden text can be present in the current retained tree
+                // without a measurement query or paint artifact. No artifact
+                // means no current proof to persist for a future subtree hit.
+                continue;
+            };
+            assert_eq!(
+                artifact.key(),
+                &current_key,
+                "stored Taffy subtree text artifact should match the current text measure key"
+            );
+            artifacts.push(TextSubtreeArtifact {
+                node_id: *node_id,
+                text_key: current_key,
+                artifact: artifact.clone(),
+            });
         }
+
+        self.current_subtree_entries.insert(cache_key.clone());
+        if artifacts.is_empty() {
+            self.subtree_cache.remove(&cache_key);
+        } else {
+            self.subtree_cache.insert(cache_key, artifacts);
+        }
+    }
+
+    pub(super) fn clear_subtree_cache_entry(&mut self, node_id: NodeId) {
+        self.subtree_cache
+            .retain(|cache_key, _| cache_key.node_id != node_id);
+    }
+
+    fn retain_current_query_cache(&mut self) {
+        let current_queries = &self.current_query_artifacts;
+        self.query_cache
+            .retain(|artifact_key, _| current_queries.contains_key(artifact_key));
+    }
+
+    fn retain_current_subtree_cache(&mut self) {
+        let current_subtree_entries = &self.current_subtree_entries;
+        self.subtree_cache
+            .retain(|cache_key, _| current_subtree_entries.contains(cache_key));
     }
 }
 
@@ -210,6 +298,28 @@ impl PendingTextArtifactQuery {
             self.available_space,
         )
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct TextSubtreeCacheKey {
+    node_id: NodeId,
+    entry_id: LayoutCacheEntryId,
+}
+
+impl TextSubtreeCacheKey {
+    fn from_final_layout_entry(entry: LayoutCacheEntry) -> Option<Self> {
+        (entry.requested_input().run_mode == RunMode::PerformLayout).then_some(Self {
+            node_id: entry.node_id(),
+            entry_id: entry.entry_id(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct TextSubtreeArtifact {
+    node_id: NodeId,
+    text_key: TextMeasureKey,
+    artifact: TextLayoutArtifact,
 }
 
 /// Exact validity key for a text artifact observed through Taffy.

@@ -81,6 +81,7 @@ fn new_test_node(taffy: &mut TaffyTree<NodeContext>) -> NodeId {
 fn occurrence(node_id: NodeId) -> RetainedLayoutOccurrence {
     RetainedLayoutOccurrence {
         node_id,
+        identity: None,
         facts: RetainedLayoutFacts {
             style: TaffyStyle::default(),
             kind: RetainedLayoutKind::Unmeasured,

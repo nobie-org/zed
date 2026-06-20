@@ -13,7 +13,6 @@ pub(super) struct BoundsCache {
     absolute_layout_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     absolute_outer_origins: FxHashMap<NodeId, Point<f32>>,
     computed_layouts: FxHashSet<NodeId>,
-    scratch_space: Vec<NodeId>,
 }
 
 /// Transaction checkpoint for derived bounds state.
@@ -21,7 +20,6 @@ pub(super) struct BoundsCacheCheckpoint {
     absolute_layout_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     absolute_outer_origins: FxHashMap<NodeId, Point<f32>>,
     computed_layouts: FxHashSet<NodeId>,
-    scratch_space: Vec<NodeId>,
 }
 
 impl BoundsCache {
@@ -30,7 +28,6 @@ impl BoundsCache {
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
-            scratch_space: Vec::new(),
         }
     }
 
@@ -39,7 +36,6 @@ impl BoundsCache {
             absolute_layout_bounds: self.absolute_layout_bounds.clone(),
             absolute_outer_origins: self.absolute_outer_origins.clone(),
             computed_layouts: self.computed_layouts.clone(),
-            scratch_space: self.scratch_space.clone(),
         }
     }
 
@@ -47,7 +43,6 @@ impl BoundsCache {
         self.absolute_layout_bounds = checkpoint.absolute_layout_bounds;
         self.absolute_outer_origins = checkpoint.absolute_outer_origins;
         self.computed_layouts = checkpoint.computed_layouts;
-        self.scratch_space = checkpoint.scratch_space;
     }
 
     pub(super) fn clear(&mut self) {

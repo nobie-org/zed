@@ -540,6 +540,7 @@ impl Renderer {
             RenderGroupDrawOutcome::NotCompleted => {
                 anyhow::bail!("scene capture draw did not complete")
             }
+            _ => anyhow::bail!("scene capture draw returned an unsupported outcome"),
         }
     }
 }

@@ -2,9 +2,9 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformInputSimulator, PlatformTestWindowRenderer, PlatformWindow,
-    Point, PromptButton, RenderGroupBackendTotals, RenderGroupDrawOutcome,
-    RequestFrameOptions, Scene, SceneCapture, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    Point, PromptButton, RenderGroupBackendTotals, RenderGroupDrawOutcome, RequestFrameOptions,
+    Scene, SceneCapture, Size, TestPlatform, TileId, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;

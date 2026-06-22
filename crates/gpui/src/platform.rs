@@ -33,10 +33,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     FontStyle, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageLoadCx, ImageSource, Keymap,
     LineLayout, Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderGroupDrawOutcome,
-    RenderImage,
-    RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
-    SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point,
-    px, size,
+    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+    Size, SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash,
+    point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]

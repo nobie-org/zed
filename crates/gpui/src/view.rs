@@ -106,7 +106,7 @@ impl Element for AnyView {
 
     fn request_layout(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
@@ -121,7 +121,12 @@ impl Element for AnyView {
             {
                 let mut root_style = Style::default();
                 root_style.refine(style);
-                let layout_id = window.request_layout(root_style, Some(child_layout_id), cx);
+                let layout_id = window.request_layout_with_global_id(
+                    global_id,
+                    root_style,
+                    Some(child_layout_id),
+                    cx,
+                );
                 (layout_id, Some(element))
             } else {
                 (child_layout_id, Some(element))
@@ -323,5 +328,93 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut BuildCx<'_>, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AppContext as _, InteractiveElement as _, Styled as _, TestAppContext, div, px, size,
+    };
+    use std::ops::Deref;
+
+    struct CachedParentView {
+        child: Entity<CachedChildView>,
+    }
+
+    impl Render for CachedParentView {
+        fn render(
+            &mut self,
+            _window: &mut BuildCx<'_>,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            AnyView::from(self.child.clone()).cached(StyleRefinement::default())
+        }
+    }
+
+    struct CachedChildView {
+        wide: bool,
+    }
+
+    impl Render for CachedChildView {
+        fn render(
+            &mut self,
+            _window: &mut BuildCx<'_>,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let width = if self.wide { px(80.) } else { px(40.) };
+            div().id("cached-child-box").w(width).h(px(20.))
+        }
+    }
+
+    #[gpui::test]
+    fn cached_any_view_wrapper_is_retained_when_child_layout_changes(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(800.), px(600.)), |_, cx| {
+            let child = cx.new(|_| CachedChildView { wide: false });
+            CachedParentView { child }
+        });
+        cx.run_until_parked();
+
+        let first_sample = cx
+            .update_window(*window.deref(), |_, window, _| {
+                window.last_layout_work_sample()
+            })
+            .unwrap()
+            .expect("opening the window should draw once");
+        assert!(
+            first_sample.retained_layout_creates > 0,
+            "the first retained frame should build retained occurrences"
+        );
+
+        window
+            .update(cx, |parent, _window, cx| {
+                parent.child.update(cx, |child, cx| {
+                    child.wide = true;
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let second_sample = cx
+            .update_window(*window.deref(), |_, window, _| {
+                window.last_layout_work_sample()
+            })
+            .unwrap()
+            .expect("notifying the child should draw again");
+
+        assert_eq!(
+            second_sample.retained_layout_creates, 0,
+            "a cached AnyView wrapper with stable view identity must recommit locally, not rebuild"
+        );
+        assert_eq!(
+            second_sample.retained_layout_removes, 0,
+            "a child layout change must not detach the cached AnyView wrapper subtree"
+        );
+        assert_eq!(
+            second_sample.retained_layout_miss_no_previous, 0,
+            "the cached AnyView wrapper should have a previous retained occurrence"
+        );
     }
 }

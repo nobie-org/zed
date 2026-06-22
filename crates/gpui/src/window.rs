@@ -2471,6 +2471,19 @@ impl LayoutFrame {
         cx: &mut App,
     ) {
         window.invalidator.debug_assert_prepaint();
+        if std::env::var_os("GPUI_TRACE_RETAINED_LAYOUT_ROOTS").is_some() {
+            let location = root_site.location();
+            eprintln!(
+                "gpui retained_layout root_compute draw_id={} layout_id={:?} root_site={}:{}:{} global_id={:?} available_space={:?}",
+                crate::nobie_platform_trace::current_draw_id(),
+                layout_id,
+                location.file(),
+                location.line(),
+                location.column(),
+                global_id,
+                available_space,
+            );
+        }
         let retained_root = window
             .layout_engine
             .as_mut()

@@ -51,6 +51,10 @@ impl RetainedLayoutRootSite {
     pub(crate) fn caller(location: &'static Location<'static>) -> Self {
         Self(location)
     }
+
+    pub(crate) fn location(&self) -> &'static Location<'static> {
+        self.0
+    }
 }
 
 /// Stable identity for a computed layout root across frames.

@@ -151,6 +151,7 @@ fn grouped_visible_roots_are_registered_intents_not_solve_now_helpers() {
         "grouped visible-root drain must not solve a retained root and then skip it"
     );
     for forbidden in [
+        "pub fn new(output: T, placements: Vec<DeferredVisibleRootPlacement>)",
         "enum VisibleRootVisibility",
         "VisibleRootVisibility::",
         "VisibleRootState::Cancelled",
@@ -210,6 +211,9 @@ fn layout_frame_size_and_visible_root_methods_are_not_crate_authority() {
     let layout_frame = source_item(&window, "impl LayoutFrame");
 
     for forbidden in [
+        "fn prepaint_window_root_at(",
+        "fn prepaint_detached_root_at(",
+        "fn prepaint_detached_root_at_with_identity(",
         "pub(crate) fn layout_visible_root(",
         "pub(crate) fn measure_size_only_root(",
         "pub(crate) fn compute_detached_root_layout(",
@@ -466,6 +470,30 @@ fn retained_solver_execution_is_private_to_layout_frame() {
     assert!(
         offenders.is_empty(),
         "retained solve execution must stay private to LayoutFrame/LayoutEngine, found in {offenders:?}"
+    );
+}
+
+#[test]
+fn draw_test_element_uses_layout_frame_not_manual_root_solves() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let window = std::fs::read_to_string(crate_root.join("src/window.rs")).unwrap();
+    let draw_test_element = source_item(&window, "pub(crate) fn draw_test_element");
+
+    for forbidden in [
+        "DetachedRootLayoutPass",
+        "request_detached_root_layout(",
+        "compute_detached_root_layout(",
+        "mark_detached_root_layout_computed(",
+    ] {
+        assert!(
+            !draw_test_element.contains(forbidden),
+            "test drawing must use LayoutFrame's root-layout path, not manual detached-root solve steps: {forbidden}"
+        );
+    }
+
+    assert!(
+        draw_test_element.contains("layout_frame.layout_detached_root_size("),
+        "test drawing should route typed drawables through the private LayoutFrame root-layout path"
     );
 }
 

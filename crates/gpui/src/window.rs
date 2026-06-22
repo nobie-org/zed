@@ -1503,7 +1503,7 @@ impl<'a> PrepaintCx<'a> {
         &mut self,
         roots: Vec<(AnyElement, Size<AvailableSpace>)>,
         place: impl FnOnce(
-            &[Size<Pixels>],
+            VisibleRootGroupSizes<'_>,
             &mut VisibleRootGroupCx<'_>,
             &mut App,
         ) -> VisibleRootGroupPlacement<T>
@@ -2301,6 +2301,76 @@ pub(crate) struct LaidOutVisibleRoot {
     size: Size<Pixels>,
 }
 
+trait DetachedRootLayoutElement {
+    fn request_detached_root_layout(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> crate::element::DetachedRootLayoutRequest;
+
+    fn mark_detached_root_layout_computed(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+    );
+}
+
+impl DetachedRootLayoutElement for AnyElement {
+    fn request_detached_root_layout(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> crate::element::DetachedRootLayoutRequest {
+        AnyElement::request_detached_root_layout(self, available_space, pass, window, cx)
+    }
+
+    fn mark_detached_root_layout_computed(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+    ) {
+        AnyElement::mark_detached_root_layout_computed(self, layout_id, available_space, pass)
+    }
+}
+
+impl<E: crate::element::Element> DetachedRootLayoutElement for crate::element::Drawable<E> {
+    fn request_detached_root_layout(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> crate::element::DetachedRootLayoutRequest {
+        crate::element::Drawable::request_detached_root_layout(
+            self,
+            available_space,
+            pass,
+            window,
+            cx,
+        )
+    }
+
+    fn mark_detached_root_layout_computed(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+    ) {
+        crate::element::Drawable::mark_detached_root_layout_computed(
+            self,
+            layout_id,
+            available_space,
+            pass,
+        )
+    }
+}
+
 impl LaidOutVisibleRoot {
     pub(crate) fn size(&self) -> Size<Pixels> {
         self.size
@@ -2323,30 +2393,28 @@ impl LayoutFrame {
     }
 
     #[track_caller]
-    fn prepaint_window_root_at(
+    fn layout_window_root(
         &mut self,
         window: &mut Window,
-        element: &mut AnyElement,
-        origin: Point<Pixels>,
+        element: AnyElement,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
-    ) -> Option<FocusHandle> {
+    ) -> LaidOutVisibleRoot {
         let global_id = window.main_window_root_global_id();
-        self.prepaint_detached_root_at_with_identity(
+        self.layout_visible_root_with_identity(
             window,
             element,
-            origin,
-            available_space,
             RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            available_space,
             Some(&global_id),
             cx,
         )
     }
 
-    fn layout_detached_root_size(
+    fn layout_detached_root_size<E: DetachedRootLayoutElement>(
         &mut self,
         window: &mut Window,
-        element: &mut AnyElement,
+        element: &mut E,
         root_site: crate::layout::RetainedLayoutRootSite,
         available_space: Size<AvailableSpace>,
         global_id_override: Option<&GlobalElementId>,
@@ -2375,60 +2443,38 @@ impl LayoutFrame {
     fn layout_visible_root(
         &mut self,
         window: &mut Window,
-        mut element: AnyElement,
+        element: AnyElement,
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) -> LaidOutVisibleRoot {
-        let size = self.layout_detached_root_size(
-            window,
-            &mut element,
-            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-            available_space,
-            None,
-            cx,
-        );
-        LaidOutVisibleRoot { element, size }
-    }
-
-    #[track_caller]
-    fn prepaint_detached_root_at(
-        &mut self,
-        window: &mut Window,
-        element: &mut AnyElement,
-        origin: Point<Pixels>,
-        available_space: Size<AvailableSpace>,
-        cx: &mut App,
-    ) -> Option<FocusHandle> {
-        self.prepaint_detached_root_at_with_identity(
+        self.layout_visible_root_with_identity(
             window,
             element,
-            origin,
-            available_space,
             RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            available_space,
             None,
             cx,
         )
     }
 
-    fn prepaint_detached_root_at_with_identity(
+    fn layout_visible_root_with_identity(
         &mut self,
         window: &mut Window,
-        element: &mut AnyElement,
-        origin: Point<Pixels>,
-        available_space: Size<AvailableSpace>,
+        mut element: AnyElement,
         root_site: RetainedLayoutRootSite,
+        available_space: Size<AvailableSpace>,
         global_id_override: Option<&GlobalElementId>,
         cx: &mut App,
-    ) -> Option<FocusHandle> {
-        self.layout_detached_root_size(
+    ) -> LaidOutVisibleRoot {
+        let size = self.layout_detached_root_size(
             window,
-            element,
+            &mut element,
             root_site,
             available_space,
             global_id_override,
             cx,
         );
-        element.prepaint_at(origin, window, cx)
+        LaidOutVisibleRoot { element, size }
     }
 
     fn compute_detached_root_layout(
@@ -3226,26 +3272,6 @@ pub struct OwnerPaintedVisibleRoot {
     index: usize,
 }
 
-impl OwnerPaintedVisibleRoot {
-    /// Returns a read-only handle for the visible root's published geometry.
-    ///
-    /// This handle is not layout authority. It can only observe bounds after
-    /// the frame lifecycle has solved and prepainted the registered root.
-    pub fn geometry(&self) -> VisibleRootGeometry {
-        VisibleRootGeometry { index: self.index }
-    }
-}
-
-/// Read-only handle for geometry published by a visible detached root.
-///
-/// A geometry handle cannot create, mutate, or solve a root. It only names the
-/// frame output slot for a root that was already registered through the visible
-/// root intent API.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct VisibleRootGeometry {
-    index: usize,
-}
-
 /// Typed value produced by the private frame drain.
 ///
 /// `FramePrepaintOutput` is a read handle, not a computation handle. It cannot schedule
@@ -3343,12 +3369,70 @@ impl DeferredVisibleRootIntent {
     }
 }
 
+/// Solved sizes for every root in a closed visible-root group.
+///
+/// This value is the only public constructor path for
+/// [`VisibleRootGroupPlacement`]. It consumes the exact solved-size slice owned
+/// by the private frame drain and emits exactly one placement per registered
+/// root, so callers cannot represent a solved group whose placement count is
+/// too short or too long.
+#[derive(Clone, Copy)]
+pub struct VisibleRootGroupSizes<'a> {
+    sizes: &'a [Size<Pixels>],
+}
+
+impl<'a> VisibleRootGroupSizes<'a> {
+    fn new(sizes: &'a [Size<Pixels>]) -> Self {
+        Self { sizes }
+    }
+
+    /// The number of visible roots in this group.
+    pub fn len(&self) -> usize {
+        self.sizes.len()
+    }
+
+    /// Returns whether this group contains no visible roots.
+    pub fn is_empty(&self) -> bool {
+        self.sizes.is_empty()
+    }
+
+    /// Returns the solved size for a visible root by index.
+    pub fn get(&self, index: usize) -> Option<Size<Pixels>> {
+        self.sizes.get(index).copied()
+    }
+
+    /// Builds one placement for every visible root in this group.
+    ///
+    /// The closure is called once per root, in registration order, with that
+    /// root's solved size. The returned placement count is therefore derived
+    /// from the group itself rather than supplied as a separate, fallible
+    /// vector.
+    pub fn place_all<T>(
+        self,
+        output: T,
+        mut place: impl FnMut(usize, Size<Pixels>) -> DeferredVisibleRootPlacement,
+    ) -> VisibleRootGroupPlacement<T> {
+        VisibleRootGroupPlacement {
+            output,
+            placements: self
+                .sizes
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, size)| place(index, size))
+                .collect(),
+            followups: Vec::new(),
+        }
+    }
+}
+
 /// Result of placing a closed visible-root group.
 ///
 /// The frame owner solves the group, calls the placement function with solved
-/// sizes, and consumes this value. Callers can choose which group roots are
-/// painted and can request additional deferred roots whose layout depends on
-/// the group sizes. They cannot observe or mutate solver state.
+/// sizes, and consumes this value. Callers provide one placement per registered
+/// root through [`VisibleRootGroupSizes::place_all`] and can request additional
+/// deferred roots whose layout depends on the group sizes. They cannot observe
+/// or mutate solver state.
 pub struct VisibleRootGroupPlacement<T> {
     output: T,
     placements: Vec<DeferredVisibleRootPlacement>,
@@ -3356,15 +3440,6 @@ pub struct VisibleRootGroupPlacement<T> {
 }
 
 impl<T> VisibleRootGroupPlacement<T> {
-    /// Creates a group result with one placement per grouped visible root.
-    pub fn new(output: T, placements: Vec<DeferredVisibleRootPlacement>) -> Self {
-        Self {
-            output,
-            placements,
-            followups: Vec::new(),
-        }
-    }
-
     /// Adds roots that should be deferred after the group sizes are known.
     pub fn with_followups(
         mut self,
@@ -3679,27 +3754,26 @@ struct PendingVisibleRoot {
 
 struct ReadyVisibleRoot {
     element: Option<AnyElement>,
-    bounds: Bounds<Pixels>,
-    focus: Option<FocusHandle>,
     paint_range: Range<PaintIndex>,
-}
-
-enum VisibleRootState {
-    Pending(PendingVisibleRoot),
-    Prepainting,
-    Ready(ReadyVisibleRoot),
 }
 
 struct VisibleRootIntent {
     context: VisibleRootContext,
     root_site: RetainedLayoutRootSite,
     paint: VisibleRootPaint,
-    state: VisibleRootState,
+    pending: PendingVisibleRoot,
+    output_index: usize,
+}
+
+struct PrepaintedVisibleRootSlot {
+    context: VisibleRootContext,
+    paint: VisibleRootPaint,
+    ready: ReadyVisibleRoot,
 }
 
 type VisibleRootGroupRun = Box<
     dyn FnOnce(
-        &[Size<Pixels>],
+        VisibleRootGroupSizes<'_>,
         &mut VisibleRootGroupCx<'_>,
         &mut App,
     ) -> UntypedVisibleRootGroupPlacement,
@@ -3744,7 +3818,8 @@ pub(crate) struct Frame {
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
-    visible_roots: Vec<VisibleRootIntent>,
+    visible_roots: Vec<Option<VisibleRootIntent>>,
+    prepainted_visible_roots: Vec<Option<PrepaintedVisibleRootSlot>>,
     visible_root_groups: Vec<Option<VisibleRootGroupIntent>>,
     custom_layouts: Vec<Option<CustomLayoutIntent>>,
     frame_prepaint_outputs: Vec<FramePrepaintOutputSlot>,
@@ -3766,6 +3841,7 @@ pub(crate) struct PrepaintStateIndex {
     tooltips_index: usize,
     deferred_draws_index: usize,
     visible_roots_index: usize,
+    prepainted_visible_roots_index: usize,
     visible_root_groups_index: usize,
     custom_layouts_index: usize,
     frame_prepaint_outputs_index: usize,
@@ -3799,6 +3875,7 @@ impl Frame {
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             visible_roots: Vec::new(),
+            prepainted_visible_roots: Vec::new(),
             visible_root_groups: Vec::new(),
             custom_layouts: Vec::new(),
             frame_prepaint_outputs: Vec::new(),
@@ -3831,6 +3908,7 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.visible_roots.clear();
+        self.prepainted_visible_roots.clear();
         self.visible_root_groups.clear();
         self.custom_layouts.clear();
         self.frame_prepaint_outputs.clear();
@@ -5234,22 +5312,6 @@ impl Window {
         self.viewport_size
     }
 
-    /// Returns published bounds for a visible detached root from rendered frame output.
-    ///
-    /// This is a geometry read, not layout authority. If the handle names a
-    /// root that has not been solved and prepainted by the frame lifecycle, or
-    /// no longer belongs to the rendered frame, this returns `None` rather than
-    /// performing layout.
-    pub fn visible_root_bounds(&self, geometry: VisibleRootGeometry) -> Option<Bounds<Pixels>> {
-        self.rendered_frame
-            .visible_roots
-            .get(geometry.index)
-            .and_then(|root| match root.state {
-                VisibleRootState::Ready(ref ready) => Some(ready.bounds),
-                VisibleRootState::Pending(_) | VisibleRootState::Prepainting => None,
-            })
-    }
-
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
@@ -5905,14 +5967,11 @@ impl Window {
         };
 
         // Layout all root elements.
-        let mut root_element = self.root.as_ref().unwrap().clone().into_any();
-        layout_frame.prepaint_window_root_at(
-            self,
-            &mut root_element,
-            Point::default(),
-            root_size.into(),
-            cx,
-        );
+        let root_element = self.root.as_ref().unwrap().clone().into_any();
+        let root_element = layout_frame
+            .layout_window_root(self, root_element, root_size.into(), cx)
+            .prepaint_at(Point::default(), self, cx)
+            .0;
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, layout_frame, cx);
@@ -5925,27 +5984,21 @@ impl Window {
         let mut tooltip_root = None;
         if let Some(prompt) = self.prompt.take() {
             self.tooltip_bounds.take();
-            let mut element = prompt.view.any_view().into_any();
-            layout_frame.prepaint_detached_root_at(
-                self,
-                &mut element,
-                Point::default(),
-                root_size.into(),
-                cx,
-            );
+            let element = prompt.view.any_view().into_any();
+            let element = layout_frame
+                .layout_visible_root(self, element, root_size.into(), cx)
+                .prepaint_at(Point::default(), self, cx)
+                .0;
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
             self.tooltip_bounds.take();
-            let mut element = active_drag.view.clone().into_any();
+            let element = active_drag.view.clone().into_any();
             let offset = self.mouse_position() - active_drag.cursor_offset;
-            layout_frame.prepaint_detached_root_at(
-                self,
-                &mut element,
-                offset,
-                AvailableSpace::min_size(),
-                cx,
-            );
+            let element = layout_frame
+                .layout_visible_root(self, element, AvailableSpace::min_size(), cx)
+                .prepaint_at(offset, self, cx)
+                .0;
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
@@ -5963,7 +6016,7 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Paint);
         {
             let mut paint_cx = PaintCx::new(self);
-            root_element.paint(&mut paint_cx, cx);
+            paint_cx.paint_prepainted_visible_root(root_element, cx);
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -5972,12 +6025,12 @@ impl Window {
         self.paint_deferred_draws(cx);
         self.paint_deferred_visible_roots(cx);
 
-        if let Some(mut prompt_element) = prompt_element {
+        if let Some(prompt_element) = prompt_element {
             let mut paint_cx = PaintCx::new(self);
-            prompt_element.paint(&mut paint_cx, cx);
-        } else if let Some(mut drag_element) = active_drag_element {
+            paint_cx.paint_prepainted_visible_root(prompt_element, cx);
+        } else if let Some(drag_element) = active_drag_element {
             let mut paint_cx = PaintCx::new(self);
-            drag_element.paint(&mut paint_cx, cx);
+            paint_cx.paint_prepainted_visible_root(drag_element, cx);
         } else if let Some(tooltip_root) = tooltip_root {
             self.paint_tooltip_visible_root(tooltip_root, cx);
         }
@@ -6122,6 +6175,9 @@ impl Window {
             .visible_roots
             .truncate(index.visible_roots_index);
         self.next_frame
+            .prepainted_visible_roots
+            .truncate(index.prepainted_visible_roots_index);
+        self.next_frame
             .visible_root_groups
             .truncate(index.visible_root_groups_index);
         self.next_frame
@@ -6194,7 +6250,7 @@ impl Window {
                 .place
                 .take()
                 .expect("visible root group should own its placement function")(
-                &sizes,
+                VisibleRootGroupSizes::new(&sizes),
                 &mut group_cx,
                 cx,
             );
@@ -6203,13 +6259,13 @@ impl Window {
                 placements,
                 followups,
             } = placement;
-            assert_eq!(
+            debug_assert_eq!(
                 placements.len(),
                 group.roots.len(),
-                "visible root group placement count must match root count"
+                "VisibleRootGroupSizes::place_all must emit one placement per root"
             );
 
-            for (((mut element, _), placement), root_size) in
+            for (((mut element, _), placement), _root_size) in
                 group.roots.into_iter().zip(placements).zip(sizes)
             {
                 self.element_id_stack.clone_from(&context.element_id_stack);
@@ -6221,33 +6277,36 @@ impl Window {
                     .set_active_node(context.parent_node);
 
                 let origin = placement.origin;
-                let bounds = Bounds::new(origin, root_size);
                 let previous_content_mask_stack = mem::replace(
                     &mut self.content_mask_stack,
                     context.content_mask_stack.clone(),
                 );
-                let (element, focus) = self.with_rendered_view(context.current_view, |window| {
+                let element = self.with_rendered_view(context.current_view, |window| {
                     window.with_rem_size(Some(context.rem_size), |window| {
-                        let focus = element.prepaint_at(origin, window, cx);
-                        (element, focus)
+                        let _focus = element.prepaint_at(origin, window, cx);
+                        element
                     })
                 });
                 self.content_mask_stack = previous_content_mask_stack;
 
-                self.next_frame.visible_roots.push(VisibleRootIntent {
-                    context: context.clone(),
-                    root_site: group.root_site,
-                    paint: VisibleRootPaint::Deferred {
-                        priority: placement.priority,
-                        content_mask: placement.content_mask,
-                    },
-                    state: VisibleRootState::Ready(ReadyVisibleRoot {
-                        element: Some(element),
-                        bounds,
-                        focus,
-                        paint_range: PaintIndex::default()..PaintIndex::default(),
-                    }),
-                });
+                let output_index = self.next_frame.prepainted_visible_roots.len();
+                self.next_frame
+                    .prepainted_visible_roots
+                    .push(Some(PrepaintedVisibleRootSlot {
+                        context: context.clone(),
+                        paint: VisibleRootPaint::Deferred {
+                            priority: placement.priority,
+                            content_mask: placement.content_mask,
+                        },
+                        ready: ReadyVisibleRoot {
+                            element: Some(element),
+                            paint_range: PaintIndex::default()..PaintIndex::default(),
+                        },
+                    }));
+                debug_assert_eq!(
+                    output_index + 1,
+                    self.next_frame.prepainted_visible_roots.len()
+                );
             }
 
             for followup in followups {
@@ -6261,22 +6320,25 @@ impl Window {
                     priority,
                     content_mask,
                 } = placement;
-                self.next_frame.visible_roots.push(VisibleRootIntent {
+                let output_index = self.next_frame.prepainted_visible_roots.len();
+                self.next_frame.prepainted_visible_roots.push(None);
+                self.next_frame.visible_roots.push(Some(VisibleRootIntent {
                     context: context.clone(),
                     root_site: group.root_site,
                     paint: VisibleRootPaint::Deferred {
                         priority,
                         content_mask,
                     },
-                    state: VisibleRootState::Pending(PendingVisibleRoot {
+                    pending: PendingVisibleRoot {
                         element,
                         available_space,
                         placement: VisibleRootPlacement::FromSolvedSize(Box::new(move |_, _| {
                             origin
                         })),
                         on_prepaint: None,
-                    }),
-                });
+                    },
+                    output_index,
+                }));
             }
 
             self.element_id_stack.clear();
@@ -6328,22 +6390,24 @@ impl Window {
                 return None;
             }
 
-            let index = self.next_frame.visible_roots.len();
-            self.next_frame.visible_roots.push(VisibleRootIntent {
+            let index = self.next_frame.prepainted_visible_roots.len();
+            self.next_frame.prepainted_visible_roots.push(None);
+            self.next_frame.visible_roots.push(Some(VisibleRootIntent {
                 context: tooltip_request.context,
                 root_site: RetainedLayoutRootSite::caller(core::panic::Location::caller()),
                 paint: VisibleRootPaint::Tooltip {
                     id: tooltip_request.id,
                 },
-                state: VisibleRootState::Pending(PendingVisibleRoot {
+                pending: PendingVisibleRoot {
                     element: tooltip_view.into_any(),
                     available_space: AvailableSpace::min_size(),
                     placement: VisibleRootPlacement::FromSolvedSize(Box::new(move |size, _| {
                         tooltip_origin(mouse_position, window_bounds, size)
                     })),
                     on_prepaint: None,
-                }),
-            });
+                },
+                output_index: index,
+            }));
             return Some(index);
         }
         None
@@ -6465,11 +6529,11 @@ impl Window {
     fn paint_deferred_visible_roots(&mut self, cx: &mut App) {
         let mut indices = self
             .next_frame
-            .visible_roots
+            .prepainted_visible_roots
             .iter()
             .enumerate()
-            .filter_map(|(index, root)| match root.paint {
-                VisibleRootPaint::Deferred { priority, .. } => Some((index, priority)),
+            .filter_map(|(index, root)| match &root.as_ref()?.paint {
+                VisibleRootPaint::Deferred { priority, .. } => Some((index, *priority)),
                 VisibleRootPaint::OwnerPainted | VisibleRootPaint::Tooltip { .. } => None,
             })
             .collect::<SmallVec<[_; 8]>>();
@@ -6478,19 +6542,15 @@ impl Window {
         for (index, _) in indices {
             let paint_start = self.paint_index();
             let (context, content_mask, mut element) = {
-                let root = &mut self.next_frame.visible_roots[index];
-                let content_mask = match root.paint {
-                    VisibleRootPaint::Deferred { content_mask, .. } => content_mask,
+                let root = self
+                    .next_frame
+                    .prepainted_visible_roots
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .expect("deferred visible root output is missing");
+                let content_mask = match &root.paint {
+                    VisibleRootPaint::Deferred { content_mask, .. } => *content_mask,
                     VisibleRootPaint::OwnerPainted | VisibleRootPaint::Tooltip { .. } => continue,
-                };
-                let ready = match &mut root.state {
-                    VisibleRootState::Ready(ready) => ready,
-                    VisibleRootState::Prepainting => {
-                        panic!("deferred visible root is already being prepainted")
-                    }
-                    VisibleRootState::Pending(_) => {
-                        panic!("deferred visible root must be prepainted before paint");
-                    }
                 };
                 (
                     VisibleRootContext {
@@ -6502,7 +6562,7 @@ impl Window {
                         rem_size: root.context.rem_size,
                     },
                     content_mask,
-                    ready
+                    root.ready
                         .element
                         .take()
                         .expect("deferred visible root should own an element before paint"),
@@ -6522,10 +6582,13 @@ impl Window {
                 })
             });
             let paint_end = self.paint_index();
-            let VisibleRootState::Ready(ready) = &mut self.next_frame.visible_roots[index].state
-            else {
-                unreachable!("deferred visible root state changed during paint");
-            };
+            let ready = &mut self
+                .next_frame
+                .prepainted_visible_roots
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .expect("deferred visible root output disappeared during paint")
+                .ready;
             ready.element = Some(element);
             ready.paint_range = paint_start..paint_end;
         }
@@ -6542,13 +6605,10 @@ impl Window {
                 break;
             }
 
-            if matches!(
-                self.next_frame.visible_roots[index].state,
-                VisibleRootState::Ready(_)
-            ) {
+            let Some(intent) = self.next_frame.visible_roots[index].take() else {
                 index += 1;
                 continue;
-            }
+            };
 
             let (
                 current_view,
@@ -6559,28 +6619,20 @@ impl Window {
                 rem_size,
                 root_site,
                 pending,
-            ) = {
-                let intent = &mut self.next_frame.visible_roots[index];
-                let pending = match mem::replace(&mut intent.state, VisibleRootState::Prepainting) {
-                    VisibleRootState::Pending(pending) => pending,
-                    VisibleRootState::Prepainting => {
-                        panic!("visible root was re-entered while prepainting")
-                    }
-                    VisibleRootState::Ready(_) => {
-                        unreachable!("visible root pending state checked above")
-                    }
-                };
-                (
-                    intent.context.current_view,
-                    intent.context.parent_node,
-                    intent.context.element_id_stack.clone(),
-                    intent.context.text_style_stack.clone(),
-                    intent.context.content_mask_stack.clone(),
-                    intent.context.rem_size,
-                    intent.root_site,
-                    pending,
-                )
-            };
+                paint,
+                output_index,
+            ) = (
+                intent.context.current_view,
+                intent.context.parent_node,
+                intent.context.element_id_stack.clone(),
+                intent.context.text_style_stack.clone(),
+                intent.context.content_mask_stack.clone(),
+                intent.context.rem_size,
+                intent.root_site,
+                intent.pending,
+                intent.paint,
+                intent.output_index,
+            );
 
             self.element_id_stack.clone_from(&element_id_stack);
             self.text_style_stack.clone_from(&text_style_stack);
@@ -6605,7 +6657,7 @@ impl Window {
             let bounds = Bounds::new(origin, root_size);
 
             let previous_content_mask_stack =
-                mem::replace(&mut self.content_mask_stack, content_mask_stack);
+                mem::replace(&mut self.content_mask_stack, content_mask_stack.clone());
             let (element, bounds, focus) = self.with_rendered_view(current_view, |window| {
                 window.with_rem_size(Some(rem_size), |window| {
                     let focus = element.prepaint_at(origin, window, cx);
@@ -6614,28 +6666,50 @@ impl Window {
             });
             self.content_mask_stack = previous_content_mask_stack;
 
-            let on_prepaint = {
-                let intent = &mut self.next_frame.visible_roots[index];
-                intent.state = VisibleRootState::Ready(ReadyVisibleRoot {
-                    element: Some(element),
-                    bounds,
-                    focus,
-                    paint_range: PaintIndex::default()..PaintIndex::default(),
-                });
-                if let VisibleRootPaint::Tooltip { id } = intent.paint {
-                    self.tooltip_bounds = Some(TooltipBounds { id, bounds });
-                }
-                on_prepaint
+            let focus_for_feedback = focus.clone();
+            let tooltip_id = match &paint {
+                VisibleRootPaint::Tooltip { id } => Some(*id),
+                VisibleRootPaint::OwnerPainted | VisibleRootPaint::Deferred { .. } => None,
             };
+            let output = self
+                .next_frame
+                .prepainted_visible_roots
+                .get_mut(output_index)
+                .expect("visible root output slot is missing");
+            match output {
+                Some(_) => panic!("visible root output was resolved twice"),
+                None => {
+                    *output = Some(PrepaintedVisibleRootSlot {
+                        context: VisibleRootContext {
+                            current_view,
+                            parent_node,
+                            element_id_stack: element_id_stack.clone(),
+                            text_style_stack: text_style_stack.clone(),
+                            content_mask_stack: content_mask_stack.clone(),
+                            rem_size,
+                        },
+                        paint,
+                        ready: ReadyVisibleRoot {
+                            element: Some(element),
+                            paint_range: PaintIndex::default()..PaintIndex::default(),
+                        },
+                    });
+                }
+            }
+            if let Some(id) = tooltip_id {
+                self.tooltip_bounds = Some(TooltipBounds { id, bounds });
+            }
 
             if let Some(on_prepaint) = on_prepaint {
-                let VisibleRootState::Ready(ready) = &self.next_frame.visible_roots[index].state
-                else {
-                    unreachable!("visible root was just marked ready");
-                };
-                let focus = ready.focus.clone();
                 let mut feedback_cx = VisibleRootFeedbackCx::new(self);
-                on_prepaint(VisibleRootPrepaint { bounds, focus }, &mut feedback_cx, cx);
+                on_prepaint(
+                    VisibleRootPrepaint {
+                        bounds,
+                        focus: focus_for_feedback,
+                    },
+                    &mut feedback_cx,
+                    cx,
+                );
             }
 
             index += 1;
@@ -6649,19 +6723,11 @@ impl Window {
         let (context, mut element) = {
             let root = self
                 .next_frame
-                .visible_roots
+                .prepainted_visible_roots
                 .get_mut(index)
-                .expect("tooltip visible root handle is invalid");
+                .and_then(Option::as_mut)
+                .expect("tooltip visible root output is missing");
             assert!(matches!(root.paint, VisibleRootPaint::Tooltip { .. }));
-            let ready = match &mut root.state {
-                VisibleRootState::Ready(ready) => ready,
-                VisibleRootState::Prepainting => {
-                    panic!("tooltip visible root is already being prepainted")
-                }
-                VisibleRootState::Pending(_) => {
-                    panic!("tooltip visible root must be prepainted before paint");
-                }
-            };
             (
                 VisibleRootContext {
                     current_view: root.context.current_view,
@@ -6671,7 +6737,7 @@ impl Window {
                     content_mask_stack: root.context.content_mask_stack.clone(),
                     rem_size: root.context.rem_size,
                 },
-                ready
+                root.ready
                     .element
                     .take()
                     .expect("tooltip visible root should own an element before paint"),
@@ -6688,10 +6754,13 @@ impl Window {
                 element.paint(&mut paint_cx, cx);
             })
         });
-        let VisibleRootState::Ready(ready) = &mut self.next_frame.visible_roots[index].state else {
-            unreachable!("tooltip visible root state changed during paint");
-        };
-        ready.element = Some(element);
+        self.next_frame
+            .prepainted_visible_roots
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .expect("tooltip visible root output disappeared during paint")
+            .ready
+            .element = Some(element);
         self.element_id_stack.clear();
     }
 
@@ -6708,6 +6777,7 @@ impl Window {
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             visible_roots_index: self.next_frame.visible_roots.len(),
+            prepainted_visible_roots_index: self.next_frame.prepainted_visible_roots.len(),
             visible_root_groups_index: self.next_frame.visible_root_groups.len(),
             custom_layouts_index: self.next_frame.custom_layouts.len(),
             frame_prepaint_outputs_index: self.next_frame.frame_prepaint_outputs.len(),
@@ -7046,6 +7116,9 @@ impl Window {
             self.next_frame
                 .visible_roots
                 .truncate(index.visible_roots_index);
+            self.next_frame
+                .prepainted_visible_roots
+                .truncate(index.prepainted_visible_roots_index);
             self.next_frame
                 .visible_root_groups
                 .truncate(index.visible_root_groups_index);
@@ -7407,7 +7480,7 @@ impl Window {
         roots: Vec<(AnyElement, Size<AvailableSpace>)>,
         root_site: RetainedLayoutRootSite,
         place: impl FnOnce(
-            &[Size<Pixels>],
+            VisibleRootGroupSizes<'_>,
             &mut VisibleRootGroupCx<'_>,
             &mut App,
         ) -> VisibleRootGroupPlacement<T>
@@ -7449,18 +7522,20 @@ impl Window {
     ) -> usize {
         self.invalidator.debug_assert_prepaint();
         let context = self.visible_root_context();
-        let index = self.next_frame.visible_roots.len();
-        self.next_frame.visible_roots.push(VisibleRootIntent {
+        let index = self.next_frame.prepainted_visible_roots.len();
+        self.next_frame.prepainted_visible_roots.push(None);
+        self.next_frame.visible_roots.push(Some(VisibleRootIntent {
             context,
             root_site,
             paint,
-            state: VisibleRootState::Pending(PendingVisibleRoot {
+            pending: PendingVisibleRoot {
                 element,
                 available_space,
                 placement,
                 on_prepaint,
-            }),
-        });
+            },
+            output_index: index,
+        }));
         index
     }
 
@@ -7524,20 +7599,12 @@ impl Window {
         self.invalidator.debug_assert_paint();
         let mut element = self
             .next_frame
-            .visible_roots
+            .prepainted_visible_roots
             .get_mut(handle.index)
-            .and_then(|intent| {
-                assert!(matches!(intent.paint, VisibleRootPaint::OwnerPainted));
-                let ready = match &mut intent.state {
-                    VisibleRootState::Ready(ready) => ready,
-                    VisibleRootState::Prepainting => {
-                        panic!("owner-painted visible root is already being prepainted")
-                    }
-                    VisibleRootState::Pending(_) => {
-                        panic!("owner-painted visible root must be prepainted before paint")
-                    }
-                };
-                ready.element.take()
+            .and_then(Option::as_mut)
+            .and_then(|root| {
+                assert!(matches!(root.paint, VisibleRootPaint::OwnerPainted));
+                root.ready.element.take()
             })
             .expect("owner-painted visible root handle is invalid or already painted");
         let mut paint_cx = PaintCx::new(self);
@@ -8239,22 +8306,14 @@ impl Window {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.invalidator.set_phase(DrawPhase::Prepaint);
             let mut element = crate::element::Drawable::new(element);
-            let mut pass = DetachedRootLayoutPass { _private: () };
-            let request =
-                element.request_detached_root_layout(available_space, &mut pass, self, cx);
-            let layout_id = request.layout_id();
-
-            if request.needs_solve() {
-                layout_frame.compute_detached_root_layout(
-                    self,
-                    layout_id,
-                    RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-                    request.global_id(),
-                    available_space,
-                    cx,
-                );
-                element.mark_detached_root_layout_computed(layout_id, available_space, &mut pass);
-            }
+            layout_frame.layout_detached_root_size(
+                self,
+                &mut element,
+                RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+                available_space,
+                None,
+                cx,
+            );
 
             self.with_absolute_element_offset(origin, |window| {
                 let mut prepaint_cx = crate::PrepaintCx::new(window);
@@ -9718,16 +9777,22 @@ impl Window {
         inspector_width: Pixels,
         layout_frame: &mut LayoutFrame,
         cx: &mut App,
-    ) -> Option<AnyElement> {
+    ) -> Option<PrepaintedVisibleRoot> {
         if let Some(inspector) = self.inspector.take() {
-            let mut inspector_element = AnyView::from(inspector.clone()).into_any_element();
-            layout_frame.prepaint_detached_root_at(
-                self,
-                &mut inspector_element,
-                point(self.viewport_size.width - inspector_width, px(0.0)),
-                size(inspector_width, self.viewport_size.height).into(),
-                cx,
-            );
+            let inspector_element = AnyView::from(inspector.clone()).into_any_element();
+            let inspector_element = layout_frame
+                .layout_visible_root(
+                    self,
+                    inspector_element,
+                    size(inspector_width, self.viewport_size.height).into(),
+                    cx,
+                )
+                .prepaint_at(
+                    point(self.viewport_size.width - inspector_width, px(0.0)),
+                    self,
+                    cx,
+                )
+                .0;
             self.inspector = Some(inspector);
             Some(inspector_element)
         } else {
@@ -9736,10 +9801,14 @@ impl Window {
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]
-    fn paint_inspector(&mut self, mut inspector_element: Option<AnyElement>, cx: &mut App) {
-        if let Some(mut inspector_element) = inspector_element {
+    fn paint_inspector(
+        &mut self,
+        mut inspector_element: Option<PrepaintedVisibleRoot>,
+        cx: &mut App,
+    ) {
+        if let Some(inspector_element) = inspector_element.take() {
             let mut paint_cx = PaintCx::new(self);
-            inspector_element.paint(&mut paint_cx, cx);
+            paint_cx.paint_prepainted_visible_root(inspector_element, cx);
         };
     }
 

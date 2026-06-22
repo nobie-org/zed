@@ -125,7 +125,7 @@ impl Specimen {
 }
 
 impl RenderOnce for Specimen {
-    fn render(self, window: &mut gpui::BuildCx<'_>, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let rem_size = window.rem_size();
         let scale = self.scale;
         let global_style = cx.text_context();
@@ -186,7 +186,7 @@ impl CharacterGrid {
 }
 
 impl RenderOnce for CharacterGrid {
-    fn render(self, _window: &mut gpui::BuildCx<'_>, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let mut theme = SpecimenTheme::default();
 
         if self.invert {
@@ -275,11 +275,7 @@ const FONT_FAMILIES: [&str; 5] = [
 ];
 
 impl Render for TextExample {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tcx = cx.text_context();
         let colors = cx.default_colors().clone();
 

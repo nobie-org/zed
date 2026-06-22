@@ -1,5 +1,0 @@
-error[E0599]: no method named `owner_painted_visible_root` found for mutable reference `&mut VisibleRootPlacementCx<'_>` in the current scope
- --> tests/retained_layout_lifecycle/visible_root_placement_cx_cannot_schedule_visible_root.rs:4:18
-  |
-4 |     placement_cx.owner_painted_visible_root(
-  |     -------------^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut VisibleRootPlacementCx<'_>`

@@ -384,17 +384,15 @@ impl Boundary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Font, FontFeatures, FontStyle, FontWeight, NoopTextSystem, TestAppContext, TextSystem, font,
-    };
+    use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{TextRun, WindowTextSystem, WrapBoundary};
-    use std::sync::Arc;
 
     fn build_wrapper() -> LineWrapper {
-        let text_system = Arc::new(TextSystem::new(Arc::new(NoopTextSystem::new())));
-        let id = text_system.resolve_font(&font(".ZedMono"));
-        LineWrapper::new(id, px(16.), text_system)
+        let dispatcher = TestDispatcher::new(0);
+        let cx = TestAppContext::build(dispatcher, None);
+        let id = cx.text_system().resolve_font(&font(".ZedMono"));
+        LineWrapper::new(id, px(16.), cx.text_system().clone())
     }
 
     fn generate_test_runs(input_run_len: &[usize]) -> Vec<TextRun> {

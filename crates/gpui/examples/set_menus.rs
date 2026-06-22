@@ -9,11 +9,7 @@ use gpui_platform::application;
 struct SetMenus;
 
 impl Render for SetMenus {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .bg(gpui::white())

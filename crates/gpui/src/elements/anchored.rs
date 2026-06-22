@@ -2,8 +2,8 @@ use smallvec::SmallVec;
 
 use crate::{
     Anchor, AnyElement, App, Axis, Bounds, Display, Edges, Element, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, LayoutRequestCx, PaintCx, ParentElement, Pixels,
-    Point, Position, PrepaintCx, Size, Style, Window, point, px,
+    InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Point, Position, Size, Style,
+    Window, point, px,
 };
 
 /// The state that the anchored element element uses to track its children.
@@ -99,7 +99,7 @@ impl Element for Anchored {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         let child_layout_ids = self
@@ -125,7 +125,7 @@ impl Element for Anchored {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         if request_layout.child_layout_ids.is_empty() {
@@ -179,7 +179,7 @@ impl Element for Anchored {
             }
         }
 
-        let client_inset = window.client_inset().unwrap_or(px(0.));
+        let client_inset = window.client_inset.unwrap_or(px(0.));
         let edges = match self.fit_mode {
             AnchoredFitMode::SnapToWindowWithMargin(edges) => edges,
             _ => Edges::default(),
@@ -221,7 +221,7 @@ impl Element for Anchored {
         _bounds: crate::Bounds<crate::Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         for child in &mut self.children {
@@ -300,11 +300,7 @@ mod tests {
     }
 
     impl Render for AnchoredTestView {
-        fn render(
-            &mut self,
-            _window: &mut crate::BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(
                 div()
                     .id("scroll-container")

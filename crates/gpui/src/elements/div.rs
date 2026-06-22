@@ -17,14 +17,14 @@
 
 use crate::PinchEvent;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
-    Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
-    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LayoutRequestCx,
-    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
-    MousePressureEvent, MouseUpEvent, Overflow, PaintCx, ParentElement, Pixels, Point, PrepaintCx,
-    Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    Visibility, Window, WindowControlArea, point, px, size,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, Hitbox,
+    HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
+    KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent, Overflow,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
+    size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -48,146 +48,6 @@ use super::ImageCacheProvider;
 const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
-
-trait StyleComputeCx {
-    fn last_input_was_keyboard(&self) -> bool;
-    fn is_focused(&self, focus_handle: &FocusHandle) -> bool;
-    fn within_focused(&mut self, focus_handle: &FocusHandle, cx: &mut App) -> bool;
-    fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool;
-    fn is_hitbox_hovered(&self, hitbox: &Hitbox) -> bool;
-    fn evaluate_drop_predicate(
-        &mut self,
-        value: &dyn Any,
-        predicate: &dyn Fn(&dyn Any, &mut Window, &mut App) -> bool,
-        cx: &mut App,
-    ) -> bool;
-    fn build_drag_over_style(
-        &mut self,
-        value: &dyn Any,
-        build: &dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement,
-        cx: &mut App,
-    ) -> StyleRefinement;
-}
-
-impl StyleComputeCx for LayoutRequestCx<'_> {
-    fn last_input_was_keyboard(&self) -> bool {
-        LayoutRequestCx::last_input_was_keyboard(self)
-    }
-
-    fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
-        LayoutRequestCx::is_focused(self, focus_handle)
-    }
-
-    fn within_focused(&mut self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
-        LayoutRequestCx::within_focused(self, focus_handle, cx)
-    }
-
-    fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
-        LayoutRequestCx::hitbox_id_is_hovered(self, hitbox_id)
-    }
-
-    fn is_hitbox_hovered(&self, _hitbox: &Hitbox) -> bool {
-        panic!("layout request cannot compute hitbox-dependent style");
-    }
-
-    fn evaluate_drop_predicate(
-        &mut self,
-        _value: &dyn Any,
-        _predicate: &dyn Fn(&dyn Any, &mut Window, &mut App) -> bool,
-        _cx: &mut App,
-    ) -> bool {
-        panic!("layout request cannot evaluate drop predicates");
-    }
-
-    fn build_drag_over_style(
-        &mut self,
-        _value: &dyn Any,
-        _build: &dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement,
-        _cx: &mut App,
-    ) -> StyleRefinement {
-        panic!("layout request cannot build drag-over style");
-    }
-}
-
-impl StyleComputeCx for PrepaintCx<'_> {
-    fn last_input_was_keyboard(&self) -> bool {
-        PrepaintCx::last_input_was_keyboard(self)
-    }
-
-    fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
-        PrepaintCx::is_focused(self, focus_handle)
-    }
-
-    fn within_focused(&mut self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
-        PrepaintCx::within_focused(self, focus_handle, cx)
-    }
-
-    fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
-        PrepaintCx::hitbox_id_is_hovered(self, hitbox_id)
-    }
-
-    fn is_hitbox_hovered(&self, _hitbox: &Hitbox) -> bool {
-        panic!("prepaint cannot compute hitbox-dependent style before hitbox registration");
-    }
-
-    fn evaluate_drop_predicate(
-        &mut self,
-        _value: &dyn Any,
-        _predicate: &dyn Fn(&dyn Any, &mut Window, &mut App) -> bool,
-        _cx: &mut App,
-    ) -> bool {
-        panic!("prepaint cannot evaluate drop predicates");
-    }
-
-    fn build_drag_over_style(
-        &mut self,
-        _value: &dyn Any,
-        _build: &dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement,
-        _cx: &mut App,
-    ) -> StyleRefinement {
-        panic!("prepaint cannot build drag-over style");
-    }
-}
-
-impl StyleComputeCx for PaintCx<'_> {
-    fn last_input_was_keyboard(&self) -> bool {
-        PaintCx::last_input_was_keyboard(self)
-    }
-
-    fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
-        PaintCx::is_focused(self, focus_handle)
-    }
-
-    fn within_focused(&mut self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
-        PaintCx::within_focused(self, focus_handle, cx)
-    }
-
-    fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
-        PaintCx::hitbox_id_is_hovered(self, hitbox_id)
-    }
-
-    fn is_hitbox_hovered(&self, hitbox: &Hitbox) -> bool {
-        PaintCx::is_hovered(self, hitbox)
-    }
-
-    fn evaluate_drop_predicate(
-        &mut self,
-        value: &dyn Any,
-        predicate: &dyn Fn(&dyn Any, &mut Window, &mut App) -> bool,
-        cx: &mut App,
-    ) -> bool {
-        PaintCx::evaluate_drop_predicate(self, value, predicate, cx)
-    }
-
-    fn build_drag_over_style(
-        &mut self,
-        value: &dyn Any,
-        build: &dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement,
-        cx: &mut App,
-    ) -> StyleRefinement {
-        PaintCx::build_drag_over_style(self, value, build, cx)
-    }
-}
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -1520,9 +1380,9 @@ pub fn div() -> Div {
 pub struct Div {
     interactivity: Interactivity,
     children: SmallVec<[StackSafe<AnyElement>; 2]>,
-    prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut App) + 'static>>,
+    prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
-    prepaint_order_fn: Option<Box<dyn Fn(&mut App) -> SmallVec<[usize; 8]>>>,
+    prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
 }
 
 impl Div {
@@ -1530,7 +1390,7 @@ impl Div {
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
         mut self,
-        listener: impl Fn(Vec<Bounds<Pixels>>, &mut App) + 'static,
+        listener: impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.prepaint_listener = Some(Box::new(listener));
         self
@@ -1552,7 +1412,7 @@ impl Div {
     /// be prepainted first so its scroll position update is visible to the other editor.
     pub fn with_dynamic_prepaint_order(
         mut self,
-        order_fn: impl Fn(&mut App) -> SmallVec<[usize; 8]> + 'static,
+        order_fn: impl Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]> + 'static,
     ) -> Self {
         self.prepaint_order_fn = Some(Box::new(order_fn));
         self
@@ -1567,7 +1427,6 @@ impl Div {
 /// bounds of the children after the layout phase is complete.
 pub struct DivFrameState {
     child_layout_ids: SmallVec<[LayoutId; 2]>,
-    image_cache: Option<AnyImageCache>,
 }
 
 /// Interactivity state displayed an manipulated in the inspector.
@@ -1620,7 +1479,7 @@ impl Element for Div {
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut child_layout_ids = SmallVec::new();
@@ -1629,7 +1488,7 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
-        let layout_id = window.with_image_cache(image_cache.clone(), |window| {
+        let layout_id = window.with_image_cache(image_cache, |window| {
             self.interactivity.request_layout(
                 global_id,
                 inspector_id,
@@ -1642,24 +1501,13 @@ impl Element for Div {
                             .iter_mut()
                             .map(|child| child.request_layout(window, cx))
                             .collect::<SmallVec<_>>();
-                        window.request_layout_with_global_id(
-                            global_id,
-                            style,
-                            child_layout_ids.iter().copied(),
-                            cx,
-                        )
+                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
                     })
                 },
             )
         });
 
-        (
-            layout_id,
-            DivFrameState {
-                child_layout_ids,
-                image_cache,
-            },
-        )
+        (layout_id, DivFrameState { child_layout_ids })
     }
 
     #[stacksafe]
@@ -1669,9 +1517,14 @@ impl Element for Div {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<Hitbox> {
+        let image_cache = self
+            .image_cache
+            .as_mut()
+            .map(|provider| provider.provide(window, cx));
+
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
             request_layout.child_layout_ids.len()
@@ -1726,10 +1579,10 @@ impl Element for Div {
                     return hitbox;
                 }
 
-                window.with_image_cache(request_layout.image_cache.clone(), |window| {
+                window.with_image_cache(image_cache, |window| {
                     window.with_element_offset(scroll_offset, |window| {
                         if let Some(order_fn) = &self.prepaint_order_fn {
-                            let order = order_fn(cx);
+                            let order = order_fn(window, cx);
                             for idx in order {
                                 if let Some(child) = self.children.get_mut(idx) {
                                     child.prepaint(window, cx);
@@ -1743,7 +1596,7 @@ impl Element for Div {
                     });
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
-                        listener(children_bounds, cx);
+                        listener(children_bounds, window, cx);
                     }
                 });
 
@@ -1760,10 +1613,15 @@ impl Element for Div {
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         hitbox: &mut Option<Hitbox>,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_image_cache(_request_layout.image_cache.clone(), |window| {
+        let image_cache = self
+            .image_cache
+            .as_mut()
+            .map(|provider| provider.provide(window, cx));
+
+        window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
                 inspector_id,
@@ -1865,15 +1723,15 @@ impl Interactivity {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
-        f: impl FnOnce(Style, &mut LayoutRequestCx<'_>, &mut App) -> LayoutId,
+        f: impl FnOnce(Style, &mut Window, &mut App) -> LayoutId,
     ) -> LayoutId {
         #[cfg(any(feature = "inspector", debug_assertions))]
         window.with_inspector_state(
             _inspector_id,
             cx,
-            |inspector_state: &mut Option<DivInspectorState>| {
+            |inspector_state: &mut Option<DivInspectorState>, _window| {
                 if let Some(inspector_state) = inspector_state {
                     self.base_style = inspector_state.base_style.clone();
                 } else {
@@ -1952,9 +1810,9 @@ impl Interactivity {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         content_size: Size<Pixels>,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
-        f: impl FnOnce(&Style, Point<Pixels>, Option<Hitbox>, &mut PrepaintCx<'_>, &mut App) -> R,
+        f: impl FnOnce(&Style, Point<Pixels>, Option<Hitbox>, &mut Window, &mut App) -> R,
     ) -> R {
         self.content_size = content_size;
 
@@ -1962,7 +1820,7 @@ impl Interactivity {
         window.with_inspector_state(
             _inspector_id,
             cx,
-            |inspector_state: &mut Option<DivInspectorState>| {
+            |inspector_state: &mut Option<DivInspectorState>, _window| {
                 if let Some(inspector_state) = inspector_state {
                     inspector_state.bounds = bounds;
                     inspector_state.content_size = content_size;
@@ -2021,7 +1879,7 @@ impl Interactivity {
         )
     }
 
-    fn should_insert_hitbox(&self, style: &Style, window: &PrepaintCx<'_>, cx: &App) -> bool {
+    fn should_insert_hitbox(&self, style: &Style, window: &Window, cx: &App) -> bool {
         self.hitbox_behavior != HitboxBehavior::Normal
             || self.window_control.is_some()
             || style.mouse_cursor.is_some()
@@ -2049,7 +1907,7 @@ impl Interactivity {
         &self,
         bounds: Bounds<Pixels>,
         style: &Style,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         _cx: &mut App,
     ) -> Point<Pixels> {
         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
@@ -2117,11 +1975,11 @@ impl Interactivity {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         hitbox: Option<&Hitbox>,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
-        f: impl FnOnce(&Style, &mut PaintCx<'_>, &mut App),
+        f: impl FnOnce(&Style, &mut Window, &mut App),
     ) {
-        self.hovered = hitbox.map(|hitbox| window.is_hovered(hitbox));
+        self.hovered = hitbox.map(|hitbox| hitbox.is_hovered(window));
         window.with_optional_element_state::<InteractiveElementState, _>(
             global_id,
             |element_state, window| {
@@ -2132,7 +1990,10 @@ impl Interactivity {
 
                 #[cfg(any(feature = "test-support", test))]
                 if let Some(debug_selector) = &self.debug_selector {
-                    window.insert_debug_bounds(debug_selector.clone(), bounds);
+                    window
+                        .next_frame
+                        .debug_bounds
+                        .insert(debug_selector.clone(), bounds);
                 }
 
                 self.paint_hover_group_handler(window, cx);
@@ -2146,11 +2007,11 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
                 if let Some(focus_handle) = &self.tracked_focus_handle {
-                    window.insert_tab_stop(focus_handle);
+                    window.next_frame.tab_stops.insert(focus_handle);
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
-                    style.paint(bounds, window, cx, |window, cx| {
+                    style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
                                 style.overflow_mask(bounds, window.rem_size()),
@@ -2225,20 +2086,20 @@ impl Interactivity {
         global_id: Option<&GlobalElementId>,
         hitbox: &Hitbox,
         style: &Style,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         use crate::{BorderStyle, TextAlign};
 
         if let Some(global_id) = global_id
             && (style.debug || style.debug_below || cx.has_global::<crate::DebugBelow>())
-            && window.is_hovered(hitbox)
+            && hitbox.is_hovered(window)
         {
             const FONT_SIZE: crate::Pixels = crate::Pixels(10.);
             let element_id = format!("{global_id:?}");
             let str_len = element_id.len();
 
-            let render_debug_text = |window: &mut PaintCx<'_>| {
+            let render_debug_text = |window: &mut Window| {
                 if let Some(text) = window
                     .text_system()
                     .shape_text(
@@ -2273,7 +2134,7 @@ impl Interactivity {
                             }
                         });
 
-                        let was_hovered = window.is_hovered(hitbox);
+                        let was_hovered = hitbox.is_hovered(window);
                         let current_view = window.current_view();
                         window.on_mouse_event({
                             let hitbox = hitbox.clone();
@@ -2340,13 +2201,13 @@ impl Interactivity {
         &mut self,
         hitbox: &Hitbox,
         element_state: Option<&mut InteractiveElementState>,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         let is_focused = self
             .tracked_focus_handle
             .as_ref()
-            .map(|handle| window.is_focused(handle))
+            .map(|handle| handle.is_focused(window))
             .unwrap_or(false);
 
         // If this element can be focused, register a mouse down listener
@@ -2755,7 +2616,7 @@ impl Interactivity {
         }
     }
 
-    fn paint_keyboard_listeners(&mut self, window: &mut PaintCx<'_>, _cx: &mut App) {
+    fn paint_keyboard_listeners(&mut self, window: &mut Window, _cx: &mut App) {
         let key_down_listeners = mem::take(&mut self.key_down_listeners);
         let key_up_listeners = mem::take(&mut self.key_up_listeners);
         let modifiers_changed_listeners = mem::take(&mut self.modifiers_changed_listeners);
@@ -2787,14 +2648,14 @@ impl Interactivity {
         }
     }
 
-    fn paint_hover_group_handler(&self, window: &mut PaintCx<'_>, cx: &mut App) {
+    fn paint_hover_group_handler(&self, window: &mut Window, cx: &mut App) {
         let group_hitbox = self
             .group_hover_style
             .as_ref()
             .and_then(|group_hover| GroupHitboxes::get(&group_hover.group, cx));
 
         if let Some(group_hitbox) = group_hitbox {
-            let was_hovered = window.hitbox_id_is_hovered(group_hitbox);
+            let was_hovered = group_hitbox.is_hovered(window);
             let current_view = window.current_view();
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = group_hitbox.is_hovered(window);
@@ -2809,7 +2670,7 @@ impl Interactivity {
         &self,
         hitbox: &Hitbox,
         style: &Style,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         _cx: &mut App,
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
@@ -2863,7 +2724,7 @@ impl Interactivity {
         &self,
         global_id: Option<&GlobalElementId>,
         hitbox: Option<&Hitbox>,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Style {
         window.with_optional_element_state(global_id, |element_state, window| {
@@ -2879,7 +2740,7 @@ impl Interactivity {
         &self,
         hitbox: Option<&Hitbox>,
         element_state: Option<&mut InteractiveElementState>,
-        window: &mut impl StyleComputeCx,
+        window: &mut Window,
         cx: &mut App,
     ) -> Style {
         let mut style = Style::default();
@@ -2887,19 +2748,19 @@ impl Interactivity {
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             if let Some(in_focus_style) = self.in_focus_style.as_ref()
-                && window.within_focused(focus_handle, cx)
+                && focus_handle.within_focused(window, cx)
             {
                 style.refine(in_focus_style);
             }
 
             if let Some(focus_style) = self.focus_style.as_ref()
-                && window.is_focused(focus_handle)
+                && focus_handle.is_focused(window)
             {
                 style.refine(focus_style);
             }
 
             if let Some(focus_visible_style) = self.focus_visible_style.as_ref()
-                && window.is_focused(focus_handle)
+                && focus_handle.is_focused(window)
                 && window.last_input_was_keyboard()
             {
                 style.refine(focus_visible_style);
@@ -2910,7 +2771,7 @@ impl Interactivity {
             if let Some(group_hover) = self.group_hover_style.as_ref() {
                 let is_group_hovered =
                     if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
-                        window.hitbox_id_is_hovered(group_hitbox_id)
+                        group_hitbox_id.is_hovered(window)
                     } else if let Some(element_state) = element_state.as_ref() {
                         element_state
                             .hover_state
@@ -2928,7 +2789,7 @@ impl Interactivity {
 
             if let Some(hover_style) = self.hover_style.as_ref() {
                 let is_hovered = if let Some(hitbox) = hitbox {
-                    window.is_hitbox_hovered(hitbox)
+                    hitbox.is_hovered(window)
                 } else if let Some(element_state) = element_state.as_ref() {
                     element_state
                         .hover_state
@@ -2949,8 +2810,7 @@ impl Interactivity {
             if let Some(drag) = cx.active_drag.take() {
                 let mut can_drop = true;
                 if let Some(can_drop_predicate) = &self.can_drop_predicate {
-                    can_drop =
-                        window.evaluate_drop_predicate(drag.value.as_ref(), can_drop_predicate, cx);
+                    can_drop = can_drop_predicate(drag.value.as_ref(), window, cx);
                 }
 
                 if can_drop {
@@ -2958,21 +2818,16 @@ impl Interactivity {
                         if let Some(group_hitbox_id) =
                             GroupHitboxes::get(&group_drag_style.group, cx)
                             && *state_type == drag.value.as_ref().type_id()
-                            && window.hitbox_id_is_hovered(group_hitbox_id)
+                            && group_hitbox_id.is_hovered(window)
                         {
                             style.refine(&group_drag_style.style);
                         }
                     }
 
                     for (state_type, build_drag_over_style) in &self.drag_over_styles {
-                        if *state_type == drag.value.as_ref().type_id()
-                            && window.is_hitbox_hovered(hitbox)
+                        if *state_type == drag.value.as_ref().type_id() && hitbox.is_hovered(window)
                         {
-                            style.refine(&window.build_drag_over_style(
-                                drag.value.as_ref(),
-                                build_drag_over_style,
-                                cx,
-                            ));
+                            style.refine(&build_drag_over_style(drag.value.as_ref(), window, cx));
                         }
                     }
                 }
@@ -3050,13 +2905,11 @@ pub(crate) enum ActiveTooltip {
     Visible {
         tooltip: AnyTooltip,
         is_hoverable: bool,
-        tooltip_id: Option<TooltipId>,
     },
     /// Tooltip is visible and hoverable, but the mouse is no longer hovering. Currently delaying
     /// before hiding it.
     WaitingForHide {
         tooltip: AnyTooltip,
-        tooltip_id: Option<TooltipId>,
         _task: Task<()>,
     },
 }
@@ -3091,28 +2944,15 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
 
 pub(crate) fn set_tooltip_on_window(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
-    window: &mut PrepaintCx<'_>,
+    window: &mut Window,
 ) -> Option<TooltipId> {
-    let mut active_tooltip = active_tooltip.borrow_mut();
-    let (tooltip, tooltip_id) = match active_tooltip.as_mut() {
+    let tooltip = match active_tooltip.borrow().as_ref() {
         None => return None,
         Some(ActiveTooltip::WaitingForShow { .. }) => return None,
-        Some(ActiveTooltip::Visible {
-            tooltip,
-            tooltip_id,
-            ..
-        })
-        | Some(ActiveTooltip::WaitingForHide {
-            tooltip,
-            tooltip_id,
-            ..
-        }) => (tooltip.clone(), tooltip_id),
+        Some(ActiveTooltip::Visible { tooltip, .. }) => tooltip.clone(),
+        Some(ActiveTooltip::WaitingForHide { tooltip, .. }) => tooltip.clone(),
     };
-    let tooltip_hovered =
-        tooltip_id.is_some_and(|tooltip_id| window.is_tooltip_hovered(tooltip_id));
-    let new_tooltip_id = window.set_tooltip_with_hover_state(tooltip, tooltip_hovered);
-    *tooltip_id = Some(new_tooltip_id);
-    Some(new_tooltip_id)
+    Some(window.set_tooltip(tooltip))
 }
 
 pub(crate) fn register_tooltip_mouse_handlers(
@@ -3121,7 +2961,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
-    window: &mut PaintCx<'_>,
+    window: &mut Window,
 ) {
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
@@ -3231,27 +3071,28 @@ fn handle_tooltip_mouse_move(
                             build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
                                 let weak_active_tooltip = Rc::downgrade(&active_tooltip);
                                 ActiveTooltip::Visible {
-                                    tooltip: AnyTooltip::new(
+                                    tooltip: AnyTooltip {
                                         view,
-                                        window.mouse_position(),
-                                        move |tooltip_facts, window, cx| {
-                                            let Some(active_tooltip) =
-                                                weak_active_tooltip.upgrade()
-                                            else {
-                                                return false;
-                                            };
-                                            handle_tooltip_check_visible_and_update(
-                                                &active_tooltip,
-                                                tooltip_is_hoverable,
-                                                &check_is_hovered_during_prepaint,
-                                                tooltip_facts,
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    ),
+                                        mouse_position: window.mouse_position(),
+                                        check_visible_and_update: Rc::new(
+                                            move |tooltip_bounds, window, cx| {
+                                                let Some(active_tooltip) =
+                                                    weak_active_tooltip.upgrade()
+                                                else {
+                                                    return false;
+                                                };
+                                                handle_tooltip_check_visible_and_update(
+                                                    &active_tooltip,
+                                                    tooltip_is_hoverable,
+                                                    &check_is_hovered_during_prepaint,
+                                                    tooltip_bounds,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ),
+                                    },
                                     is_hoverable: tooltip_is_hoverable,
-                                    tooltip_id: None,
                                 }
                             });
                         *active_tooltip.borrow_mut() = new_tooltip;
@@ -3276,8 +3117,8 @@ fn handle_tooltip_check_visible_and_update(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     tooltip_is_hoverable: bool,
     check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
-    tooltip_facts: crate::TooltipVisibilityFacts,
-    window: &mut crate::TooltipVisibilityCx<'_>,
+    tooltip_bounds: Bounds<Pixels>,
+    window: &mut Window,
     cx: &mut App,
 ) -> bool {
     // Separates logic for what mutation should occur from applying it, to avoid overlapping RefCell
@@ -3285,35 +3126,27 @@ fn handle_tooltip_check_visible_and_update(
     enum Action {
         None,
         Hide,
-        ScheduleHide(AnyTooltip, Option<TooltipId>),
-        CancelHide(AnyTooltip, Option<TooltipId>),
+        ScheduleHide(AnyTooltip),
+        CancelHide(AnyTooltip),
     }
 
-    let is_hovered = window.is_hovered_by(check_is_hovered.as_ref())
-        || (tooltip_is_hoverable && tooltip_facts.tooltip_hovered());
+    let is_hovered = check_is_hovered(window)
+        || (tooltip_is_hoverable && tooltip_bounds.contains(&window.mouse_position()));
     let action = match active_tooltip.borrow().as_ref() {
-        Some(ActiveTooltip::Visible {
-            tooltip,
-            tooltip_id,
-            ..
-        }) => {
+        Some(ActiveTooltip::Visible { tooltip, .. }) => {
             if is_hovered {
                 Action::None
             } else {
                 if tooltip_is_hoverable {
-                    Action::ScheduleHide(tooltip.clone(), *tooltip_id)
+                    Action::ScheduleHide(tooltip.clone())
                 } else {
                     Action::Hide
                 }
             }
         }
-        Some(ActiveTooltip::WaitingForHide {
-            tooltip,
-            tooltip_id,
-            ..
-        }) => {
+        Some(ActiveTooltip::WaitingForHide { tooltip, .. }) => {
             if is_hovered {
-                Action::CancelHide(tooltip.clone(), *tooltip_id)
+                Action::CancelHide(tooltip.clone())
             } else {
                 Action::None
             }
@@ -3323,8 +3156,8 @@ fn handle_tooltip_check_visible_and_update(
 
     match action {
         Action::None => {}
-        Action::Hide => window.clear_active_tooltip(active_tooltip),
-        Action::ScheduleHide(tooltip, tooltip_id) => {
+        Action::Hide => clear_active_tooltip(active_tooltip, window),
+        Action::ScheduleHide(tooltip) => {
             let delayed_hide_task = window.spawn(cx, {
                 let weak_active_tooltip = Rc::downgrade(active_tooltip);
                 async move |cx| {
@@ -3343,16 +3176,14 @@ fn handle_tooltip_check_visible_and_update(
                 .borrow_mut()
                 .replace(ActiveTooltip::WaitingForHide {
                     tooltip,
-                    tooltip_id,
                     _task: delayed_hide_task,
                 });
         }
-        Action::CancelHide(tooltip, tooltip_id) => {
+        Action::CancelHide(tooltip) => {
             // Cancel waiting to hide tooltip when it becomes hovered.
             active_tooltip.borrow_mut().replace(ActiveTooltip::Visible {
                 tooltip,
                 is_hoverable: true,
-                tooltip_id,
             });
         }
     }
@@ -3436,7 +3267,7 @@ where
         &mut self,
         id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.element.request_layout(id, inspector_id, window, cx)
@@ -3448,7 +3279,7 @@ where
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         state: &mut Self::RequestLayoutState,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> E::PrepaintState {
         self.element
@@ -3462,7 +3293,7 @@ where
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         self.element.paint(
@@ -3748,19 +3579,13 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AppContext as _, Context, InputEvent, MouseMoveEvent, TestAppContext, util::FluentBuilder,
-    };
+    use crate::{AppContext as _, Context, InputEvent, MouseMoveEvent, TestAppContext};
     use std::rc::Weak;
 
     struct TestTooltipView;
 
     impl Render for TestTooltipView {
-        fn render(
-            &mut self,
-            _window: &mut crate::BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().w(px(20.)).h(px(20.)).child("tooltip")
         }
     }
@@ -3796,7 +3621,7 @@ mod tests {
             &mut self,
             _id: Option<&GlobalElementId>,
             _inspector_id: Option<&InspectorElementId>,
-            window: &mut LayoutRequestCx<'_>,
+            window: &mut Window,
             cx: &mut App,
         ) -> (LayoutId, Self::RequestLayoutState) {
             (self.child.request_layout(window, cx), ())
@@ -3808,7 +3633,7 @@ mod tests {
             _inspector_id: Option<&InspectorElementId>,
             _bounds: Bounds<Pixels>,
             _request_layout: &mut Self::RequestLayoutState,
-            window: &mut PrepaintCx<'_>,
+            window: &mut Window,
             cx: &mut App,
         ) -> Self::PrepaintState {
             self.child.prepaint(window, cx);
@@ -3821,7 +3646,7 @@ mod tests {
             _bounds: Bounds<Pixels>,
             _request_layout: &mut Self::RequestLayoutState,
             _prepaint: &mut Self::PrepaintState,
-            window: &mut PaintCx<'_>,
+            window: &mut Window,
             cx: &mut App,
         ) {
             self.child.paint(window, cx);
@@ -3841,27 +3666,21 @@ mod tests {
 
     struct TooltipOwner {
         captured_active_tooltip: CapturedActiveTooltip,
-        hoverable: bool,
     }
 
     impl Render for TooltipOwner {
-        fn render(
-            &mut self,
-            _window: &mut crate::BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
-            let tooltip = div()
-                .id("target")
-                .w(px(50.))
-                .h(px(50.))
-                .when(self.hoverable, |element| {
-                    element.hoverable_tooltip(|_, cx| cx.new(|_| TestTooltipView).into())
-                })
-                .when(!self.hoverable, |element| {
-                    element.tooltip(|_, cx| cx.new(|_| TestTooltipView).into())
-                });
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             TooltipCaptureElement {
-                child: div().size_full().child(tooltip).into_any_element(),
+                child: div()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("target")
+                            .w(px(50.))
+                            .h(px(50.))
+                            .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
+                    )
+                    .into_any_element(),
                 captured_active_tooltip: self.captured_active_tooltip.clone(),
             }
         }
@@ -3910,35 +3729,27 @@ mod tests {
         crate::AnyWindowHandle,
         CapturedActiveTooltip,
     ) {
-        setup_tooltip_owner_test_with(false, point(px(10.), px(10.)))
-    }
-
-    fn setup_tooltip_owner_test_with(
-        hoverable: bool,
-        mouse_position: Point<Pixels>,
-    ) -> (
-        TestAppContext,
-        crate::AnyWindowHandle,
-        CapturedActiveTooltip,
-    ) {
         let mut test_app = TestAppContext::single();
         let captured_active_tooltip: CapturedActiveTooltip = Rc::new(RefCell::new(None));
         let window = test_app.add_window({
             let captured_active_tooltip = captured_active_tooltip.clone();
             move |_, _| TooltipOwner {
                 captured_active_tooltip,
-                hoverable,
             }
         });
         let any_window = window.into();
 
-        test_app.draw_window(any_window).unwrap();
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear();
+            })
+            .unwrap();
 
         test_app
             .update_window(any_window, |_, window, cx| {
                 window.dispatch_event(
                     MouseMoveEvent {
-                        position: mouse_position,
+                        position: point(px(10.), px(10.)),
                         modifiers: Default::default(),
                         pressed_button: None,
                     }
@@ -3948,7 +3759,11 @@ mod tests {
             })
             .unwrap();
 
-        test_app.draw_window(any_window).unwrap();
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear();
+            })
+            .unwrap();
 
         (test_app, any_window, captured_active_tooltip)
     }
@@ -3999,43 +3814,5 @@ mod tests {
         drop(active_tooltip);
 
         assert!(weak_active_tooltip.upgrade().is_none());
-    }
-
-    #[test]
-    fn hoverable_tooltip_uses_previous_bounds_for_liveness() {
-        let (mut test_app, any_window, captured_active_tooltip) =
-            setup_tooltip_owner_test_with(true, point(px(45.), px(45.)));
-
-        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
-        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
-
-        test_app.dispatcher.advance_clock(TOOLTIP_SHOW_DELAY);
-        test_app.run_until_parked();
-        test_app.draw_window(any_window).unwrap();
-
-        assert!(matches!(
-            active_tooltip.borrow().as_ref(),
-            Some(ActiveTooltip::Visible { .. })
-        ));
-
-        test_app
-            .update_window(any_window, |_, window, cx| {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(55.), px(55.)),
-                        modifiers: Default::default(),
-                        pressed_button: None,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            })
-            .unwrap();
-        test_app.draw_window(any_window).unwrap();
-
-        assert!(matches!(
-            active_tooltip.borrow().as_ref(),
-            Some(ActiveTooltip::Visible { .. })
-        ));
     }
 }

@@ -1,5 +1,0 @@
-error[E0599]: no method named `measure_scratch_root` found for mutable reference `&mut PaintCx<'_>` in the current scope
-  --> tests/retained_layout_lifecycle/paint_cannot_solve_scratch_root.rs:59:16
-   |
-59 |         window.measure_scratch_root(
-   |         -------^^^^^^^^^^^^^^^^^^^^ method not found in `&mut PaintCx<'_>`

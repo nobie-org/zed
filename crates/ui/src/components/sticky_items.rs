@@ -212,7 +212,8 @@ where
                     window,
                     cx,
                 );
-                drifting_dec.prepaint_as_root(sticky_origin, decor_available_space, window, cx);
+                drifting_dec.layout_as_root(decor_available_space, window, cx);
+                drifting_dec.prepaint_at(sticky_origin, window, cx);
                 last_decoration_element = Some(drifting_dec);
             }
 
@@ -226,7 +227,8 @@ where
                     window,
                     cx,
                 );
-                rest_dec.prepaint_as_root(bounds.origin, decor_available_space, window, cx);
+                rest_dec.layout_as_root(decor_available_space, window, cx);
+                rest_dec.prepaint_at(bounds.origin, window, cx);
                 rest_decoration_elements.push(rest_dec);
             }
         }
@@ -253,13 +255,15 @@ where
                     item_height * rest_elements.len() + drifting_y_offset,
                 );
 
-            drifting_element.prepaint_as_root(sticky_origin, element_available_space, window, cx);
+            drifting_element.layout_as_root(element_available_space, window, cx);
+            drifting_element.prepaint_at(sticky_origin, window, cx);
         }
 
         for (ix, element) in rest_elements.iter_mut().enumerate() {
             let sticky_origin = base_origin + point(px(0.), item_height * ix);
 
-            element.prepaint_as_root(sticky_origin, element_available_space, window, cx);
+            element.layout_as_root(element_available_space, window, cx);
+            element.prepaint_at(sticky_origin, window, cx);
         }
 
         StickyItemsElement {

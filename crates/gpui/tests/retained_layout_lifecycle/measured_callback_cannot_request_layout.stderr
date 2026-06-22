@@ -1,5 +1,0 @@
-error[E0599]: no method named `request_layout` found for mutable reference `&mut MeasureCx<'_>` in the current scope
-  --> tests/retained_layout_lifecycle/measured_callback_cannot_request_layout.rs:36:24
-   |
-36 |             measure_cx.request_layout(Style::default());
-   |                        ^^^^^^^^^^^^^^ method not found in `&mut MeasureCx<'_>`

@@ -1,5 +1,0 @@
-error[E0599]: no method named `frame_prepaint_plan` found for mutable reference `&mut PrepaintCx<'_>` in the current scope
-  --> tests/retained_layout_lifecycle/prepaint_cannot_schedule_frame_layout_plan.rs:47:16
-   |
-47 |         window.frame_prepaint_plan(|_, _| ());
-   |                ^^^^^^^^^^^^^^^^^^^ method not found in `&mut PrepaintCx<'_>`

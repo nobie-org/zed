@@ -102,11 +102,7 @@ impl ImageLoadingExample {
 }
 
 impl Render for ImageLoadingExample {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_col().size_full().justify_around().child(
             div().flex().flex_row().w_full().justify_around().child(
                 div()
@@ -122,11 +118,9 @@ impl Render for ImageLoadingExample {
                         };
 
                         // Load within the 'loading delay', should not show loading fallback
-                        img(
-                            move |window: &mut gpui::ImageLoadCx<'_, '_>, cx: &mut App| {
-                                window.use_asset::<LoadImageWithParameters>(&image_source, cx)
-                            },
-                        )
+                        img(move |window: &mut Window, cx: &mut App| {
+                            window.use_asset::<LoadImageWithParameters>(&image_source, cx)
+                        })
                         .id("image-1")
                         .border_1()
                         .size_12()
@@ -144,11 +138,9 @@ impl Render for ImageLoadingExample {
                             fail: false,
                         };
 
-                        img(
-                            move |window: &mut gpui::ImageLoadCx<'_, '_>, cx: &mut App| {
-                                window.use_asset::<LoadImageWithParameters>(&image_source, cx)
-                            },
-                        )
+                        img(move |window: &mut Window, cx: &mut App| {
+                            window.use_asset::<LoadImageWithParameters>(&image_source, cx)
+                        })
                         .id("image-2")
                         .with_fallback(|| Self::fallback_element().into_any_element())
                         .with_loading(|| Self::loading_element().into_any_element())
@@ -167,11 +159,9 @@ impl Render for ImageLoadingExample {
                         };
 
                         // Fail to load after a long delay
-                        img(
-                            move |window: &mut gpui::ImageLoadCx<'_, '_>, cx: &mut App| {
-                                window.use_asset::<LoadImageWithParameters>(&image_source, cx)
-                            },
-                        )
+                        img(move |window: &mut Window, cx: &mut App| {
+                            window.use_asset::<LoadImageWithParameters>(&image_source, cx)
+                        })
                         .id("image-3")
                         .with_fallback(|| Self::fallback_element().into_any_element())
                         .with_loading(|| Self::loading_element().into_any_element())

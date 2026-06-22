@@ -39,11 +39,7 @@ const ARROW_CIRCLE_SVG: &str = concat!(
 struct AnimationExample {}
 
 impl Render for AnimationExample {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()

@@ -886,8 +886,6 @@ pub struct PaintSurface {
 #[allow(missing_docs)]
 pub enum PaintSurfaceSource {
     #[cfg(target_os = "macos")]
-    Surface(core_video::pixel_buffer::CVPixelBuffer),
-    #[cfg(target_os = "macos")]
     MetalTexture(metal::Texture),
     WgpuTexture(wgpu::TextureView),
 }

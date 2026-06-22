@@ -15,22 +15,14 @@ struct BottomListDemo {
 
 impl BottomListDemo {
     fn new() -> Self {
-        let list_state = ListState::new(ITEM_COUNT, ListAlignment::Bottom, px(500.));
-        list_state.set_size_hints(
-            0..ITEM_COUNT,
-            (0..ITEM_COUNT).map(|index| size(px(100.), px(30. + (index % 5) as f32 * 10.))),
-        );
-
-        Self { list_state }
+        Self {
+            list_state: ListState::new(ITEM_COUNT, ListAlignment::Bottom, px(500.)).measure_all(),
+        }
     }
 }
 
 impl Render for BottomListDemo {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let max_offset = self.list_state.max_offset_for_scrollbar().y;
         let current_offset = -self.list_state.scroll_px_offset_for_scrollbar().y;
 

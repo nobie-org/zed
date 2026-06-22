@@ -27,11 +27,7 @@ fn button(text: &str, on_click: impl Fn(&mut Window, &mut App) + 'static) -> imp
 }
 
 impl Render for SubWindow {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let window_bounds =
             WindowBounds::Windowed(Bounds::centered(None, size(px(250.0), px(200.0)), cx));
 
@@ -95,11 +91,7 @@ impl Render for SubWindow {
 struct WindowDemo {}
 
 impl Render for WindowDemo {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let window_bounds =
             WindowBounds::Windowed(Bounds::centered(None, size(px(300.0), px(300.0)), cx));
 

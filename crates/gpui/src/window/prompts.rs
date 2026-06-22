@@ -100,7 +100,7 @@ pub struct FallbackPromptRenderer {
 }
 
 impl Render for FallbackPromptRenderer {
-    fn render(&mut self, _: &mut crate::BuildCx<'_>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = div()
             .cursor_default()
             .track_focus(&self.focus)

@@ -42,14 +42,15 @@ pub use visual_test_context::*;
 use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, ClipboardItem, CursorStyle, DispatchPhase,
-    DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding,
-    KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels,
-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
-    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
-    Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem, ThermalState, Window,
-    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
+    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
+    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
+    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
+    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
+    SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem,
+    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -68,21 +69,6 @@ mod visual_test_context;
 
 /// The duration for which futures returned from [Context::on_app_quit] can run before the application fully quits.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// Private app-runtime capability for initiating a window frame.
-///
-/// Window drawing executes retained layout. The app runtime and its test
-/// harnesses own that lifecycle; broad GPUI framework code must not be able to
-/// draw merely because it has `&mut Window`.
-pub(crate) struct WindowFrameAuthority {
-    _private: (),
-}
-
-impl WindowFrameAuthority {
-    fn new() -> Self {
-        Self { _private: () }
-    }
-}
 
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
@@ -1148,8 +1134,7 @@ impl App {
                     // this didn't cause any issues on non windows platforms as it seems we always won the race to on_request_frame
                     // on windows we quite frequently lose the race and return a window that has never rendered, which leads to a crash
                     // where DispatchTree::root_node_id asserts on empty nodes
-                    let mut frame_authority = WindowFrameAuthority::new();
-                    let clear = window.draw_for_app(&mut frame_authority, cx);
+                    let clear = window.draw(cx);
                     clear.clear();
 
                     cx.window_handles.insert(id, window.handle);
@@ -1503,11 +1488,8 @@ impl App {
                         })
                         .collect::<Vec<_>>()
                     {
-                        self.update_window(window, |_, window, cx| {
-                            let mut frame_authority = WindowFrameAuthority::new();
-                            window.draw_for_app(&mut frame_authority, cx).clear()
-                        })
-                        .unwrap();
+                        self.update_window(window, |_, window, cx| window.draw(cx).clear())
+                            .unwrap();
                     }
                 }
 
@@ -2482,24 +2464,9 @@ impl App {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub fn register_inspector_element<T: 'static, R: crate::IntoElement>(
         &mut self,
-        f: impl 'static + Fn(crate::InspectorElementId, &T, &mut crate::BuildCx<'_>, &mut App) -> R,
+        f: impl 'static + Fn(crate::InspectorElementId, &T, &mut Window, &mut App) -> R,
     ) {
         self.inspector_element_registry.register(f);
-    }
-
-    /// Registers a window-scoped synchronizer for an inspector state.
-    #[cfg(any(feature = "inspector", debug_assertions))]
-    pub fn register_inspector_state_sync<T: 'static>(
-        &mut self,
-        f: impl 'static
-        + Fn(
-            crate::InspectorElementId,
-            &T,
-            &mut crate::Window,
-            &mut crate::Context<crate::Inspector>,
-        ),
-    ) {
-        self.inspector_element_registry.register_state_sync(f);
     }
 
     /// Initializes gpui's default colors for the application.
@@ -2723,115 +2690,16 @@ pub struct AnyDrag {
 /// tooltip behavior on a custom element. Otherwise, use [Div::tooltip](crate::Interactivity::tooltip).
 #[derive(Clone)]
 pub struct AnyTooltip {
-    view: AnyView,
-    mouse_position: Point<Pixels>,
-    check_visible_and_update: Rc<TooltipVisibilityFn>,
-}
+    /// The view used to display the tooltip
+    pub view: AnyView,
 
-type TooltipVisibilityFn =
-    dyn for<'a> Fn(TooltipVisibilityFacts, &mut TooltipVisibilityCx<'a>, &mut App) -> bool;
+    /// The absolute position of the mouse when the tooltip was deployed.
+    pub mouse_position: Point<Pixels>,
 
-/// Immutable facts available while updating tooltip liveness.
-///
-/// Tooltip liveness is decided before the current tooltip root is solved. The
-/// only tooltip-geometry fact it may use is whether the mouse was inside the
-/// previous frame's tooltip bounds for the same tooltip handle. Current-frame
-/// tooltip size is produced later by the visible-root drain.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct TooltipVisibilityFacts {
-    tooltip_hovered: bool,
-}
-
-impl TooltipVisibilityFacts {
-    pub(crate) fn new(tooltip_hovered: bool) -> Self {
-        Self { tooltip_hovered }
-    }
-
-    /// Whether the mouse is inside the previous frame's tooltip bounds.
-    pub fn tooltip_hovered(&self) -> bool {
-        self.tooltip_hovered
-    }
-}
-
-impl AnyTooltip {
-    /// Creates a tooltip with a visibility callback that cannot reach raw window layout authority.
-    pub fn new(
-        view: AnyView,
-        mouse_position: Point<Pixels>,
-        check_visible_and_update: impl for<'a> Fn(
-            TooltipVisibilityFacts,
-            &mut TooltipVisibilityCx<'a>,
-            &mut App,
-        ) -> bool
-        + 'static,
-    ) -> Self {
-        Self {
-            view,
-            mouse_position,
-            check_visible_and_update: Rc::new(check_visible_and_update),
-        }
-    }
-
-    pub(crate) fn view(&self) -> &AnyView {
-        &self.view
-    }
-
-    pub(crate) fn mouse_position(&self) -> Point<Pixels> {
-        self.mouse_position
-    }
-
-    pub(crate) fn check_visible_and_update(
-        &self,
-        facts: TooltipVisibilityFacts,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        let mut tooltip_cx = TooltipVisibilityCx::new(window);
-        (self.check_visible_and_update)(facts, &mut tooltip_cx, cx)
-    }
-}
-
-/// Narrow context for tooltip visibility maintenance.
-///
-/// Tooltip callbacks can observe mouse position and refresh the window, but
-/// they cannot name or call layout/root-solve APIs through raw [`Window`].
-pub struct TooltipVisibilityCx<'a> {
-    window: &'a mut Window,
-}
-
-impl<'a> TooltipVisibilityCx<'a> {
-    pub(crate) fn new(window: &'a mut Window) -> Self {
-        Self { window }
-    }
-
-    pub(crate) fn is_hovered_by(&self, check: &dyn Fn(&Window) -> bool) -> bool {
-        check(self.window)
-    }
-
-    pub(crate) fn clear_active_tooltip(
-        &mut self,
-        active_tooltip: &Rc<RefCell<Option<crate::elements::ActiveTooltip>>>,
-    ) {
-        crate::elements::clear_active_tooltip(active_tooltip, self.window);
-    }
-
-    pub(crate) fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
-    where
-        R: 'static,
-        AsyncFn: AsyncFnOnce(&mut AsyncWindowContext) -> R + 'static,
-    {
-        self.window.spawn(cx, f)
-    }
-
-    /// Returns the current mouse position in window coordinates.
-    pub fn mouse_position(&self) -> Point<Pixels> {
-        self.window.mouse_position()
-    }
-
-    /// Requests that the window draw again.
-    pub fn refresh(&mut self) {
-        self.window.refresh();
-    }
+    /// Given the bounds of the tooltip, checks whether the tooltip should still be visible and
+    /// updates its state accordingly. This is needed atop the hovered element's mouse move handler
+    /// to handle the case where the element is not painted (e.g. via use of `visible_on_hover`).
+    pub check_visible_and_update: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) -> bool>,
 }
 
 /// A keystroke event, and potentially the associated action

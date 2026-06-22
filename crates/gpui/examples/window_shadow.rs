@@ -17,11 +17,7 @@ struct WindowShadow {}
 // 3. We need to implement the techniques in here in Zed
 
 impl Render for WindowShadow {
-    fn render(
-        &mut self,
-        window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let decorations = window.window_decorations();
         let rounding = px(10.0);
         let shadow_size = px(10.0);

@@ -1,10 +1,9 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, Font, GlobalElementId,
+    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    LayoutRequestCx, MeasureCx, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintCx, Pixels,
-    Point, PrepaintCx, SharedString, Size, TextOverflow, TextRun, TextStyle, TooltipId,
-    TruncateFrom, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
-    register_tooltip_mouse_handlers, set_tooltip_on_window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
+    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
+    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -35,7 +34,7 @@ impl Element for &'static str {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
@@ -49,7 +48,7 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
+        _window: &mut Window,
         _cx: &mut App,
     ) {
         text_layout.prepaint(bounds, self)
@@ -62,7 +61,7 @@ impl Element for &'static str {
         _bounds: Bounds<Pixels>,
         text_layout: &mut TextLayout,
         _: &mut (),
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         text_layout.paint(self, window, cx)
@@ -109,7 +108,7 @@ impl Element for SharedString {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
@@ -123,7 +122,7 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
+        _window: &mut Window,
         _cx: &mut App,
     ) {
         text_layout.prepaint(bounds, self.as_ref())
@@ -136,7 +135,7 @@ impl Element for SharedString {
         _bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         text_layout.paint(self.as_ref(), window, cx)
@@ -323,7 +322,7 @@ impl Element for StyledText {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let font_family_overrides = self.delayed_font_family_overrides.take();
@@ -349,7 +348,7 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
+        _window: &mut Window,
         _cx: &mut App,
     ) {
         self.layout.prepaint(bounds, &self.text)
@@ -362,7 +361,7 @@ impl Element for StyledText {
         _bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         self.layout.paint(&self.text, window, cx)
@@ -377,209 +376,26 @@ impl IntoElement for StyledText {
     }
 }
 
-/// The frame-local layout state for a text element.
-///
-/// Paint, prepaint, and hit testing need shaped lines in this handle. Retained
-/// layout hydrates `TextLayout` only from a current compute callback or an
-/// exact query-keyed artifact selected by passive Taffy cache observation.
+/// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
-#[derive(Clone)]
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
+    wrap_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
 
-/// Layout-visible identity for text measurement.
-///
-/// The key contains every input that can affect shaped text size or glyph runs,
-/// including scale factor and the text system shaping epoch. If the key changes,
-/// retained layout cannot preserve text measurement state.
-///
-/// This key is not a complete text artifact key by itself: shaped text also
-/// depends on Taffy's measurement query, such as known dimensions and available
-/// space. Retained layout records that query when Taffy calls the callback or
-/// passively reports a cache hit/store, but it never treats `TextMeasureKey`
-/// alone as proof that a shaped artifact can be replayed.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct TextMeasureKey {
-    text: SharedString,
-    runs: Vec<TextRun>,
-    font: Font,
-    font_size: Pixels,
-    line_height: Pixels,
-    white_space: WhiteSpace,
-    text_overflow: Option<TextOverflow>,
-    line_clamp: Option<usize>,
-    scale_factor_bits: u32,
-    shaping_epoch: u64,
-}
-
-impl TextMeasureKey {
-    /// Capture the text measurement inputs for the current style environment.
-    pub(crate) fn new(
-        text: SharedString,
-        runs: Vec<TextRun>,
-        text_style: &TextStyle,
-        font_size: Pixels,
-        line_height: Pixels,
-        scale_factor: f32,
-        shaping_epoch: u64,
-    ) -> Self {
-        Self {
-            text,
-            runs,
-            font: text_style.font(),
-            font_size,
-            line_height,
-            white_space: text_style.white_space,
-            text_overflow: text_style.text_overflow.clone(),
-            line_clamp: text_style.line_clamp,
-            scale_factor_bits: scale_factor.to_bits(),
-            shaping_epoch,
-        }
-    }
-
-    /// Produce a shaped text artifact for one Taffy measurement query.
-    ///
-    /// This returns data only. Hydrating `TextLayout` is a separate step owned
-    /// by the layout engine's same-compute measurement callback.
-    pub(crate) fn measure(
-        &self,
-        known_dimensions: Size<Option<Pixels>>,
-        available_space: Size<crate::AvailableSpace>,
-        measure_cx: &mut MeasureCx<'_>,
-    ) -> TextLayoutArtifact {
-        let wrap_width = if self.white_space == WhiteSpace::Normal {
-            known_dimensions.width.or(match available_space.width {
-                crate::AvailableSpace::Definite(width) => Some(width),
-                _ => None,
-            })
-        } else {
-            None
-        };
-
-        let (truncate_width, truncation_affix, truncate_from) =
-            if let Some(text_overflow) = self.text_overflow.clone() {
-                let width = known_dimensions.width.or(match available_space.width {
-                    crate::AvailableSpace::Definite(width) => match self.line_clamp {
-                        Some(max_lines) => Some(width * max_lines),
-                        None => Some(width),
-                    },
-                    _ => None,
-                });
-
-                match text_overflow {
-                    TextOverflow::Truncate(affix) => (width, affix, TruncateFrom::End),
-                    TextOverflow::TruncateStart(affix) => (width, affix, TruncateFrom::Start),
-                }
-            } else {
-                (None, "".into(), TruncateFrom::End)
-            };
-
-        let mut line_wrapper = measure_cx
-            .app_text_system()
-            .line_wrapper(self.font.clone(), self.font_size);
-        let (text, runs) = if let Some(truncate_width) = truncate_width {
-            line_wrapper.truncate_line(
-                self.text.clone(),
-                truncate_width,
-                &truncation_affix,
-                &self.runs,
-                truncate_from,
-            )
-        } else {
-            (self.text.clone(), Cow::Borrowed(&*self.runs))
-        };
-        let len = text.len();
-
-        let Some(lines) = measure_cx
-            .text_system()
-            .shape_text(text, self.font_size, &runs, wrap_width, self.line_clamp)
-            .log_err()
-        else {
-            return TextLayoutArtifact {
-                key: self.clone(),
-                inner: TextLayoutInner {
-                    lines: Default::default(),
-                    len: 0,
-                    line_height: self.line_height,
-                    size: Some(Size::default()),
-                    bounds: None,
-                },
-            };
-        };
-
-        let mut size: Size<Pixels> = Size::default();
-        for line in &lines {
-            let line_size = line.size(self.line_height);
-            size.height += line_size.height;
-            size.width = size.width.max(line_size.width).ceil();
-        }
-
-        TextLayoutArtifact {
-            key: self.clone(),
-            inner: TextLayoutInner {
-                lines,
-                len,
-                line_height: self.line_height,
-                size: Some(size),
-                bounds: None,
-            },
-        }
-    }
-}
-
-/// Shaped text data valid for one `TextMeasureKey` and measurement query.
-///
-/// The artifact is deliberately not retained by `TextMeasureKey` alone because
-/// wrapping and truncation also depend on Taffy's measurement query.
-#[derive(Clone)]
-pub(crate) struct TextLayoutArtifact {
-    key: TextMeasureKey,
-    inner: TextLayoutInner,
-}
-
-impl TextLayoutArtifact {
-    /// Return the validity key for this artifact.
-    pub(crate) fn key(&self) -> &TextMeasureKey {
-        &self.key
-    }
-
-    /// Return the measured size reported to Taffy.
-    pub(crate) fn size(&self) -> Size<Pixels> {
-        self.inner
-            .size
-            .expect("text layout artifact should always carry a measured size")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests(key: TextMeasureKey, size: Size<Pixels>) -> Self {
-        Self {
-            key,
-            inner: TextLayoutInner {
-                lines: Default::default(),
-                len: 0,
-                line_height: Pixels::ZERO,
-                size: Some(size),
-                bounds: None,
-            },
-        }
-    }
-}
-
 impl TextLayout {
-    /// Request measured layout for this text and register artifact hydration.
     fn layout(
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
-        window: &mut LayoutRequestCx<'_>,
-        _cx: &mut App,
+        window: &mut Window,
+        _: &mut App,
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -594,34 +410,105 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        let measure_key = TextMeasureKey::new(
-            text,
-            runs,
-            &text_style,
-            font_size,
-            line_height,
-            window.scale_factor(),
-            window.text_system().shaping_epoch(),
-        );
-        let measure_key_for_measure = measure_key.clone();
-        let layout = self.clone();
+        window.request_measured_layout(Default::default(), {
+            let element_state = self.clone();
 
-        window.request_text_measured_layout(
-            Default::default(),
-            measure_key,
-            move |artifact| layout.hydrate(artifact),
-            move |known_dimensions, available_space, measure_cx| {
-                measure_key_for_measure.measure(known_dimensions, available_space, measure_cx)
-            },
-        )
-    }
+            move |known_dimensions, available_space, window, cx| {
+                let wrap_width = if text_style.white_space == WhiteSpace::Normal {
+                    known_dimensions.width.or(match available_space.width {
+                        crate::AvailableSpace::Definite(x) => Some(x),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
 
-    /// Install a newly measured artifact into this frame's layout state.
-    fn hydrate(&self, artifact: &TextLayoutArtifact) {
-        let mut state = self.0.borrow_mut();
-        let mut inner = artifact.inner.clone();
-        inner.bounds = None;
-        state.replace(inner);
+                let (truncate_width, truncation_affix, truncate_from) =
+                    if let Some(text_overflow) = text_style.text_overflow.clone() {
+                        let width = known_dimensions.width.or(match available_space.width {
+                            crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
+                                Some(max_lines) => Some(x * max_lines),
+                                None => Some(x),
+                            },
+                            _ => None,
+                        });
+
+                        match text_overflow {
+                            TextOverflow::Truncate(s) => (width, s, TruncateFrom::End),
+                            TextOverflow::TruncateStart(s) => (width, s, TruncateFrom::Start),
+                        }
+                    } else {
+                        (None, "".into(), TruncateFrom::End)
+                    };
+
+                // Only use cached layout if:
+                // 1. We have a cached size
+                // 2. wrap_width matches (or both are None)
+                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
+                //    because the previous layout may have been computed without truncation)
+                if let Some(text_layout) = element_state.0.borrow().as_ref()
+                    && let Some(size) = text_layout.size
+                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && truncate_width.is_none()
+                {
+                    return size;
+                }
+
+                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
+                let (text, runs) = if let Some(truncate_width) = truncate_width {
+                    line_wrapper.truncate_line(
+                        text.clone(),
+                        truncate_width,
+                        &truncation_affix,
+                        &runs,
+                        truncate_from,
+                    )
+                } else {
+                    (text.clone(), Cow::Borrowed(&*runs))
+                };
+                let len = text.len();
+
+                let Some(lines) = window
+                    .text_system()
+                    .shape_text(
+                        text,
+                        font_size,
+                        &runs,
+                        wrap_width,            // Wrap if we know the width.
+                        text_style.line_clamp, // Limit the number of lines if line_clamp is set.
+                    )
+                    .log_err()
+                else {
+                    element_state.0.borrow_mut().replace(TextLayoutInner {
+                        lines: Default::default(),
+                        len: 0,
+                        line_height,
+                        wrap_width,
+                        size: Some(Size::default()),
+                        bounds: None,
+                    });
+                    return Size::default();
+                };
+
+                let mut size: Size<Pixels> = Size::default();
+                for line in &lines {
+                    let line_size = line.size(line_height);
+                    size.height += line_size.height;
+                    size.width = size.width.max(line_size.width).ceil();
+                }
+
+                element_state.0.borrow_mut().replace(TextLayoutInner {
+                    lines,
+                    len,
+                    line_height,
+                    wrap_width,
+                    size: Some(size),
+                    bounds: None,
+                });
+
+                size
+            }
+        })
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
@@ -633,7 +520,7 @@ impl TextLayout {
         element_state.bounds = Some(bounds);
     }
 
-    fn paint(&self, text: &str, window: &mut PaintCx<'_>, cx: &mut App) {
+    fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -911,7 +798,7 @@ impl Element for InteractiveText {
         &mut self,
         _id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.text.request_layout(None, inspector_id, window, cx)
@@ -923,7 +810,7 @@ impl Element for InteractiveText {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         state: &mut Self::RequestLayoutState,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Hitbox {
         window.with_optional_element_state::<InteractiveTextState, _>(
@@ -957,7 +844,7 @@ impl Element for InteractiveText {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         hitbox: &mut Hitbox,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         let current_view = window.current_view();

@@ -1,5 +1,0 @@
-error[E0599]: no method named `measure_scratch_root` found for mutable reference `&mut PrepaintCx<'_>` in the current scope
-  --> tests/retained_layout_lifecycle/scratch_measurement_is_not_paintable.rs:47:28
-   |
-47 |         let _size = window.measure_scratch_root(
-   |                     -------^^^^^^^^^^^^^^^^^^^^ method not found in `&mut PrepaintCx<'_>`

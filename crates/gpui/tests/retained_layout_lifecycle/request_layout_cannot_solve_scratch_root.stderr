@@ -1,5 +1,0 @@
-error[E0599]: no method named `measure_scratch_root` found for mutable reference `&mut LayoutRequestCx<'_>` in the current scope
-  --> tests/retained_layout_lifecycle/request_layout_cannot_solve_scratch_root.rs:35:28
-   |
-35 |         let _size = window.measure_scratch_root(
-   |                     -------^^^^^^^^^^^^^^^^^^^^ method not found in `&mut LayoutRequestCx<'_>`

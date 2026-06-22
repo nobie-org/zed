@@ -46,11 +46,7 @@ impl Example {
 }
 
 impl Render for Example {
-    fn render(
-        &mut self,
-        window: &mut gpui::BuildCx<'_>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         fn tab_stop_style<T: Styled>(this: T) -> T {
             this.border_3().border_color(gpui::blue())
         }
@@ -101,7 +97,7 @@ impl Render for Example {
                             .border_1()
                             .border_color(gpui::black())
                             .when(
-                                item_handle.tab_stop && window.is_focused(&item_handle),
+                                item_handle.tab_stop && item_handle.is_focused(window),
                                 tab_stop_style,
                             )
                             .map(|this| match item_handle.tab_stop {

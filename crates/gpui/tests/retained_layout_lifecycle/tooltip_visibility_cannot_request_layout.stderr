@@ -1,5 +1,0 @@
-error[E0599]: no method named `request_layout` found for mutable reference `&mut TooltipVisibilityCx<'_>` in the current scope
- --> tests/retained_layout_lifecycle/tooltip_visibility_cannot_request_layout.rs:5:16
-  |
-5 |         window.request_layout(Style::default(), [], cx);
-  |                ^^^^^^^^^^^^^^ method not found in `&mut TooltipVisibilityCx<'_>`

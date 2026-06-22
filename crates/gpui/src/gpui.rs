@@ -79,13 +79,13 @@ pub mod render_group_diagnostics {
         RenderGroupSupportCounters, SemanticRenderGroupSpec,
     };
 }
-mod layout;
 mod shared_uri;
 mod style;
 mod styled;
 mod subscription;
 mod svg_renderer;
 mod tab_stop;
+mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
@@ -125,7 +125,6 @@ pub use color::*;
 pub use ctor::ctor;
 pub use element::*;
 pub use elements::*;
-pub(crate) use elements::{TextLayoutArtifact, TextMeasureKey};
 pub use executor::*;
 pub use geometry::*;
 pub use global::*;
@@ -140,10 +139,6 @@ pub use inspector::*;
 pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
-use layout::LayoutEngine;
-#[cfg(any(test, feature = "test-support"))]
-pub use layout::RetainedSubtreeWorkSample;
-pub use layout::{AvailableSpace, LayoutId, LayoutWorkSample};
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;
@@ -171,6 +166,8 @@ pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
+use taffy::TaffyLayoutEngine;
+pub use taffy::{AvailableSpace, LayoutId, LayoutWorkSample};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;

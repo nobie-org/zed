@@ -49,11 +49,7 @@ mod example {
     }
 
     impl Render for LayerShellExample {
-        fn render(
-            &mut self,
-            _window: &mut gpui::BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

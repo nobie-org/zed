@@ -15,11 +15,7 @@ impl GifViewer {
 }
 
 impl Render for GifViewer {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(
             img(self.gif_path.clone())
                 .size_full()

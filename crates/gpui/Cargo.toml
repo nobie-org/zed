@@ -101,7 +101,7 @@ async-channel.workspace = true
 stacksafe.workspace = true
 strum.workspace = true
 sum_tree.workspace = true
-taffy = { git = "https://github.com/nobie-org/taffy.git", rev = "869f6ac6620404fefebc02bf53282e8353c31d7c" }
+taffy = "=0.11.0"
 thiserror.workspace = true
 gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
@@ -162,13 +162,8 @@ gpui_util = { workspace = true }
 lyon = { version = "1.0", features = ["extra"] }
 proptest = { workspace = true }
 rand.workspace = true
-reqwest_client.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
-trybuild.workspace = true
 unicode-segmentation = { workspace = true }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-hegel.workspace = true
 
 [build-dependencies]
 embed-resource = { version = "3.0", optional = true }

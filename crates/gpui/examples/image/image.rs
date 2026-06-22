@@ -56,7 +56,7 @@ impl ImageContainer {
 }
 
 impl RenderOnce for ImageContainer {
-    fn render(self, _window: &mut gpui::BuildCx<'_>, _: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, _: &mut App) -> impl IntoElement {
         div().child(
             div()
                 .flex_row()
@@ -75,11 +75,7 @@ struct ImageShowcase {
 }
 
 impl Render for ImageShowcase {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("main")
             .bg(gpui::white())

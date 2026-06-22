@@ -37,11 +37,7 @@ impl ImageGallery {
 }
 
 impl Render for ImageGallery {
-    fn render(
-        &mut self,
-        _window: &mut gpui::BuildCx<'_>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let image_url: SharedString =
             format!("https://picsum.photos/400/200?t={}", self.image_key).into();
 
@@ -148,11 +144,7 @@ struct SimpleLruCacheProvider {
 }
 
 impl ImageCacheProvider for SimpleLruCacheProvider {
-    fn provide(
-        &mut self,
-        window: &mut gpui::LayoutRequestCx<'_>,
-        cx: &mut App,
-    ) -> gpui::AnyImageCache {
+    fn provide(&mut self, window: &mut Window, cx: &mut App) -> gpui::AnyImageCache {
         window
             .with_global_id(self.id.clone(), |global_id, window| {
                 window.with_element_state::<Entity<SimpleLruCache>, _>(
@@ -201,7 +193,7 @@ impl ImageCache for SimpleLruCache {
     fn load(
         &mut self,
         resource: &gpui::Resource,
-        window: &mut gpui::ImageLoadCx<'_, '_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<gpui::RenderImage>, gpui::ImageCacheError>> {
         assert_eq!(self.usages.len(), self.cache.len());
@@ -230,7 +222,7 @@ impl ImageCache for SimpleLruCache {
                 .remove(&oldest)
                 .expect("cache and usages must be in sync");
             if let Some(Ok(image)) = image.get() {
-                cx.drop_image(image, None);
+                cx.drop_image(image, Some(window));
             }
         }
         self.cache

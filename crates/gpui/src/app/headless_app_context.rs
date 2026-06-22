@@ -161,16 +161,6 @@ impl HeadlessAppContext {
         app.update_window(window, f)
     }
 
-    /// Force a redraw of one headless test window through the app-owned frame lifecycle.
-    pub fn draw_window(&mut self, window: AnyWindowHandle) -> Result<()> {
-        let mut app = self.app.borrow_mut();
-        app.update_window(window, |_, window, cx| {
-            let mut frame_authority = super::WindowFrameAuthority::new();
-            window.draw_for_app(&mut frame_authority, cx).clear();
-        })
-        .map(|_| ())
-    }
-
     /// Captures a screenshot from a window.
     ///
     /// Requires that the context was created with a renderer factory that
@@ -178,7 +168,7 @@ impl HeadlessAppContext {
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         let mut app = self.app.borrow_mut();
         app.update_window(window, |_, window, cx| {
-            let capture = window.draw_app_frame_present_and_capture(cx)?;
+            let capture = window.draw_present_and_capture_immediately(cx)?;
             RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
                 .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
         })?

@@ -53,7 +53,7 @@ mod conditional {
 
     /// Function set on `App` to render the inspector UI.
     pub type InspectorRenderer =
-        Box<dyn Fn(&mut Inspector, &mut crate::BuildCx<'_>, &mut Context<Inspector>) -> AnyElement>;
+        Box<dyn Fn(&mut Inspector, &mut Window, &mut Context<Inspector>) -> AnyElement>;
 
     /// Manages inspector state - which element is currently selected and whether the inspector is
     /// in picking mode.
@@ -142,36 +142,6 @@ mod conditional {
             result
         }
 
-        pub(crate) fn sync_active_element_state<T: 'static>(
-            &self,
-            window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            let Some(active_element) = self.active_element.as_ref() else {
-                return;
-            };
-
-            let type_id = TypeId::of::<T>();
-            let Some(state) = active_element
-                .states
-                .get(&type_id)
-                .map(|state| state.as_ref())
-            else {
-                return;
-            };
-
-            if let Some(sync) = cx
-                .inspector_element_registry
-                .state_sync_by_type_id
-                .remove(&type_id)
-            {
-                sync(active_element.id.clone(), state, window, cx);
-                cx.inspector_element_registry
-                    .state_sync_by_type_id
-                    .insert(type_id, sync);
-            }
-        }
-
         /// Starts element picking mode, allowing the user to select elements by clicking.
         pub fn start_picking(&mut self) {
             self.pick_depth = Some(0.0);
@@ -185,7 +155,7 @@ mod conditional {
         /// Renders elements for all registered inspector states of the active inspector element.
         pub fn render_inspector_states(
             &self,
-            window: &mut crate::BuildCx<'_>,
+            window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Vec<AnyElement> {
             let mut elements = Vec::new();
@@ -215,11 +185,7 @@ mod conditional {
     }
 
     impl Render for Inspector {
-        fn render(
-            &mut self,
-            window: &mut crate::BuildCx<'_>,
-            cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             if let Some(inspector_renderer) = cx.inspector_renderer.take() {
                 let result = inspector_renderer(self, window, cx);
                 cx.inspector_renderer = Some(inspector_renderer);
@@ -234,44 +200,20 @@ mod conditional {
     pub(crate) struct InspectorElementRegistry {
         renderers_by_type_id: FxHashMap<
             TypeId,
-            Box<
-                dyn Fn(
-                    InspectorElementId,
-                    &dyn Any,
-                    &mut crate::BuildCx<'_>,
-                    &mut App,
-                ) -> AnyElement,
-            >,
-        >,
-        state_sync_by_type_id: FxHashMap<
-            TypeId,
-            Box<dyn Fn(InspectorElementId, &dyn Any, &mut Window, &mut Context<Inspector>)>,
+            Box<dyn Fn(InspectorElementId, &dyn Any, &mut Window, &mut App) -> AnyElement>,
         >,
     }
 
     impl InspectorElementRegistry {
         pub fn register<T: 'static, R: IntoElement>(
             &mut self,
-            f: impl 'static + Fn(InspectorElementId, &T, &mut crate::BuildCx<'_>, &mut App) -> R,
+            f: impl 'static + Fn(InspectorElementId, &T, &mut Window, &mut App) -> R,
         ) {
             self.renderers_by_type_id.insert(
                 TypeId::of::<T>(),
                 Box::new(move |id, value, window, cx| {
                     let value = value.downcast_ref().unwrap();
                     f(id, value, window, cx).into_any_element()
-                }),
-            );
-        }
-
-        pub fn register_state_sync<T: 'static>(
-            &mut self,
-            f: impl 'static + Fn(InspectorElementId, &T, &mut Window, &mut Context<Inspector>),
-        ) {
-            self.state_sync_by_type_id.insert(
-                TypeId::of::<T>(),
-                Box::new(move |id, value, window, cx| {
-                    let value = value.downcast_ref().unwrap();
-                    f(id, value, window, cx);
                 }),
             );
         }

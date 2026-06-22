@@ -1,5 +1,0 @@
-error[E0599]: no method named `transact` found for mutable reference `&mut PrepaintCx<'_>` in the current scope
-  --> tests/retained_layout_lifecycle/prepaint_cannot_transact.rs:47:16
-   |
-47 |         window.transact(cx, |_window, _cx| Ok::<_, anyhow::Error>(()));
-   |                ^^^^^^^^ method not found in `&mut PrepaintCx<'_>`

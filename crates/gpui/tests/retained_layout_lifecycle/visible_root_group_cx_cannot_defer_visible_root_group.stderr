@@ -1,5 +1,0 @@
-error[E0599]: no method named `defer_visible_root_group` found for mutable reference `&mut VisibleRootGroupCx<'_>` in the current scope
- --> tests/retained_layout_lifecycle/visible_root_group_cx_cannot_defer_visible_root_group.rs:4:14
-  |
-4 |     group_cx.defer_visible_root_group(Vec::new(), |_, _, _| todo!(), cx);
-  |              ^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&mut VisibleRootGroupCx<'_>`

@@ -1,5 +1,4 @@
 **/*.db
-/crates/gpui/.hegel/
 **/*.proptest-regressions
 **/cargo-target
 **/target

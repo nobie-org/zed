@@ -1,13 +1,13 @@
-use crate::Empty;
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, BuildCx, ContentMask, Context, Element,
-    ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    LayoutRequestCx, PaintCx, PaintIndex, Pixels, PrepaintCx, PrepaintStateIndex, Render, Style,
-    StyleRefinement, TextStyle, WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
+    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
+    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
 };
+use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
+use std::mem;
 use std::rc::Rc;
 use std::{any::TypeId, fmt, ops::Range};
 
@@ -29,7 +29,7 @@ struct ViewCacheKey {
 #[derive(Clone, Debug)]
 pub struct AnyView {
     entity: AnyEntity,
-    render: fn(&AnyView, &mut BuildCx<'_>, &mut App) -> AnyElement,
+    render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
     cached_style: Option<Rc<StyleRefinement>>,
 }
 
@@ -106,30 +106,26 @@ impl Element for AnyView {
 
     fn request_layout(
         &mut self,
-        global_id: Option<&GlobalElementId>,
+        _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         window.with_rendered_view(self.entity_id(), |window| {
             // Disable caching when inspecting so that mouse_hit_test has all hitboxes.
             let caching_disabled = window.is_inspector_picking(cx);
-            let mut element = window.build(|window| (self.render)(self, window, cx));
-            let child_layout_id = element.request_layout(window, cx);
-            if let Some(style) = self.cached_style.as_ref()
-                && !caching_disabled
-            {
-                let mut root_style = Style::default();
-                root_style.refine(style);
-                let layout_id = window.request_layout_with_global_id(
-                    global_id,
-                    root_style,
-                    Some(child_layout_id),
-                    cx,
-                );
-                (layout_id, Some(element))
-            } else {
-                (child_layout_id, Some(element))
+            match self.cached_style.as_ref() {
+                Some(style) if !caching_disabled => {
+                    let mut root_style = Style::default();
+                    root_style.refine(style);
+                    let layout_id = window.request_layout(root_style, None, cx);
+                    (layout_id, None)
+                }
+                _ => {
+                    let mut element = (self.render)(self, window, cx);
+                    let layout_id = element.request_layout(window, cx);
+                    (layout_id, Some(element))
+                }
             }
         })
     }
@@ -140,46 +136,14 @@ impl Element for AnyView {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         element: &mut Self::RequestLayoutState,
-        window: &mut PrepaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
         window.set_view_id(self.entity_id());
         window.with_rendered_view(self.entity_id(), |window| {
             if let Some(mut element) = element.take() {
-                let caching_disabled = window.is_inspector_picking(cx);
-                if self.cached_style.is_some() && !caching_disabled {
-                    return window.with_element_state::<AnyViewState, _>(
-                        global_id.unwrap(),
-                        |_, window| {
-                            let content_mask = window.content_mask();
-                            let text_style = window.text_style();
-                            let prepaint_start = window.prepaint_index();
-                            let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
-                                window.with_refreshing(true, |window| {
-                                    element.prepaint(window, cx);
-                                });
-                            });
-                            let prepaint_end = window.prepaint_index();
-
-                            (
-                                Some(element),
-                                AnyViewState {
-                                    accessed_entities,
-                                    prepaint_range: prepaint_start..prepaint_end,
-                                    paint_range: PaintIndex::default()..PaintIndex::default(),
-                                    cache_key: ViewCacheKey {
-                                        bounds,
-                                        content_mask,
-                                        text_style,
-                                    },
-                                },
-                            )
-                        },
-                    );
-                } else {
-                    element.prepaint(window, cx);
-                    return Some(element);
-                }
+                element.prepaint(window, cx);
+                return Some(element);
             }
 
             window.with_element_state::<AnyViewState, _>(
@@ -192,8 +156,8 @@ impl Element for AnyView {
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
-                        && !window.is_view_dirty(self.entity_id())
-                        && !window.is_refreshing()
+                        && !window.dirty_views.contains(&self.entity_id())
+                        && !window.refreshing
                     {
                         let prepaint_start = window.prepaint_index();
                         window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -205,7 +169,31 @@ impl Element for AnyView {
                         return (None, element_state);
                     }
 
-                    panic!("cached view prepaint cache miss without a rendered element")
+                    let refreshing = mem::replace(&mut window.refreshing, true);
+                    let prepaint_start = window.prepaint_index();
+                    let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                        let mut element = (self.render)(self, window, cx);
+                        element.layout_as_root(bounds.size.into(), window, cx);
+                        element.prepaint_at(bounds.origin, window, cx);
+                        element
+                    });
+
+                    let prepaint_end = window.prepaint_index();
+                    window.refreshing = refreshing;
+
+                    (
+                        Some(element),
+                        AnyViewState {
+                            accessed_entities,
+                            prepaint_range: prepaint_start..prepaint_end,
+                            paint_range: PaintIndex::default()..PaintIndex::default(),
+                            cache_key: ViewCacheKey {
+                                bounds,
+                                content_mask,
+                                text_style,
+                            },
+                        },
+                    )
                 },
             )
         })
@@ -218,7 +206,7 @@ impl Element for AnyView {
         _bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         element: &mut Self::PrepaintState,
-        window: &mut PaintCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) {
         window.with_rendered_view(self.entity_id(), |window| {
@@ -232,9 +220,9 @@ impl Element for AnyView {
                         let paint_start = window.paint_index();
 
                         if let Some(element) = element {
-                            window.with_refreshing(true, |window| {
-                                element.paint(window, cx);
-                            });
+                            let refreshing = mem::replace(&mut window.refreshing, true);
+                            element.paint(window, cx);
+                            window.refreshing = refreshing;
                         } else {
                             window.reuse_paint(element_state.paint_range.clone());
                         }
@@ -271,7 +259,7 @@ impl IntoElement for AnyView {
 /// A weak, dynamically-typed view handle that does not prevent the view from being released.
 pub struct AnyWeakView {
     entity: AnyWeakEntity,
-    render: fn(&AnyView, &mut BuildCx<'_>, &mut App) -> AnyElement,
+    render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
 }
 
 impl AnyWeakView {
@@ -310,11 +298,11 @@ impl std::fmt::Debug for AnyWeakView {
 }
 
 mod any_view {
-    use crate::{AnyElement, AnyView, App, BuildCx, IntoElement, Render};
+    use crate::{AnyElement, AnyView, App, IntoElement, Render, Window};
 
     pub(crate) fn render<V: 'static + Render>(
         view: &AnyView,
-        window: &mut BuildCx<'_>,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let view = view.clone().downcast::<V>().unwrap();
@@ -326,95 +314,7 @@ mod any_view {
 pub struct EmptyView;
 
 impl Render for EmptyView {
-    fn render(&mut self, _window: &mut BuildCx<'_>, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        AppContext as _, InteractiveElement as _, Styled as _, TestAppContext, div, px, size,
-    };
-    use std::ops::Deref;
-
-    struct CachedParentView {
-        child: Entity<CachedChildView>,
-    }
-
-    impl Render for CachedParentView {
-        fn render(
-            &mut self,
-            _window: &mut BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
-            AnyView::from(self.child.clone()).cached(StyleRefinement::default())
-        }
-    }
-
-    struct CachedChildView {
-        wide: bool,
-    }
-
-    impl Render for CachedChildView {
-        fn render(
-            &mut self,
-            _window: &mut BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
-            let width = if self.wide { px(80.) } else { px(40.) };
-            div().id("cached-child-box").w(width).h(px(20.))
-        }
-    }
-
-    #[gpui::test]
-    fn cached_any_view_wrapper_is_retained_when_child_layout_changes(cx: &mut TestAppContext) {
-        let window = cx.open_window(size(px(800.), px(600.)), |_, cx| {
-            let child = cx.new(|_| CachedChildView { wide: false });
-            CachedParentView { child }
-        });
-        cx.run_until_parked();
-
-        let first_sample = cx
-            .update_window(*window.deref(), |_, window, _| {
-                window.last_layout_work_sample()
-            })
-            .unwrap()
-            .expect("opening the window should draw once");
-        assert!(
-            first_sample.retained_layout_creates > 0,
-            "the first retained frame should build retained occurrences"
-        );
-
-        window
-            .update(cx, |parent, _window, cx| {
-                parent.child.update(cx, |child, cx| {
-                    child.wide = true;
-                    cx.notify();
-                });
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        let second_sample = cx
-            .update_window(*window.deref(), |_, window, _| {
-                window.last_layout_work_sample()
-            })
-            .unwrap()
-            .expect("notifying the child should draw again");
-
-        assert_eq!(
-            second_sample.retained_layout_creates, 0,
-            "a cached AnyView wrapper with stable view identity must recommit locally, not rebuild"
-        );
-        assert_eq!(
-            second_sample.retained_layout_removes, 0,
-            "a child layout change must not detach the cached AnyView wrapper subtree"
-        );
-        assert_eq!(
-            second_sample.retained_layout_miss_no_previous, 0,
-            "the cached AnyView wrapper should have a previous retained occurrence"
-        );
     }
 }

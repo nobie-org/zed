@@ -486,8 +486,7 @@ impl<V: 'static + Render> TestAppWindow<V> {
         let mut app = self.app.borrow_mut();
         let any_handle: AnyWindowHandle = self.handle.into();
         app.update_window(any_handle, |_, window, cx| {
-            let mut frame_authority = super::WindowFrameAuthority::new();
-            window.draw_for_app(&mut frame_authority, cx).clear();
+            window.draw(cx).clear();
         })
         .unwrap();
     }
@@ -535,11 +534,7 @@ mod tests {
     }
 
     impl Render for Counter {
-        fn render(
-            &mut self,
-            _window: &mut crate::BuildCx<'_>,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().child(format!("Count: {}", self.count))
         }
     }

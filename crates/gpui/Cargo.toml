@@ -101,7 +101,7 @@ async-channel.workspace = true
 stacksafe.workspace = true
 strum.workspace = true
 sum_tree.workspace = true
-taffy = { git = "https://github.com/nobie-org/taffy.git", rev = "edc99e58a652a2bb82556df436f5dbd783114d48" }
+taffy = { git = "https://github.com/nobie-org/taffy.git", rev = "4f0394b3b7858bd158e03093925cc2d55ae6e9df" }
 thiserror.workspace = true
 gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }

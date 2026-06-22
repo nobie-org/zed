@@ -6233,17 +6233,22 @@ impl Window {
                 .dispatch_tree
                 .set_active_node(context.parent_node);
 
-            let mut sizes = Vec::with_capacity(group.roots.len());
-            for (element, available_space) in &mut group.roots {
-                sizes.push(layout_frame.layout_detached_root_size(
+            let root_count = group.roots.len();
+            let mut laid_out_roots = Vec::with_capacity(root_count);
+            for (element, available_space) in group.roots {
+                laid_out_roots.push(layout_frame.layout_visible_root_with_identity(
                     self,
                     element,
                     group.root_site,
-                    *available_space,
+                    available_space,
                     None,
                     cx,
                 ));
             }
+            let sizes = laid_out_roots
+                .iter()
+                .map(LaidOutVisibleRoot::size)
+                .collect::<Vec<_>>();
 
             let mut group_cx = VisibleRootGroupCx::new(self);
             let placement = group
@@ -6261,13 +6266,11 @@ impl Window {
             } = placement;
             debug_assert_eq!(
                 placements.len(),
-                group.roots.len(),
+                root_count,
                 "VisibleRootGroupSizes::place_all must emit one placement per root"
             );
 
-            for (((mut element, _), placement), _root_size) in
-                group.roots.into_iter().zip(placements).zip(sizes)
-            {
+            for (root, placement) in laid_out_roots.into_iter().zip(placements) {
                 self.element_id_stack.clone_from(&context.element_id_stack);
                 self.text_style_stack.clone_from(&context.text_style_stack);
                 self.content_mask_stack
@@ -6283,7 +6286,8 @@ impl Window {
                 );
                 let element = self.with_rendered_view(context.current_view, |window| {
                     window.with_rem_size(Some(context.rem_size), |window| {
-                        let _focus = element.prepaint_at(origin, window, cx);
+                        let (prepainted_root, _focus) = root.prepaint_at(origin, window, cx);
+                        let PrepaintedVisibleRoot { element } = prepainted_root;
                         element
                     })
                 });
@@ -6639,19 +6643,20 @@ impl Window {
             self.next_frame.dispatch_tree.set_active_node(parent_node);
 
             let PendingVisibleRoot {
-                mut element,
+                element,
                 available_space,
                 placement,
                 on_prepaint,
             } = pending;
-            let root_size = layout_frame.layout_detached_root_size(
+            let root = layout_frame.layout_visible_root_with_identity(
                 self,
-                &mut element,
+                element,
                 root_site,
                 available_space,
                 None,
                 cx,
             );
+            let root_size = root.size();
             let placement_cx = VisibleRootPlacementCx::new(self);
             let origin = placement.place(root_size, placement_cx);
             let bounds = Bounds::new(origin, root_size);
@@ -6660,7 +6665,8 @@ impl Window {
                 mem::replace(&mut self.content_mask_stack, content_mask_stack.clone());
             let (element, bounds, focus) = self.with_rendered_view(current_view, |window| {
                 window.with_rem_size(Some(rem_size), |window| {
-                    let focus = element.prepaint_at(origin, window, cx);
+                    let (prepainted_root, focus) = root.prepaint_at(origin, window, cx);
+                    let PrepaintedVisibleRoot { element } = prepainted_root;
                     (element, bounds, focus)
                 })
             });

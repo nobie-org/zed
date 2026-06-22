@@ -448,6 +448,36 @@ fn laid_out_visible_root_is_a_consumed_value_not_loose_geometry() {
 }
 
 #[test]
+fn visible_root_drains_consume_laid_out_roots() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let window = std::fs::read_to_string(crate_root.join("src/window.rs")).unwrap();
+
+    let mut offenders = Vec::new();
+    for method_name in ["fn drain_visible_root_groups", "fn prepaint_visible_roots"] {
+        let method = source_item(&window, method_name);
+        if !method.contains("layout_frame.layout_visible_root_with_identity(") {
+            offenders.push(format!(
+                "{method_name}: missing frame-owned visible-root layout"
+            ));
+        }
+        if !method.contains("root.prepaint_at(origin, window, cx)") {
+            offenders.push(format!("{method_name}: does not consume laid-out root"));
+        }
+        for forbidden in ["layout_detached_root_size(", "element.prepaint_at(origin"] {
+            if method.contains(forbidden) {
+                offenders.push(format!("{method_name}: contains {forbidden}"));
+            }
+        }
+    }
+
+    assert_eq!(
+        offenders,
+        Vec::<String>::new(),
+        "visible-root drains must carry the laid-out root token into prepaint"
+    );
+}
+
+#[test]
 fn retained_solver_execution_is_private_to_layout_frame() {
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_root = crate_root.join("src");

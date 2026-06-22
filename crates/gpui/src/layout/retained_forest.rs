@@ -1570,11 +1570,14 @@ impl RetainedLayoutForest {
 
     /// Assign previous child nodes to current child facts.
     ///
-    /// A retained node may be preserved only when exact current facts prove it
-    /// already represents the same subtree, or when a unique sibling identity
-    /// proves it is the same semantic child whose current facts will be
-    /// committed before the legal root solve. Same-position broad-kind reuse is
-    /// deliberately absent.
+    /// A retained node may be preserved as semantic history only when exact
+    /// current facts prove it already represents the same subtree, or when a
+    /// unique sibling identity proves it is the same semantic child.
+    ///
+    /// If those proofs fail, a same-position compatible node may still be
+    /// reassigned as storage. That is not identity: the commit path must
+    /// overwrite current facts into the retained node and private solver mirror
+    /// before the legal root solve.
     fn assign_previous_child_nodes(
         &self,
         children: &[LayoutId],
@@ -1630,6 +1633,13 @@ impl RetainedLayoutForest {
             if assigned[index].is_none() {
                 assigned[index] =
                     self.take_unique_exact_previous_child(*child, children, previous_children);
+            }
+        }
+
+        for (index, child) in children.iter().enumerate() {
+            if assigned[index].is_none() {
+                assigned[index] =
+                    self.take_same_position_storage_child(*child, index, previous_children);
             }
         }
 
@@ -1738,6 +1748,25 @@ impl RetainedLayoutForest {
             }
         }
         previous_children.get_mut(matched_index?)?.take()
+    }
+
+    /// Remove the previous child at the same structural position as storage.
+    ///
+    /// This is deliberately weaker than semantic reuse. It preserves the
+    /// private allocation/solver node only; `commit_facts` must recommit the
+    /// current layout facts and dirty any changed mirror state before solving.
+    fn take_same_position_storage_child(
+        &self,
+        child: LayoutId,
+        current_index: usize,
+        previous_children: &mut [Option<RetainedLayoutNode>],
+    ) -> Option<RetainedLayoutNode> {
+        let previous_child = previous_children.get_mut(current_index)?;
+        let candidate = previous_child.as_ref()?;
+        if self.retained_node_can_host_recommitted_facts(child, candidate) {
+            return previous_child.take();
+        }
+        None
     }
 
     fn current_exact_child_count(&self, child: LayoutId, current_children: &[LayoutId]) -> usize {

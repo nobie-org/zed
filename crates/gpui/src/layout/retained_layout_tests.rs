@@ -1062,6 +1062,15 @@ impl GeneratedTree {
         }
     }
 
+    fn can_host_recommitted_facts(&self, current: &Self) -> bool {
+        matches!(
+            (self, current),
+            (Self::Unmeasured { .. }, Self::Unmeasured { .. })
+                | (Self::PureSize { .. }, Self::PureSize { .. })
+                | (Self::Text { .. }, Self::Text { .. })
+        )
+    }
+
     fn exact_child_count(child: &Self, children: &[Self]) -> usize {
         children
             .iter()
@@ -1365,6 +1374,21 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                     if let Some(index) = matching_previous_index {
                         previous_used[index] = true;
                         assigned_previous_indices[current_index] = Some(index);
+                    }
+                }
+
+                for (current_index, current_child) in current_children.iter().enumerate() {
+                    if assigned_previous_indices[current_index].is_some() {
+                        continue;
+                    }
+                    let Some(previous_child) = previous_children.get(current_index) else {
+                        continue;
+                    };
+                    if !previous_used[current_index]
+                        && previous_child.can_host_recommitted_facts(current_child)
+                    {
+                        previous_used[current_index] = true;
+                        assigned_previous_indices[current_index] = Some(current_index);
                     }
                 }
 
@@ -3082,7 +3106,7 @@ fn changed_keyed_unmeasured_child_updates_retained_node_and_style() {
 }
 
 #[test]
-fn changed_unkeyed_same_position_child_rebuilds_without_identity_proof() {
+fn changed_unkeyed_same_position_child_reuses_storage_with_full_recommit() {
     let mut engine = LayoutEngine::new();
     let first_child = request_leaf(&mut engine, 10.0);
     let first_root = request_container(&mut engine, &[first_child]);
@@ -3098,17 +3122,15 @@ fn changed_unkeyed_same_position_child_rebuilds_without_identity_proof() {
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
 
     assert_eq!(second_root_node, first_root_node);
-    assert_ne!(
+    assert_eq!(
         second_child_nodes[0], first_child_nodes[0],
-        "changed anonymous same-position child has no identity proof and must be rebuilt"
+        "same-position anonymous storage may be reused when current facts are fully recommitted"
     );
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            creates: 1,
-            removes: 1,
-            child_list_updates: 1,
+            reuses: 2,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3116,6 +3138,62 @@ fn changed_unkeyed_same_position_child_rebuilds_without_identity_proof() {
     let mut fresh = LayoutEngine::new();
     let fresh_child = request_leaf(&mut fresh, 20.0);
     let fresh_root = request_container(&mut fresh, &[fresh_child]);
+    let fresh_root_node = fresh.commit_layout(fresh_root);
+    assert_eq!(
+        retained_layout_shape(&engine, second_root_node),
+        retained_layout_shape(&fresh, fresh_root_node)
+    );
+}
+
+#[test]
+fn anonymous_wrapper_reuses_storage_while_keyed_descendant_changes() {
+    fn request_frame(engine: &mut LayoutEngine, changing_width: f32) -> LayoutId {
+        let stable_leaf = request_leaf(engine, 10.0);
+        let changing_leaf = request_keyed_leaf(engine, 21_201, changing_width);
+        let keyed_panel = request_keyed_layout(
+            engine,
+            21_202,
+            Style::default(),
+            &[stable_leaf, changing_leaf],
+        );
+        let anonymous_wrapper = request_container(engine, &[keyed_panel]);
+        request_container(engine, &[anonymous_wrapper])
+    }
+
+    let mut engine = LayoutEngine::new();
+    let first_root = request_frame(&mut engine, 20.0);
+    let first_root_node = engine.commit_layout(first_root);
+    let first_wrapper_node = engine.retained_child_tokens_for_tests(first_root_node)[0];
+    let first_panel_node = engine.retained_child_tokens_for_tests(first_wrapper_node)[0];
+    let first_panel_children = engine.retained_child_tokens_for_tests(first_panel_node);
+    engine.finish_frame();
+
+    engine.reset_retained_mutation_sample_for_tests();
+    let second_root = request_frame(&mut engine, 30.0);
+    let second_root_node = engine.commit_layout(second_root);
+    assert_facts_committed_exactly(&engine, second_root);
+    let second_wrapper_node = engine.retained_child_tokens_for_tests(second_root_node)[0];
+    let second_panel_node = engine.retained_child_tokens_for_tests(second_wrapper_node)[0];
+    let second_panel_children = engine.retained_child_tokens_for_tests(second_panel_node);
+
+    assert_eq!(second_root_node, first_root_node);
+    assert_eq!(
+        second_wrapper_node, first_wrapper_node,
+        "anonymous wrapper storage should survive a descendant-only change"
+    );
+    assert_eq!(second_panel_node, first_panel_node);
+    assert_eq!(second_panel_children, first_panel_children);
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 5,
+            style_updates: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_root = request_frame(&mut fresh, 30.0);
     let fresh_root_node = fresh.commit_layout(fresh_root);
     assert_eq!(
         retained_layout_shape(&engine, second_root_node),
@@ -3831,7 +3909,7 @@ fn duplicate_same_position_exact_children_reuse_on_exact_repeat() {
 }
 
 #[test]
-fn duplicate_exact_child_rebuilds_when_sibling_count_changes_and_identity_is_ambiguous() {
+fn duplicate_exact_child_reuses_same_position_storage_when_sibling_count_changes() {
     let mut engine = LayoutEngine::new();
     let left = request_leaf(&mut engine, 10.0);
     let right = request_leaf(&mut engine, 10.0);
@@ -3847,9 +3925,9 @@ fn duplicate_exact_child_rebuilds_when_sibling_count_changes_and_identity_is_amb
     assert_facts_committed_exactly(&engine, second_root);
 
     let child_node = engine.retained_node_token_for_tests(child);
-    assert!(
-        !first_child_nodes.contains(&child_node),
-        "duplicate anonymous previous siblings are not identity proof"
+    assert_eq!(
+        child_node, first_child_nodes[0],
+        "duplicate anonymous previous siblings are not identity proof, but the same-position node may be reused as fully recommitted storage"
     );
     assert_eq!(
         engine.retained_child_tokens_for_tests(second_root_node),
@@ -3862,10 +3940,9 @@ fn duplicate_exact_child_rebuilds_when_sibling_count_changes_and_identity_is_amb
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            creates: 1,
+            reuses: 2,
             child_list_updates: 1,
-            removes: 2,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3882,7 +3959,7 @@ fn duplicate_exact_child_rebuilds_when_sibling_count_changes_and_identity_is_amb
 }
 
 #[test]
-fn moved_duplicate_exact_child_rebuilds_when_identity_is_ambiguous() {
+fn moved_duplicate_exact_child_uses_same_position_storage_when_identity_is_ambiguous() {
     let mut retained = LayoutEngine::new();
     let changed_slot = request_leaf(&mut retained, 20.0);
     let duplicate_left = request_leaf(&mut retained, 10.0);
@@ -3911,17 +3988,17 @@ fn moved_duplicate_exact_child_rebuilds_when_identity_is_ambiguous() {
         !first_duplicate_nodes.contains(&child_node),
         "duplicate anonymous exact siblings are not identity proof"
     );
-    assert_ne!(
+    assert_eq!(
         child_node, first_changed_slot_node,
-        "ambiguous anonymous identity must not preserve unrelated retained node history"
+        "ambiguous anonymous identity is not preserved, but the same-position node may host recommitted current facts"
     );
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            creates: 1,
+            reuses: 2,
+            style_updates: 1,
             child_list_updates: 1,
-            removes: 3,
+            removes: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3989,10 +4066,8 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
-            creates: 1,
-            child_list_updates: 1,
-            removes: 1,
+            reuses: 3,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4349,10 +4424,8 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
-            creates: 1,
-            child_list_updates: 1,
-            removes: 1,
+            reuses: 3,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4420,10 +4493,8 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            creates: 1,
-            child_list_updates: 1,
-            removes: 1,
+            reuses: 4,
+            style_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4510,11 +4581,8 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            creates: 1,
-            child_list_updates: 1,
-            context_clears: 1,
-            removes: 1,
+            reuses: 4,
+            dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
     );

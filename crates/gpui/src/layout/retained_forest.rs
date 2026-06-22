@@ -1636,6 +1636,13 @@ impl RetainedLayoutForest {
             }
         }
 
+        for (index, child) in children.iter().enumerate() {
+            if assigned[index].is_none() {
+                assigned[index] =
+                    self.take_same_slot_previous_child(*child, index, previous_children);
+            }
+        }
+
         assigned
     }
 
@@ -1711,7 +1718,7 @@ impl RetainedLayoutForest {
             .flatten()?;
         let previous_child = previous_children.get_mut(previous_index)?;
         let candidate = previous_child.as_ref()?;
-        if self.retained_node_can_preserve_unique_semantic_facts(child, candidate) {
+        if self.retained_node_can_host_recommitted_facts(child, candidate) {
             return previous_child.take();
         }
         None
@@ -1741,6 +1748,26 @@ impl RetainedLayoutForest {
             }
         }
         previous_children.get_mut(matched_index?)?.take()
+    }
+
+    /// Remove the previous child from the same sibling slot when it can host
+    /// the current facts through full recommit.
+    ///
+    /// This is allocation-slot reuse, not semantic proof. The retained node's
+    /// old style, children, measured facts, and artifact bindings are all
+    /// rewritten or invalidated by `commit_facts` before the legal root solve.
+    fn take_same_slot_previous_child(
+        &self,
+        child: LayoutId,
+        current_index: usize,
+        previous_children: &mut [Option<RetainedLayoutOccurrence>],
+    ) -> Option<RetainedLayoutOccurrence> {
+        let previous_child = previous_children.get_mut(current_index)?;
+        let candidate = previous_child.as_ref()?;
+        if self.retained_node_can_host_recommitted_facts(child, candidate) {
+            return previous_child.take();
+        }
+        None
     }
 
     fn current_exact_child_count(&self, child: LayoutId, current_children: &[LayoutId]) -> usize {
@@ -1927,8 +1954,14 @@ impl RetainedLayoutForest {
         }
     }
 
-    /// Return whether a unique semantic identity may preserve mirror identity.
-    fn retained_node_can_preserve_unique_semantic_facts(
+    /// Return whether a previous occurrence can host current facts.
+    ///
+    /// A `true` result is not equality. It means the occurrence kind is
+    /// compatible enough that committing current facts can overwrite every
+    /// layout-visible fact without rebuilding the solver node. Opaque measured
+    /// closures return `false` because the old callback is not comparable
+    /// layout meaning.
+    fn retained_node_can_host_recommitted_facts(
         &self,
         id: LayoutId,
         previous: &RetainedLayoutOccurrence,

@@ -1,9 +1,10 @@
 use crate::{
     AnyElement, App, Bounds, Composite, CompositeBlendMode, CompositeEffect, ContentLayer, Corners,
     DerivedLayer, Element, ElementId, GlassSurface, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Point, Window, scene::RenderGroupInput,
+    IntoElement, LayoutId, LayoutRequestCx, PaintCx, Pixels, Point, PrepaintCx,
+    scene::RenderGroupInput,
 };
-use std::{mem, panic};
+use std::panic;
 
 /// Creates a render group builder.
 ///
@@ -421,7 +422,7 @@ impl Element for RenderGroup {
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         (self.child.request_layout(window, cx), ())
@@ -433,16 +434,16 @@ impl Element for RenderGroup {
         _: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState {
         // Cached paint ranges refer to the scene they were recorded into. A
         // render group records into a fresh sub-scene, so descendants must
         // re-enter their normal paint path instead of replaying parent-scene
         // ranges from a previous frame.
-        let refreshing = mem::replace(&mut window.refreshing, true);
-        self.child.prepaint(window, cx);
-        window.refreshing = refreshing;
+        window.with_refreshing(true, |window| {
+            self.child.prepaint(window, cx);
+        });
     }
 
     fn paint(
@@ -452,7 +453,7 @@ impl Element for RenderGroup {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         let input = self.input.clone();

@@ -1151,12 +1151,17 @@ impl Editor {
                     .render_edit_prediction_jump_outside_popover(snapshot, window, cx)
                     .into_any();
 
-                let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-                let origin_x = text_bounds.size.width - size.width - px(30.);
-                let origin = text_bounds.origin + gpui::Point::new(origin_x, px(16.));
-                element.prepaint_at(origin, window, cx);
+                let (bounds, _) = element.prepaint_as_root_with_origin(
+                    AvailableSpace::min_size(),
+                    window,
+                    cx,
+                    |size| {
+                        let origin_x = text_bounds.size.width - size.width - px(30.);
+                        text_bounds.origin + gpui::Point::new(origin_x, px(16.))
+                    },
+                );
 
-                Some((element, origin))
+                Some((element, bounds.origin))
             }
         }
     }
@@ -1719,23 +1724,22 @@ impl Editor {
             .child(div().w(POLE_WIDTH).bg(border_color).h(line_height))
             .into_any();
 
-        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let (bounds, _) =
+            element.prepaint_as_root_with_origin(AvailableSpace::min_size(), window, cx, |size| {
+                let mut origin = scrolled_content_origin + point(target_x, target_y.into())
+                    - point(
+                        if flag_on_right {
+                            POLE_WIDTH
+                        } else {
+                            size.width - POLE_WIDTH
+                        },
+                        size.height - line_height,
+                    );
+                origin.x = origin.x.max(content_origin.x);
+                origin
+            });
 
-        let mut origin = scrolled_content_origin + point(target_x, target_y.into())
-            - point(
-                if flag_on_right {
-                    POLE_WIDTH
-                } else {
-                    size.width - POLE_WIDTH
-                },
-                size.height - line_height,
-            );
-
-        origin.x = origin.x.max(content_origin.x);
-
-        element.prepaint_at(origin, window, cx);
-
-        Some((element, origin))
+        Some((element, bounds.origin))
     }
 
     fn render_edit_prediction_scroll_popover(
@@ -1749,12 +1753,6 @@ impl Editor {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
-        let mut element = self
-            .render_edit_prediction_line_popover("Scroll", Some(scroll_icon), window, cx)
-            .into_any();
-
-        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-
         let cursor = newest_selection_head?;
         let cursor_row_layout =
             line_layouts.get(cursor.row().minus(visible_row_range.start) as usize)?;
@@ -1762,10 +1760,16 @@ impl Editor {
 
         let cursor_character_x = cursor_row_layout.x_for_index(cursor_column);
 
-        let origin = scrolled_content_origin + point(cursor_character_x, to_y(size));
+        let mut element = self
+            .render_edit_prediction_line_popover("Scroll", Some(scroll_icon), window, cx)
+            .into_any();
 
-        element.prepaint_at(origin, window, cx);
-        Some((element, origin))
+        let (bounds, _) =
+            element.prepaint_as_root_with_origin(AvailableSpace::min_size(), window, cx, |size| {
+                scrolled_content_origin + point(cursor_character_x, to_y(size))
+            });
+
+        Some((element, bounds.origin))
     }
 
     fn render_edit_prediction_eager_jump_popover(
@@ -1793,15 +1797,19 @@ impl Editor {
                 )
                 .into_any();
 
-            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-            let offset = point(
-                (text_bounds.size.width - size.width) / 2.,
-                Self::EDIT_PREDICTION_POPOVER_PADDING_Y,
+            let (bounds, _) = element.prepaint_as_root_with_origin(
+                AvailableSpace::min_size(),
+                window,
+                cx,
+                |size| {
+                    let offset = point(
+                        (text_bounds.size.width - size.width) / 2.,
+                        Self::EDIT_PREDICTION_POPOVER_PADDING_Y,
+                    );
+                    text_bounds.origin + offset
+                },
             );
-
-            let origin = text_bounds.origin + offset;
-            element.prepaint_at(origin, window, cx);
-            Some((element, origin))
+            Some((element, bounds.origin))
         } else if (target_display_point.row().as_f64() + 1.) > scroll_bottom {
             let mut element = self
                 .render_edit_prediction_line_popover(
@@ -1812,15 +1820,21 @@ impl Editor {
                 )
                 .into_any();
 
-            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-            let offset = point(
-                (text_bounds.size.width - size.width) / 2.,
-                text_bounds.size.height - size.height - Self::EDIT_PREDICTION_POPOVER_PADDING_Y,
+            let (bounds, _) = element.prepaint_as_root_with_origin(
+                AvailableSpace::min_size(),
+                window,
+                cx,
+                |size| {
+                    let offset = point(
+                        (text_bounds.size.width - size.width) / 2.,
+                        text_bounds.size.height
+                            - size.height
+                            - Self::EDIT_PREDICTION_POPOVER_PADDING_Y,
+                    );
+                    text_bounds.origin + offset
+                },
             );
-
-            let origin = text_bounds.origin + offset;
-            element.prepaint_at(origin, window, cx);
-            Some((element, origin))
+            Some((element, bounds.origin))
         } else {
             self.render_edit_prediction_end_of_line_popover(
                 "Jump to Edit",
@@ -1855,14 +1869,14 @@ impl Editor {
             editor_snapshot.line_len(target_display_point.row()),
         );
 
-        let mut element = self
-            .render_edit_prediction_line_popover(label, None, window, cx)
-            .into_any();
-
-        let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-
         let line_origin =
             self.display_to_pixel_point(target_line_end, editor_snapshot, window, cx)?;
+
+        let mut icon = None;
+        let mut size = self
+            .render_edit_prediction_line_popover(label, icon, window, cx)
+            .into_any()
+            .measure_as_root(AvailableSpace::min_size(), window, cx);
 
         let start_point = content_origin - point(scroll_pixel_position.x.into(), Pixels::ZERO);
         let mut origin = start_point
@@ -1875,24 +1889,28 @@ impl Editor {
         if origin.x > max_x {
             let offset = line_height + Self::EDIT_PREDICTION_POPOVER_PADDING_Y;
 
-            let icon = if visible_row_range.contains(&(target_display_point.row() + 2)) {
-                origin.y += offset;
-                IconName::ArrowUp
-            } else {
-                origin.y -= offset;
-                IconName::ArrowDown
-            };
+            icon = Some(
+                if visible_row_range.contains(&(target_display_point.row() + 2)) {
+                    origin.y += offset;
+                    IconName::ArrowUp
+                } else {
+                    origin.y -= offset;
+                    IconName::ArrowDown
+                },
+            );
 
-            element = self
-                .render_edit_prediction_line_popover(label, Some(icon), window, cx)
-                .into_any();
-
-            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+            size = self
+                .render_edit_prediction_line_popover(label, icon, window, cx)
+                .into_any()
+                .measure_as_root(AvailableSpace::min_size(), window, cx);
 
             origin.x = content_origin.x + editor_width - size.width - px(2.);
         }
 
-        element.prepaint_at(origin, window, cx);
+        let mut element = self
+            .render_edit_prediction_line_popover(label, icon, window, cx)
+            .into_any();
+        element.prepaint_as_root(origin, AvailableSpace::min_size(), window, cx);
         Some((element, origin))
     }
 
@@ -1946,59 +1964,61 @@ impl Editor {
             edit_prediction_fallback_text(edits, cx)
         };
 
-        let styled_text = highlighted_edits.to_styled_text(&style.text);
         let line_count = highlighted_edits.text.lines().count();
 
         const BORDER_WIDTH: Pixels = px(1.);
 
-        let keybind = self.render_edit_prediction_keybind(window, cx);
-        let has_keybind = keybind.is_some();
+        let build_element = |window: &mut Window, cx: &mut App| {
+            let styled_text = highlighted_edits.to_styled_text(&style.text);
+            let keybind = self.render_edit_prediction_keybind(window, cx);
+            let has_keybind = keybind.is_some();
 
-        let mut element = h_flex()
-            .items_start()
-            .child(
-                h_flex()
-                    .bg(cx.theme().colors().editor_background)
-                    .border(BORDER_WIDTH)
-                    .shadow_xs()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_l_lg()
-                    .when(line_count > 1, |el| el.rounded_br_lg())
-                    .pr_1()
-                    .child(styled_text),
-            )
-            .child(
-                h_flex()
-                    .h(line_height + BORDER_WIDTH * 2.)
-                    .px_1p5()
-                    .gap_1()
-                    // Workaround: For some reason, there's a gap if we don't do this
-                    .ml(-BORDER_WIDTH)
-                    .shadow(vec![gpui::BoxShadow {
-                        color: gpui::black().opacity(0.05),
-                        offset: point(px(1.), px(1.)),
-                        blur_radius: px(2.),
-                        spread_radius: px(0.),
-                    }])
-                    .bg(Editor::edit_prediction_line_popover_bg_color(cx))
-                    .border(BORDER_WIDTH)
-                    .border_color(cx.theme().colors().border)
-                    .rounded_r_lg()
-                    .id("edit_prediction_diff_popover_keybind")
-                    .when(!has_keybind, |el| {
-                        let status_colors = cx.theme().status();
+            h_flex()
+                .items_start()
+                .child(
+                    h_flex()
+                        .bg(cx.theme().colors().editor_background)
+                        .border(BORDER_WIDTH)
+                        .shadow_xs()
+                        .border_color(cx.theme().colors().border)
+                        .rounded_l_lg()
+                        .when(line_count > 1, |el| el.rounded_br_lg())
+                        .pr_1()
+                        .child(styled_text),
+                )
+                .child(
+                    h_flex()
+                        .h(line_height + BORDER_WIDTH * 2.)
+                        .px_1p5()
+                        .gap_1()
+                        // Workaround: For some reason, there's a gap if we don't do this
+                        .ml(-BORDER_WIDTH)
+                        .shadow(vec![gpui::BoxShadow {
+                            color: gpui::black().opacity(0.05),
+                            offset: point(px(1.), px(1.)),
+                            blur_radius: px(2.),
+                            spread_radius: px(0.),
+                        }])
+                        .bg(Editor::edit_prediction_line_popover_bg_color(cx))
+                        .border(BORDER_WIDTH)
+                        .border_color(cx.theme().colors().border)
+                        .rounded_r_lg()
+                        .id("edit_prediction_diff_popover_keybind")
+                        .when(!has_keybind, |el| {
+                            let status_colors = cx.theme().status();
 
-                        el.bg(status_colors.error_background)
-                            .border_color(status_colors.error.opacity(0.6))
-                            .child(Icon::new(IconName::Info).color(Color::Error))
-                            .cursor_default()
-                            .hoverable_tooltip(move |_window, cx| {
-                                cx.new(|_| MissingEditPredictionKeybindingTooltip).into()
-                            })
-                    })
-                    .children(keybind),
-            )
-            .into_any();
+                            el.bg(status_colors.error_background)
+                                .border_color(status_colors.error.opacity(0.6))
+                                .child(Icon::new(IconName::Info).color(Color::Error))
+                                .cursor_default()
+                                .hoverable_tooltip(move |_window, cx| {
+                                    cx.new(|_| MissingEditPredictionKeybindingTooltip).into()
+                                })
+                        })
+                        .children(keybind),
+                )
+                .into_any()
+        };
 
         let longest_row =
             editor_snapshot.longest_row_in_range(edit_start.row()..edit_end.row() + 1);
@@ -2029,7 +2049,8 @@ impl Editor {
             ) - scroll_pixel_position.x,
         );
 
-        let element_bounds = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let element_bounds =
+            build_element(window, cx).measure_as_root(AvailableSpace::min_size(), window, cx);
 
         // Fully visible if it can be displayed within the window (allow overlapping other
         // panes). However, this is only allowed if the popover starts within text_bounds.
@@ -2087,7 +2108,15 @@ impl Editor {
                 bounds: *text_bounds,
             }),
             |window| {
-                window.defer_draw(element, origin, 1, Some(window.content_mask()));
+                let content_mask = Some(window.content_mask());
+                build_element(window, cx).defer_as_root_with_origin(
+                    AvailableSpace::min_size(),
+                    window,
+                    cx,
+                    1,
+                    content_mask,
+                    |_| origin,
+                );
             },
         );
 

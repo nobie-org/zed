@@ -19,7 +19,7 @@ impl GradientViewer {
 }
 
 impl Render for GradientViewer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut gpui::BuildCx<'_>, cx: &mut Context<Self>) -> impl IntoElement {
         let color_space = self.color_space;
 
         div()

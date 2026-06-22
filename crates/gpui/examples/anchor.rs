@@ -79,7 +79,11 @@ impl AnchorDemo {
 }
 
 impl Render for AnchorDemo {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let buttons = Self::buttons();
         let button_size = size(px(120.0), px(65.0));
 

@@ -2,8 +2,9 @@ use std::{fs, path::Path, sync::Arc};
 
 use crate::{
     App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
+    Interactivity, IntoElement, LayoutId, LayoutRequestCx, PaintCx, Pixels, Point, PrepaintCx,
+    Radians, SharedString, Size, StyleRefinement, Styled, TransformationMatrix, Window, point, px,
+    radians, size,
 };
 use gpui_util::ResultExt;
 
@@ -63,7 +64,7 @@ impl Element for Svg {
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let layout_id = self.interactivity.request_layout(
@@ -82,7 +83,7 @@ impl Element for Svg {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Option<Hitbox> {
         self.interactivity.prepaint(
@@ -103,7 +104,7 @@ impl Element for Svg {
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         hitbox: &mut Option<Hitbox>,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) where
         Self: Sized,

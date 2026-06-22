@@ -16,7 +16,7 @@ static DEPTH: LazyLock<u64> = LazyLock::new(|| {
 });
 
 impl Render for Tree {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut gpui::BuildCx<'_>, _: &mut Context<Self>) -> impl IntoElement {
         let mut depth = *DEPTH;
         static COLORS: [gpui::Hsla; 4] = [gpui::red(), gpui::blue(), gpui::green(), gpui::yellow()];
         let mut colors = COLORS.iter().cycle().copied();

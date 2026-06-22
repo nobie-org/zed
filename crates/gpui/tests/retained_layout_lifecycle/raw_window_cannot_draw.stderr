@@ -1,0 +1,21 @@
+error[E0624]: method `draw` is private
+ --> tests/retained_layout_lifecycle/raw_window_cannot_draw.rs:4:20
+  |
+4 |     let _ = window.draw(cx);
+  |                    ^^^^ private method
+  |
+ ::: src/window.rs
+  |
+  |     #[profiling::function]
+  |     ---------------------- private method defined here
+
+error[E0624]: method `draw_for_app` is private
+ --> tests/retained_layout_lifecycle/raw_window_cannot_draw.rs:5:20
+  |
+5 |     let _ = window.draw_for_app(cx);
+  |                    ^^^^^^^^^^^^ private method
+  |
+ ::: src/window.rs
+  |
+  |     #[profiling::function]
+  |     ---------------------- private method defined here

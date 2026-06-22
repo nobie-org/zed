@@ -40,7 +40,11 @@ impl AssetSource for Assets {
 struct SvgExample;
 
 impl Render for SvgExample {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_row()

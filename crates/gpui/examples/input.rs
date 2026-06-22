@@ -432,7 +432,7 @@ impl Element for TextElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
+        window: &mut gpui::LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
@@ -447,7 +447,7 @@ impl Element for TextElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut gpui::PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
@@ -546,7 +546,7 @@ impl Element for TextElement {
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut gpui::PaintCx<'_>,
         cx: &mut App,
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
@@ -569,7 +569,7 @@ impl Element for TextElement {
         )
         .unwrap();
 
-        if focus_handle.is_focused(window)
+        if window.is_focused(&focus_handle)
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -583,7 +583,11 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .key_context("TextInput")
@@ -648,7 +652,11 @@ impl InputExample {
 }
 
 impl Render for InputExample {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .bg(rgb(0xaaaaaa))
             .track_focus(&self.focus_handle(cx))

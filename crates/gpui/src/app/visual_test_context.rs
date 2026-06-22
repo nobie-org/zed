@@ -381,7 +381,7 @@ impl VisualTestAppContext {
     #[cfg(any(test, feature = "test-support"))]
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         self.update_window(window, |_, window, cx| {
-            let capture = window.draw_present_and_capture_immediately(cx)?;
+            let capture = window.draw_app_frame_present_and_capture(cx)?;
             RgbaImage::from_raw(capture.width_px, capture.height_px, capture.rgba)
                 .ok_or_else(|| anyhow::anyhow!("failed to build RgbaImage from presented capture"))
         })?

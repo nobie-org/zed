@@ -234,7 +234,7 @@ const FIELDS: [(&str, f32); 24] = [
 ];
 
 impl RenderOnce for TableRow {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut gpui::BuildCx<'_>, _cx: &mut App) -> impl IntoElement {
         let color = self.quote.change_color();
         div()
             .flex()
@@ -293,7 +293,11 @@ impl DataTable {
             .height
     }
 
-    fn render_scrollbar(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_scrollbar(
+        &mut self,
+        _: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let scroll_height = self.scroll_height();
         let table_bounds = self.table_bounds();
         let table_height = table_bounds.size.height;
@@ -375,7 +379,11 @@ impl DataTable {
 }
 
 impl Render for DataTable {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .bg(gpui::white())
             .text_sm()
@@ -429,7 +437,7 @@ impl Render for DataTable {
                                 uniform_list(
                                     "items",
                                     self.quotes.len(),
-                                    cx.processor(move |this, range: Range<usize>, _, _| {
+                                    cx.processor_build(move |this, range: Range<usize>, _, _| {
                                         this.visible_range = range.clone();
                                         let mut items = Vec::with_capacity(range.end - range.start);
                                         for i in range {

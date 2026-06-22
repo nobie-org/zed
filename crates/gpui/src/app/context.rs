@@ -1,8 +1,8 @@
 use crate::{
-    AnyEntity, AnyView, AnyWindowHandle, AppContext, AsyncApp, DispatchPhase, Effect, ElementId,
-    EntityId, EntityReadContext, EventEmitter, FocusHandle, FocusOutEvent, Focusable, Global,
-    KeystrokeObserver, Priority, Reservation, SubscriberSet, Subscription, Task, TextSystem,
-    WeakEntity, WeakFocusHandle, Window, WindowHandle,
+    AnyEntity, AnyView, AnyWindowHandle, AppContext, AsyncApp, BuildCx, DispatchPhase, Effect,
+    ElementId, EntityId, EntityReadContext, EventEmitter, FocusHandle, FocusOutEvent, Focusable,
+    Global, KeystrokeObserver, Priority, Reservation, SubscriberSet, Subscription, Task,
+    TextSystem, WeakEntity, WeakFocusHandle, Window, WindowHandle,
 };
 use anyhow::Result;
 use futures::FutureExt;
@@ -92,12 +92,12 @@ impl<'a, T: 'static> RenderContext<'a, T> {
         self.app.text_system()
     }
 
-    /// Use window-owned element state while rendering an entity.
+    /// Use element-scoped state while constructing current-frame layout facts.
     pub fn use_keyed_element_state<S: 'static>(
         &mut self,
-        window: &mut Window,
+        window: &mut BuildCx<'_>,
         key: impl Into<ElementId>,
-        init: impl FnOnce(&mut Window, &mut Context<S>) -> S,
+        init: impl FnOnce(&mut BuildCx<'_>, &mut Context<S>) -> S,
     ) -> Entity<S> {
         window.use_keyed_state(key, self.app, init)
     }

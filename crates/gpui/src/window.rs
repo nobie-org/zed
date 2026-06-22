@@ -304,7 +304,7 @@ impl<'a> BuildCx<'a> {
         f: impl FnOnce(&mut T, &mut Window, &mut Context<T>) + 'static,
     ) {
         self.window.defer(cx, move |window, cx| {
-            view.update(cx, |view, cx| f(view, window, cx)).ok()
+            view.update(cx, |view, cx| f(view, window, cx));
         });
     }
 

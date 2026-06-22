@@ -88,6 +88,17 @@ impl<'a> BuildCx<'a> {
         Self { window }
     }
 
+    /// Request a one-shot focus transition before this frame prepaints.
+    ///
+    /// Build code can discover the current frame's focus targets, but it must
+    /// not mutate the prepaint dispatch tree directly. The window applies this
+    /// request after layout has collected current-frame metadata and before the
+    /// laid-out root prepaints, so `track_focus` binds the new focus in the
+    /// same frame.
+    pub fn request_focus_before_prepaint(&mut self, focus_handle: &FocusHandle) {
+        self.window.request_focus_before_prepaint(focus_handle);
+    }
+
     pub fn current_view(&self) -> EntityId {
         self.window.current_view()
     }
@@ -2386,6 +2397,7 @@ impl LaidOutVisibleRoot {
         window: &mut Window,
         cx: &mut App,
     ) -> (PrepaintedVisibleRoot, Option<FocusHandle>) {
+        window.apply_focus_request_before_prepaint(cx);
         let focus = self.element.prepaint_at(origin, window, cx);
         (PrepaintedVisibleRoot::new(self.element), focus)
     }
@@ -4062,6 +4074,7 @@ pub struct Window {
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
+    focus_before_prepaint: Option<FocusHandle>,
     focus_enabled: bool,
     pending_input: Option<PendingInput>,
     pending_modifier: ModifierState,
@@ -4716,6 +4729,7 @@ impl Window {
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
+            focus_before_prepaint: None,
             focus_enabled: true,
             pending_input: None,
             pending_modifier: ModifierState::default(),
@@ -4919,6 +4933,16 @@ impl Window {
         });
 
         self.refresh();
+    }
+
+    fn request_focus_before_prepaint(&mut self, handle: &FocusHandle) {
+        self.focus_before_prepaint = Some(handle.clone());
+    }
+
+    fn apply_focus_request_before_prepaint(&mut self, cx: &mut App) {
+        if let Some(handle) = self.focus_before_prepaint.take() {
+            self.focus(&handle, cx);
+        }
     }
 
     /// Move focus without app-level pending-input notification.
@@ -5960,6 +5984,7 @@ impl Window {
 
     fn draw_roots(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
+        self.focus_before_prepaint = None;
 
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
         let root_size = {

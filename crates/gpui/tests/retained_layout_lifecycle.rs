@@ -53,6 +53,11 @@ fn intermediate_frame_layout_vocabulary_does_not_exist_in_production_sources() {
             "ListFramePrepaintCx",
             "schedule_frame_prepaint_work",
             "schedule_list_prepaint_work",
+            "register_list_prepaint",
+            "list_prepaints",
+            "PendingListPrepaint",
+            "ListPrepaintIntent",
+            "PrepaintItemsResponse",
             "layout_visible_root_size",
             "prepaint_list_visible_root_at",
         ] {
@@ -286,6 +291,7 @@ fn window_draw_requires_app_frame_authority() {
 
         let allowed = relative == "window.rs"
             || relative == "app.rs"
+            || relative == "app/headless_app_context.rs"
             || relative == "app/test_app.rs"
             || relative == "app/test_context.rs";
         if !allowed {
@@ -331,39 +337,49 @@ fn list_custom_layout_does_not_receive_raw_layout_frame() {
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let list = std::fs::read_to_string(crate_root.join("src/elements/list.rs")).unwrap();
 
-    for forbidden in ["LayoutFrame", "layout_frame"] {
+    for forbidden in [
+        "CustomLayoutCx",
+        "LayoutFrame",
+        "layout_frame",
+        "LaidOutVisibleRoot",
+        "PrepaintedVisibleRoot",
+    ] {
         assert!(
             !list.contains(forbidden),
-            "list custom layout must use the narrow frame-owned capability, not raw frame authority: {forbidden}"
+            "list custom layout must use inert custom-layout steps, not raw frame/root authority: {forbidden}"
         );
     }
     assert!(
-        list.contains("CustomLayoutCx"),
-        "list should express variable-height work through the generic custom-layout capability"
+        list.contains("CustomLayoutStep"),
+        "list should express variable-height work through the generic custom-layout step protocol"
     );
 }
 
 #[test]
-fn custom_layout_context_is_private_and_narrow() {
+fn custom_layout_step_protocol_is_inert_and_frame_drained() {
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_root = crate_root.join("src");
     let window = std::fs::read_to_string(source_root.join("window.rs")).unwrap();
-    let custom_layout_impl = source_item(&window, "impl<'a> CustomLayoutCx<'a>");
+    let custom_layout_step = source_item(&window, "pub(crate) enum CustomLayoutStep<T>");
 
     for required in [
-        "pub(crate) fn build",
-        "pub(crate) fn layout_visible_root",
-        "pub(crate) fn prepaint_visible_root_at",
-        "pub(crate) fn take_autoscroll",
+        "BuildVisibleRoot",
+        "PrepaintVisibleRoot",
+        "TakeAutoscroll",
+        "ContainsFocused",
+        "RestartAttempt",
+        "Finish(T)",
     ] {
         assert!(
-            custom_layout_impl.contains(required),
-            "custom layout context should expose the final narrow custom-layout operation: {required}"
+            custom_layout_step.contains(required),
+            "custom layout step protocol should contain the final inert operation: {required}"
         );
     }
 
     for forbidden in [
         "pub fn ",
+        "&mut Window",
+        "LayoutFrame",
         "fn window(",
         "fn window_mut(",
         "request_layout(",
@@ -378,8 +394,8 @@ fn custom_layout_context_is_private_and_narrow() {
         "on_mouse_event(",
     ] {
         assert!(
-            !custom_layout_impl.contains(forbidden),
-            "custom layout context must not expose raw window/frame/prepaint authority: {forbidden}"
+            !custom_layout_step.contains(forbidden),
+            "custom layout step protocol must not expose raw window/frame/prepaint authority: {forbidden}"
         );
     }
 
@@ -393,15 +409,12 @@ fn custom_layout_context_is_private_and_narrow() {
             continue;
         }
 
-        let allowed = relative == "window.rs" || relative == "elements/list.rs";
-        if !allowed {
-            offenders.push(relative.into_owned());
-        }
+        offenders.push(relative.into_owned());
     }
 
     assert!(
         offenders.is_empty(),
-        "custom layout solve capability must remain confined to the private frame drain and generic custom-layout user, found in {offenders:?}"
+        "CustomLayoutCx must not exist; custom layout is inert step data drained by the private frame owner, found in {offenders:?}"
     );
 }
 

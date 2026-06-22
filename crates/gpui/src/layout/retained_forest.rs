@@ -1,6 +1,6 @@
 //! Retained GPUI layout forest and private solver mirror.
 //!
-//! The forest is the authority for retained layout occurrences. A solver mirror
+//! The forest is the authority for retained layout nodes. A solver mirror
 //! is kept behind a private facade for layout execution and caching; callers may
 //! request layout, compute roots, and read bounds, but cannot see or mutate
 //! solver nodes directly.
@@ -13,7 +13,7 @@ mod facts;
 mod frame;
 mod geometry;
 mod measurement;
-mod occurrence;
+mod node;
 mod root_slots;
 mod roots;
 mod solver;
@@ -31,10 +31,10 @@ use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
 use facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind, LayoutArtifactPolicy};
 use frame::{CurrentLayoutFactsLog, CurrentLayoutFactsLogCheckpoint};
 use geometry::{FrameLayoutOutput, FrameLayoutOutputCheckpoint};
-pub(super) use measurement::MeasuredLayoutRequest;
 pub(crate) use measurement::PureSizeMeasure;
+pub(super) use measurement::{LayoutArtifact, LayoutArtifactKey, MeasuredLayoutRequest};
 use measurement::{MeasuredLayoutFacts, MeasurementStore, MeasurementStoreCheckpoint};
-use occurrence::{RetainedLayoutOccurrence, RetainedLayoutOccurrenceKind};
+use node::{RetainedLayoutNode, RetainedLayoutNodeKind};
 use root_slots::{RootSlots, RootSlotsCheckpoint};
 use roots::{RootRegistry, RootRegistryCheckpoint};
 use solver::{
@@ -86,7 +86,7 @@ pub(super) struct FreshLayoutComparisonSummary {
     pub(super) target_mismatches: u64,
 }
 
-/// Opaque test handle for a retained occurrence.
+/// Opaque test handle for a retained node.
 ///
 /// Tests can compare or inspect retained forest behavior without depending on
 /// the concrete solver node type or making it part of GPUI's public layout model.
@@ -135,7 +135,7 @@ pub(super) struct RetainedLayoutProjectionForTests {
     children: Vec<RetainedLayoutProjectionForTests>,
 }
 
-/// Owner of retained GPUI layout occurrences and their private solver mirror.
+/// Owner of retained GPUI layout nodes and their private solver mirror.
 ///
 /// All mirror mutations are encapsulated here. Methods such as
 /// `request_layout`, `compute_layout`, and `finish_frame` move retained facts,
@@ -248,7 +248,7 @@ impl RetainedLayoutForest {
     /// Promote successfully computed current roots and sweep everything else.
     ///
     /// After this call, current-frame facts, committed mappings, measurement
-    /// producers, and bounds caches are gone. Only retained root occurrences
+    /// producers, and bounds caches are gone. Only retained root nodes
     /// survive to the next frame.
     pub(super) fn finish_frame(&mut self) -> (RetainedLayoutWork, RetainedLayoutMissWork) {
         self.flush_detached_subtree_removals();
@@ -629,7 +629,7 @@ impl RetainedLayoutForest {
         &mut self,
         reason: &'static str,
         id: LayoutId,
-        previous: Option<&RetainedLayoutOccurrence>,
+        previous: Option<&RetainedLayoutNode>,
         detail: impl FnOnce() -> String,
     ) {
         let Some(limit) = trace::miss_trace_limit() else {
@@ -754,7 +754,7 @@ impl RetainedLayoutForest {
         }
     }
 
-    fn retained_node_summary(node: &RetainedLayoutOccurrence) -> String {
+    fn retained_node_summary(node: &RetainedLayoutNode) -> String {
         format!(
             "{{node_id={:?}, kind={}, measured_facts={}, children={}, style={}}}",
             node.node_id,
@@ -767,14 +767,14 @@ impl RetainedLayoutForest {
         )
     }
 
-    fn retained_tree_summary(node: &RetainedLayoutOccurrence) -> String {
+    fn retained_tree_summary(node: &RetainedLayoutNode) -> String {
         let mut lines = Vec::new();
         Self::push_retained_tree_summary(node, 0, &mut lines);
         format!("[{}]", lines.join(" | "))
     }
 
     fn push_retained_tree_summary(
-        node: &RetainedLayoutOccurrence,
+        node: &RetainedLayoutNode,
         depth: usize,
         lines: &mut Vec<String>,
     ) {
@@ -1273,8 +1273,8 @@ impl RetainedLayoutForest {
 impl RetainedLayoutForest {
     /// Commit a current-frame facts into a retained root slot.
     ///
-    /// This method is the root of the retained occurrence update. It may reuse a
-    /// previous occurrence, build fresh mirror nodes, or detach obsolete
+    /// This method is the root of the retained node update. It may reuse a
+    /// previous node, build fresh mirror nodes, or detach obsolete
     /// subtrees, but all resulting solver mutations stay inside the forest.
     fn commit_layout(&mut self, root_id: RetainedLayoutRootId, id: LayoutId) -> SolverNodeId {
         if let Some(node_id) = self.committed.try_node(id) {
@@ -1343,12 +1343,12 @@ impl RetainedLayoutForest {
         RetainedNodeToken(self.commit_root_layout(root_id, id))
     }
 
-    /// Commit one current facts against an optional previous retained occurrence.
+    /// Commit one current facts against an optional previous retained node.
     fn commit_facts(
         &mut self,
         id: LayoutId,
-        previous: Option<RetainedLayoutOccurrence>,
-    ) -> RetainedLayoutOccurrence {
+        previous: Option<RetainedLayoutNode>,
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
@@ -1370,7 +1370,7 @@ impl RetainedLayoutForest {
 
         if let (Some(global_id), Some(work_snapshot)) = (probe_global_id, work_snapshot) {
             let work_delta = self.work.delta_since(work_snapshot);
-            let node_ids = Self::retained_occurrence_node_ids(&retained_node);
+            let node_ids = Self::retained_node_ids(&retained_node);
             self.subtree_probe
                 .record_committed_subtree(global_id, id, node_ids, work_delta);
         }
@@ -1378,8 +1378,8 @@ impl RetainedLayoutForest {
         retained_node
     }
 
-    /// Build a retained occurrence with fresh mirror nodes only.
-    fn build_fresh_occurrence(&mut self, id: LayoutId) -> RetainedLayoutOccurrence {
+    /// Build a retained node with fresh mirror nodes only.
+    fn build_fresh_retained_node(&mut self, id: LayoutId) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
@@ -1387,21 +1387,21 @@ impl RetainedLayoutForest {
 
         match self.facts(id).kind.clone() {
             CurrentLayoutNodeKind::Unmeasured { children } => {
-                self.build_fresh_unmeasured_occurrence(id, self.facts(id).style.clone(), children)
+                self.build_fresh_unmeasured_node(id, self.facts(id).style.clone(), children)
             }
             CurrentLayoutNodeKind::Measured(measured) => {
-                self.build_fresh_measured_occurrence(id, self.facts(id).style.clone(), measured)
+                self.build_fresh_measured_node(id, self.facts(id).style.clone(), measured)
             }
         }
     }
 
-    /// Build an unmeasured retained occurrence and mirror subtree from scratch.
-    fn build_fresh_unmeasured_occurrence(
+    /// Build an unmeasured retained node and mirror subtree from scratch.
+    fn build_fresh_unmeasured_node(
         &mut self,
         id: LayoutId,
         style: SolverStyle,
         children: Vec<LayoutId>,
-    ) -> RetainedLayoutOccurrence {
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
@@ -1410,7 +1410,7 @@ impl RetainedLayoutForest {
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
         for child in children {
-            let retained_child = self.build_fresh_occurrence(child);
+            let retained_child = self.build_fresh_retained_node(child);
             child_node_ids.push(retained_child.node_id);
             retained_children.push(retained_child);
         }
@@ -1424,23 +1424,23 @@ impl RetainedLayoutForest {
         self.work.record_create();
         self.mark_solver_node_committed(node_id);
         self.committed.insert(id, node_id);
-        RetainedLayoutOccurrence {
+        RetainedLayoutNode {
             node_id,
             identity: self.facts(id).global_id.clone(),
             style,
-            kind: RetainedLayoutOccurrenceKind::Unmeasured {
+            kind: RetainedLayoutNodeKind::Unmeasured {
                 children: retained_children,
             },
         }
     }
 
-    /// Build a measured retained occurrence and mirror node from scratch.
-    fn build_fresh_measured_occurrence(
+    /// Build a measured retained node and mirror node from scratch.
+    fn build_fresh_measured_node(
         &mut self,
         id: LayoutId,
         style: SolverStyle,
         measured_facts: MeasuredLayoutFacts,
-    ) -> RetainedLayoutOccurrence {
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
@@ -1452,11 +1452,11 @@ impl RetainedLayoutForest {
         self.measurements
             .insert_current_measurement_for_layout(node_id, id, &measured_facts);
         self.committed.insert(id, node_id);
-        RetainedLayoutOccurrence {
+        RetainedLayoutNode {
             node_id,
             identity: self.facts(id).global_id.clone(),
             style,
-            kind: RetainedLayoutOccurrenceKind::Measured { measured_facts },
+            kind: RetainedLayoutNodeKind::Measured { measured_facts },
         }
     }
 
@@ -1465,14 +1465,14 @@ impl RetainedLayoutForest {
         self.frame.facts(id)
     }
 
-    /// Commit an unmeasured facts, reusing the previous occurrence when valid.
+    /// Commit an unmeasured facts, reusing the previous node when valid.
     fn commit_unmeasured_facts(
         &mut self,
         id: LayoutId,
         style: SolverStyle,
         children: Vec<LayoutId>,
-        previous: Option<RetainedLayoutOccurrence>,
-    ) -> RetainedLayoutOccurrence {
+        previous: Option<RetainedLayoutNode>,
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
@@ -1481,45 +1481,42 @@ impl RetainedLayoutForest {
         let Some(previous) = previous else {
             self.work.record_no_previous_miss();
             self.trace_retained_layout_miss("no_previous", id, None, || String::new());
-            return self.build_fresh_unmeasured_occurrence(id, style, children);
+            return self.build_fresh_unmeasured_node(id, style, children);
         };
 
-        self.update_unmeasured_retained_occurrence(id, style, children, previous)
+        self.update_unmeasured_retained_node(id, style, children, previous)
     }
 
-    /// Update an unmeasured occurrence and mirror node to match the current facts.
-    fn update_unmeasured_retained_occurrence(
+    /// Update an unmeasured node and mirror node to match the current facts.
+    fn update_unmeasured_retained_node(
         &mut self,
         id: LayoutId,
         style: SolverStyle,
         children: Vec<LayoutId>,
-        previous: RetainedLayoutOccurrence,
-    ) -> RetainedLayoutOccurrence {
+        previous: RetainedLayoutNode,
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
         );
 
-        if !matches!(
-            previous.kind,
-            RetainedLayoutOccurrenceKind::Unmeasured { .. }
-        ) {
-            let fresh = self.build_fresh_unmeasured_occurrence(id, style, children);
+        if !matches!(previous.kind, RetainedLayoutNodeKind::Unmeasured { .. }) {
+            let fresh = self.build_fresh_unmeasured_node(id, style, children);
             self.root_slots.detach_subtree(previous);
             return fresh;
         }
 
-        let RetainedLayoutOccurrence {
+        let RetainedLayoutNode {
             node_id,
             style: previous_style,
             kind:
-                RetainedLayoutOccurrenceKind::Unmeasured {
+                RetainedLayoutNodeKind::Unmeasured {
                     children: previous_children,
                 },
             ..
         } = previous
         else {
-            unreachable!("measured previous occurrence handled above")
+            unreachable!("measured previous node handled above")
         };
         let previous_child_node_ids = previous_children
             .iter()
@@ -1532,7 +1529,7 @@ impl RetainedLayoutForest {
         self.committed.insert(id, node_id);
 
         let mut assigned_previous_children =
-            self.assign_previous_child_occurrences(&children, previous_children.as_mut_slice());
+            self.assign_previous_child_nodes(&children, previous_children.as_mut_slice());
         let mut retained_children = Vec::with_capacity(children.len());
         let mut child_node_ids = Vec::with_capacity(children.len());
         for (index, child) in children.into_iter().enumerate() {
@@ -1560,36 +1557,36 @@ impl RetainedLayoutForest {
             self.root_slots.detach_subtree(previous_child);
         }
 
-        let retained_node = RetainedLayoutOccurrence {
+        let retained_node = RetainedLayoutNode {
             node_id,
             identity: self.facts(id).global_id.clone(),
             style,
-            kind: RetainedLayoutOccurrenceKind::Unmeasured {
+            kind: RetainedLayoutNodeKind::Unmeasured {
                 children: retained_children,
             },
         };
         retained_node
     }
 
-    /// Assign previous child occurrences to current child facts.
+    /// Assign previous child nodes to current child facts.
     ///
-    /// An occurrence may be preserved only when exact current facts prove it
+    /// A retained node may be preserved only when exact current facts prove it
     /// already represents the same subtree, or when a unique sibling identity
     /// proves it is the same semantic child whose current facts will be
     /// committed before the legal root solve. Same-position broad-kind reuse is
     /// deliberately absent.
-    fn assign_previous_child_occurrences(
+    fn assign_previous_child_nodes(
         &self,
         children: &[LayoutId],
-        previous_children: &mut [Option<RetainedLayoutOccurrence>],
-    ) -> Vec<Option<RetainedLayoutOccurrence>> {
+        previous_children: &mut [Option<RetainedLayoutNode>],
+    ) -> Vec<Option<RetainedLayoutNode>> {
         let mut assigned = std::iter::repeat_with(|| None)
             .take(children.len())
             .collect::<Vec<_>>();
         let unique_current_global_ids = self.unique_current_child_global_ids(children);
         let unique_previous_global_ids = Self::unique_previous_child_global_ids(previous_children);
 
-        let same_slot_exact_matches = children
+        let same_position_exact_matches = children
             .iter()
             .enumerate()
             .map(|(index, child)| {
@@ -1600,7 +1597,7 @@ impl RetainedLayoutForest {
                     return false;
                 };
                 self.retained_node_is_exact_current_facts(*child, candidate)
-                    && self.same_slot_exact_match_is_unambiguous(
+                    && self.same_position_exact_match_is_unambiguous(
                         *child,
                         children,
                         previous_children,
@@ -1608,11 +1605,11 @@ impl RetainedLayoutForest {
             })
             .collect::<Vec<_>>();
 
-        for (index, should_preserve) in same_slot_exact_matches.into_iter().enumerate() {
+        for (index, should_preserve) in same_position_exact_matches.into_iter().enumerate() {
             if should_preserve {
                 let previous_child = previous_children
                     .get_mut(index)
-                    .expect("previous child index should exist after same-slot lookup");
+                    .expect("previous child index should exist after exact-position lookup");
                 assigned[index] = previous_child.take();
             }
         }
@@ -1636,21 +1633,14 @@ impl RetainedLayoutForest {
             }
         }
 
-        for (index, child) in children.iter().enumerate() {
-            if assigned[index].is_none() {
-                assigned[index] =
-                    self.take_same_slot_previous_child(*child, index, previous_children);
-            }
-        }
-
         assigned
     }
 
-    fn same_slot_exact_match_is_unambiguous(
+    fn same_position_exact_match_is_unambiguous(
         &self,
         child: LayoutId,
         current_children: &[LayoutId],
-        previous_children: &[Option<RetainedLayoutOccurrence>],
+        previous_children: &[Option<RetainedLayoutNode>],
     ) -> bool {
         self.current_exact_child_count(child, current_children)
             == self.previous_exact_child_count(child, previous_children)
@@ -1672,7 +1662,7 @@ impl RetainedLayoutForest {
 
     /// Find unique previous child identities. Duplicates are not semantic proof.
     fn unique_previous_child_global_ids(
-        previous_children: &[Option<RetainedLayoutOccurrence>],
+        previous_children: &[Option<RetainedLayoutNode>],
     ) -> FxHashMap<GlobalElementId, Option<usize>> {
         let mut ids = FxHashMap::default();
         for (index, previous_child) in previous_children.iter().enumerate() {
@@ -1704,10 +1694,10 @@ impl RetainedLayoutForest {
         &self,
         child: LayoutId,
         current_index: usize,
-        previous_children: &mut [Option<RetainedLayoutOccurrence>],
+        previous_children: &mut [Option<RetainedLayoutNode>],
         unique_current_global_ids: &FxHashMap<GlobalElementId, Option<usize>>,
         unique_previous_global_ids: &FxHashMap<GlobalElementId, Option<usize>>,
-    ) -> Option<RetainedLayoutOccurrence> {
+    ) -> Option<RetainedLayoutNode> {
         let global_id = self.facts(child).global_id.as_ref()?;
         if unique_current_global_ids.get(global_id).copied().flatten() != Some(current_index) {
             return None;
@@ -1729,8 +1719,8 @@ impl RetainedLayoutForest {
         &self,
         child: LayoutId,
         current_children: &[LayoutId],
-        previous_children: &mut [Option<RetainedLayoutOccurrence>],
-    ) -> Option<RetainedLayoutOccurrence> {
+        previous_children: &mut [Option<RetainedLayoutNode>],
+    ) -> Option<RetainedLayoutNode> {
         if self.current_exact_child_count(child, current_children) != 1 {
             return None;
         }
@@ -1750,26 +1740,6 @@ impl RetainedLayoutForest {
         previous_children.get_mut(matched_index?)?.take()
     }
 
-    /// Remove the previous child from the same sibling slot when it can host
-    /// the current facts through full recommit.
-    ///
-    /// This is allocation-slot reuse, not semantic proof. The retained node's
-    /// old style, children, measured facts, and artifact bindings are all
-    /// rewritten or invalidated by `commit_facts` before the legal root solve.
-    fn take_same_slot_previous_child(
-        &self,
-        child: LayoutId,
-        current_index: usize,
-        previous_children: &mut [Option<RetainedLayoutOccurrence>],
-    ) -> Option<RetainedLayoutOccurrence> {
-        let previous_child = previous_children.get_mut(current_index)?;
-        let candidate = previous_child.as_ref()?;
-        if self.retained_node_can_host_recommitted_facts(child, candidate) {
-            return previous_child.take();
-        }
-        None
-    }
-
     fn current_exact_child_count(&self, child: LayoutId, current_children: &[LayoutId]) -> usize {
         current_children
             .iter()
@@ -1780,7 +1750,7 @@ impl RetainedLayoutForest {
     fn previous_exact_child_count(
         &self,
         child: LayoutId,
-        previous_children: &[Option<RetainedLayoutOccurrence>],
+        previous_children: &[Option<RetainedLayoutNode>],
     ) -> usize {
         previous_children
             .iter()
@@ -1838,8 +1808,8 @@ impl RetainedLayoutForest {
         id: LayoutId,
         style: SolverStyle,
         measured_facts: MeasuredLayoutFacts,
-        previous: Option<RetainedLayoutOccurrence>,
-    ) -> RetainedLayoutOccurrence {
+        previous: Option<RetainedLayoutNode>,
+    ) -> RetainedLayoutNode {
         assert!(
             !self.committed.contains_layout(id),
             "layout facts should appear only once in a committed layout tree"
@@ -1848,7 +1818,7 @@ impl RetainedLayoutForest {
         let Some(previous) = previous else {
             self.work.record_no_previous_miss();
             self.trace_retained_layout_miss("no_previous", id, None, || String::new());
-            return self.build_fresh_measured_occurrence(id, style, measured_facts);
+            return self.build_fresh_measured_node(id, style, measured_facts);
         };
 
         let previous_measured_facts = previous.measured_facts().cloned();
@@ -1870,19 +1840,19 @@ impl RetainedLayoutForest {
                     Self::debug_fingerprint(&measured_facts)
                 )
             });
-            let fresh = self.build_fresh_measured_occurrence(id, style, measured_facts);
+            let fresh = self.build_fresh_measured_node(id, style, measured_facts);
             self.root_slots.detach_subtree(previous);
             return fresh;
         }
 
-        let RetainedLayoutOccurrence {
+        let RetainedLayoutNode {
             node_id,
             style: previous_style,
-            kind: RetainedLayoutOccurrenceKind::Measured { .. },
+            kind: RetainedLayoutNodeKind::Measured { .. },
             ..
         } = previous
         else {
-            unreachable!("unmeasured previous occurrence handled by compatibility check")
+            unreachable!("unmeasured previous node handled by compatibility check")
         };
         self.work.record_reuse();
         self.mark_solver_node_committed(node_id);
@@ -1903,23 +1873,23 @@ impl RetainedLayoutForest {
 
         self.measurements
             .insert_current_measurement_for_layout(node_id, id, &measured_facts);
-        RetainedLayoutOccurrence {
+        RetainedLayoutNode {
             node_id,
             identity: self.facts(id).global_id.clone(),
             style,
-            kind: RetainedLayoutOccurrenceKind::Measured { measured_facts },
+            kind: RetainedLayoutNodeKind::Measured { measured_facts },
         }
     }
 
-    /// Check whether an existing occurrence subtree is an exact semantic match.
+    /// Check whether an existing node subtree is an exact semantic match.
     ///
     /// This is a proof rule, not a heuristic. A `true` result means the
-    /// occurrence's retained facts and child shape already match the current
+    /// node's retained facts and child shape already match the current
     /// facts tree, so its solver cache can remain meaningful.
     fn retained_node_is_exact_current_facts(
         &self,
         id: LayoutId,
-        previous: &RetainedLayoutOccurrence,
+        previous: &RetainedLayoutNode,
     ) -> bool {
         let facts = self.facts(id);
         if previous.identity.as_ref() != facts.global_id.as_ref() {
@@ -1932,7 +1902,7 @@ impl RetainedLayoutForest {
         match (&facts.kind, &previous.kind) {
             (
                 CurrentLayoutNodeKind::Unmeasured { children },
-                RetainedLayoutOccurrenceKind::Unmeasured {
+                RetainedLayoutNodeKind::Unmeasured {
                     children: previous_children,
                 },
             ) => {
@@ -1946,7 +1916,7 @@ impl RetainedLayoutForest {
             }
             (
                 CurrentLayoutNodeKind::Measured(measured),
-                RetainedLayoutOccurrenceKind::Measured {
+                RetainedLayoutNodeKind::Measured {
                     measured_facts: previous_measured_facts,
                 },
             ) => previous_measured_facts == measured,
@@ -1954,9 +1924,9 @@ impl RetainedLayoutForest {
         }
     }
 
-    /// Return whether a previous occurrence can host current facts.
+    /// Return whether a previous node can host current facts.
     ///
-    /// A `true` result is not equality. It means the occurrence kind is
+    /// A `true` result is not equality. It means the node kind is
     /// compatible enough that committing current facts can overwrite every
     /// layout-visible fact without rebuilding the solver node. Opaque measured
     /// closures return `false` because the old callback is not comparable
@@ -1964,16 +1934,16 @@ impl RetainedLayoutForest {
     fn retained_node_can_host_recommitted_facts(
         &self,
         id: LayoutId,
-        previous: &RetainedLayoutOccurrence,
+        previous: &RetainedLayoutNode,
     ) -> bool {
         match (&self.facts(id).kind, &previous.kind) {
             (
                 CurrentLayoutNodeKind::Unmeasured { .. },
-                RetainedLayoutOccurrenceKind::Unmeasured { .. },
+                RetainedLayoutNodeKind::Unmeasured { .. },
             ) => true,
             (
                 CurrentLayoutNodeKind::Measured(measured),
-                RetainedLayoutOccurrenceKind::Measured {
+                RetainedLayoutNodeKind::Measured {
                     measured_facts: previous_measured_facts,
                 },
             ) => previous_measured_facts.can_reuse_solver_node_with(measured),
@@ -1981,10 +1951,10 @@ impl RetainedLayoutForest {
         }
     }
 
-    fn retained_occurrence_node_ids(retained_node: &RetainedLayoutOccurrence) -> Vec<SolverNodeId> {
+    fn retained_node_ids(retained_node: &RetainedLayoutNode) -> Vec<SolverNodeId> {
         let mut node_ids = vec![retained_node.node_id];
         for child in retained_node.children() {
-            node_ids.extend(Self::retained_occurrence_node_ids(child));
+            node_ids.extend(Self::retained_node_ids(child));
         }
         node_ids
     }
@@ -2078,11 +2048,8 @@ impl RetainedLayoutForest {
         }
     }
 
-    fn remove_retained_subtree(&mut self, retained_node: RetainedLayoutOccurrence) {
-        let is_measured = matches!(
-            retained_node.kind,
-            RetainedLayoutOccurrenceKind::Measured { .. }
-        );
+    fn remove_retained_subtree(&mut self, retained_node: RetainedLayoutNode) {
+        let is_measured = matches!(retained_node.kind, RetainedLayoutNodeKind::Measured { .. });
         let node_id = retained_node.node_id;
         for child in retained_node.into_children() {
             self.remove_retained_subtree(child);

@@ -448,7 +448,7 @@ fn compute_canvas_chrome_frame_output(
         spec.root_height as f32,
         spec.scale_factor,
     );
-    assert_intent_committed_exactly(engine, root);
+    assert_facts_committed_exactly(engine, root);
 
     let panel = engine.retained_node_token_for_tests(panel);
     let flex_child = engine.retained_node_token_for_tests(flex_child);
@@ -1015,7 +1015,7 @@ impl GeneratedTree {
         }
     }
 
-    fn retained_occurrence_is_exact_current_intent(&self, current: &Self) -> bool {
+    fn retained_node_matches_current_facts(&self, current: &Self) -> bool {
         match (self, current) {
             (
                 Self::Unmeasured {
@@ -1033,7 +1033,7 @@ impl GeneratedTree {
                         .iter()
                         .zip(current_children)
                         .all(|(previous, current)| {
-                            previous.retained_occurrence_is_exact_current_intent(current)
+                            previous.retained_node_matches_current_facts(current)
                         })
             }
             (
@@ -1065,7 +1065,7 @@ impl GeneratedTree {
     fn exact_child_count(child: &Self, children: &[Self]) -> usize {
         children
             .iter()
-            .filter(|candidate| child.retained_occurrence_is_exact_current_intent(candidate))
+            .filter(|candidate| child.retained_node_matches_current_facts(candidate))
             .count()
     }
 
@@ -1078,17 +1078,8 @@ impl GeneratedTree {
             .iter()
             .zip(previous_used)
             .filter(|(_, used)| !**used)
-            .filter(|(candidate, _)| candidate.retained_occurrence_is_exact_current_intent(child))
+            .filter(|(candidate, _)| candidate.retained_node_matches_current_facts(child))
             .count()
-    }
-
-    fn can_host_recommitted_facts(&self, current: &Self) -> bool {
-        matches!(
-            (self, current),
-            (Self::Unmeasured { .. }, Self::Unmeasured { .. })
-                | (Self::PureSize { .. }, Self::PureSize { .. })
-                | (Self::Text { .. }, Self::Text { .. })
-        )
     }
 }
 
@@ -1311,7 +1302,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
         previous: &GeneratedTree,
         current: &GeneratedTree,
     ) -> ExpectedCommitResult {
-        if previous.retained_occurrence_is_exact_current_intent(current) {
+        if previous.retained_node_matches_current_facts(current) {
             return self.add_reused_tree(current);
         }
 
@@ -1336,7 +1327,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
 
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     if let Some(previous_child) = previous_children.get(current_index) {
-                        if previous_child.retained_occurrence_is_exact_current_intent(current_child)
+                        if previous_child.retained_node_matches_current_facts(current_child)
                             && GeneratedTree::exact_child_count(current_child, current_children)
                                 == GeneratedTree::exact_child_count(
                                     current_child,
@@ -1369,27 +1360,11 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
                             .position(|(index, previous_child)| {
                                 !previous_used[index]
                                     && previous_child
-                                        .retained_occurrence_is_exact_current_intent(current_child)
+                                        .retained_node_matches_current_facts(current_child)
                             });
                     if let Some(index) = matching_previous_index {
                         previous_used[index] = true;
                         assigned_previous_indices[current_index] = Some(index);
-                    }
-                }
-
-                for (current_index, current_child) in current_children.iter().enumerate() {
-                    if assigned_previous_indices[current_index].is_some() {
-                        continue;
-                    }
-                    let Some(previous_child) = previous_children.get(current_index) else {
-                        continue;
-                    };
-                    if previous_used[current_index] {
-                        continue;
-                    }
-                    if previous_child.can_host_recommitted_facts(current_child) {
-                        previous_used[current_index] = true;
-                        assigned_previous_indices[current_index] = Some(current_index);
                     }
                 }
 
@@ -1708,8 +1683,8 @@ fn retained_node_size(engine: &LayoutEngine, node_id: RetainedNodeToken) -> Size
     engine.retained_node_size_for_tests(node_id)
 }
 
-fn assert_intent_committed_exactly(engine: &LayoutEngine, id: LayoutId) {
-    engine.assert_intent_committed_exactly_for_tests(id);
+fn assert_facts_committed_exactly(engine: &LayoutEngine, id: LayoutId) {
+    engine.assert_facts_committed_exactly_for_tests(id);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1734,7 +1709,7 @@ fn generated_retained_commit_matches_fresh_outputs(cx: &mut TestAppContext) {
                 available_height,
             );
             for root in &retained_ids {
-                assert_intent_committed_exactly(&retained, *root);
+                assert_facts_committed_exactly(&retained, *root);
             }
 
             let mut fresh = LayoutEngine::new();
@@ -1747,7 +1722,7 @@ fn generated_retained_commit_matches_fresh_outputs(cx: &mut TestAppContext) {
                 available_height,
             );
             for root in &fresh_ids {
-                assert_intent_committed_exactly(&fresh, *root);
+                assert_facts_committed_exactly(&fresh, *root);
             }
 
             assert_eq!(
@@ -1802,7 +1777,7 @@ fn generated_retained_layout_matches_fresh_across_changing_root_constraints(
                 available_height,
             );
             for root in &retained_ids {
-                assert_intent_committed_exactly(&retained, *root);
+                assert_facts_committed_exactly(&retained, *root);
             }
 
             let mut fresh = LayoutEngine::new();
@@ -1815,7 +1790,7 @@ fn generated_retained_layout_matches_fresh_across_changing_root_constraints(
                 available_height,
             );
             for root in &fresh_ids {
-                assert_intent_committed_exactly(&fresh, *root);
+                assert_facts_committed_exactly(&fresh, *root);
             }
 
             assert_eq!(
@@ -1875,7 +1850,7 @@ fn retained_layout_matches_fresh_after_root_constraint_aba_regression(cx: &mut T
             available_height,
         );
         for root in &retained_ids {
-            assert_intent_committed_exactly(&retained, *root);
+            assert_facts_committed_exactly(&retained, *root);
         }
 
         let mut fresh = LayoutEngine::new();
@@ -1888,7 +1863,7 @@ fn retained_layout_matches_fresh_after_root_constraint_aba_regression(cx: &mut T
             available_height,
         );
         for root in &fresh_ids {
-            assert_intent_committed_exactly(&fresh, *root);
+            assert_facts_committed_exactly(&fresh, *root);
         }
 
         assert_eq!(
@@ -1947,7 +1922,7 @@ fn retained_layout_matches_fresh_after_root_constraint_change_with_full_child_re
             available_height,
         );
         for root in &retained_ids {
-            assert_intent_committed_exactly(&retained, *root);
+            assert_facts_committed_exactly(&retained, *root);
         }
 
         let mut fresh = LayoutEngine::new();
@@ -1960,7 +1935,7 @@ fn retained_layout_matches_fresh_after_root_constraint_change_with_full_child_re
             available_height,
         );
         for root in &fresh_ids {
-            assert_intent_committed_exactly(&fresh, *root);
+            assert_facts_committed_exactly(&fresh, *root);
         }
 
         assert_eq!(
@@ -2209,7 +2184,7 @@ fn retained_layout_matches_fresh_with_opaque_leaf_after_same_root_constraint_rep
             available_height,
         );
         for root in &retained_ids {
-            assert_intent_committed_exactly(&retained, *root);
+            assert_facts_committed_exactly(&retained, *root);
         }
 
         let mut fresh = LayoutEngine::new();
@@ -2222,7 +2197,7 @@ fn retained_layout_matches_fresh_with_opaque_leaf_after_same_root_constraint_rep
             available_height,
         );
         for root in &fresh_ids {
-            assert_intent_committed_exactly(&fresh, *root);
+            assert_facts_committed_exactly(&fresh, *root);
         }
 
         assert_eq!(
@@ -3034,7 +3009,7 @@ fn retained_commit_matches_fresh_commit_after_insert_delete_and_reorder() {
 
     let retained_second_root = request_row(&mut retained, &[30.0, 10.0, 40.0, 20.0]);
     let retained_root_node = retained.commit_layout(retained_second_root);
-    assert_intent_committed_exactly(&retained, retained_second_root);
+    assert_facts_committed_exactly(&retained, retained_second_root);
 
     let mut fresh = LayoutEngine::new();
     let fresh_root = request_row(&mut fresh, &[30.0, 10.0, 40.0, 20.0]);
@@ -3082,7 +3057,7 @@ fn changed_keyed_unmeasured_child_updates_retained_node_and_style() {
     let changing = request_keyed_leaf(&mut engine, 21_001, 30.0);
     let second_root = request_container(&mut engine, &[stable, changing]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
 
     assert_eq!(
@@ -3107,7 +3082,7 @@ fn changed_keyed_unmeasured_child_updates_retained_node_and_style() {
 }
 
 #[test]
-fn changed_unkeyed_same_slot_child_reuses_node_with_full_recommit() {
+fn changed_unkeyed_same_position_child_rebuilds_without_identity_proof() {
     let mut engine = LayoutEngine::new();
     let first_child = request_leaf(&mut engine, 10.0);
     let first_root = request_container(&mut engine, &[first_child]);
@@ -3119,16 +3094,21 @@ fn changed_unkeyed_same_slot_child_reuses_node_with_full_recommit() {
     let second_child = request_leaf(&mut engine, 20.0);
     let second_root = request_container(&mut engine, &[second_child]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
 
     assert_eq!(second_root_node, first_root_node);
-    assert_eq!(second_child_nodes[0], first_child_nodes[0]);
+    assert_ne!(
+        second_child_nodes[0], first_child_nodes[0],
+        "changed anonymous same-position child has no identity proof and must be rebuilt"
+    );
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
-            style_updates: 1,
+            reuses: 1,
+            creates: 1,
+            removes: 1,
+            child_list_updates: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3158,7 +3138,7 @@ fn unique_global_id_reorder_preserves_semantic_child_node() {
     let second_a = request_keyed_leaf(&mut engine, 1, 10.0);
     let second_root = request_flex_container(&mut engine, &[second_b, second_a]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
 
     assert_eq!(
@@ -3199,7 +3179,7 @@ fn duplicate_global_id_is_not_semantic_identity() {
     let second = request_keyed_leaf(&mut engine, 1, 20.0);
     let second_root = request_flex_container(&mut engine, &[second]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
     let second_child = engine.retained_node_token_for_tests(second);
 
     assert_eq!(second_root_node, first_root_node);
@@ -3245,7 +3225,7 @@ fn changed_measured_child_is_not_an_exact_reordered_match() {
     let second_measured = request_pure_list_measured(&mut engine, 0.0, 0.0);
     let second_root = request_container(&mut engine, &[second_measured]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
 
     let mut fresh = LayoutEngine::new();
@@ -3308,7 +3288,7 @@ fn changed_ancestor_reuses_unmeasured_path_and_updates_changed_leaf() {
     let stable_sibling = request_leaf(&mut engine, 99.0);
     let second_root = request_container(&mut engine, &[changed_child, stable_sibling]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
 
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
     let second_changed_child_node = second_child_nodes[0];
@@ -3384,7 +3364,7 @@ fn semantic_reuse_updates_changed_descendant_geometry_without_child_list_mutatio
     let second_root = request_flex_container(&mut retained, &[changed_child]);
     let retained_root_node =
         compute_layout_without_measure(&mut retained, second_root, 300.0, 100.0);
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
 
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
@@ -3455,7 +3435,7 @@ fn hovered_swatch_style_change_reuses_appearance_subtree_and_stable_siblings() {
         request_appearance_swatch_panel(&mut retained, 32.0);
     let retained_root_node =
         compute_layout_without_measure(&mut retained, second_root, 320.0, 100.0);
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
 
     assert_eq!(retained_root_node, first_root_node);
     assert_eq!(
@@ -3562,12 +3542,12 @@ fn retained_commit_matches_fresh_commit_for_frame_sequence_gallery() {
     for widths in frames {
         let retained_root = request_row(&mut retained, widths);
         let retained_root_node = retained.commit_layout(retained_root);
-        assert_intent_committed_exactly(&retained, retained_root);
+        assert_facts_committed_exactly(&retained, retained_root);
 
         let mut fresh = LayoutEngine::new();
         let fresh_root = request_row(&mut fresh, widths);
         let fresh_root_node = fresh.commit_layout(fresh_root);
-        assert_intent_committed_exactly(&fresh, fresh_root);
+        assert_facts_committed_exactly(&fresh, fresh_root);
 
         assert_eq!(
             retained_layout_shape(&retained, retained_root_node),
@@ -3654,7 +3634,7 @@ fn unique_global_id_style_change_updates_retained_node_and_matches_fresh_layout(
     let fresh_root = request_flex_container(&mut fresh, &[stable, changing]);
     let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, 240.0, 80.0);
 
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
     assert_eq!(retained_root, first_root_node);
     assert_eq!(
         retained.retained_node_token_for_tests(retained_stable),
@@ -3707,7 +3687,7 @@ fn same_index_exact_child_is_not_stolen_by_changed_equal_sibling() {
     let fresh_root = request_flex_container(&mut fresh, &[changing, stable]);
     let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, 240.0, 80.0);
 
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
     assert_eq!(retained_root, first_root_node);
     assert_eq!(
         retained.retained_node_token_for_tests(retained_changing),
@@ -3760,7 +3740,7 @@ fn flex_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
     let fresh_root = request_flex_container(&mut fresh, &[b, c, a]);
     let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, 240.0, 80.0);
 
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -3803,7 +3783,7 @@ fn grid_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
     let fresh_root = request_grid_container(&mut fresh, &[b, c, a]);
     let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, 240.0, 80.0);
 
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -3822,7 +3802,7 @@ fn grid_parent_reorder_reuses_exact_children_and_matches_fresh_layout() {
 }
 
 #[test]
-fn duplicate_same_slot_exact_children_reuse_on_exact_repeat() {
+fn duplicate_same_position_exact_children_reuse_on_exact_repeat() {
     let mut engine = LayoutEngine::new();
     let left = request_leaf(&mut engine, 10.0);
     let right = request_leaf(&mut engine, 10.0);
@@ -3836,7 +3816,7 @@ fn duplicate_same_slot_exact_children_reuse_on_exact_repeat() {
     let right = request_leaf(&mut engine, 10.0);
     let second_root = request_container(&mut engine, &[left, right]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
     let second_child_nodes = engine.retained_child_tokens_for_tests(second_root_node);
 
     assert_eq!(second_root_node, first_root_node);
@@ -3851,7 +3831,7 @@ fn duplicate_same_slot_exact_children_reuse_on_exact_repeat() {
 }
 
 #[test]
-fn duplicate_same_slot_child_reuses_same_slot_when_sibling_count_changes() {
+fn duplicate_exact_child_rebuilds_when_sibling_count_changes_and_identity_is_ambiguous() {
     let mut engine = LayoutEngine::new();
     let left = request_leaf(&mut engine, 10.0);
     let right = request_leaf(&mut engine, 10.0);
@@ -3864,10 +3844,13 @@ fn duplicate_same_slot_child_reuses_same_slot_when_sibling_count_changes() {
     let child = request_leaf(&mut engine, 10.0);
     let second_root = request_container(&mut engine, &[child]);
     let second_root_node = engine.commit_layout(second_root);
-    assert_intent_committed_exactly(&engine, second_root);
+    assert_facts_committed_exactly(&engine, second_root);
 
     let child_node = engine.retained_node_token_for_tests(child);
-    assert_eq!(child_node, first_child_nodes[0]);
+    assert!(
+        !first_child_nodes.contains(&child_node),
+        "duplicate anonymous previous siblings are not identity proof"
+    );
     assert_eq!(
         engine.retained_child_tokens_for_tests(second_root_node),
         vec![child_node]
@@ -3879,9 +3862,10 @@ fn duplicate_same_slot_child_reuses_same_slot_when_sibling_count_changes() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
+            reuses: 1,
+            creates: 1,
             child_list_updates: 1,
-            removes: 1,
+            removes: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3898,7 +3882,7 @@ fn duplicate_same_slot_child_reuses_same_slot_when_sibling_count_changes() {
 }
 
 #[test]
-fn moved_duplicate_exact_child_uses_same_slot_storage_when_identity_is_ambiguous() {
+fn moved_duplicate_exact_child_rebuilds_when_identity_is_ambiguous() {
     let mut retained = LayoutEngine::new();
     let changed_slot = request_leaf(&mut retained, 20.0);
     let duplicate_left = request_leaf(&mut retained, 10.0);
@@ -3919,7 +3903,7 @@ fn moved_duplicate_exact_child_uses_same_slot_storage_when_identity_is_ambiguous
     let child = request_leaf(&mut retained, 10.0);
     let second_root = request_container(&mut retained, &[child]);
     let second_root_node = retained.commit_layout(second_root);
-    assert_intent_committed_exactly(&retained, second_root);
+    assert_facts_committed_exactly(&retained, second_root);
     let child_node = retained.retained_node_token_for_tests(child);
 
     assert_eq!(second_root_node, first_root_node);
@@ -3927,17 +3911,17 @@ fn moved_duplicate_exact_child_uses_same_slot_storage_when_identity_is_ambiguous
         !first_duplicate_nodes.contains(&child_node),
         "duplicate anonymous exact siblings are not identity proof"
     );
-    assert_eq!(
+    assert_ne!(
         child_node, first_changed_slot_node,
-        "ambiguous anonymous identity falls back to same-slot storage reuse with full recommit"
+        "ambiguous anonymous identity must not preserve unrelated retained node history"
     );
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 2,
-            style_updates: 1,
+            reuses: 1,
+            creates: 1,
             child_list_updates: 1,
-            removes: 2,
+            removes: 3,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -3967,7 +3951,7 @@ fn moved_child_has_exactly_the_current_intent_parent() {
     let right = request_container(&mut engine, &[child]);
     let root = request_container(&mut engine, &[left, right]);
     engine.commit_layout(root);
-    assert_intent_committed_exactly(&engine, root);
+    assert_facts_committed_exactly(&engine, root);
 
     let left_node = engine.retained_node_token_for_tests(left);
     let right_node = engine.retained_node_token_for_tests(right);
@@ -4005,8 +3989,10 @@ fn child_reparenting_rollback_restores_precheckpoint_retained_state() {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            style_updates: 1,
+            reuses: 2,
+            creates: 1,
+            child_list_updates: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4036,7 +4022,7 @@ fn node_kind_changes_do_not_reuse_stale_measured_context() {
 
     let leaf = request_leaf(&mut engine, 10.0);
     engine.commit_layout(leaf);
-    assert_intent_committed_exactly(&engine, leaf);
+    assert_facts_committed_exactly(&engine, leaf);
 
     let leaf_node = engine.retained_node_token_for_tests(leaf);
     assert!(!engine.retained_node_has_measure_context_for_tests(leaf_node));
@@ -4063,7 +4049,7 @@ fn measured_producer_drops_at_frame_finish_and_marker_drops_on_removal() {
 
     let leaf = request_leaf(&mut engine, 10.0);
     engine.commit_layout(leaf);
-    assert_intent_committed_exactly(&engine, leaf);
+    assert_facts_committed_exactly(&engine, leaf);
     assert_eq!(drops.get(), 1);
     let leaf_node = engine.retained_node_token_for_tests(leaf);
     assert!(!engine.retained_node_has_measure_context_for_tests(leaf_node));
@@ -4079,7 +4065,7 @@ fn opaque_measured_node_is_rebuilt_because_closure_semantics_are_opaque() {
     engine.reset_retained_mutation_sample_for_tests();
     let measured = request_auto_measured(&mut engine, 10.0);
     let second_node = engine.commit_layout(measured);
-    assert_intent_committed_exactly(&engine, measured);
+    assert_facts_committed_exactly(&engine, measured);
 
     assert_ne!(second_node, first_node);
     assert_eq!(
@@ -4107,7 +4093,7 @@ fn unmeasured_subtree_with_opaque_descendant_retains_parent_and_rebuilds_opaque_
     let root = request_container(&mut engine, &[measured]);
     let second_root_node = engine.commit_layout(root);
     let second_measured_node = engine.retained_node_token_for_tests(measured);
-    assert_intent_committed_exactly(&engine, root);
+    assert_facts_committed_exactly(&engine, root);
 
     assert_eq!(second_root_node, first_root_node);
     assert_ne!(second_measured_node, first_measured_node);
@@ -4297,7 +4283,7 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
         size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
     );
 
-    assert_intent_committed_exactly(&engine, root);
+    assert_facts_committed_exactly(&engine, root);
     assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
@@ -4363,8 +4349,10 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 3,
-            style_updates: 1,
+            reuses: 2,
+            creates: 1,
+            child_list_updates: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4432,8 +4420,10 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 4,
-            style_updates: 1,
+            reuses: 3,
+            creates: 1,
+            child_list_updates: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4520,8 +4510,11 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 4,
-            dirty_marks: 1,
+            reuses: 3,
+            creates: 1,
+            child_list_updates: 1,
+            context_clears: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -4548,7 +4541,7 @@ fn same_text_measure_key_with_changed_solver_style_reuses_text_node() {
         size(px(40.0), px(20.0)),
     );
     let second_node = engine.commit_layout(text);
-    assert_intent_committed_exactly(&engine, text);
+    assert_facts_committed_exactly(&engine, text);
 
     assert_eq!(second_node, first_node);
     assert_eq!(
@@ -5123,7 +5116,7 @@ fn changed_flex_ancestor_updates_canvas_subtree_and_matches_fresh_layout() {
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5184,7 +5177,7 @@ fn reused_canvas_panel_under_inserted_sidebar_matches_fresh_layout() {
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5254,7 +5247,7 @@ fn reused_canvas_panel_inside_chrome_shell_after_sidebar_resize_matches_fresh_la
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5323,7 +5316,7 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5394,7 +5387,7 @@ fn reused_canvas_panel_after_scaled_sidebar_resize_matches_fresh_layout() {
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5462,7 +5455,7 @@ fn reused_canvas_panel_after_scaled_gapped_sidebar_resize_matches_fresh_layout()
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5530,7 +5523,7 @@ fn reused_canvas_panel_after_scaled_root_width_resize_matches_fresh_layout() {
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5639,7 +5632,7 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)
@@ -5695,7 +5688,7 @@ fn exact_canvas_sibling_recomputes_after_sidebar_subtree_change() {
     let fresh_canvas_host = fresh.retained_node_token_for_tests(canvas_host);
     let fresh_canvas = fresh.retained_node_token_for_tests(canvas);
 
-    assert_intent_committed_exactly(&retained, root);
+    assert_facts_committed_exactly(&retained, root);
     assert_eq!(
         retained_layout_projection(&retained, retained_root),
         retained_layout_projection(&fresh, fresh_root)

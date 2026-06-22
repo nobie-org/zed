@@ -16,7 +16,7 @@ pub(in crate::layout) struct RetainedLayoutWork {
     pub(in crate::layout) removes: u64,
 }
 
-/// Counts why a retained occurrence could not be reused.
+/// Counts why a retained node could not be reused.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::layout) struct RetainedLayoutMissWork {
     pub(in crate::layout) no_previous: u64,

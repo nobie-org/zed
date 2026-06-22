@@ -22,9 +22,9 @@ pub struct RetainedSubtreeWorkSample {
     pub layout_id: usize,
     /// Number of retained mirror nodes inside the observed subtree.
     pub node_count: usize,
-    /// Retained occurrences reused while committing this subtree.
+    /// Retained nodes reused while committing this subtree.
     pub retained_reuses: u64,
-    /// Retained occurrence misses while committing this subtree.
+    /// Retained node misses while committing this subtree.
     pub retained_misses: u64,
     /// Mirror nodes created inside this subtree.
     pub mirror_node_creates: u64,
@@ -88,35 +88,35 @@ pub struct LayoutWorkSample {
     /// Wall time spent inside measured layout work counted by
     /// [`LayoutWorkSample::measured_layout_calls`].
     pub measured_layout_duration: Duration,
-    /// Retained layout occurrences allocated while committing current layout intent.
+    /// Retained layout nodes allocated while committing current layout facts.
     pub retained_layout_creates: u64,
-    /// Retained layout occurrences reused while committing current layout intent.
+    /// Retained layout nodes reused while committing current layout facts.
     pub retained_layout_reuses: u64,
-    /// Retained layout occurrence style updates emitted while committing current intent.
+    /// Retained layout node style updates emitted while committing current facts.
     pub retained_layout_style_updates: u64,
-    /// Retained layout child-list updates emitted while committing current intent.
+    /// Retained layout child-list updates emitted while committing current facts.
     pub retained_layout_child_list_updates: u64,
-    /// Explicit retained mirror dirty marks emitted while committing current intent.
+    /// Explicit retained mirror dirty marks emitted while committing current facts.
     pub retained_layout_dirty_marks: u64,
-    /// Retained measured-context clears emitted while removing retained occurrences.
+    /// Retained measured-context clears emitted while removing retained nodes.
     pub retained_layout_measured_context_clears: u64,
-    /// Retained layout occurrences removed while sweeping old subtrees.
+    /// Retained layout nodes removed while sweeping old retained subtrees.
     pub retained_layout_removes: u64,
-    /// Retained occurrence matches missed because no previous occurrence was available.
+    /// Retained node matches missed because no previous node was available.
     pub retained_layout_miss_no_previous: u64,
-    /// Retained occurrence matches missed because style changed.
+    /// Retained node matches missed because style changed.
     pub retained_layout_miss_style: u64,
-    /// Retained occurrence matches missed because node kind changed.
+    /// Retained node matches missed because node kind changed.
     pub retained_layout_miss_kind: u64,
-    /// Retained measured occurrence matches missed because measured facts changed.
+    /// Retained measured node matches missed because measured facts changed.
     ///
     /// This field keeps the historical telemetry name. The retained forest
     /// records the miss as a measured-facts miss internally, but callers should
     /// not need to track that implementation wording.
     pub retained_layout_miss_measured_kind: u64,
-    /// Retained occurrence matches missed because child count changed.
+    /// Retained node matches missed because child count changed.
     pub retained_layout_miss_child_count: u64,
-    /// Retained occurrence matches missed because a descendant subtree changed.
+    /// Retained node matches missed because a descendant subtree changed.
     pub retained_layout_miss_child_subtree: u64,
     /// Retained child matches missed because no exact previous sibling subtree was available.
     pub retained_layout_miss_no_exact_child: u64,

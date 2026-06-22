@@ -65,8 +65,7 @@ use uuid::Uuid;
 
 mod prompts;
 
-use crate::elements::{PendingListPrepaint, PrepaintItemsResponse};
-use crate::layout::{PureSizeMeasure, RetainedLayoutRootSite};
+use crate::layout::{LayoutCheckpoint, PureSizeMeasure, RetainedLayoutRootSite};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -1443,16 +1442,16 @@ impl<'a> PrepaintCx<'a> {
             .defer_draw(element, absolute_offset, priority, content_mask);
     }
 
-    /// Registers variable-height list work for the private frame drain.
+    /// Registers closed custom layout work for the private frame drain.
     ///
-    /// The work is a closed list primitive, not arbitrary frame code. It cannot
-    /// run until the window-owned drain supplies private layout/prepaint
-    /// authority.
-    pub(crate) fn register_list_prepaint(
+    /// The work cannot run until the window-owned drain supplies private
+    /// layout/prepaint authority. Callers receive only a typed output handle;
+    /// the job cannot expose or keep frame solve authority.
+    pub(crate) fn register_custom_layout<T: 'static>(
         &mut self,
-        work: PendingListPrepaint,
-    ) -> FramePrepaintOutput<PrepaintItemsResponse> {
-        self.window.register_list_prepaint(work)
+        work: impl FnOnce() -> CustomLayoutStep<T> + 'static,
+    ) -> FramePrepaintOutput<T> {
+        self.window.register_custom_layout(work)
     }
 
     /// Registers a detached root that will be painted by the caller in local
@@ -2141,6 +2140,12 @@ impl<'a> PaintCx<'a> {
         root.element.paint(self, cx);
     }
 
+    /// Paints a custom-layout child root already prepainted by the private
+    /// frame owner.
+    pub(crate) fn paint_custom_layout_root(&mut self, root: CustomLayoutPaintRoot, cx: &mut App) {
+        self.paint_prepainted_visible_root(root.root, cx);
+    }
+
     pub fn text_system(&self) -> &Arc<WindowTextSystem> {
         self.window.text_system()
     }
@@ -2295,55 +2300,6 @@ impl LaidOutVisibleRoot {
     ) -> (PrepaintedVisibleRoot, Option<FocusHandle>) {
         let focus = self.element.prepaint_at(origin, window, cx);
         (PrepaintedVisibleRoot::new(self.element), focus)
-    }
-}
-
-/// Narrow capability for frame-owned custom layout work.
-///
-/// Custom layout work may need to solve visible child roots while iterating
-/// over already-solved owner bounds. This context is created only by the
-/// private frame drain. It exposes the minimum operations that closed frame
-/// work needs without handing out `LayoutFrame` itself.
-pub(crate) struct CustomLayoutCx<'a> {
-    window: &'a mut Window,
-    layout_frame: &'a mut LayoutFrame,
-}
-
-impl<'a> CustomLayoutCx<'a> {
-    fn new(window: &'a mut Window, layout_frame: &'a mut LayoutFrame) -> Self {
-        Self {
-            window,
-            layout_frame,
-        }
-    }
-
-    pub(crate) fn build<R>(&mut self, f: impl FnOnce(&mut BuildCx<'_>) -> R) -> R {
-        self.window.build(f)
-    }
-
-    pub(crate) fn layout_visible_root(
-        &mut self,
-        element: AnyElement,
-        available_space: Size<AvailableSpace>,
-        cx: &mut App,
-    ) -> LaidOutVisibleRoot {
-        self.layout_frame
-            .layout_visible_root(self.window, element, available_space, cx)
-    }
-
-    pub(crate) fn prepaint_visible_root_at(
-        &mut self,
-        root: LaidOutVisibleRoot,
-        origin: Point<Pixels>,
-        content_mask: Option<ContentMask<Pixels>>,
-        cx: &mut App,
-    ) -> (PrepaintedVisibleRoot, Option<FocusHandle>) {
-        self.window
-            .with_content_mask(content_mask, |window| root.prepaint_at(origin, window, cx))
-    }
-
-    pub(crate) fn take_autoscroll(&mut self) -> Option<Bounds<Pixels>> {
-        self.window.take_autoscroll()
     }
 }
 
@@ -3295,6 +3251,30 @@ impl<T> Clone for FramePrepaintOutput<T> {
     }
 }
 
+/// Opaque custom-layout child root after the private frame owner has solved it.
+///
+/// Custom layout programs may inspect the solved size and feed the handle back
+/// into a later `PrepaintVisibleRoot` step. They cannot prepaint it directly,
+/// access the element, or reach layout solver state.
+pub(crate) struct CustomLayoutRoot {
+    root: LaidOutVisibleRoot,
+}
+
+impl CustomLayoutRoot {
+    /// Solved size of the custom-layout child root.
+    pub(crate) fn size(&self) -> Size<Pixels> {
+        self.root.size()
+    }
+}
+
+/// Opaque prepainted custom-layout child root.
+///
+/// Paint code may consume this handle through `PaintCx`; it cannot recover the
+/// underlying element or retained root.
+pub(crate) struct CustomLayoutPaintRoot {
+    root: PrepaintedVisibleRoot,
+}
+
 /// Deferred paint placement for one root in a closed visible-root group.
 ///
 /// The fields are private so callers can ask for a root to be deferred, but
@@ -3385,6 +3365,119 @@ struct UntypedVisibleRootGroupPlacement {
     output: Box<dyn Any>,
     placements: Vec<DeferredVisibleRootPlacement>,
     followups: Vec<DeferredVisibleRootIntent>,
+}
+
+type CustomLayoutBuildVisibleRoot =
+    Box<dyn FnOnce(&mut BuildCx<'_>, &mut App) -> AnyElement + 'static>;
+
+/// One operation requested by a custom layout program.
+///
+/// Custom layout code constructs these values; it never receives `Window`,
+/// `LayoutFrame`, retained roots, or solver nodes. The private frame owner is
+/// the only code that interprets a step and performs the corresponding layout
+/// or prepaint operation.
+pub(crate) enum CustomLayoutStep<T> {
+    /// Build and solve one paintable child root, then continue with its solved
+    /// size and owned root value.
+    BuildVisibleRoot {
+        build: CustomLayoutBuildVisibleRoot,
+        available_space: Size<AvailableSpace>,
+        then: Box<dyn FnOnce(CustomLayoutRoot) -> CustomLayoutStep<T> + 'static>,
+    },
+    /// Prepaint a previously solved child root at a chosen origin.
+    PrepaintVisibleRoot {
+        root: CustomLayoutRoot,
+        origin: Point<Pixels>,
+        content_mask: Option<ContentMask<Pixels>>,
+        then: Box<
+            dyn FnOnce(CustomLayoutPaintRoot, Option<FocusHandle>) -> CustomLayoutStep<T> + 'static,
+        >,
+    },
+    /// Read and clear autoscroll feedback produced by already-prepainted child
+    /// roots.
+    TakeAutoscroll {
+        then: Box<dyn FnOnce(Option<Bounds<Pixels>>) -> CustomLayoutStep<T> + 'static>,
+    },
+    /// Ask whether a retained focus handle contains the current focus.
+    ContainsFocused {
+        focus_handle: FocusHandle,
+        then: Box<dyn FnOnce(bool) -> CustomLayoutStep<T> + 'static>,
+    },
+    /// Discard frame side effects from the current custom-layout attempt and
+    /// start over with updated caller-owned state.
+    RestartAttempt {
+        next: Box<dyn FnOnce() -> CustomLayoutStep<T> + 'static>,
+    },
+    /// Finish the custom layout output for this frame.
+    Finish(T),
+}
+
+enum ErasedCustomLayoutStep {
+    BuildVisibleRoot {
+        build: CustomLayoutBuildVisibleRoot,
+        available_space: Size<AvailableSpace>,
+        then: Box<dyn FnOnce(CustomLayoutRoot) -> ErasedCustomLayoutStep + 'static>,
+    },
+    PrepaintVisibleRoot {
+        root: CustomLayoutRoot,
+        origin: Point<Pixels>,
+        content_mask: Option<ContentMask<Pixels>>,
+        then: Box<
+            dyn FnOnce(CustomLayoutPaintRoot, Option<FocusHandle>) -> ErasedCustomLayoutStep
+                + 'static,
+        >,
+    },
+    TakeAutoscroll {
+        then: Box<dyn FnOnce(Option<Bounds<Pixels>>) -> ErasedCustomLayoutStep + 'static>,
+    },
+    ContainsFocused {
+        focus_handle: FocusHandle,
+        then: Box<dyn FnOnce(bool) -> ErasedCustomLayoutStep + 'static>,
+    },
+    RestartAttempt {
+        next: Box<dyn FnOnce() -> ErasedCustomLayoutStep + 'static>,
+    },
+    Finish(Box<dyn Any>),
+}
+
+impl<T: 'static> CustomLayoutStep<T> {
+    fn erase(self) -> ErasedCustomLayoutStep {
+        match self {
+            Self::BuildVisibleRoot {
+                build,
+                available_space,
+                then,
+            } => ErasedCustomLayoutStep::BuildVisibleRoot {
+                build,
+                available_space,
+                then: Box::new(|root| then(root).erase()),
+            },
+            Self::PrepaintVisibleRoot {
+                root,
+                origin,
+                content_mask,
+                then,
+            } => ErasedCustomLayoutStep::PrepaintVisibleRoot {
+                root,
+                origin,
+                content_mask,
+                then: Box::new(|root, focus| then(root, focus).erase()),
+            },
+            Self::TakeAutoscroll { then } => ErasedCustomLayoutStep::TakeAutoscroll {
+                then: Box::new(|autoscroll| then(autoscroll).erase()),
+            },
+            Self::ContainsFocused { focus_handle, then } => {
+                ErasedCustomLayoutStep::ContainsFocused {
+                    focus_handle,
+                    then: Box::new(|contains| then(contains).erase()),
+                }
+            }
+            Self::RestartAttempt { next } => ErasedCustomLayoutStep::RestartAttempt {
+                next: Box::new(|| next().erase()),
+            },
+            Self::Finish(output) => ErasedCustomLayoutStep::Finish(Box::new(output)),
+        }
+    }
 }
 
 /// Read-only placement-phase facts owned by the private frame drain.
@@ -3598,10 +3691,18 @@ type VisibleRootGroupRun = Box<
     ) -> UntypedVisibleRootGroupPlacement,
 >;
 
-struct ListPrepaintIntent {
+type FrameCustomLayoutRun = Box<dyn FnOnce() -> ErasedCustomLayoutStep + 'static>;
+
+struct CustomLayoutIntent {
     context: VisibleRootContext,
-    work: Option<PendingListPrepaint>,
+    work: Option<FrameCustomLayoutRun>,
     output_index: usize,
+}
+
+struct CustomLayoutAttemptCheckpoint {
+    prepaint: PrepaintStateIndex,
+    layout: LayoutCheckpoint,
+    requested_autoscroll: Option<Bounds<Pixels>>,
 }
 
 struct VisibleRootGroupIntent {
@@ -3631,7 +3732,7 @@ pub(crate) struct Frame {
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     visible_roots: Vec<VisibleRootIntent>,
     visible_root_groups: Vec<Option<VisibleRootGroupIntent>>,
-    list_prepaints: Vec<Option<ListPrepaintIntent>>,
+    custom_layouts: Vec<Option<CustomLayoutIntent>>,
     frame_prepaint_outputs: Vec<FramePrepaintOutputSlot>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
@@ -3652,7 +3753,7 @@ pub(crate) struct PrepaintStateIndex {
     deferred_draws_index: usize,
     visible_roots_index: usize,
     visible_root_groups_index: usize,
-    list_prepaints_index: usize,
+    custom_layouts_index: usize,
     frame_prepaint_outputs_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
@@ -3685,7 +3786,7 @@ impl Frame {
             deferred_draws: Vec::new(),
             visible_roots: Vec::new(),
             visible_root_groups: Vec::new(),
-            list_prepaints: Vec::new(),
+            custom_layouts: Vec::new(),
             frame_prepaint_outputs: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
@@ -3717,7 +3818,7 @@ impl Frame {
         self.deferred_draws.clear();
         self.visible_roots.clear();
         self.visible_root_groups.clear();
-        self.list_prepaints.clear();
+        self.custom_layouts.clear();
         self.frame_prepaint_outputs.clear();
         self.tab_stops.clear();
         self.focus = None;
@@ -5873,73 +5974,176 @@ impl Window {
 
     fn drain_frame_prepaint_phase(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
         loop {
-            let list_prepaint_len = self.next_frame.list_prepaints.len();
+            let custom_layout_len = self.next_frame.custom_layouts.len();
             let visible_root_group_len = self.next_frame.visible_root_groups.len();
             let visible_root_len = self.next_frame.visible_roots.len();
 
-            self.drain_list_prepaints(cx, layout_frame);
+            self.drain_custom_layouts(cx, layout_frame);
             self.drain_visible_root_groups(cx, layout_frame);
             self.prepaint_visible_roots(cx, layout_frame);
 
-            let no_new_list_prepaints = self.next_frame.list_prepaints.len() == list_prepaint_len;
+            let no_new_custom_layouts = self.next_frame.custom_layouts.len() == custom_layout_len;
             let no_new_groups = self.next_frame.visible_root_groups.len() == visible_root_group_len;
             let no_new_roots = self.next_frame.visible_roots.len() == visible_root_len;
-            if no_new_list_prepaints && no_new_groups && no_new_roots {
+            if no_new_custom_layouts && no_new_groups && no_new_roots {
                 break;
             }
         }
     }
 
-    fn drain_list_prepaints(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
+    fn drain_custom_layouts(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
         let mut index = 0;
-        while index < self.next_frame.list_prepaints.len() {
-            let Some(mut plan) = self.next_frame.list_prepaints[index].take() else {
+        while index < self.next_frame.custom_layouts.len() {
+            let Some(mut plan) = self.next_frame.custom_layouts[index].take() else {
                 index += 1;
                 continue;
             };
 
             let context = plan.context.clone();
-            self.element_id_stack.clone_from(&context.element_id_stack);
-            self.text_style_stack.clone_from(&context.text_style_stack);
-            self.content_mask_stack
-                .clone_from(&context.content_mask_stack);
-            self.next_frame
-                .dispatch_tree
-                .set_active_node(context.parent_node);
-
-            let value = self.with_rendered_view(context.current_view, |window| {
-                window.with_rem_size(Some(context.rem_size), |window| {
-                    let mut frame = CustomLayoutCx::new(window, layout_frame);
-                    let value = plan
-                        .work
-                        .take()
-                        .expect("list prepaint should own its work")
-                        .run(&mut frame, cx);
-                    Box::new(value) as Box<dyn Any>
-                })
-            });
-
-            self.element_id_stack.clear();
-            self.text_style_stack.clear();
-            self.content_mask_stack.clear();
+            let work = plan
+                .work
+                .take()
+                .expect("custom layout job should own its work");
+            let mut step = work();
+            let mut checkpoint = self.custom_layout_attempt_checkpoint();
+            let value = loop {
+                match step {
+                    ErasedCustomLayoutStep::BuildVisibleRoot {
+                        build,
+                        available_space,
+                        then,
+                    } => {
+                        self.restore_visible_root_context(&context);
+                        let root = self.with_rendered_view(context.current_view, |window| {
+                            window.with_rem_size(Some(context.rem_size), |window| {
+                                let element = window.build(|window| build(window, cx));
+                                let root = layout_frame.layout_visible_root(
+                                    window,
+                                    element,
+                                    available_space,
+                                    cx,
+                                );
+                                CustomLayoutRoot { root }
+                            })
+                        });
+                        self.clear_visible_root_context();
+                        step = then(root);
+                    }
+                    ErasedCustomLayoutStep::PrepaintVisibleRoot {
+                        root,
+                        origin,
+                        content_mask,
+                        then,
+                    } => {
+                        self.restore_visible_root_context(&context);
+                        let (root, focus) =
+                            self.with_rendered_view(context.current_view, |window| {
+                                window.with_rem_size(Some(context.rem_size), |window| {
+                                    window.with_content_mask(content_mask, |window| {
+                                        root.root.prepaint_at(origin, window, cx)
+                                    })
+                                })
+                            });
+                        self.clear_visible_root_context();
+                        step = then(CustomLayoutPaintRoot { root }, focus);
+                    }
+                    ErasedCustomLayoutStep::TakeAutoscroll { then } => {
+                        let autoscroll = self.take_autoscroll();
+                        step = then(autoscroll);
+                    }
+                    ErasedCustomLayoutStep::ContainsFocused { focus_handle, then } => {
+                        let contains = focus_handle.contains_focused(self, cx);
+                        step = then(contains);
+                    }
+                    ErasedCustomLayoutStep::RestartAttempt { next } => {
+                        self.rollback_custom_layout_attempt(checkpoint);
+                        checkpoint = self.custom_layout_attempt_checkpoint();
+                        step = next();
+                    }
+                    ErasedCustomLayoutStep::Finish(value) => break value,
+                }
+            };
 
             let output = self
                 .next_frame
                 .frame_prepaint_outputs
                 .get_mut(plan.output_index)
-                .expect("list prepaint references a missing frame output");
+                .expect("custom layout job references a missing frame output");
             match output {
                 FramePrepaintOutputSlot::Pending => *output = FramePrepaintOutputSlot::Ready(value),
                 FramePrepaintOutputSlot::Ready(_) => {
-                    panic!("list prepaint resolved the same frame output twice")
+                    panic!("custom layout job resolved the same frame output twice")
                 }
                 FramePrepaintOutputSlot::Taken => {
-                    panic!("list prepaint output was taken before resolve")
+                    panic!("custom layout output was taken before resolve")
                 }
             }
 
             index += 1;
         }
+    }
+
+    fn custom_layout_attempt_checkpoint(&self) -> CustomLayoutAttemptCheckpoint {
+        CustomLayoutAttemptCheckpoint {
+            prepaint: self.prepaint_index(),
+            layout: self
+                .layout_engine
+                .as_ref()
+                .expect("custom layout attempts require an installed layout engine for rollback")
+                .checkpoint(),
+            requested_autoscroll: self.requested_autoscroll,
+        }
+    }
+
+    fn rollback_custom_layout_attempt(&mut self, checkpoint: CustomLayoutAttemptCheckpoint) {
+        let index = checkpoint.prepaint;
+        self.next_frame.hitboxes.truncate(index.hitboxes_index);
+        self.next_frame
+            .tooltip_requests
+            .truncate(index.tooltips_index);
+        self.next_frame
+            .deferred_draws
+            .truncate(index.deferred_draws_index);
+        self.next_frame
+            .visible_roots
+            .truncate(index.visible_roots_index);
+        self.next_frame
+            .visible_root_groups
+            .truncate(index.visible_root_groups_index);
+        self.next_frame
+            .custom_layouts
+            .truncate(index.custom_layouts_index);
+        self.next_frame
+            .frame_prepaint_outputs
+            .truncate(index.frame_prepaint_outputs_index);
+        self.next_frame
+            .dispatch_tree
+            .truncate(index.dispatch_tree_index);
+        self.next_frame
+            .accessed_element_states
+            .truncate(index.accessed_element_states_index);
+        self.text_system.truncate_layouts(index.line_layout_index);
+        self.layout_engine
+            .as_mut()
+            .expect("custom layout attempts require an installed layout engine for rollback")
+            .rollback_to_checkpoint(checkpoint.layout);
+        self.requested_autoscroll = checkpoint.requested_autoscroll;
+    }
+
+    fn restore_visible_root_context(&mut self, context: &VisibleRootContext) {
+        self.element_id_stack.clone_from(&context.element_id_stack);
+        self.text_style_stack.clone_from(&context.text_style_stack);
+        self.content_mask_stack
+            .clone_from(&context.content_mask_stack);
+        self.next_frame
+            .dispatch_tree
+            .set_active_node(context.parent_node);
+    }
+
+    fn clear_visible_root_context(&mut self) {
+        self.element_id_stack.clear();
+        self.text_style_stack.clear();
+        self.content_mask_stack.clear();
     }
 
     fn drain_visible_root_groups(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
@@ -6491,7 +6695,7 @@ impl Window {
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             visible_roots_index: self.next_frame.visible_roots.len(),
             visible_root_groups_index: self.next_frame.visible_root_groups.len(),
-            list_prepaints_index: self.next_frame.list_prepaints.len(),
+            custom_layouts_index: self.next_frame.custom_layouts.len(),
             frame_prepaint_outputs_index: self.next_frame.frame_prepaint_outputs.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -6832,8 +7036,8 @@ impl Window {
                 .visible_root_groups
                 .truncate(index.visible_root_groups_index);
             self.next_frame
-                .list_prepaints
-                .truncate(index.list_prepaints_index);
+                .custom_layouts
+                .truncate(index.custom_layouts_index);
             self.next_frame
                 .frame_prepaint_outputs
                 .truncate(index.frame_prepaint_outputs_index);
@@ -7166,18 +7370,19 @@ impl Window {
         }
     }
 
-    fn register_list_prepaint(
+    fn register_custom_layout<T: 'static>(
         &mut self,
-        work: PendingListPrepaint,
-    ) -> FramePrepaintOutput<PrepaintItemsResponse> {
+        work: impl FnOnce() -> CustomLayoutStep<T> + 'static,
+    ) -> FramePrepaintOutput<T> {
         self.invalidator.debug_assert_prepaint();
         let output = self.reserve_frame_output();
         let context = self.visible_root_context();
+        let run = Box::new(move || work().erase());
         self.next_frame
-            .list_prepaints
-            .push(Some(ListPrepaintIntent {
+            .custom_layouts
+            .push(Some(CustomLayoutIntent {
                 context,
-                work: Some(work),
+                work: Some(run),
                 output_index: output.index,
             }));
         output
@@ -10153,8 +10358,10 @@ pub fn outline(
 mod tests {
     use super::DrawPhase;
     use crate::{
-        AppContext as _, Context, IntoElement, ParentElement as _, Render, Style, TestAppContext,
-        Window, div, px, size,
+        App, AppContext as _, AvailableSpace, Bounds, Context, Element, ElementId, GlobalElementId,
+        InspectorElementId, IntoElement, LayoutId, LayoutRequestCx, OwnerPaintedVisibleRoot,
+        PaintCx, ParentElement as _, Pixels, PrepaintCx, Render, Style, TestAppContext, Window,
+        div, point, px, size,
     };
     use std::ops::Deref as _;
 
@@ -10237,5 +10444,101 @@ mod tests {
         assert_eq!(second_sample.measured_layout_node_requests, 0);
         assert_eq!(second_sample.child_edges, 2);
         assert_eq!(second_sample.compute_layout_calls, 1);
+    }
+
+    struct OwnerPaintedTextRootsTestView;
+
+    impl Render for OwnerPaintedTextRootsTestView {
+        fn render(
+            &mut self,
+            _: &mut crate::BuildCx<'_>,
+            _: &mut Context<Self>,
+        ) -> impl IntoElement {
+            div().child(OwnerPaintedTextRootsElement)
+        }
+    }
+
+    struct OwnerPaintedTextRootsElement;
+
+    impl IntoElement for OwnerPaintedTextRootsElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for OwnerPaintedTextRootsElement {
+        type RequestLayoutState = ();
+        type PrepaintState = Vec<OwnerPaintedVisibleRoot>;
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut LayoutRequestCx<'_>,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            (window.request_layout(Style::default(), [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            window: &mut PrepaintCx<'_>,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            (0..2)
+                .map(|ix| {
+                    let y = px(ix as f32 * 20.0);
+                    let text = format!("detached text root {ix}");
+                    window.owner_painted_visible_root(
+                        div().child(text).into_any_element(),
+                        size(
+                            AvailableSpace::Definite(px(180.0)),
+                            AvailableSpace::Definite(px(20.0)),
+                        ),
+                        move |_| point(px(0.0), y),
+                        cx,
+                    )
+                })
+                .collect()
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            roots: &mut Self::PrepaintState,
+            window: &mut PaintCx<'_>,
+            cx: &mut App,
+        ) {
+            for root in roots.drain(..) {
+                window.paint_visible_root(root, cx);
+            }
+        }
+    }
+
+    #[test]
+    fn owner_painted_visible_text_roots_keep_prepainted_bounds_until_paint() {
+        let mut test_app = TestAppContext::single();
+        let _window = test_app.open_window(size(px(800.0), px(600.0)), |_, _| {
+            OwnerPaintedTextRootsTestView
+        });
+
+        test_app.run_until_parked();
     }
 }

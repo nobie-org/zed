@@ -5,10 +5,10 @@ use super::{
     frame::CurrentLayoutFactsLog,
     geometry::FrameLayoutOutput,
     measurement::{
-        CurrentMeasurement, LayoutMeasureContext, MeasuredLayoutFacts, MeasuredLayoutResult,
-        MeasurementStore, PureSizeMeasure,
+        CurrentMeasurement, LayoutMeasureContext, MeasuredLayoutFacts, MeasurementStore,
+        PureSizeMeasure,
     },
-    occurrence::{RetainedLayoutOccurrence, RetainedLayoutOccurrenceKind},
+    node::{RetainedLayoutNode, RetainedLayoutNodeKind},
     root_slots::RootSlots,
     roots::RootRegistry,
     solver::{LayoutSolver, SolverNodeId, SolverStyle},
@@ -61,24 +61,21 @@ fn new_test_node(solver: &mut LayoutSolver) -> SolverNodeId {
     solver.new_leaf(SolverStyle::default())
 }
 
-fn occurrence(node_id: SolverNodeId) -> RetainedLayoutOccurrence {
-    RetainedLayoutOccurrence {
+fn new_node(node_id: SolverNodeId) -> RetainedLayoutNode {
+    RetainedLayoutNode {
         node_id,
         identity: None,
         style: SolverStyle::default(),
-        kind: RetainedLayoutOccurrenceKind::Unmeasured {
+        kind: RetainedLayoutNodeKind::Unmeasured {
             children: Vec::new(),
         },
     }
 }
 
 fn producer_context(width: f32, height: f32) -> LayoutMeasureContext {
-    LayoutMeasureContext {
-        measure: StackSafe::new(Box::new(move |_, _, _| {
-            MeasuredLayoutResult::Size(size(px(width), px(height)))
-        })),
-        text_hydrator: None,
-    }
+    LayoutMeasureContext::Size(StackSafe::new(Box::new(move |_, _, _| {
+        size(px(width), px(height))
+    })))
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -278,21 +275,21 @@ fn root_slots_checkpoint_restores_current_roots_and_detached_removals(_cx: &mut 
         let mut solver = LayoutSolver::new();
         let root_a = RetainedLayoutRootId::new(draw_u8(&tc, 0, 10).into());
         let root_b = RetainedLayoutRootId::new((draw_u8(&tc, 11, 20)).into());
-        let occurrence_a = occurrence(new_test_node(&mut solver));
-        let detached_a = occurrence(new_test_node(&mut solver));
-        let occurrence_b = occurrence(new_test_node(&mut solver));
-        let detached_b = occurrence(new_test_node(&mut solver));
+        let new_node_a = new_node(new_test_node(&mut solver));
+        let detached_a = new_node(new_test_node(&mut solver));
+        let new_node_b = new_node(new_test_node(&mut solver));
+        let detached_b = new_node(new_test_node(&mut solver));
         let mut slots = RootSlots::new();
 
-        slots.insert_current_root(root_a, occurrence_a.clone());
+        slots.insert_current_root(root_a, new_node_a.clone());
         slots.detach_subtree(detached_a.clone());
         let checkpoint = slots.checkpoint();
-        slots.insert_current_root(root_b, occurrence_b);
+        slots.insert_current_root(root_b, new_node_b);
         slots.detach_subtree(detached_b);
         slots.rollback_to_checkpoint(checkpoint);
         slots.promote_current_roots();
 
-        assert_eq!(slots.take_retained_root(root_a), Some(occurrence_a));
+        assert_eq!(slots.take_retained_root(root_a), Some(new_node_a));
         assert_eq!(slots.take_retained_root(root_b), None);
         assert_eq!(slots.take_detached_subtree_removals(), vec![detached_a]);
     })

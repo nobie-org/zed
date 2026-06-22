@@ -5,25 +5,21 @@
 //! artifacts such as shaped text. Solver node context stays a private marker and
 //! never stores GPUI paint or hit-test state.
 
+mod artifacts;
 mod producer_registry;
 #[cfg(test)]
 mod tests;
-mod text_artifacts;
 
 use super::super::LayoutId;
 use super::AvailableSpace;
 use super::solver::{SolverCacheEvent, SolverMeasureObservation, SolverNodeId};
-use crate::{
-    App, MeasureCx, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size,
-    util::ceil_to_device_pixel,
-};
+use crate::{App, MeasureCx, Pixels, Size, Window, size};
+use artifacts::{ArtifactCacheKey, ArtifactProof, ArtifactStore, ArtifactStoreCheckpoint};
+pub(in crate::layout) use artifacts::{LayoutArtifact, LayoutArtifactKey};
 use collections::FxHashMap;
 use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
 use stacksafe::StackSafe;
 use std::rc::Rc;
-use text_artifacts::{
-    TextArtifactCacheKey, TextArtifactProof, TextArtifactStore, TextArtifactStoreCheckpoint,
-};
 
 /// Current-frame executable producer for measured layout.
 ///
@@ -31,12 +27,12 @@ use text_artifacts::{
 /// comparable retained meaning; opaque producers are intentionally conservative
 /// unless a call site supplies an explicit pure measure key.
 pub(super) type NodeMeasureFn = StackSafe<
+    Box<dyn FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut MeasureCx<'_>) -> Size<Pixels>>,
+>;
+
+type ArtifactMeasureFn = StackSafe<
     Box<
-        dyn FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut MeasureCx<'_>,
-        ) -> MeasuredLayoutResult,
+        dyn FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut MeasureCx<'_>) -> LayoutArtifact,
     >,
 >;
 
@@ -47,47 +43,38 @@ pub(super) type NodeMeasureFn = StackSafe<
 #[derive(Clone)]
 pub(super) struct NodeContext;
 
-type TextHydrator = Rc<dyn Fn(&TextLayoutArtifact)>;
+type ArtifactHydrator = Rc<dyn Fn(&LayoutArtifact)>;
 
 /// Current-frame producer bundle registered for a measured facts.
 ///
-/// Text measured nodes also carry a hydrator that installs an artifact into the
-/// current element state when the current compute invokes the text producer.
-pub(in crate::layout) struct LayoutMeasureContext {
-    pub(super) measure: NodeMeasureFn,
-    pub(super) text_hydrator: Option<TextHydrator>,
+/// Producer contexts are frame-local executable effects. The solver-facing
+/// callback always receives a size; artifact producers are a separate family so
+/// layout measurement cannot pretend that paint/hit-test artifacts are a solver
+/// result type.
+pub(in crate::layout) enum LayoutMeasureContext {
+    Size(NodeMeasureFn),
+    Artifact(ArtifactMeasureContext),
 }
 
-/// Output produced by a measured layout callback.
-///
-/// Size-only results are enough for pure or opaque measured nodes. Text returns
-/// an artifact because GPUI must hydrate shaped lines for paint and hit testing
-/// from the exact measurement query the solver asked in the current compute.
-pub(super) enum MeasuredLayoutResult {
-    Size(Size<Pixels>),
-    Text(TextLayoutArtifact),
-}
-
-impl MeasuredLayoutResult {
-    fn size(&self) -> Size<Pixels> {
-        match self {
-            Self::Size(size) => *size,
-            Self::Text(artifact) => artifact.size(),
-        }
-    }
+/// Current-frame executable producer for a measured node with a GPUI artifact.
+pub(in crate::layout) struct ArtifactMeasureContext {
+    pub(super) measure: ArtifactMeasureFn,
+    pub(super) hydrate: ArtifactHydrator,
 }
 
 /// Measurement-owned request data for one measured layout facts.
 ///
 /// The retained forest treats this as a generic measured node. This type owns
-/// the distinction between opaque producers, pure size facts, and text artifact
+/// the distinction between opaque producers, pure size facts, and artifact
 /// hydration so retained tree code cannot construct impossible combinations such
-/// as a pure-size node with a callback or a text node without a producer.
-pub(in crate::layout) enum MeasuredLayoutRequest {
+/// as a pure-size node with a callback or an artifact node without a producer.
+pub(in crate::layout) struct MeasuredLayoutRequest(MeasuredLayoutRequestRepr);
+
+enum MeasuredLayoutRequestRepr {
     Opaque(LayoutMeasureContext),
     PureSize(PureSizeMeasure),
-    Text {
-        key: TextMeasureKey,
+    Artifact {
+        key: LayoutArtifactKey,
         context: LayoutMeasureContext,
     },
 }
@@ -101,56 +88,47 @@ impl MeasuredLayoutRequest {
         ) -> Size<Pixels>
         + 'static,
     ) -> Self {
-        Self::Opaque(LayoutMeasureContext {
-            measure: StackSafe::new(Box::new(
+        Self(MeasuredLayoutRequestRepr::Opaque(
+            LayoutMeasureContext::Size(StackSafe::new(Box::new(
                 move |known_dimensions, available_space, measure_cx| {
-                    MeasuredLayoutResult::Size(measure(
-                        known_dimensions,
-                        available_space,
-                        measure_cx,
-                    ))
+                    measure(known_dimensions, available_space, measure_cx)
                 },
-            )),
-            text_hydrator: None,
-        })
+            ))),
+        ))
     }
 
     pub(in crate::layout) fn pure_size(measure: PureSizeMeasure) -> Self {
-        Self::PureSize(measure)
+        Self(MeasuredLayoutRequestRepr::PureSize(measure))
     }
 
-    pub(in crate::layout) fn text(
-        measure_key: TextMeasureKey,
-        hydrate: impl Fn(&TextLayoutArtifact) + 'static,
+    pub(in crate::layout) fn artifact(
+        key: LayoutArtifactKey,
+        hydrate: impl Fn(&LayoutArtifact) + 'static,
         mut measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
             &mut MeasureCx<'_>,
-        ) -> TextLayoutArtifact
+        ) -> LayoutArtifact
         + 'static,
     ) -> Self {
-        Self::Text {
-            key: measure_key,
-            context: LayoutMeasureContext {
+        Self(MeasuredLayoutRequestRepr::Artifact {
+            key,
+            context: LayoutMeasureContext::Artifact(ArtifactMeasureContext {
                 measure: StackSafe::new(Box::new(
                     move |known_dimensions, available_space, measure_cx| {
-                        MeasuredLayoutResult::Text(measure(
-                            known_dimensions,
-                            available_space,
-                            measure_cx,
-                        ))
+                        measure(known_dimensions, available_space, measure_cx)
                     },
                 )),
-                text_hydrator: Some(Rc::new(hydrate)),
-            },
-        }
+                hydrate: Rc::new(hydrate),
+            }),
+        })
     }
 }
 
 /// Explicit, comparable size functions for measured nodes.
 ///
 /// A value of this type is layout-visible data. If it is unchanged and the
-/// retained occurrence is reused, the forest can let the solver reuse measurement
+/// retained node is reused, the forest can let the solver reuse measurement
 /// cache without re-running an arbitrary closure.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PureSizeMeasure {
@@ -294,10 +272,10 @@ impl ContentSizePureSizeMeasure {
 ///
 /// `Opaque` means no retained measurement identity has been proven. `PureSize`
 /// is explicit data and may preserve solver measurement cache when unchanged.
-/// `Text` is explicit layout identity, but the shaped artifact also depends on
-/// the solver's measurement query (`known_dimensions` and `available_space`). GPUI
-/// therefore hydrates artifacts from callbacks or exact query-keyed cache
-/// observations; it never treats `TextMeasureKey` alone as artifact proof.
+/// Artifact-producing measured nodes carry explicit layout identity, but their
+/// render artifact also depends on the solver's measurement query. GPUI
+/// therefore hydrates artifacts from callbacks or exact query-keyed observations;
+/// retained node identity alone is never artifact proof.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct MeasuredLayoutFacts(MeasuredLayoutFactsRepr);
 
@@ -305,7 +283,7 @@ pub(super) struct MeasuredLayoutFacts(MeasuredLayoutFactsRepr);
 enum MeasuredLayoutFactsRepr {
     Opaque,
     PureSize(PureSizeMeasure),
-    Text(TextMeasureKey),
+    Artifact(LayoutArtifactKey),
 }
 
 impl MeasuredLayoutFacts {
@@ -317,8 +295,8 @@ impl MeasuredLayoutFacts {
         Self(MeasuredLayoutFactsRepr::PureSize(measure))
     }
 
-    pub(super) fn text(key: TextMeasureKey) -> Self {
-        Self(MeasuredLayoutFactsRepr::Text(key))
+    pub(super) fn artifact(key: LayoutArtifactKey) -> Self {
+        Self(MeasuredLayoutFactsRepr::Artifact(key))
     }
 
     pub(super) fn can_reuse_solver_node_with(&self, current: &Self) -> bool {
@@ -328,8 +306,8 @@ impl MeasuredLayoutFacts {
                 MeasuredLayoutFactsRepr::PureSize(_),
                 MeasuredLayoutFactsRepr::PureSize(_)
             ) | (
-                MeasuredLayoutFactsRepr::Text(_),
-                MeasuredLayoutFactsRepr::Text(_)
+                MeasuredLayoutFactsRepr::Artifact(_),
+                MeasuredLayoutFactsRepr::Artifact(_)
             )
         )
     }
@@ -352,13 +330,9 @@ impl MeasuredLayoutFacts {
             MeasuredLayoutFactsRepr::PureSize(measure) => {
                 measure.measure(known_dimensions, available_space)
             }
-            MeasuredLayoutFactsRepr::Text(key) => key
-                .measure(
-                    known_dimensions,
-                    available_space,
-                    &mut MeasureCx::new(window, cx),
-                )
-                .size(),
+            MeasuredLayoutFactsRepr::Artifact(key) => {
+                key.measure_for_fresh_compare(known_dimensions, available_space, window, cx)
+            }
         }
     }
 }
@@ -367,7 +341,7 @@ impl MeasuredLayoutFacts {
 ///
 /// The retained fact tree stores only `MeasuredLayoutFacts`. This value remains
 /// inside `MeasurementStore` until the current `LayoutId` is committed to one
-/// solver node, preventing producer slots or text artifacts from becoming part
+/// solver node, preventing producer slots or artifacts from becoming part
 /// of the descriptor tree.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct RegisteredMeasuredLayout {
@@ -390,7 +364,10 @@ impl RegisteredMeasuredLayout {
 pub(super) enum CurrentMeasurement {
     Opaque(usize),
     PureSize(PureSizeMeasure),
-    Text { key: TextMeasureKey, measure: usize },
+    Artifact {
+        key: LayoutArtifactKey,
+        measure: usize,
+    },
 }
 
 /// Telemetry classification for one measured solver query.
@@ -459,21 +436,19 @@ impl MeasuredQueryAnswer {
     }
 }
 
-/// Owner of measured producers and current-frame text layout hydration.
+/// Owner of measured producers and current-frame artifact hydration.
 ///
 /// This is GPUI state, not solver state. The solver can decide whether a measured node
-/// cache entry is valid, but GPUI owns the executable producer slots and text
+/// cache entry is valid, but GPUI owns the executable producer slots and
 /// artifacts. Passive solver cache events may report that it reused a
 /// measurement result or final-layout cache entry, but GPUI treats those only as
-/// current-solve observations. Text artifacts are reused through an exact query
-/// key or through a final-layout cache entry that selected the same current text
-/// descendants. Retained node identity and `TextMeasureKey` alone are never
-/// artifact proof.
+/// current-solve observations. Artifacts are reused through an exact query
+/// key. Retained node identity is never artifact proof.
 pub(super) struct MeasurementStore {
     producers: ProducerRegistry,
     pending_measurements: FxHashMap<LayoutId, RegisteredMeasuredLayout>,
     current_measurements: FxHashMap<SolverNodeId, CurrentMeasurement>,
-    text_artifacts: TextArtifactStore,
+    artifacts: ArtifactStore,
 }
 
 /// Transaction checkpoint for current-frame measurement producers and mappings.
@@ -481,7 +456,7 @@ pub(super) struct MeasurementStoreCheckpoint {
     producers: ProducerRegistryCheckpoint,
     pending_measurements: FxHashMap<LayoutId, RegisteredMeasuredLayout>,
     current_measurements: FxHashMap<SolverNodeId, CurrentMeasurement>,
-    text_artifacts: TextArtifactStoreCheckpoint,
+    artifacts: ArtifactStoreCheckpoint,
 }
 
 /// Measurement-owned artifact obligation table for one legal solver root solve.
@@ -506,18 +481,18 @@ impl MeasurementStore {
             producers: ProducerRegistry::new(),
             pending_measurements: FxHashMap::default(),
             current_measurements: FxHashMap::default(),
-            text_artifacts: TextArtifactStore::new(),
+            artifacts: ArtifactStore::new(),
         }
     }
 
     pub(super) fn begin_frame(&mut self) {
         self.pending_measurements.clear();
         self.current_measurements.clear();
-        self.text_artifacts.begin_frame();
+        self.artifacts.begin_frame();
     }
 
     pub(super) fn finish_frame(&mut self) {
-        self.text_artifacts.finish_frame();
+        self.artifacts.finish_frame();
         self.producers.clear();
         self.pending_measurements.clear();
         self.current_measurements.clear();
@@ -528,7 +503,7 @@ impl MeasurementStore {
             producers: self.producers.checkpoint(),
             pending_measurements: self.pending_measurements.clone(),
             current_measurements: self.current_measurements.clone(),
-            text_artifacts: self.text_artifacts.checkpoint(),
+            artifacts: self.artifacts.checkpoint(),
         }
     }
 
@@ -536,31 +511,30 @@ impl MeasurementStore {
         self.producers.rollback_to_checkpoint(checkpoint.producers);
         self.pending_measurements = checkpoint.pending_measurements;
         self.current_measurements = checkpoint.current_measurements;
-        self.text_artifacts
-            .rollback_to_checkpoint(checkpoint.text_artifacts);
+        self.artifacts.rollback_to_checkpoint(checkpoint.artifacts);
     }
 
     pub(super) fn register_request(
         &mut self,
         request: MeasuredLayoutRequest,
     ) -> RegisteredMeasuredLayout {
-        let (facts, measurement) = match request {
-            MeasuredLayoutRequest::Opaque(context) => {
+        let (facts, measurement) = match request.0 {
+            MeasuredLayoutRequestRepr::Opaque(context) => {
                 let producer = self.producers.push(context);
                 (
                     MeasuredLayoutFacts::opaque(),
                     CurrentMeasurement::Opaque(producer),
                 )
             }
-            MeasuredLayoutRequest::PureSize(measure) => (
+            MeasuredLayoutRequestRepr::PureSize(measure) => (
                 MeasuredLayoutFacts::pure_size(measure.clone()),
                 CurrentMeasurement::PureSize(measure),
             ),
-            MeasuredLayoutRequest::Text { key, context } => {
+            MeasuredLayoutRequestRepr::Artifact { key, context } => {
                 let producer = self.producers.push(context);
                 (
-                    MeasuredLayoutFacts::text(key.clone()),
-                    CurrentMeasurement::Text {
+                    MeasuredLayoutFacts::artifact(key.clone()),
+                    CurrentMeasurement::Artifact {
                         key,
                         measure: producer,
                     },
@@ -628,7 +602,7 @@ impl MeasurementStore {
     fn has_current_artifact_measurement(&self, node_id: SolverNodeId) -> bool {
         matches!(
             self.current_measurement(node_id),
-            Some(CurrentMeasurement::Text { .. })
+            Some(CurrentMeasurement::Artifact { .. })
         )
     }
 
@@ -684,8 +658,8 @@ impl MeasurementStore {
                 Some(CurrentMeasurement::PureSize(actual)),
             ) => assert_eq!(actual, expected),
             (
-                MeasuredLayoutFactsRepr::Text(expected),
-                Some(CurrentMeasurement::Text { key: actual, .. }),
+                MeasuredLayoutFactsRepr::Artifact(expected),
+                Some(CurrentMeasurement::Artifact { key: actual, .. }),
             ) => assert_eq!(actual, expected),
             _ => {
                 panic!("measured facts should have matching current measurement state")
@@ -693,13 +667,14 @@ impl MeasurementStore {
         }
     }
 
-    /// Hydrate text nodes from the artifacts selected by the completed solve.
+    /// Hydrate artifact nodes from the artifacts selected by the completed solve.
     ///
     /// The solver may invoke a callback or report a passive cache hit/store event.
     /// Those events are artifact producers, not GPUI paint-state side effects.
     /// Hydration happens once here after the solve. There is no retained-node
-    /// artifact hydration path; if the solver skips a text node without reporting an
-    /// exact measurement query, GPUI has no artifact proof for that node.
+    /// artifact hydration path; if the solver skips an artifact node without
+    /// reporting an exact measurement query, GPUI has no artifact proof for that
+    /// node.
     pub(super) fn finish_completed_solve(
         &mut self,
         observer: &MeasurementSolveObserver,
@@ -707,28 +682,32 @@ impl MeasurementStore {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for proof in self.text_artifacts.take_pending_proofs() {
+        for proof in self.artifacts.take_pending_proofs() {
             let cache_key = proof.cache_key();
-            if let Some(artifact) = self.text_artifacts.current_artifact_for_query(&cache_key) {
-                assert_text_artifact_matches_proof(&artifact, &proof, scale_factor);
+            if let Some(artifact) = self.artifacts.current_artifact_for_query(&cache_key) {
+                proof.assert_matches_artifact(&artifact, scale_factor);
                 continue;
             }
-            self.hydrate_text_artifact_from_current_producer(proof, scale_factor, window, cx);
+            self.hydrate_artifact_from_current_producer(proof, scale_factor, window, cx);
         }
 
-        self.assert_solved_root_text_artifacts_selected(observer);
+        self.assert_solved_root_artifacts_selected(observer);
 
-        for (node_id, artifact) in self.text_artifacts.current_artifacts() {
-            self.hydrate_text_node(node_id, &artifact);
+        for node_id in observer.root_artifact_descendants() {
+            let artifact = self
+                .artifacts
+                .current_artifact(*node_id)
+                .expect("solved root artifact should have been selected before hydration");
+            self.hydrate_artifact_node(*node_id, &artifact);
         }
     }
 
-    fn assert_solved_root_text_artifacts_selected(&self, observer: &MeasurementSolveObserver) {
+    fn assert_solved_root_artifacts_selected(&self, observer: &MeasurementSolveObserver) {
         let missing = observer
             .root_artifact_descendants()
             .iter()
             .copied()
-            .filter(|node_id| !self.text_artifacts.has_current_artifact(*node_id))
+            .filter(|node_id| !self.artifacts.has_current_artifact(*node_id))
             .collect::<Vec<_>>();
         if missing.is_empty() {
             return;
@@ -740,7 +719,7 @@ impl MeasurementStore {
             .collect::<Vec<_>>()
             .join(", ");
         panic!(
-            "completed retained layout solve did not select text artifacts for solved root nodes: {missing}"
+            "completed retained layout solve did not select artifacts for solved root nodes: {missing}"
         );
     }
 
@@ -748,102 +727,99 @@ impl MeasurementStore {
         ComputeMeasurementState::new(
             &mut self.producers,
             &mut self.current_measurements,
-            &mut self.text_artifacts,
+            &mut self.artifacts,
         )
     }
 
     #[stacksafe::stacksafe]
-    fn hydrate_text_artifact_from_current_producer(
+    fn hydrate_artifact_from_current_producer(
         &mut self,
-        proof: TextArtifactProof,
+        proof: ArtifactProof,
         scale_factor: f32,
         window: &mut Window,
         cx: &App,
     ) {
-        let Some(CurrentMeasurement::Text { key, measure }) =
+        let Some(CurrentMeasurement::Artifact { key, measure }) =
             self.current_measurements.get(&proof.node_id).cloned()
         else {
             panic!("solver cache-hit text query should refer to a current text measurement");
         };
         assert_eq!(
-            &key, &proof.text_key,
-            "solver cache-hit text query should match the current text measure key"
+            &key, &proof.artifact_key,
+            "solver cache-hit artifact query should match the current artifact key"
         );
 
         let artifact = {
             let mut measure_cx = MeasureCx::new(window, cx);
-            let measure = &mut self
+            let context = self
                 .producers
                 .context_mut(measure)
-                .expect("text measured layout should have a current producer and hydrator")
-                .measure;
-            match measure(
+                .expect("artifact measured layout should have a current producer and hydrator");
+            let LayoutMeasureContext::Artifact(context) = context else {
+                panic!("artifact measured layout should have an artifact producer");
+            };
+            (context.measure)(
                 proof.known_dimensions,
                 proof.available_space,
                 &mut measure_cx,
-            ) {
-                MeasuredLayoutResult::Text(artifact) => artifact,
-                MeasuredLayoutResult::Size(_) => {
-                    panic!("text measured layout producer returned a size-only result");
-                }
-            }
+            )
         };
-        assert_eq!(
-            artifact.key(),
-            &key,
-            "hydrated solver cache-hit text artifact should match the current text measure key"
+        key.assert_matches_artifact(
+            &artifact,
+            "hydrated solver cache-hit artifact should match the current artifact key",
         );
-        assert_text_artifact_matches_proof(&artifact, &proof, scale_factor);
+        proof.assert_matches_artifact(&artifact, scale_factor);
 
         let cache_key = proof.cache_key();
-        self.text_artifacts
+        self.artifacts
             .record_for_query(proof.node_id, cache_key.clone(), &artifact);
-        self.text_artifacts.cache_artifact(cache_key, artifact);
+        self.artifacts.cache_artifact(cache_key, artifact);
     }
 
-    fn hydrate_text_node(&mut self, node_id: SolverNodeId, artifact: &TextLayoutArtifact) {
-        let Some(CurrentMeasurement::Text { key, measure }) =
+    fn hydrate_artifact_node(&mut self, node_id: SolverNodeId, artifact: &LayoutArtifact) {
+        let Some(CurrentMeasurement::Artifact { key, measure }) =
             self.current_measurements.get_mut(&node_id)
         else {
-            panic!("selected text artifact should hydrate a current text measurement");
+            panic!("selected artifact should hydrate a current text measurement");
         };
-        assert_eq!(
-            artifact.key(),
-            key,
-            "hydrated text artifact should match the current text measure key"
+        key.assert_matches_artifact(
+            artifact,
+            "hydrated artifact should match the current artifact key",
         );
-        let hydrate = self
+        let context = self
             .producers
             .context(*measure)
-            .and_then(|measure| measure.text_hydrator.as_ref())
-            .map(Rc::clone)
-            .expect("text measured layout should have a hydrator");
+            .expect("artifact measured layout should have a hydrator");
+        let LayoutMeasureContext::Artifact(context) = context else {
+            panic!("artifact measured layout should have an artifact hydrator");
+        };
+        let hydrate = Rc::clone(&context.hydrate);
         hydrate(artifact);
     }
 }
 
 /// Per-compute bridge between solver measurement callbacks and GPUI artifacts.
 ///
-/// The solver owns whether a measured node callback runs. GPUI hydrates text from a
-/// callback result in the same compute. When the same retained text node is
-/// measured with the same exact callback query, GPUI can hydrate from its
+/// The solver owns whether a measured node callback runs. GPUI hydrates artifacts
+/// from a callback result in the same compute. When the same retained artifact
+/// node is measured with the same exact callback query, GPUI can hydrate from its
 /// query-keyed artifact cache without running the text producer again.
 pub(super) struct ComputeMeasurementState<'a> {
     producers: &'a mut ProducerRegistry,
     current_measurements: &'a mut FxHashMap<SolverNodeId, CurrentMeasurement>,
-    text_artifacts: &'a mut TextArtifactStore,
+    artifacts: &'a mut ArtifactStore,
 }
 
 impl<'a> ComputeMeasurementState<'a> {
     fn new(
         producers: &'a mut ProducerRegistry,
         current_measurements: &'a mut FxHashMap<SolverNodeId, CurrentMeasurement>,
-        text_artifacts: &'a mut TextArtifactStore,
+        artifacts: &'a mut ArtifactStore,
     ) -> Self {
         Self {
             producers,
             current_measurements,
-            text_artifacts,
+            artifacts,
         }
     }
 
@@ -867,53 +843,48 @@ impl<'a> ComputeMeasurementState<'a> {
 
         match current_measurement {
             CurrentMeasurement::Opaque(measure) => {
-                let measure = &mut self
+                let context = self
                     .producers
                     .context_mut(measure)
-                    .expect("opaque measured layout should have a current producer")
-                    .measure;
-                MeasuredQueryAnswer::hard_work(
-                    measure(known_dimensions, available_space, &mut measure_cx).size(),
-                )
+                    .expect("opaque measured layout should have a current producer");
+                let LayoutMeasureContext::Size(measure) = context else {
+                    panic!("opaque measured layout should have a size producer");
+                };
+                MeasuredQueryAnswer::hard_work(measure(
+                    known_dimensions,
+                    available_space,
+                    &mut measure_cx,
+                ))
             }
             CurrentMeasurement::PureSize(measure) => {
                 MeasuredQueryAnswer::hard_work(measure.measure(known_dimensions, available_space))
             }
-            CurrentMeasurement::Text { key, measure, .. } => {
-                let cache_key = TextArtifactCacheKey::new(
-                    node_id,
-                    key.clone(),
-                    known_dimensions,
-                    available_space,
-                );
-                if let Some(artifact) = self.text_artifacts.artifact_for_query(&cache_key) {
+            CurrentMeasurement::Artifact { key, measure, .. } => {
+                let cache_key =
+                    ArtifactCacheKey::new(node_id, key.clone(), known_dimensions, available_space);
+                if let Some(artifact) = self.artifacts.artifact_for_query(&cache_key) {
                     let size = artifact.size();
-                    self.record_text_artifact_for_query(node_id, cache_key, &artifact);
+                    self.record_artifact_for_query(node_id, cache_key, &artifact);
                     return MeasuredQueryAnswer::no_work(size);
                 }
 
                 let measure_id = measure;
                 let artifact = {
-                    let measure = &mut self
-                        .producers
-                        .context_mut(measure_id)
-                        .expect("text measured layout should have a current producer and hydrator")
-                        .measure;
-                    match measure(known_dimensions, available_space, &mut measure_cx) {
-                        MeasuredLayoutResult::Text(artifact) => artifact,
-                        MeasuredLayoutResult::Size(_) => {
-                            panic!("text measured layout producer returned a size-only result");
-                        }
-                    }
+                    let context = self.producers.context_mut(measure_id).expect(
+                        "artifact measured layout should have a current producer and hydrator",
+                    );
+                    let LayoutMeasureContext::Artifact(context) = context else {
+                        panic!("artifact measured layout should have an artifact producer");
+                    };
+                    (context.measure)(known_dimensions, available_space, &mut measure_cx)
                 };
-                assert_eq!(
-                    artifact.key(),
-                    &key,
-                    "text measured layout artifact should match the current text measure key"
+                key.assert_matches_artifact(
+                    &artifact,
+                    "artifact measured layout artifact should match the current artifact key",
                 );
                 let size = artifact.size();
-                self.record_text_artifact_for_query(node_id, cache_key.clone(), &artifact);
-                self.text_artifacts.cache_artifact(cache_key, artifact);
+                self.record_artifact_for_query(node_id, cache_key.clone(), &artifact);
+                self.artifacts.cache_artifact(cache_key, artifact);
                 MeasuredQueryAnswer::hard_work(size)
             }
         }
@@ -926,76 +897,47 @@ impl<'a> ComputeMeasurementState<'a> {
     ) {
         match event {
             SolverCacheEvent::Measure(observation) => {
-                self.record_text_artifact_for_measure_observation(observation, scale_factor);
+                self.record_artifact_for_measure_observation(observation, scale_factor);
             }
             SolverCacheEvent::Hit(_) | SolverCacheEvent::Stored(_) => {}
             SolverCacheEvent::Cleared(_) => {}
         }
     }
 
-    fn record_text_artifact_for_measure_observation(
+    fn record_artifact_for_measure_observation(
         &mut self,
         observation: SolverMeasureObservation,
         scale_factor: f32,
     ) {
         let node_id = observation.node_id();
-        let Some(CurrentMeasurement::Text { key, .. }) = self.current_measurements.get(&node_id)
+        let Some(CurrentMeasurement::Artifact { key, .. }) =
+            self.current_measurements.get(&node_id)
         else {
             return;
         };
         let key = key.clone();
-        let proof = TextArtifactProof::from_solver_measure_observation(
-            key.clone(),
-            observation,
-            scale_factor,
-        );
+        let proof =
+            ArtifactProof::from_solver_measure_observation(key.clone(), observation, scale_factor);
         let query_key = proof.cache_key();
-        let Some(artifact) = self.text_artifacts.artifact_for_query(&query_key) else {
-            self.text_artifacts.push_pending_proof(proof);
+        let Some(artifact) = self.artifacts.artifact_for_query(&query_key) else {
+            self.artifacts.push_pending_proof(proof);
             return;
         };
-        assert_eq!(
-            artifact.key(),
-            &key,
-            "solver measure observation text artifact should match the current text measure key"
+        key.assert_matches_artifact(
+            &artifact,
+            "solver measure observation artifact should match the current artifact key",
         );
-        assert_text_artifact_matches_proof(&artifact, &proof, scale_factor);
-        self.record_text_artifact_for_query(node_id, query_key, &artifact);
+        proof.assert_matches_artifact(&artifact, scale_factor);
+        self.record_artifact_for_query(node_id, query_key, &artifact);
     }
 
-    fn record_text_artifact_for_query(
+    fn record_artifact_for_query(
         &mut self,
         node_id: SolverNodeId,
-        cache_key: TextArtifactCacheKey,
-        artifact: &TextLayoutArtifact,
+        cache_key: ArtifactCacheKey,
+        artifact: &LayoutArtifact,
     ) {
-        self.text_artifacts
+        self.artifacts
             .record_for_query(node_id, cache_key, artifact);
     }
-}
-
-fn assert_text_artifact_matches_proof(
-    artifact: &TextLayoutArtifact,
-    proof: &TextArtifactProof,
-    scale_factor: f32,
-) {
-    assert_eq!(
-        artifact.key(),
-        &proof.text_key,
-        "current text artifact should match the exact solver query text key"
-    );
-    assert_eq!(
-        snap_text_artifact_size_to_solver_measurement(artifact.size(), scale_factor),
-        proof.measured_size,
-        "current text artifact should match the exact solver query measured size"
-    );
-}
-
-fn snap_text_artifact_size_to_solver_measurement(
-    size: Size<Pixels>,
-    scale_factor: f32,
-) -> Size<Pixels> {
-    size.map(|dimension| {
-        Pixels(ceil_to_device_pixel(dimension.0.max(0.0), scale_factor) / scale_factor)
-    })
 }

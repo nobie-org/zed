@@ -41,7 +41,7 @@ where
 
     UniformList {
         item_count,
-        item_to_measure_index: 0,
+        item_size: None,
         render_items: Box::new(render_range),
         decorations: Vec::new(),
         interactivity: Interactivity {
@@ -58,7 +58,7 @@ where
 /// A list element for efficiently laying out and displaying a list of uniform-height elements.
 pub struct UniformList {
     item_count: usize,
-    item_to_measure_index: usize,
+    item_size: Option<Size<Pixels>>,
     render_items: Box<
         dyn for<'a> Fn(
             Range<usize>,
@@ -75,7 +75,7 @@ pub struct UniformList {
 
 /// Frame state used by the [UniformList].
 pub struct UniformListFrameState {
-    item_size: Option<Size<Pixels>>,
+    item_size: Size<Pixels>,
 }
 
 pub struct UniformListPrepaintState {
@@ -300,10 +300,15 @@ impl Element for UniformList {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
-        let item_size = self
-            .scroll_handle
-            .as_ref()
-            .and_then(|handle| handle.0.borrow().last_item_size.map(|size| size.item));
+        let item_size = self.item_size.unwrap_or_else(|| {
+            if max_items == 0 {
+                Size::default()
+            } else {
+                panic!(
+                    "uniform_list requires an explicit item size; call UniformList::with_item_size for non-empty lists"
+                )
+            }
+        });
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
@@ -315,7 +320,7 @@ impl Element for UniformList {
                         window.request_pure_measured_layout(
                             style,
                             PureSizeMeasure::uniform_list(
-                                item_size.unwrap_or_default(),
+                                item_size,
                                 max_items,
                                 window.scale_factor(),
                             ),
@@ -360,11 +365,7 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = frame_state.item_size.unwrap_or_else(|| {
-            panic!(
-                "uniform list item size must be produced before prepaint; prepaint cannot solve scratch layout"
-            )
-        });
+        let longest_item_size = frame_state.item_size;
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {
@@ -665,9 +666,13 @@ impl<T: UniformListDecoration + 'static> UniformListDecoration for Entity<T> {
 }
 
 impl UniformList {
-    /// Selects a specific list item for measurement.
-    pub fn with_width_from_item(mut self, item_index: Option<usize>) -> Self {
-        self.item_to_measure_index = item_index.unwrap_or(0);
+    /// Supplies the uniform size of every item in this list.
+    ///
+    /// Retained layout cannot safely infer this by laying out an arbitrary item
+    /// during request-layout or prepaint. The item size is layout-visible data,
+    /// so non-empty uniform lists require it as an explicit current-frame fact.
+    pub fn with_item_size(mut self, item_size: Size<Pixels>) -> Self {
+        self.item_size = Some(item_size);
         self
     }
 
@@ -748,7 +753,7 @@ mod test {
     fn test_scroll_strategy_nearest(cx: &mut TestAppContext) {
         use crate::{
             Context, FocusHandle, ScrollStrategy, UniformListScrollHandle, Window, div, prelude::*,
-            px, uniform_list,
+            px, size, uniform_list,
         };
         use std::ops::Range;
 
@@ -819,6 +824,7 @@ mod test {
                                     .collect()
                             }),
                         )
+                        .with_item_size(size(px(100.0), px(20.0)))
                         .track_scroll(&self.scroll_handle)
                         .h(px(200.0)),
                     )

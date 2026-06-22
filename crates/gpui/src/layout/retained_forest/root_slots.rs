@@ -1,27 +1,27 @@
 //! Retained root slots and deferred subtree removals.
 //!
-//! Root slots are the cross-frame ownership layer above individual occurrences:
+//! Root slots are the cross-frame ownership layer above individual retained nodes:
 //! previous roots are consumed during commit, current roots are promoted at
 //! frame finish, and detached subtrees are removed only by the forest's mirror
 //! cleanup path.
 
 use super::super::RetainedLayoutRootId;
-use super::occurrence::RetainedLayoutOccurrence;
+use super::node::RetainedLayoutNode;
 use collections::FxHashMap;
 use std::mem;
 
 /// Owns previous/current root slots and detached subtree removals.
 pub(super) struct RootSlots {
-    retained_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutOccurrence>,
-    current_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutOccurrence>,
-    detached_subtree_removals: Vec<RetainedLayoutOccurrence>,
+    retained_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
+    current_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
+    detached_subtree_removals: Vec<RetainedLayoutNode>,
 }
 
 /// Transaction checkpoint for root slot state.
 pub(super) struct RootSlotsCheckpoint {
-    retained_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutOccurrence>,
-    current_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutOccurrence>,
-    detached_subtree_removals: Vec<RetainedLayoutOccurrence>,
+    retained_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
+    current_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
+    detached_subtree_removals: Vec<RetainedLayoutNode>,
 }
 
 impl RootSlots {
@@ -47,7 +47,7 @@ impl RootSlots {
         self.detached_subtree_removals = checkpoint.detached_subtree_removals;
     }
 
-    pub(super) fn take_retained_roots(&mut self) -> Vec<RetainedLayoutOccurrence> {
+    pub(super) fn take_retained_roots(&mut self) -> Vec<RetainedLayoutNode> {
         mem::take(&mut self.retained_roots).into_values().collect()
     }
 
@@ -62,14 +62,14 @@ impl RootSlots {
     pub(super) fn take_retained_root(
         &mut self,
         root_id: RetainedLayoutRootId,
-    ) -> Option<RetainedLayoutOccurrence> {
+    ) -> Option<RetainedLayoutNode> {
         self.retained_roots.remove(&root_id)
     }
 
     pub(super) fn insert_current_root(
         &mut self,
         root_id: RetainedLayoutRootId,
-        root: RetainedLayoutOccurrence,
+        root: RetainedLayoutNode,
     ) {
         let previous = self.current_roots.insert(root_id, root);
         assert!(
@@ -82,11 +82,11 @@ impl RootSlots {
         self.current_roots.len()
     }
 
-    pub(super) fn detach_subtree(&mut self, root: RetainedLayoutOccurrence) {
+    pub(super) fn detach_subtree(&mut self, root: RetainedLayoutNode) {
         self.detached_subtree_removals.push(root);
     }
 
-    pub(super) fn take_detached_subtree_removals(&mut self) -> Vec<RetainedLayoutOccurrence> {
+    pub(super) fn take_detached_subtree_removals(&mut self) -> Vec<RetainedLayoutNode> {
         mem::take(&mut self.detached_subtree_removals)
     }
 }

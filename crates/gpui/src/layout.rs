@@ -20,7 +20,8 @@ use retained_forest::{
     RetainedLayoutShapeForTests, RetainedNodeToken,
 };
 use retained_forest::{
-    MeasuredLayoutRequest, RetainedLayoutForest, RetainedLayoutForestCheckpoint,
+    LayoutArtifact, LayoutArtifactKey, MeasuredLayoutRequest, RetainedLayoutForest,
+    RetainedLayoutForestCheckpoint,
 };
 pub use telemetry::LayoutWorkSample;
 #[cfg(any(test, feature = "test-support"))]
@@ -69,6 +70,21 @@ impl RetainedLayoutRootId {
     fn new(id: u64) -> Self {
         Self(id)
     }
+}
+
+fn text_layout_artifact_key(measure_key: TextMeasureKey) -> LayoutArtifactKey {
+    LayoutArtifactKey::new(
+        measure_key,
+        |measure_key, known_dimensions, available_space, window, cx| {
+            measure_key
+                .measure(
+                    known_dimensions,
+                    available_space,
+                    &mut MeasureCx::new(window, cx),
+                )
+                .size()
+        },
+    )
 }
 
 /// One-shot authority to solve one retained layout root.
@@ -275,7 +291,7 @@ impl LayoutEngine {
         scale_factor: f32,
         measure_key: TextMeasureKey,
         hydrate: impl Fn(&TextLayoutArtifact) + 'static,
-        measure: impl FnMut(
+        mut measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
             &mut MeasureCx<'_>,
@@ -283,11 +299,25 @@ impl LayoutEngine {
         + 'static,
     ) -> LayoutId {
         self.layout_work.measured_layout_node_requests += 1;
+        let artifact_key = text_layout_artifact_key(measure_key);
         self.forest.request_measured_layout(
             style,
             rem_size,
             scale_factor,
-            MeasuredLayoutRequest::text(measure_key, hydrate, measure),
+            MeasuredLayoutRequest::artifact(
+                artifact_key,
+                move |artifact| {
+                    let artifact = artifact
+                        .downcast_ref::<TextLayoutArtifact>()
+                        .expect("text measured layout should hydrate a text artifact");
+                    hydrate(artifact)
+                },
+                move |known_dimensions, available_space, measure_cx| {
+                    let artifact = measure(known_dimensions, available_space, measure_cx);
+                    let artifact_key = text_layout_artifact_key(artifact.key().clone());
+                    LayoutArtifact::new(artifact_key, artifact.size(), artifact)
+                },
+            ),
         )
     }
 
@@ -338,7 +368,7 @@ impl LayoutEngine {
         self.compute_layout_in_root(id, root_id, available_space, window, cx);
     }
 
-    /// Commit the current intent into the retained forest and ask the mirror to compute it.
+    /// Commit the current facts into the retained forest and ask the mirror to compute them.
     fn compute_layout_in_root(
         &mut self,
         id: LayoutId,
@@ -525,7 +555,7 @@ impl LayoutEngine {
     }
 
     #[cfg(test)]
-    fn assert_intent_committed_exactly_for_tests(&self, id: LayoutId) {
+    fn assert_facts_committed_exactly_for_tests(&self, id: LayoutId) {
         self.forest.assert_facts_committed_exactly_for_tests(id);
     }
 

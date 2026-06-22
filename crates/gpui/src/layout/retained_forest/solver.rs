@@ -177,6 +177,13 @@ trait SolverBackend: Clone {
     fn capture_layout_tree(&self, root: SolverNodeId) -> Vec<(SolverNodeId, SolverLayout)>;
     fn style(&self, node_id: SolverNodeId) -> Option<SolverStyle>;
     fn has_measure_context(&self, node_id: SolverNodeId) -> bool;
+    fn compute_layout_with_measure(
+        &mut self,
+        root: SolverNodeId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
+    );
     fn compute_layout_with_measure_and_cache_events(
         &mut self,
         root: SolverNodeId,
@@ -256,6 +263,17 @@ impl LayoutSolver {
 
     pub(super) fn has_measure_context(&self, node_id: SolverNodeId) -> bool {
         self.backend.has_measure_context(node_id)
+    }
+
+    pub(super) fn compute_layout_with_measure(
+        &mut self,
+        root: SolverNodeId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
+    ) {
+        self.backend
+            .compute_layout_with_measure(root, available_space, scale_factor, measure);
     }
 
     pub(super) fn compute_layout_with_measure_and_cache_events(

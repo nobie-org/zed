@@ -439,6 +439,7 @@ impl RetainedLayoutForest {
             node_id,
             available_space,
             scale_factor,
+            measurement_solve_observer.has_artifact_obligations(),
             window,
             cx,
             &mut subtree_compute_recorder,
@@ -564,6 +565,7 @@ impl RetainedLayoutForest {
         node_id: SolverNodeId,
         available_space: Size<AvailableSpace>,
         scale_factor: f32,
+        observe_measurement_cache_events: bool,
         window: &mut Window,
         cx: &mut App,
         subtree_compute_recorder: &mut SubtreeProbeComputeRecorder,
@@ -581,11 +583,8 @@ impl RetainedLayoutForest {
         let compute_measurements = std::cell::RefCell::new(measurements.compute_state());
         let subtree_compute_recorder = std::cell::RefCell::new(subtree_compute_recorder);
 
-        solver.compute_layout_with_measure_and_cache_events(
-            node_id,
-            available_space,
-            scale_factor,
-            |node_id, has_measure_context, query: SolverMeasureQuery| {
+        let mut measure =
+            |node_id: SolverNodeId, has_measure_context: bool, query: SolverMeasureQuery| {
                 if !has_measure_context {
                     assert!(
                         !compute_measurements
@@ -613,14 +612,29 @@ impl RetainedLayoutForest {
                     measured_layout_duration += measure_start.elapsed();
                 }
                 snap_measured_size_to_device_pixels(answer.size(), scale_factor)
-            },
-            |event| {
-                cache_event_tracer.record(event);
-                compute_measurements
-                    .borrow_mut()
-                    .observe_layout_cache_event(event, scale_factor);
-            },
-        );
+            };
+
+        if observe_measurement_cache_events {
+            solver.compute_layout_with_measure_and_cache_events(
+                node_id,
+                available_space,
+                scale_factor,
+                &mut measure,
+                |event| {
+                    cache_event_tracer.record(event);
+                    compute_measurements
+                        .borrow_mut()
+                        .observe_layout_cache_event(event, scale_factor);
+                },
+            );
+        } else {
+            solver.compute_layout_with_measure(
+                node_id,
+                available_space,
+                scale_factor,
+                &mut measure,
+            );
+        }
 
         (measured_layout_calls, measured_layout_duration)
     }

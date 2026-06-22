@@ -470,6 +470,10 @@ pub(super) struct MeasurementSolveObserver {
 }
 
 impl MeasurementSolveObserver {
+    pub(super) fn has_artifact_obligations(&self) -> bool {
+        !self.root_artifact_descendants.is_empty()
+    }
+
     fn root_artifact_descendants(&self) -> &[SolverNodeId] {
         &self.root_artifact_descendants
     }

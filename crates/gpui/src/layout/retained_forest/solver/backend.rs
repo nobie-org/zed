@@ -281,6 +281,41 @@ impl SolverBackend for SolverBackendImpl {
         self.taffy.get_node_context(node_id.0.0).is_some()
     }
 
+    fn compute_layout_with_measure(
+        &mut self,
+        root: SolverNodeId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        mut measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
+    ) {
+        let taffy_available_space = scale_available_space_for_taffy(available_space, scale_factor);
+        self.taffy
+            .compute_layout_with_measure(
+                root.0.0,
+                taffy_available_space,
+                |known_dimensions, available_space, node_id, node_context, _style| {
+                    let known_dimensions = size(
+                        known_dimensions.width.map(|e| Pixels(e / scale_factor)),
+                        known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+                    );
+                    let available_space = size(
+                        available_space_from_taffy(available_space.width, scale_factor),
+                        available_space_from_taffy(available_space.height, scale_factor),
+                    );
+                    measure(
+                        SolverNodeId(BackendNodeId(node_id)),
+                        node_context.is_some(),
+                        SolverMeasureQuery {
+                            known_dimensions,
+                            available_space,
+                        },
+                    )
+                    .into()
+                },
+            )
+            .expect(EXPECT_MESSAGE);
+    }
+
     fn compute_layout_with_measure_and_cache_events(
         &mut self,
         root: SolverNodeId,

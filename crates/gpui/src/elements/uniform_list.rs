@@ -5,10 +5,11 @@
 //! elements with uniform height.
 
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
+    AnyElement, App, AvailableSpace, Bounds, BuildCx, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, layout::PureSizeMeasure, point, px, size,
+    IsZero, LayoutId, LayoutRequestCx, ListSizingBehavior, Overflow, OwnerPaintedVisibleRoot,
+    PaintCx, Pixels, Point, PrepaintCx, ScrollHandle, Size, StyleRefinement, Styled,
+    layout::PureSizeMeasure, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -22,7 +23,7 @@ use super::ListHorizontalSizingBehavior;
 pub fn uniform_list<R>(
     id: impl Into<ElementId>,
     item_count: usize,
-    f: impl 'static + Fn(Range<usize>, &mut Window, &mut App) -> Vec<R>,
+    f: impl 'static + Fn(Range<usize>, &mut BuildCx<'_>, &mut App) -> Vec<R>,
 ) -> UniformList
 where
     R: IntoElement,
@@ -31,7 +32,7 @@ where
     let mut base_style = StyleRefinement::default();
     base_style.overflow.y = Some(Overflow::Scroll);
 
-    let render_range = move |range: Range<usize>, window: &mut Window, cx: &mut App| {
+    let render_range = move |range: Range<usize>, window: &mut BuildCx<'_>, cx: &mut App| {
         f(range, window, cx)
             .into_iter()
             .map(|component| component.into_any_element())
@@ -59,7 +60,11 @@ pub struct UniformList {
     item_count: usize,
     item_to_measure_index: usize,
     render_items: Box<
-        dyn for<'a> Fn(Range<usize>, &'a mut Window, &'a mut App) -> SmallVec<[AnyElement; 64]>,
+        dyn for<'a> Fn(
+            Range<usize>,
+            &'a mut BuildCx<'_>,
+            &'a mut App,
+        ) -> SmallVec<[AnyElement; 64]>,
     >,
     decorations: Vec<Box<dyn UniformListDecoration>>,
     interactivity: Interactivity,
@@ -70,9 +75,23 @@ pub struct UniformList {
 
 /// Frame state used by the [UniformList].
 pub struct UniformListFrameState {
-    item_size: Size<Pixels>,
-    items: SmallVec<[AnyElement; 32]>,
-    decorations: SmallVec<[AnyElement; 2]>,
+    item_size: Option<Size<Pixels>>,
+}
+
+pub struct UniformListPrepaintState {
+    hitbox: Option<Hitbox>,
+    visible_roots: UniformListVisibleRoots,
+}
+
+struct UniformListVisibleRoots {
+    items: SmallVec<[OwnerPaintedVisibleRoot; 32]>,
+    decorations: SmallVec<[OwnerPaintedVisibleRoot; 2]>,
+}
+
+struct PendingUniformListRoot {
+    element: AnyElement,
+    available_space: Size<AvailableSpace>,
+    origin: Point<Pixels>,
 }
 
 /// A handle for controlling the scroll position of a uniform list.
@@ -263,7 +282,7 @@ impl Styled for UniformList {
 
 impl Element for UniformList {
     type RequestLayoutState = UniformListFrameState;
-    type PrepaintState = Option<Hitbox>;
+    type PrepaintState = UniformListPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         self.interactivity.element_id.clone()
@@ -277,11 +296,14 @@ impl Element for UniformList {
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
-        let item_size = self.measure_item(None, window, cx);
+        let item_size = self
+            .scroll_handle
+            .as_ref()
+            .and_then(|handle| handle.0.borrow().last_item_size.map(|size| size.item));
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
@@ -293,7 +315,7 @@ impl Element for UniformList {
                         window.request_pure_measured_layout(
                             style,
                             PureSizeMeasure::uniform_list(
-                                item_size,
+                                item_size.unwrap_or_default(),
                                 max_items,
                                 window.scale_factor(),
                             ),
@@ -307,14 +329,7 @@ impl Element for UniformList {
             },
         );
 
-        (
-            layout_id,
-            UniformListFrameState {
-                item_size,
-                items: SmallVec::new(),
-                decorations: SmallVec::new(),
-            },
-        )
+        (layout_id, UniformListFrameState { item_size })
     }
 
     fn prepaint(
@@ -323,9 +338,9 @@ impl Element for UniformList {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         frame_state: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
-    ) -> Option<Hitbox> {
+    ) -> UniformListPrepaintState {
         let style = self
             .interactivity
             .compute_style(global_id, None, window, cx);
@@ -345,7 +360,11 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
-        let longest_item_size = frame_state.item_size;
+        let longest_item_size = frame_state.item_size.unwrap_or_else(|| {
+            panic!(
+                "uniform list item size must be produced before prepaint; prepaint cannot solve scratch layout"
+            )
+        });
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
         } else {
@@ -382,7 +401,11 @@ impl Element for UniformList {
                     false
                 };
 
-                if self.item_count > 0 {
+                let content_mask = ContentMask { bounds };
+                let mut pending_items = Vec::new();
+                let mut pending_decorations = Vec::new();
+
+                if self.item_count > 0 && !item_height.is_zero() {
                     let content_height = item_height * self.item_count;
 
                     let is_scrolled_vertically = !scroll_offset.y.is_zero();
@@ -471,16 +494,17 @@ impl Element for UniformList {
                     let items = if y_flipped {
                         let flipped_range = self.item_count.saturating_sub(visible_range.end)
                             ..self.item_count.saturating_sub(visible_range.start);
-                        let mut items = (self.render_items)(flipped_range, window, cx);
+                        let mut items =
+                            window.build(|window| (self.render_items)(flipped_range, window, cx));
                         items.reverse();
                         items
                     } else {
-                        (self.render_items)(visible_range.clone(), window, cx)
+                        window
+                            .build(|window| (self.render_items)(visible_range.clone(), window, cx))
                     };
 
-                    let content_mask = ContentMask { bounds };
                     window.with_content_mask(Some(content_mask), |window| {
-                        for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
+                        for (item, ix) in items.into_iter().zip(visible_range.clone()) {
                             let item_origin = padded_bounds.origin
                                 + scroll_offset
                                 + point(Pixels::ZERO, item_height * ix);
@@ -494,15 +518,17 @@ impl Element for UniformList {
                                 AvailableSpace::Definite(available_width),
                                 AvailableSpace::Definite(item_height),
                             );
-                            item.layout_as_root(available_space, window, cx);
-                            item.prepaint_at(item_origin, window, cx);
-                            frame_state.items.push(item);
+                            pending_items.push(PendingUniformListRoot {
+                                element: item,
+                                available_space,
+                                origin: item_origin,
+                            });
                         }
 
                         let bounds =
                             Bounds::new(padded_bounds.origin + scroll_offset, padded_bounds.size);
                         for decoration in &self.decorations {
-                            let mut decoration = decoration.as_ref().compute(
+                            let decoration = decoration.as_ref().compute(
                                 visible_range.clone(),
                                 bounds,
                                 scroll_offset,
@@ -515,14 +541,45 @@ impl Element for UniformList {
                                 AvailableSpace::Definite(bounds.size.width),
                                 AvailableSpace::Definite(bounds.size.height),
                             );
-                            decoration.layout_as_root(available_space, window, cx);
-                            decoration.prepaint_at(bounds.origin, window, cx);
-                            frame_state.decorations.push(decoration);
+                            pending_decorations.push(PendingUniformListRoot {
+                                element: decoration,
+                                available_space,
+                                origin: bounds.origin,
+                            });
                         }
                     });
                 }
 
-                hitbox
+                let mut visible_roots = UniformListVisibleRoots {
+                    items: SmallVec::new(),
+                    decorations: SmallVec::new(),
+                };
+                window.with_content_mask(Some(content_mask), |window| {
+                    for pending in pending_items {
+                        let origin = pending.origin;
+                        let handle = window.owner_painted_visible_root(
+                            pending.element,
+                            pending.available_space,
+                            move |_| origin,
+                            cx,
+                        );
+                        visible_roots.items.push(handle);
+                    }
+                    for pending in pending_decorations {
+                        let origin = pending.origin;
+                        let handle = window.owner_painted_visible_root(
+                            pending.element,
+                            pending.available_space,
+                            move |_| origin,
+                            cx,
+                        );
+                        visible_roots.decorations.push(handle);
+                    }
+                });
+                UniformListPrepaintState {
+                    hitbox,
+                    visible_roots,
+                }
             },
         )
     }
@@ -532,24 +589,25 @@ impl Element for UniformList {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<crate::Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
-        hitbox: &mut Option<Hitbox>,
-        window: &mut Window,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
+        let visible_roots = &mut prepaint.visible_roots;
         self.interactivity.paint(
             global_id,
             inspector_id,
             bounds,
-            hitbox.as_ref(),
+            prepaint.hitbox.as_ref(),
             window,
             cx,
             |_, window, cx| {
-                for item in &mut request_layout.items {
-                    item.paint(window, cx);
+                for item in visible_roots.items.drain(..) {
+                    window.paint_visible_root(item, cx);
                 }
-                for decoration in &mut request_layout.decorations {
-                    decoration.paint(window, cx);
+                for decoration in visible_roots.decorations.drain(..) {
+                    window.paint_visible_root(decoration, cx);
                 }
             },
         )
@@ -576,7 +634,7 @@ pub trait UniformListDecoration {
         scroll_offset: Point<Pixels>,
         item_height: Pixels,
         item_count: usize,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> AnyElement;
 }
@@ -589,7 +647,7 @@ impl<T: UniformListDecoration + 'static> UniformListDecoration for Entity<T> {
         scroll_offset: Point<Pixels>,
         item_height: Pixels,
         item_count: usize,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> AnyElement {
         self.update(cx, |inner, cx| {
@@ -642,30 +700,6 @@ impl UniformList {
     pub fn with_decoration(mut self, decoration: impl UniformListDecoration + 'static) -> Self {
         self.decorations.push(Box::new(decoration));
         self
-    }
-
-    fn measure_item(
-        &self,
-        list_width: Option<Pixels>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Size<Pixels> {
-        if self.item_count == 0 {
-            return Size::default();
-        }
-
-        let item_ix = cmp::min(self.item_to_measure_index, self.item_count - 1);
-        let mut items = (self.render_items)(item_ix..item_ix + 1, window, cx);
-        let Some(item_to_measure) = items.pop() else {
-            return Size::default();
-        };
-        let available_space = size(
-            list_width.map_or(AvailableSpace::MinContent, |width| {
-                AvailableSpace::Definite(width)
-            }),
-            AvailableSpace::MinContent,
-        );
-        item_to_measure.measure_as_root(available_space, window, cx)
     }
 
     /// Track and render scroll state of this list with reference to the given scroll handle.
@@ -763,7 +797,11 @@ mod test {
         }
 
         impl Render for TestView {
-            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut crate::BuildCx<'_>,
+                cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 div()
                     .id("list-example")
                     .track_focus(&self.focus_handle)
@@ -774,7 +812,7 @@ mod test {
                         uniform_list(
                             "entries",
                             self.length,
-                            cx.processor(|this, range: Range<usize>, _window, _cx| {
+                            cx.processor_build(|this, range: Range<usize>, _window, _cx| {
                                 this.visible_range = range.clone();
                                 range
                                     .map(|ix| div().id(ix).h(px(20.0)).child(format!("Item {ix}")))

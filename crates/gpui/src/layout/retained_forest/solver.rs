@@ -146,6 +146,10 @@ impl SolverMeasureObservation {
             available_space: self.0.available_space(scale_factor),
         }
     }
+
+    pub(super) fn measured_size(&self, scale_factor: f32) -> Size<Pixels> {
+        self.0.measured_size(scale_factor)
+    }
 }
 
 /// Private layout solver facade used by the retained forest.

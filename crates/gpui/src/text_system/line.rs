@@ -1,6 +1,6 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
+    App, Bounds, DevicePixels, Half, Hsla, LineLayout, PaintCx, Pixels, Point, RenderGlyphParams,
+    Result, ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle,
     WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -86,7 +86,7 @@ impl ShapedLine {
         line_height: Pixels,
         align: TextAlign,
         align_width: Option<Pixels>,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) -> Result<()> {
         paint_line(
@@ -111,7 +111,7 @@ impl ShapedLine {
         line_height: Pixels,
         align: TextAlign,
         align_width: Option<Pixels>,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) -> Result<()> {
         paint_line_background(
@@ -277,7 +277,7 @@ impl WrappedLine {
         line_height: Pixels,
         align: TextAlign,
         bounds: Option<Bounds<Pixels>>,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) -> Result<()> {
         let align_width = match bounds {
@@ -307,7 +307,7 @@ impl WrappedLine {
         line_height: Pixels,
         align: TextAlign,
         bounds: Option<Bounds<Pixels>>,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) -> Result<()> {
         let align_width = match bounds {
@@ -339,7 +339,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
-    window: &mut Window,
+    window: &mut PaintCx<'_>,
     cx: &mut App,
 ) -> Result<()> {
     let line_bounds = Bounds::new(
@@ -585,7 +585,7 @@ fn paint_line_background(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
-    window: &mut Window,
+    window: &mut PaintCx<'_>,
     cx: &mut App,
 ) -> Result<()> {
     let line_bounds = Bounds::new(

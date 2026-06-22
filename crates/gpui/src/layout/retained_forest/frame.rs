@@ -1,51 +1,49 @@
-//! Current-frame layout intent storage.
+//! Current-frame layout facts storage.
 //!
-//! Frame intents are pure inputs for this render pass. They are not retained
+//! Frame facts are pure inputs for this render pass. They are not retained
 //! identity and are truncated on transaction rollback.
 
 use super::super::LayoutId;
-use super::facts::LayoutIntent;
+use super::facts::CurrentLayoutNodeFacts;
 
-/// Owns the current-frame layout intent log and measured producer slots.
-pub(super) struct FrameIntents {
-    intents: Vec<LayoutIntent>,
+/// Owns the current-frame layout facts log and measured producer slots.
+pub(super) struct CurrentLayoutFactsLog {
+    facts: Vec<CurrentLayoutNodeFacts>,
 }
 
-/// Transaction checkpoint for frame-local intent storage.
-pub(super) struct FrameIntentsCheckpoint {
-    intents_len: usize,
+/// Transaction checkpoint for frame-local facts storage.
+pub(super) struct CurrentLayoutFactsLogCheckpoint {
+    facts_len: usize,
 }
 
-impl FrameIntents {
+impl CurrentLayoutFactsLog {
     pub(super) fn new() -> Self {
-        Self {
-            intents: Vec::new(),
-        }
+        Self { facts: Vec::new() }
     }
 
     pub(super) fn clear(&mut self) {
-        self.intents.clear();
+        self.facts.clear();
     }
 
-    pub(super) fn checkpoint(&self) -> FrameIntentsCheckpoint {
-        FrameIntentsCheckpoint {
-            intents_len: self.intents.len(),
+    pub(super) fn checkpoint(&self) -> CurrentLayoutFactsLogCheckpoint {
+        CurrentLayoutFactsLogCheckpoint {
+            facts_len: self.facts.len(),
         }
     }
 
-    pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: FrameIntentsCheckpoint) {
-        self.intents.truncate(checkpoint.intents_len);
+    pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: CurrentLayoutFactsLogCheckpoint) {
+        self.facts.truncate(checkpoint.facts_len);
     }
 
-    pub(super) fn push_intent(&mut self, intent: LayoutIntent) -> LayoutId {
-        let id = LayoutId(self.intents.len());
-        self.intents.push(intent);
+    pub(super) fn push_facts(&mut self, facts: CurrentLayoutNodeFacts) -> LayoutId {
+        let id = LayoutId(self.facts.len());
+        self.facts.push(facts);
         id
     }
 
-    pub(super) fn intent(&self, id: LayoutId) -> &LayoutIntent {
-        self.intents
+    pub(super) fn facts(&self, id: LayoutId) -> &CurrentLayoutNodeFacts {
+        self.facts
             .get(id.0)
-            .expect("layout intent id should come from the current frame")
+            .expect("layout facts id should come from the current frame")
     }
 }

@@ -1,8 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
+    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageLoadCx, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, LayoutRequestCx, Length, ObjectFit,
+    PaintCx, Pixels, PrepaintCx, RenderImage, Resource, SharedString, SharedUri, StyleRefinement,
+    Styled, Task, Window, px,
 };
 use anyhow::Result;
 
@@ -46,7 +47,14 @@ pub enum ImageSource {
     /// Cached image data
     Image(Arc<Image>),
     /// A custom loading function to use
-    Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
+    Custom(
+        Arc<
+            dyn for<'a, 'w> Fn(
+                &mut ImageLoadCx<'a, 'w>,
+                &mut App,
+            ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>,
+        >,
+    ),
 }
 
 fn is_uri(uri: &str) -> bool {
@@ -117,7 +125,11 @@ impl From<Arc<Image>> for ImageSource {
 
 impl<F> From<F> for ImageSource
 where
-    F: Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>> + 'static,
+    F: for<'a, 'w> Fn(
+            &mut ImageLoadCx<'a, 'w>,
+            &mut App,
+        ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>
+        + 'static,
 {
     fn from(value: F) -> Self {
         Self::Custom(Arc::new(value))
@@ -277,7 +289,7 @@ impl Element for Img {
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut layout_state = ImgLayoutState {
@@ -307,8 +319,8 @@ impl Element for Img {
                     match self.source.use_data(
                         self.image_cache
                             .clone()
-                            .or_else(|| window.image_cache_stack.last().cloned()),
-                        window,
+                            .or_else(|| window.current_image_cache()),
+                        &mut ImageLoadCx::from_layout_request(window),
                         cx,
                     ) {
                         Some(Ok(data)) => {
@@ -446,7 +458,7 @@ impl Element for Img {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.interactivity.prepaint(
@@ -473,7 +485,7 @@ impl Element for Img {
         bounds: Bounds<Pixels>,
         layout_state: &mut Self::RequestLayoutState,
         hitbox: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         let source = self.source.clone();
@@ -488,8 +500,8 @@ impl Element for Img {
                 if let Some(Ok(data)) = source.use_data(
                     self.image_cache
                         .clone()
-                        .or_else(|| window.image_cache_stack.last().cloned()),
-                    window,
+                        .or_else(|| window.current_image_cache()),
+                    &mut ImageLoadCx::from_paint(window),
                     cx,
                 ) {
                     if data.frame_count() == 0 {
@@ -546,7 +558,7 @@ impl ImageSource {
     pub(crate) fn use_data(
         &self,
         cache: Option<AnyImageCache>,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         match self {
@@ -566,7 +578,7 @@ impl ImageSource {
     pub(crate) fn get_data(
         &self,
         cache: Option<AnyImageCache>,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         match self {

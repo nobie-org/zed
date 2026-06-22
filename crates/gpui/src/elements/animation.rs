@@ -2,7 +2,8 @@ use scheduler::Instant;
 use std::{rc::Rc, time::Duration};
 
 use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, Window,
+    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutRequestCx, PaintCx, PrepaintCx, Window,
 };
 
 pub use easing::*;
@@ -133,7 +134,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         let now = cx.background_executor().now();
@@ -185,7 +186,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState {
         element.prepaint(window, cx);
@@ -198,7 +199,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         _bounds: crate::Bounds<crate::Pixels>,
         element: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         element.paint(window, cx);
@@ -209,8 +210,8 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
 mod tests {
     use super::*;
     use crate::{
-        AppContext as _, Div, InteractiveElement as _, ParentElement as _, Render, Styled as _,
-        TestAppContext, Window, div, point, px, size,
+        AppContext as _, BuildCx, Div, InteractiveElement as _, ParentElement as _, Render,
+        Styled as _, TestAppContext, div, point, px, size,
     };
 
     struct AnimatedWidthView;
@@ -218,7 +219,7 @@ mod tests {
     impl Render for AnimatedWidthView {
         fn render(
             &mut self,
-            _window: &mut Window,
+            _window: &mut BuildCx<'_>,
             _cx: &mut crate::Context<Self>,
         ) -> impl IntoElement {
             div().child(

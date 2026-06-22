@@ -1,12 +1,11 @@
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
-    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
-    Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
+    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, Element, Empty,
+    EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
-    WindowHandle, WindowOptions, app::GpuiMode, layout::RetainedLayoutRootSite,
-    window::ElementArenaScope,
+    WindowHandle, WindowOptions, app::GpuiMode, window::ElementArenaScope,
 };
 use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
@@ -198,6 +197,16 @@ impl TestAppContext {
     /// draw explicitly through their harness.
     pub fn set_auto_draw_test_windows(&self, enabled: bool) {
         self.app.borrow_mut().set_auto_draw_test_windows(enabled);
+    }
+
+    /// Force a redraw of one test window through the app-owned frame lifecycle.
+    pub fn draw_window(&mut self, window: AnyWindowHandle) -> Result<()> {
+        let mut app = self.app.borrow_mut();
+        app.update_window(window, |_, window, cx| {
+            let mut frame_authority = super::WindowFrameAuthority::new();
+            window.draw_for_app(&mut frame_authority, cx).clear();
+        })
+        .map(|_| ())
     }
 
     /// Returns an executor (for running tasks in the background)
@@ -869,27 +878,8 @@ impl VisualTestContext {
     {
         self.update(|window, cx| {
             let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
-
-            window.invalidator.set_phase(DrawPhase::Prepaint);
-            let mut element = Drawable::new(f(window, cx));
-            element.layout_as_root(
-                space.into(),
-                RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-                window,
-                cx,
-            );
-            window.with_absolute_element_offset(origin, |window| element.prepaint(window, cx));
-
-            window.invalidator.set_phase(DrawPhase::Paint);
-            let (request_layout_state, prepaint_state) = element.paint(window, cx);
-
-            window.invalidator.set_phase(DrawPhase::None);
-            window.refresh();
-
-            drop(element);
-            cx.element_arena.borrow_mut().clear();
-
-            (request_layout_state, prepaint_state)
+            let element = f(window, cx);
+            window.draw_test_element(origin, space.into(), element, cx)
         })
     }
 

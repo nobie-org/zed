@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, quad, rems, size,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, PaintCx,
+    Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
+    black, phi, point, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -645,9 +645,9 @@ impl Style {
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
-        continuation: impl FnOnce(&mut Window, &mut App),
+        continuation: impl FnOnce(&mut PaintCx<'_>, &mut App),
     ) {
         #[cfg(debug_assertions)]
         if self.debug_below {

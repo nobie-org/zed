@@ -1,0 +1,5 @@
+error[E0599]: no method named `measure_scratch_root` found for mutable reference `&mut VisibleRootGroupCx<'_>` in the current scope
+ --> tests/retained_layout_lifecycle/visible_root_group_cx_cannot_solve_scratch_root.rs:4:14
+  |
+4 |     group_cx.measure_scratch_root(div().into_any_element(), AvailableSpace::min_size(), cx);
+  |              ^^^^^^^^^^^^^^^^^^^^ method not found in `&mut VisibleRootGroupCx<'_>`

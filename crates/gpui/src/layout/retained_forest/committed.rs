@@ -85,7 +85,7 @@ impl CommittedLayoutState {
         let previous = self.layout_nodes.insert(id, node_id);
         assert!(
             previous.is_none(),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
     }
 

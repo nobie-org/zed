@@ -77,11 +77,16 @@ pub struct LayoutWorkSample {
     pub compute_layout_calls: u64,
     /// Root layout computations that invoked the private solver.
     pub solver_compute_layout_calls: u64,
-    /// Measured layout callbacks invoked by the retained layout engine.
+    /// Measured layout queries that required GPUI measurement work.
+    ///
+    /// Exact retained artifact/cache answers are excluded. The private solver may
+    /// still ask a measured query during its legal solve; this counter tracks the
+    /// GPUI producer work that was not avoided.
     pub measured_layout_calls: u64,
     /// Wall time spent computing root layouts.
     pub compute_layout_duration: Duration,
-    /// Wall time spent inside measured layout callbacks.
+    /// Wall time spent inside measured layout work counted by
+    /// [`LayoutWorkSample::measured_layout_calls`].
     pub measured_layout_duration: Duration,
     /// Retained layout occurrences allocated while committing current layout intent.
     pub retained_layout_creates: u64,

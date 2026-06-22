@@ -8,7 +8,6 @@
 use super::{
     AvailableSpace, EXPECT_MESSAGE, LayoutId, RetainedLayoutRootId, RetainedLayoutRootSite,
 };
-mod bounds_cache;
 mod committed;
 mod facts;
 mod frame;
@@ -27,12 +26,11 @@ use crate::{
     App, Bounds, GlobalElementId, Pixels, Size, Style, Window, size,
     util::{ceil_to_device_pixel, round_half_toward_zero},
 };
-use bounds_cache::{BoundsCache, BoundsCacheCheckpoint};
 use collections::{FxHashMap, FxHashSet};
 use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
-use facts::{LayoutArtifactPolicy, LayoutIntent, LayoutIntentKind};
-use frame::{FrameIntents, FrameIntentsCheckpoint};
-use geometry::{GeometryStore, GeometryStoreCheckpoint};
+use facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind, LayoutArtifactPolicy};
+use frame::{CurrentLayoutFactsLog, CurrentLayoutFactsLogCheckpoint};
+use geometry::{FrameLayoutOutput, FrameLayoutOutputCheckpoint};
 pub(super) use measurement::MeasuredLayoutRequest;
 pub(crate) use measurement::PureSizeMeasure;
 use measurement::{MeasuredLayoutFacts, MeasurementStore, MeasurementStoreCheckpoint};
@@ -146,11 +144,10 @@ pub(super) struct RetainedLayoutProjectionForTests {
 pub(super) struct RetainedLayoutForest {
     solver: LayoutSolver,
     roots: RootRegistry,
-    frame: FrameIntents,
+    frame: CurrentLayoutFactsLog,
     measurements: MeasurementStore,
-    geometry: GeometryStore,
+    geometry: FrameLayoutOutput,
     committed: CommittedLayoutState,
-    bounds: BoundsCache,
     root_slots: RootSlots,
     subtree_probe: SubtreeProbe,
     work: RetainedWorkState,
@@ -163,11 +160,10 @@ pub(super) struct RetainedLayoutForest {
 pub(super) struct RetainedLayoutForestCheckpoint {
     solver: LayoutSolver,
     roots: RootRegistryCheckpoint,
-    frame: FrameIntentsCheckpoint,
+    frame: CurrentLayoutFactsLogCheckpoint,
     measurements: MeasurementStoreCheckpoint,
-    geometry: GeometryStoreCheckpoint,
+    geometry: FrameLayoutOutputCheckpoint,
     committed: CommittedLayoutCheckpoint,
-    bounds: BoundsCacheCheckpoint,
     root_slots: RootSlotsCheckpoint,
     subtree_probe: SubtreeProbeCheckpoint,
     work: RetainedWorkCheckpoint,
@@ -188,11 +184,10 @@ impl RetainedLayoutForest {
         Self {
             solver: LayoutSolver::new(),
             roots: RootRegistry::new(),
-            frame: FrameIntents::new(),
+            frame: CurrentLayoutFactsLog::new(),
             measurements: MeasurementStore::new(),
-            geometry: GeometryStore::new(),
+            geometry: FrameLayoutOutput::new(),
             committed: CommittedLayoutState::new(),
-            bounds: BoundsCache::new(),
             root_slots: RootSlots::new(),
             subtree_probe: SubtreeProbe::new(),
             work: RetainedWorkState::new(),
@@ -216,7 +211,6 @@ impl RetainedLayoutForest {
             measurements: self.measurements.checkpoint(),
             geometry: self.geometry.checkpoint(),
             committed: self.committed.checkpoint(),
-            bounds: self.bounds.checkpoint(),
             root_slots: self.root_slots.checkpoint(),
             subtree_probe: self.subtree_probe.checkpoint(),
             work: self.work.checkpoint(),
@@ -232,7 +226,6 @@ impl RetainedLayoutForest {
             .rollback_to_checkpoint(checkpoint.measurements);
         self.geometry.rollback_to_checkpoint(checkpoint.geometry);
         self.committed.rollback_to_checkpoint(checkpoint.committed);
-        self.bounds.rollback_to_checkpoint(checkpoint.bounds);
         self.root_slots
             .rollback_to_checkpoint(checkpoint.root_slots);
         self.subtree_probe
@@ -254,7 +247,7 @@ impl RetainedLayoutForest {
 
     /// Promote successfully computed current roots and sweep everything else.
     ///
-    /// After this call, current-frame intents, committed mappings, measurement
+    /// After this call, current-frame facts, committed mappings, measurement
     /// producers, and bounds caches are gone. Only retained root occurrences
     /// survive to the next frame.
     pub(super) fn finish_frame(&mut self) -> (RetainedLayoutWork, RetainedLayoutMissWork) {
@@ -269,7 +262,6 @@ impl RetainedLayoutForest {
         self.frame.clear();
         self.measurements.finish_frame();
         self.committed.clear();
-        self.bounds.clear();
         self.subtree_probe.finish_frame();
         let misses = self.work.miss_work();
         if trace::enabled() {
@@ -289,7 +281,7 @@ impl RetainedLayoutForest {
         self.work.finish_frame()
     }
 
-    /// Store an unmeasured current-frame intent.
+    /// Store unmeasured current-frame facts.
     pub(super) fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,
@@ -298,17 +290,17 @@ impl RetainedLayoutForest {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
-        self.push_intent(LayoutIntent {
+        self.push_facts(CurrentLayoutNodeFacts {
             global_id: global_id.cloned(),
             artifact_policy: LayoutArtifactPolicy::from_style(&style),
             style: SolverStyle::from_gpui_style(&style, rem_size, scale_factor),
-            kind: LayoutIntentKind::Unmeasured {
+            kind: CurrentLayoutNodeKind::Unmeasured {
                 children: children.to_vec(),
             },
         })
     }
 
-    /// Store a measured current-frame intent.
+    /// Store measured current-frame facts.
     ///
     /// The request is produced by the measurement owner. The forest records only
     /// the generic measured shape, comparable measured facts, and optional
@@ -323,19 +315,19 @@ impl RetainedLayoutForest {
         let measured = self.measurements.register_request(request);
         let measured_facts = measured.facts().clone();
 
-        let id = self.push_intent(LayoutIntent {
+        let id = self.push_facts(CurrentLayoutNodeFacts {
             global_id: None,
             artifact_policy: LayoutArtifactPolicy::from_style(&style),
             style: SolverStyle::from_gpui_style(&style, rem_size, scale_factor),
-            kind: LayoutIntentKind::Measured(measured_facts),
+            kind: CurrentLayoutNodeKind::Measured(measured_facts),
         });
         self.measurements.bind_registered_request(id, measured);
         id
     }
 
     /// Allocate the next current-frame `LayoutId`.
-    fn push_intent(&mut self, intent: LayoutIntent) -> LayoutId {
-        self.frame.push_intent(intent)
+    fn push_facts(&mut self, facts: CurrentLayoutNodeFacts) -> LayoutId {
+        self.frame.push_facts(facts)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -390,7 +382,7 @@ impl RetainedLayoutForest {
         self.solver.style(node_id)
     }
 
-    /// Commit a root intent, compute the mirror, and finish measurement effects.
+    /// Commit a root facts, compute the mirror, and finish measurement effects.
     pub(super) fn compute_layout(
         &mut self,
         root_id: RetainedLayoutRootId,
@@ -426,7 +418,7 @@ impl RetainedLayoutForest {
                         .layout_id_for_node(node_id)
                         .map(|layout_id| {
                             frame
-                                .intent(layout_id)
+                                .facts(layout_id)
                                 .artifact_policy
                                 .can_produce_artifacts()
                         })
@@ -457,7 +449,10 @@ impl RetainedLayoutForest {
 
         {
             let Self {
-                solver, geometry, ..
+                solver,
+                geometry,
+                committed,
+                ..
             } = self;
             geometry.capture_from_solver(
                 root_id,
@@ -465,10 +460,16 @@ impl RetainedLayoutForest {
                 available_space,
                 scale_factor,
                 solver.capture_layout_tree(node_id),
+                |node_id| solver.parent(node_id),
+                |node_id| committed.layout_id_for_node(node_id),
             );
         }
-        self.measurements
-            .finish_completed_solve(&measurement_solve_observer, window, cx);
+        self.measurements.finish_completed_solve(
+            &measurement_solve_observer,
+            scale_factor,
+            window,
+            cx,
+        );
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -501,14 +502,14 @@ impl RetainedLayoutForest {
         work
     }
 
-    /// Read absolute, snapped bounds for a committed layout intent.
-    pub(super) fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
-        let node_id = self.committed_node(id);
-        let bounds = self.layout_bounds_for_node(node_id, scale_factor);
+    /// Read absolute, snapped bounds for a committed layout facts.
+    pub(super) fn layout_bounds(&self, id: LayoutId) -> Bounds<Pixels> {
+        let bounds = self.layout_bounds_for_id(id);
         let has_zero_size = bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0;
         let trace_targeted_zero_bounds =
             trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0));
         if has_zero_size && (trace_targeted_zero_bounds || trace::should_trace_zero_bounds()) {
+            let node_id = self.committed_node(id);
             let layout = self.try_geometry_layout(node_id);
             let parent = self.parent(node_id);
             let parent_layout = parent.and_then(|parent| self.try_geometry_layout(parent));
@@ -549,30 +550,13 @@ impl RetainedLayoutForest {
         bounds
     }
 
-    fn layout_bounds_for_node(
-        &mut self,
-        node_id: SolverNodeId,
-        scale_factor: f32,
-    ) -> Bounds<Pixels> {
-        let Self {
-            solver,
-            geometry,
-            bounds,
-            ..
-        } = self;
-        bounds.layout_bounds_for_node(
-            node_id,
-            scale_factor,
-            |node_id| {
-                geometry.layout(node_id).unwrap_or_else(|| {
-                    panic!(
-                        "retained layout geometry should be captured before reading bounds for {:?}",
-                        node_id
-                    )
-                })
-            },
-            |node_id| solver.parent(node_id),
-        )
+    fn layout_bounds_for_id(&self, id: LayoutId) -> Bounds<Pixels> {
+        self.geometry.bounds(id).unwrap_or_else(|| {
+            panic!(
+                "retained frame geometry should be captured before reading bounds for {:?}",
+                id
+            )
+        })
     }
 
     fn compute_layout_with_measure(
@@ -612,24 +596,23 @@ impl RetainedLayoutForest {
                     return size(0.0_f32, 0.0_f32).into();
                 }
 
-                measured_layout_calls += 1;
-                let callback_telemetry = compute_measurements
-                    .borrow()
-                    .callback_telemetry(node_id)
-                    .expect("measured solver node should have a current measurement");
-                subtree_compute_recorder
-                    .borrow_mut()
-                    .record_measured_callback(node_id, callback_telemetry);
                 let measure_start = std::time::Instant::now();
-                let measured_size = compute_measurements.borrow_mut().measure(
+                let answer = compute_measurements.borrow_mut().measure(
                     node_id,
                     query.known_dimensions,
                     query.available_space,
                     window,
                     cx,
                 );
-                measured_layout_duration += measure_start.elapsed();
-                snap_measured_size_to_device_pixels(measured_size, scale_factor)
+                let telemetry = answer.telemetry();
+                subtree_compute_recorder
+                    .borrow_mut()
+                    .record_measured_callback(node_id, telemetry);
+                if telemetry.counts_layout_work() {
+                    measured_layout_calls += 1;
+                    measured_layout_duration += measure_start.elapsed();
+                }
+                snap_measured_size_to_device_pixels(answer.size(), scale_factor)
             },
             |event| {
                 cache_event_tracer.record(event);
@@ -657,8 +640,8 @@ impl RetainedLayoutForest {
         }
         let miss_trace_sample = self.work.take_miss_trace_sample_index();
 
-        let intent = self.intent(id);
-        let current = Self::layout_intent_summary(intent);
+        let facts = self.facts(id);
+        let current = Self::layout_facts_summary(facts);
         let previous = previous
             .map(Self::retained_node_summary)
             .unwrap_or_else(|| "none".to_string());
@@ -680,10 +663,10 @@ impl RetainedLayoutForest {
             return;
         }
         eprintln!(
-            "gpui retained_layout mutation kind=style_update layout_id={} node_id={:?} intent={} previous_style={} current_style={}",
+            "gpui retained_layout mutation kind=style_update layout_id={} node_id={:?} facts={} previous_style={} current_style={}",
             id.0,
             node_id,
-            Self::layout_intent_summary(self.intent(id)),
+            Self::layout_facts_summary(self.facts(id)),
             Self::debug_fingerprint(previous_style),
             Self::debug_fingerprint(current_style)
         );
@@ -694,29 +677,29 @@ impl RetainedLayoutForest {
             return;
         }
         eprintln!(
-            "gpui retained_layout mutation kind=dirty_mark layout_id={} node_id={:?} reason={} intent={}",
+            "gpui retained_layout mutation kind=dirty_mark layout_id={} node_id={:?} reason={} facts={}",
             id.0,
             node_id,
             reason,
-            Self::layout_intent_summary(self.intent(id))
+            Self::layout_facts_summary(self.facts(id))
         );
     }
 
-    fn layout_intent_summary(intent: &LayoutIntent) -> String {
+    fn layout_facts_summary(facts: &CurrentLayoutNodeFacts) -> String {
         format!(
             "{{global_id={:?}, kind={}, style={}}}",
-            intent.global_id,
-            Self::layout_intent_kind_summary(&intent.kind),
-            Self::debug_fingerprint(&intent.style)
+            facts.global_id,
+            Self::layout_node_kind_summary(&facts.kind),
+            Self::debug_fingerprint(&facts.style)
         )
     }
 
-    fn layout_intent_kind_summary(kind: &LayoutIntentKind) -> String {
+    fn layout_node_kind_summary(kind: &CurrentLayoutNodeKind) -> String {
         match kind {
-            LayoutIntentKind::Unmeasured { children } => {
+            CurrentLayoutNodeKind::Unmeasured { children } => {
                 format!("unmeasured children={}", children.len())
             }
-            LayoutIntentKind::Measured(measured) => {
+            CurrentLayoutNodeKind::Measured(measured) => {
                 format!("measured facts={}", Self::debug_fingerprint(measured))
             }
         }
@@ -826,11 +809,14 @@ impl RetainedLayoutForest {
 
     #[cfg(test)]
     pub(super) fn retained_node_layout_bounds_for_tests(
-        &mut self,
+        &self,
         token: RetainedNodeToken,
-        scale_factor: f32,
+        _scale_factor: f32,
     ) -> Bounds<Pixels> {
-        self.layout_bounds_for_node(token.0, scale_factor)
+        let layout_id = self
+            .committed_layout_id_for_node(token.0)
+            .expect("test retained node should have a committed layout id");
+        self.layout_bounds_for_id(layout_id)
     }
 
     #[cfg(test)]
@@ -880,7 +866,10 @@ impl RetainedLayoutForest {
         );
         {
             let Self {
-                solver, geometry, ..
+                solver,
+                geometry,
+                committed,
+                ..
             } = self;
             geometry.capture_from_solver(
                 root_id,
@@ -888,16 +877,18 @@ impl RetainedLayoutForest {
                 available_space,
                 scale_factor,
                 solver.capture_layout_tree(root_node),
+                |node_id| solver.parent(node_id),
+                |node_id| committed.layout_id_for_node(node_id),
             );
         }
         RetainedNodeToken(root_node)
     }
 
     #[cfg(test)]
-    pub(super) fn assert_intent_committed_exactly_for_tests(&self, id: LayoutId) {
+    pub(super) fn assert_facts_committed_exactly_for_tests(&self, id: LayoutId) {
         let node_id = self.committed_node(id);
         let mut seen = FxHashSet::default();
-        self.debug_assert_intent_node_matches(id, node_id, None, &mut seen);
+        self.debug_assert_facts_node_matches(id, node_id, None, &mut seen);
     }
 
     #[cfg(test)]
@@ -934,7 +925,7 @@ impl RetainedLayoutForest {
         cx: &mut App,
         target_layout_ids: Option<&[usize]>,
     ) -> FreshLayoutComparisonSummary {
-        if !self.intent_subtree_supports_fresh_compare(root_layout_id) {
+        if !self.facts_subtree_supports_fresh_compare(root_layout_id) {
             eprintln!(
                 "gpui retained_layout fresh_compare_skipped root_layout_id={} retained_root_node_id={:?} available_space={:?} reason=uncomparable_measured_node",
                 root_layout_id.0, retained_root_node_id, available_space
@@ -954,8 +945,8 @@ impl RetainedLayoutForest {
                 let Some(node_context) = node_context else {
                     return size(0.0_f32, 0.0_f32);
                 };
-                let LayoutIntentKind::Measured(measured) =
-                    &self.intent(node_context.layout_id).kind
+                let CurrentLayoutNodeKind::Measured(measured) =
+                    &self.facts(node_context.layout_id).kind
                 else {
                     return size(0.0_f32, 0.0_f32);
                 };
@@ -1032,32 +1023,32 @@ impl RetainedLayoutForest {
         fresh_solver: &mut FreshLayoutSolver<FreshLayoutCompareNodeContext>,
         id: LayoutId,
     ) -> FreshSolverNodeId {
-        let intent = self.intent(id);
-        match &intent.kind {
-            LayoutIntentKind::Unmeasured { children } => {
+        let facts = self.facts(id);
+        match &facts.kind {
+            CurrentLayoutNodeKind::Unmeasured { children } => {
                 let child_node_ids = children
                     .iter()
                     .map(|child| self.build_fresh_layout_compare_tree(fresh_solver, *child))
                     .collect::<Vec<_>>();
                 if child_node_ids.is_empty() {
-                    fresh_solver.new_leaf(intent.style.clone())
+                    fresh_solver.new_leaf(facts.style.clone())
                 } else {
-                    fresh_solver.new_with_children(intent.style.clone(), &child_node_ids)
+                    fresh_solver.new_with_children(facts.style.clone(), &child_node_ids)
                 }
             }
-            LayoutIntentKind::Measured(_) => fresh_solver.new_measured(
-                intent.style.clone(),
+            CurrentLayoutNodeKind::Measured(_) => fresh_solver.new_measured(
+                facts.style.clone(),
                 FreshLayoutCompareNodeContext { layout_id: id },
             ),
         }
     }
 
-    fn intent_subtree_supports_fresh_compare(&self, id: LayoutId) -> bool {
-        match &self.intent(id).kind {
-            LayoutIntentKind::Unmeasured { children } => children
+    fn facts_subtree_supports_fresh_compare(&self, id: LayoutId) -> bool {
+        match &self.facts(id).kind {
+            CurrentLayoutNodeKind::Unmeasured { children } => children
                 .iter()
-                .all(|child| self.intent_subtree_supports_fresh_compare(*child)),
-            LayoutIntentKind::Measured(measured) => measured.supports_fresh_compare(),
+                .all(|child| self.facts_subtree_supports_fresh_compare(*child)),
+            CurrentLayoutNodeKind::Measured(measured) => measured.supports_fresh_compare(),
         }
     }
 
@@ -1134,12 +1125,12 @@ impl RetainedLayoutForest {
             }
         }
 
-        if let LayoutIntentKind::Unmeasured { children } = &self.intent(id).kind {
+        if let CurrentLayoutNodeKind::Unmeasured { children } = &self.facts(id).kind {
             let fresh_child_node_ids = fresh_solver.children(fresh_node_id);
             assert_eq!(
                 fresh_child_node_ids.len(),
                 children.len(),
-                "fresh compare tree should mirror intent child count"
+                "fresh compare tree should mirror facts child count"
             );
             for (child, fresh_child_node_id) in children.iter().zip(fresh_child_node_ids) {
                 path.push(*child);
@@ -1167,7 +1158,7 @@ impl RetainedLayoutForest {
         path: &[LayoutId],
     ) -> String {
         format!(
-            "kind={} layout_id={} path={} retained_node_id={:?} fresh_node_id={:?} retained_location={:?} fresh_location={:?} retained_size={:?} fresh_size={:?} intent={}",
+            "kind={} layout_id={} path={} retained_node_id={:?} fresh_node_id={:?} retained_location={:?} fresh_location={:?} retained_size={:?} fresh_size={:?} facts={}",
             label,
             id.0,
             Self::format_layout_id_path(path),
@@ -1177,7 +1168,7 @@ impl RetainedLayoutForest {
             fresh_layout.location,
             retained_layout.size,
             fresh_layout.size,
-            Self::layout_intent_summary(self.intent(id)),
+            Self::layout_facts_summary(self.facts(id)),
         )
     }
 
@@ -1194,7 +1185,7 @@ impl RetainedLayoutForest {
 }
 
 impl RetainedLayoutForest {
-    /// Commit a current-frame intent into a retained root slot.
+    /// Commit a current-frame facts into a retained root slot.
     ///
     /// This method is the root of the retained occurrence update. It may reuse a
     /// previous occurrence, build fresh mirror nodes, or detach obsolete
@@ -1218,7 +1209,7 @@ impl RetainedLayoutForest {
             );
         }
 
-        let retained_node = self.commit_intent(id, retained_root);
+        let retained_node = self.commit_facts(id, retained_root);
         let node_id = retained_node.node_id;
         self.flush_detached_subtree_removals();
         self.root_slots.insert_current_root(root_id, retained_node);
@@ -1232,11 +1223,11 @@ impl RetainedLayoutForest {
             );
         }
         #[cfg(any(test, debug_assertions))]
-        self.debug_assert_committed_intent_matches(id, node_id);
+        self.debug_assert_committed_facts_matches(id, node_id);
         node_id
     }
 
-    /// Commit an intent that must be a mirror root before computing layout.
+    /// Commit an facts that must be a mirror root before computing layout.
     fn commit_root_layout(&mut self, root_id: RetainedLayoutRootId, id: LayoutId) -> SolverNodeId {
         let node_id = self.commit_layout(root_id, id);
         assert!(
@@ -1266,28 +1257,28 @@ impl RetainedLayoutForest {
         RetainedNodeToken(self.commit_root_layout(root_id, id))
     }
 
-    /// Commit one intent against an optional previous retained occurrence.
-    fn commit_intent(
+    /// Commit one current facts against an optional previous retained occurrence.
+    fn commit_facts(
         &mut self,
         id: LayoutId,
         previous: Option<RetainedLayoutOccurrence>,
     ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
         let probe_global_id = self
             .subtree_probe
-            .matched_global_id(self.intent(id).global_id.as_ref());
+            .matched_global_id(self.facts(id).global_id.as_ref());
         let work_snapshot = probe_global_id.as_ref().map(|_| self.work.snapshot());
-        let intent = self.intent(id);
-        let retained_node = match intent.kind.clone() {
-            LayoutIntentKind::Unmeasured { children } => {
-                self.commit_unmeasured_intent(id, intent.style.clone(), children, previous)
+        let facts = self.facts(id);
+        let retained_node = match facts.kind.clone() {
+            CurrentLayoutNodeKind::Unmeasured { children } => {
+                self.commit_unmeasured_facts(id, facts.style.clone(), children, previous)
             }
-            LayoutIntentKind::Measured(measured) => {
-                self.commit_measured_intent(id, intent.style.clone(), measured, previous)
+            CurrentLayoutNodeKind::Measured(measured) => {
+                self.commit_measured_facts(id, facts.style.clone(), measured, previous)
             }
         };
 
@@ -1305,15 +1296,15 @@ impl RetainedLayoutForest {
     fn build_fresh_occurrence(&mut self, id: LayoutId) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
-        match self.intent(id).kind.clone() {
-            LayoutIntentKind::Unmeasured { children } => {
-                self.build_fresh_unmeasured_occurrence(id, self.intent(id).style.clone(), children)
+        match self.facts(id).kind.clone() {
+            CurrentLayoutNodeKind::Unmeasured { children } => {
+                self.build_fresh_unmeasured_occurrence(id, self.facts(id).style.clone(), children)
             }
-            LayoutIntentKind::Measured(measured) => {
-                self.build_fresh_measured_occurrence(id, self.intent(id).style.clone(), measured)
+            CurrentLayoutNodeKind::Measured(measured) => {
+                self.build_fresh_measured_occurrence(id, self.facts(id).style.clone(), measured)
             }
         }
     }
@@ -1327,7 +1318,7 @@ impl RetainedLayoutForest {
     ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
         let mut retained_children = Vec::with_capacity(children.len());
@@ -1349,7 +1340,7 @@ impl RetainedLayoutForest {
         self.committed.insert(id, node_id);
         RetainedLayoutOccurrence {
             node_id,
-            identity: self.intent(id).global_id.clone(),
+            identity: self.facts(id).global_id.clone(),
             style,
             kind: RetainedLayoutOccurrenceKind::Unmeasured {
                 children: retained_children,
@@ -1366,7 +1357,7 @@ impl RetainedLayoutForest {
     ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
         let node_id = self.solver.new_measured(style.clone());
@@ -1377,19 +1368,19 @@ impl RetainedLayoutForest {
         self.committed.insert(id, node_id);
         RetainedLayoutOccurrence {
             node_id,
-            identity: self.intent(id).global_id.clone(),
+            identity: self.facts(id).global_id.clone(),
             style,
             kind: RetainedLayoutOccurrenceKind::Measured { measured_facts },
         }
     }
 
-    /// Read a current-frame intent by id.
-    fn intent(&self, id: LayoutId) -> &LayoutIntent {
-        self.frame.intent(id)
+    /// Read a current-frame facts by id.
+    fn facts(&self, id: LayoutId) -> &CurrentLayoutNodeFacts {
+        self.frame.facts(id)
     }
 
-    /// Commit an unmeasured intent, reusing the previous occurrence when valid.
-    fn commit_unmeasured_intent(
+    /// Commit an unmeasured facts, reusing the previous occurrence when valid.
+    fn commit_unmeasured_facts(
         &mut self,
         id: LayoutId,
         style: SolverStyle,
@@ -1398,7 +1389,7 @@ impl RetainedLayoutForest {
     ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
         let Some(previous) = previous else {
@@ -1410,7 +1401,7 @@ impl RetainedLayoutForest {
         self.update_unmeasured_retained_occurrence(id, style, children, previous)
     }
 
-    /// Update an unmeasured occurrence and mirror node to match the current intent.
+    /// Update an unmeasured occurrence and mirror node to match the current facts.
     fn update_unmeasured_retained_occurrence(
         &mut self,
         id: LayoutId,
@@ -1420,7 +1411,7 @@ impl RetainedLayoutForest {
     ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
         if !matches!(
@@ -1460,7 +1451,7 @@ impl RetainedLayoutForest {
         let mut child_node_ids = Vec::with_capacity(children.len());
         for (index, child) in children.into_iter().enumerate() {
             let assigned_previous_child = assigned_previous_children[index].take();
-            let retained_child = self.commit_intent(child, assigned_previous_child);
+            let retained_child = self.commit_facts(child, assigned_previous_child);
             child_node_ids.push(retained_child.node_id);
             retained_children.push(retained_child);
         }
@@ -1485,7 +1476,7 @@ impl RetainedLayoutForest {
 
         let retained_node = RetainedLayoutOccurrence {
             node_id,
-            identity: self.intent(id).global_id.clone(),
+            identity: self.facts(id).global_id.clone(),
             style,
             kind: RetainedLayoutOccurrenceKind::Unmeasured {
                 children: retained_children,
@@ -1494,7 +1485,7 @@ impl RetainedLayoutForest {
         retained_node
     }
 
-    /// Assign previous child occurrences to current child intents.
+    /// Assign previous child occurrences to current child facts.
     ///
     /// An occurrence may be preserved only when exact current facts prove it
     /// already represents the same subtree, or when a unique sibling identity
@@ -1522,7 +1513,7 @@ impl RetainedLayoutForest {
                 else {
                     return false;
                 };
-                self.retained_occurrence_is_exact_current_intent(*child, candidate)
+                self.retained_node_is_exact_current_facts(*child, candidate)
                     && self.same_slot_exact_match_is_unambiguous(
                         *child,
                         children,
@@ -1579,7 +1570,7 @@ impl RetainedLayoutForest {
     ) -> FxHashMap<GlobalElementId, Option<usize>> {
         let mut ids = FxHashMap::default();
         for (index, child) in children.iter().enumerate() {
-            if let Some(global_id) = self.intent(*child).global_id.clone() {
+            if let Some(global_id) = self.facts(*child).global_id.clone() {
                 Self::insert_unique_global_id(&mut ids, global_id, index);
             }
         }
@@ -1624,7 +1615,7 @@ impl RetainedLayoutForest {
         unique_current_global_ids: &FxHashMap<GlobalElementId, Option<usize>>,
         unique_previous_global_ids: &FxHashMap<GlobalElementId, Option<usize>>,
     ) -> Option<RetainedLayoutOccurrence> {
-        let global_id = self.intent(child).global_id.as_ref()?;
+        let global_id = self.facts(child).global_id.as_ref()?;
         if unique_current_global_ids.get(global_id).copied().flatten() != Some(current_index) {
             return None;
         }
@@ -1634,7 +1625,7 @@ impl RetainedLayoutForest {
             .flatten()?;
         let previous_child = previous_children.get_mut(previous_index)?;
         let candidate = previous_child.as_ref()?;
-        if self.retained_occurrence_can_preserve_unique_semantic_intent(child, candidate) {
+        if self.retained_node_can_preserve_unique_semantic_facts(child, candidate) {
             return previous_child.take();
         }
         None
@@ -1656,7 +1647,7 @@ impl RetainedLayoutForest {
             let Some(candidate) = previous_child.as_ref() else {
                 continue;
             };
-            if self.retained_occurrence_is_exact_current_intent(child, candidate) {
+            if self.retained_node_is_exact_current_facts(child, candidate) {
                 if matched_index.is_some() {
                     return None;
                 }
@@ -1669,7 +1660,7 @@ impl RetainedLayoutForest {
     fn current_exact_child_count(&self, child: LayoutId, current_children: &[LayoutId]) -> usize {
         current_children
             .iter()
-            .filter(|candidate| self.current_intent_subtrees_are_exact(child, **candidate))
+            .filter(|candidate| self.current_fact_subtrees_are_exact(child, **candidate))
             .count()
     }
 
@@ -1681,29 +1672,29 @@ impl RetainedLayoutForest {
         previous_children
             .iter()
             .filter_map(Option::as_ref)
-            .filter(|candidate| self.retained_occurrence_is_exact_current_intent(child, candidate))
+            .filter(|candidate| self.retained_node_is_exact_current_facts(child, candidate))
             .count()
     }
 
-    fn current_intent_subtrees_are_exact(&self, left: LayoutId, right: LayoutId) -> bool {
-        let left_intent = self.intent(left);
-        let right_intent = self.intent(right);
-        if left_intent.global_id != right_intent.global_id {
+    fn current_fact_subtrees_are_exact(&self, left: LayoutId, right: LayoutId) -> bool {
+        let left_facts = self.facts(left);
+        let right_facts = self.facts(right);
+        if left_facts.global_id != right_facts.global_id {
             return false;
         }
-        if left_intent.style != right_intent.style {
+        if left_facts.style != right_facts.style {
             return false;
         }
-        if left_intent.artifact_policy != right_intent.artifact_policy {
+        if left_facts.artifact_policy != right_facts.artifact_policy {
             return false;
         }
 
-        match (&left_intent.kind, &right_intent.kind) {
+        match (&left_facts.kind, &right_facts.kind) {
             (
-                LayoutIntentKind::Unmeasured {
+                CurrentLayoutNodeKind::Unmeasured {
                     children: left_children,
                 },
-                LayoutIntentKind::Unmeasured {
+                CurrentLayoutNodeKind::Unmeasured {
                     children: right_children,
                 },
             ) => {
@@ -1712,24 +1703,24 @@ impl RetainedLayoutForest {
                         .iter()
                         .zip(right_children)
                         .all(|(left_child, right_child)| {
-                            self.current_intent_subtrees_are_exact(*left_child, *right_child)
+                            self.current_fact_subtrees_are_exact(*left_child, *right_child)
                         })
             }
             (
-                LayoutIntentKind::Measured(left_measured),
-                LayoutIntentKind::Measured(right_measured),
+                CurrentLayoutNodeKind::Measured(left_measured),
+                CurrentLayoutNodeKind::Measured(right_measured),
             ) => left_measured == right_measured,
             _ => false,
         }
     }
 
-    /// Commit a measured intent and register its current-frame producer.
+    /// Commit a measured facts and register its current-frame producer.
     ///
     /// Pure-size and text measured nodes keep their mirror identity across
     /// explicit key changes; the key change dirties the node and replaces the
     /// comparable retained facts. Opaque producers are still rebuilt because
     /// their closure body is not layout-visible data.
-    fn commit_measured_intent(
+    fn commit_measured_facts(
         &mut self,
         id: LayoutId,
         style: SolverStyle,
@@ -1738,7 +1729,7 @@ impl RetainedLayoutForest {
     ) -> RetainedLayoutOccurrence {
         assert!(
             !self.committed.contains_layout(id),
-            "layout intent should appear only once in a committed layout tree"
+            "layout facts should appear only once in a committed layout tree"
         );
 
         let Some(previous) = previous else {
@@ -1801,7 +1792,7 @@ impl RetainedLayoutForest {
             .insert_current_measurement_for_layout(node_id, id, &measured_facts);
         RetainedLayoutOccurrence {
             node_id,
-            identity: self.intent(id).global_id.clone(),
+            identity: self.facts(id).global_id.clone(),
             style,
             kind: RetainedLayoutOccurrenceKind::Measured { measured_facts },
         }
@@ -1811,23 +1802,23 @@ impl RetainedLayoutForest {
     ///
     /// This is a proof rule, not a heuristic. A `true` result means the
     /// occurrence's retained facts and child shape already match the current
-    /// intent tree, so its solver cache can remain meaningful.
-    fn retained_occurrence_is_exact_current_intent(
+    /// facts tree, so its solver cache can remain meaningful.
+    fn retained_node_is_exact_current_facts(
         &self,
         id: LayoutId,
         previous: &RetainedLayoutOccurrence,
     ) -> bool {
-        let intent = self.intent(id);
-        if previous.identity.as_ref() != intent.global_id.as_ref() {
+        let facts = self.facts(id);
+        if previous.identity.as_ref() != facts.global_id.as_ref() {
             return false;
         }
-        if previous.style != intent.style {
+        if previous.style != facts.style {
             return false;
         }
 
-        match (&intent.kind, &previous.kind) {
+        match (&facts.kind, &previous.kind) {
             (
-                LayoutIntentKind::Unmeasured { children },
+                CurrentLayoutNodeKind::Unmeasured { children },
                 RetainedLayoutOccurrenceKind::Unmeasured {
                     children: previous_children,
                 },
@@ -1837,11 +1828,11 @@ impl RetainedLayoutForest {
                         .iter()
                         .zip(previous_children)
                         .all(|(child, previous_child)| {
-                            self.retained_occurrence_is_exact_current_intent(*child, previous_child)
+                            self.retained_node_is_exact_current_facts(*child, previous_child)
                         })
             }
             (
-                LayoutIntentKind::Measured(measured),
+                CurrentLayoutNodeKind::Measured(measured),
                 RetainedLayoutOccurrenceKind::Measured {
                     measured_facts: previous_measured_facts,
                 },
@@ -1851,18 +1842,18 @@ impl RetainedLayoutForest {
     }
 
     /// Return whether a unique semantic identity may preserve mirror identity.
-    fn retained_occurrence_can_preserve_unique_semantic_intent(
+    fn retained_node_can_preserve_unique_semantic_facts(
         &self,
         id: LayoutId,
         previous: &RetainedLayoutOccurrence,
     ) -> bool {
-        match (&self.intent(id).kind, &previous.kind) {
+        match (&self.facts(id).kind, &previous.kind) {
             (
-                LayoutIntentKind::Unmeasured { .. },
+                CurrentLayoutNodeKind::Unmeasured { .. },
                 RetainedLayoutOccurrenceKind::Unmeasured { .. },
             ) => true,
             (
-                LayoutIntentKind::Measured(measured),
+                CurrentLayoutNodeKind::Measured(measured),
                 RetainedLayoutOccurrenceKind::Measured {
                     measured_facts: previous_measured_facts,
                 },
@@ -1880,14 +1871,14 @@ impl RetainedLayoutForest {
     }
 
     #[cfg(any(test, debug_assertions))]
-    /// Assert that the private mirror is equivalent to the current intent tree.
-    fn debug_assert_committed_intent_matches(&mut self, id: LayoutId, node_id: SolverNodeId) {
+    /// Assert that the private mirror is equivalent to the current facts tree.
+    fn debug_assert_committed_facts_matches(&mut self, id: LayoutId, node_id: SolverNodeId) {
         let mut seen = FxHashSet::default();
-        self.debug_assert_intent_node_matches(id, node_id, None, &mut seen);
+        self.debug_assert_facts_node_matches(id, node_id, None, &mut seen);
     }
 
     #[cfg(any(test, debug_assertions))]
-    fn debug_assert_intent_node_matches(
+    fn debug_assert_facts_node_matches(
         &self,
         id: LayoutId,
         node_id: SolverNodeId,
@@ -1896,19 +1887,19 @@ impl RetainedLayoutForest {
     ) {
         assert!(
             seen.insert(node_id),
-            "committed solver node should appear at only one current intent position"
+            "committed solver node should appear at only one current facts position"
         );
         assert_eq!(self.solver.parent(node_id), expected_parent);
 
-        let intent = self.intent(id);
+        let facts = self.facts(id);
         let solver_style = self.solver.style(node_id).expect(EXPECT_MESSAGE);
-        assert_eq!(&solver_style, &intent.style);
+        assert_eq!(&solver_style, &facts.style);
 
-        match &intent.kind {
-            LayoutIntentKind::Unmeasured { children } => {
+        match &facts.kind {
+            CurrentLayoutNodeKind::Unmeasured { children } => {
                 assert!(
                     !self.measurements.has_current_measurement(node_id),
-                    "unmeasured intent should not have current measurement state"
+                    "unmeasured facts should not have current measurement state"
                 );
                 assert!(!self.solver.has_measure_context(node_id));
                 let child_node_ids = children
@@ -1917,7 +1908,7 @@ impl RetainedLayoutForest {
                     .collect::<Vec<_>>();
                 assert_eq!(self.solver.children(node_id), child_node_ids);
                 for (child, child_node_id) in children.iter().zip(child_node_ids) {
-                    self.debug_assert_intent_node_matches(
+                    self.debug_assert_facts_node_matches(
                         *child,
                         child_node_id,
                         Some(node_id),
@@ -1925,7 +1916,7 @@ impl RetainedLayoutForest {
                     );
                 }
             }
-            LayoutIntentKind::Measured(measured) => {
+            CurrentLayoutNodeKind::Measured(measured) => {
                 assert!(self.solver.has_measure_context(node_id));
                 assert_eq!(self.solver.children(node_id), Vec::<SolverNodeId>::new());
                 self.measurements

@@ -1,9 +1,10 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, Font, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    LayoutRequestCx, MeasureCx, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintCx, Pixels,
+    Point, PrepaintCx, SharedString, Size, TextOverflow, TextRun, TextStyle, TooltipId,
+    TruncateFrom, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
+    register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -34,7 +35,7 @@ impl Element for &'static str {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
@@ -48,7 +49,7 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        _window: &mut PrepaintCx<'_>,
         _cx: &mut App,
     ) {
         text_layout.prepaint(bounds, self)
@@ -61,7 +62,7 @@ impl Element for &'static str {
         _bounds: Bounds<Pixels>,
         text_layout: &mut TextLayout,
         _: &mut (),
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         text_layout.paint(self, window, cx)
@@ -108,7 +109,7 @@ impl Element for SharedString {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
@@ -122,7 +123,7 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        _window: &mut PrepaintCx<'_>,
         _cx: &mut App,
     ) {
         text_layout.prepaint(bounds, self.as_ref())
@@ -135,7 +136,7 @@ impl Element for SharedString {
         _bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         text_layout.paint(self.as_ref(), window, cx)
@@ -322,7 +323,7 @@ impl Element for StyledText {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let font_family_overrides = self.delayed_font_family_overrides.take();
@@ -348,7 +349,7 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        _window: &mut PrepaintCx<'_>,
         _cx: &mut App,
     ) {
         self.layout.prepaint(bounds, &self.text)
@@ -361,7 +362,7 @@ impl Element for StyledText {
         _bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         self.layout.paint(&self.text, window, cx)
@@ -451,8 +452,7 @@ impl TextMeasureKey {
         &self,
         known_dimensions: Size<Option<Pixels>>,
         available_space: Size<crate::AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
+        measure_cx: &mut MeasureCx<'_>,
     ) -> TextLayoutArtifact {
         let wrap_width = if self.white_space == WhiteSpace::Normal {
             known_dimensions.width.or(match available_space.width {
@@ -481,8 +481,8 @@ impl TextMeasureKey {
                 (None, "".into(), TruncateFrom::End)
             };
 
-        let mut line_wrapper = cx
-            .text_system()
+        let mut line_wrapper = measure_cx
+            .app_text_system()
             .line_wrapper(self.font.clone(), self.font_size);
         let (text, runs) = if let Some(truncate_width) = truncate_width {
             line_wrapper.truncate_line(
@@ -497,7 +497,7 @@ impl TextMeasureKey {
         };
         let len = text.len();
 
-        let Some(lines) = window
+        let Some(lines) = measure_cx
             .text_system()
             .shape_text(text, self.font_size, &runs, wrap_width, self.line_clamp)
             .log_err()
@@ -578,7 +578,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         _cx: &mut App,
     ) -> LayoutId {
         let text_style = window.text_style();
@@ -610,8 +610,8 @@ impl TextLayout {
             Default::default(),
             measure_key,
             move |artifact| layout.hydrate(artifact),
-            move |known_dimensions, available_space, window, cx| {
-                measure_key_for_measure.measure(known_dimensions, available_space, window, cx)
+            move |known_dimensions, available_space, measure_cx| {
+                measure_key_for_measure.measure(known_dimensions, available_space, measure_cx)
             },
         )
     }
@@ -619,9 +619,8 @@ impl TextLayout {
     /// Install a newly measured artifact into this frame's layout state.
     fn hydrate(&self, artifact: &TextLayoutArtifact) {
         let mut state = self.0.borrow_mut();
-        let bounds = state.as_ref().and_then(|inner| inner.bounds);
         let mut inner = artifact.inner.clone();
-        inner.bounds = bounds;
+        inner.bounds = None;
         state.replace(inner);
     }
 
@@ -634,7 +633,7 @@ impl TextLayout {
         element_state.bounds = Some(bounds);
     }
 
-    fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
+    fn paint(&self, text: &str, window: &mut PaintCx<'_>, cx: &mut App) {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -912,7 +911,7 @@ impl Element for InteractiveText {
         &mut self,
         _id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.text.request_layout(None, inspector_id, window, cx)
@@ -924,7 +923,7 @@ impl Element for InteractiveText {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         state: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Hitbox {
         window.with_optional_element_state::<InteractiveTextState, _>(
@@ -958,7 +957,7 @@ impl Element for InteractiveText {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         hitbox: &mut Hitbox,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         let current_view = window.current_view();

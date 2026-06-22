@@ -51,7 +51,7 @@ fn layout_work_sample_counts_compute_and_measure() {
                 Style::default(),
                 Pixels(16.0),
                 1.0,
-                move |_, _, _, _| {
+                move |_, _, _| {
                     measure_invocations_for_closure.set(measure_invocations_for_closure.get() + 1);
                     std::thread::sleep(Duration::from_micros(1));
                     size(Pixels(10.0), Pixels(20.0))
@@ -260,7 +260,7 @@ fn subtree_probe_reports_conservative_text_callbacks_separately() {
         1.0,
         key,
         |_| {},
-        move |_, _, _, _| artifact.clone(),
+        move |_, _, _| artifact.clone(),
     );
     let root = engine.request_layout_with_global_id(
         Some(&global_id),

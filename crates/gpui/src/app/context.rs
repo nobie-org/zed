@@ -145,6 +145,17 @@ impl<'a, T: 'static> RenderContext<'a, T> {
             view.update(cx, |view, cx| f(view, e, window, cx))
         }
     }
+
+    /// Convenience method for producing view state in build-only callbacks.
+    pub fn processor_build<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut crate::BuildCx<'_>, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut crate::BuildCx<'_>, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut crate::BuildCx<'_>, cx: &mut App| {
+            view.update(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
 }
 
 impl<'a, T: 'static> Context<'a, T> {
@@ -383,6 +394,18 @@ impl<'a, T: 'static> Context<'a, T> {
     ) -> impl Fn(E, &mut Window, &mut App) -> R + 'static {
         let view = self.entity();
         move |e: E, window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
+
+    /// Convenience method for producing view state in build-only callbacks.
+    /// See `processor` for the full-window callback variant.
+    pub fn processor_build<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut crate::BuildCx<'_>, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut crate::BuildCx<'_>, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut crate::BuildCx<'_>, cx: &mut App| {
             view.update(cx, |view, cx| f(view, e, window, cx))
         }
     }

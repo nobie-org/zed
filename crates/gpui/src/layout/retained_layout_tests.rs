@@ -2,9 +2,9 @@ use super::*;
 use crate::{
     AbsoluteLength, DefiniteLength, Display, Drawable, Edges, Element, ElementId, FlexDirection,
     FlexWrap, GlobalElementId, GridPlacement, GridTemplate, InspectorElementId, IntoElement,
-    Length, Overflow, ParentElement as _, Position, SharedString, Styled as _,
-    TemplateColumnMinSize, TestAppContext, TextOverflow, TextStyle, VisualTestContext, WhiteSpace,
-    div, point, px, size,
+    LayoutRequestCx, Length, Overflow, PaintCx, ParentElement as _, Position, PrepaintCx,
+    SharedString, Styled as _, TemplateColumnMinSize, TestAppContext, TextOverflow, TextStyle,
+    VisualTestContext, WhiteSpace, div, point, px, size,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -414,14 +414,70 @@ fn request_canvas_like_chrome_frame_with_sidebar_and_gap(
     (root, panel, flex_child, canvas_host, canvas)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn request_canvas_like_chrome_frame_from_spec(
+    engine: &mut LayoutEngine,
+    spec: GeneratedCanvasChromeFrameSpec,
+) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
+    request_canvas_like_chrome_frame_with_sidebar_and_gap(
+        engine,
+        |engine| {
+            request_keyed_fixed_width_sidebar_with_content(
+                engine,
+                12_014,
+                12_015,
+                spec.sidebar_width as f32,
+                spec.sidebar_content_height as f32,
+            )
+        },
+        spec.content_gap as f32,
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_canvas_chrome_frame_output(
+    engine: &mut LayoutEngine,
+    spec: GeneratedCanvasChromeFrameSpec,
+) -> CanvasChromeFrameOutputForTests {
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_canvas_like_chrome_frame_from_spec(engine, spec);
+    let retained_root = compute_layout_without_measure_with_scale(
+        engine,
+        root,
+        spec.root_width as f32,
+        spec.root_height as f32,
+        spec.scale_factor,
+    );
+    assert_intent_committed_exactly(engine, root);
+
+    let panel = engine.retained_node_token_for_tests(panel);
+    let flex_child = engine.retained_node_token_for_tests(flex_child);
+    let canvas_host = engine.retained_node_token_for_tests(canvas_host);
+    let canvas = engine.retained_node_token_for_tests(canvas);
+    let canvas_size = retained_node_size(engine, canvas);
+
+    CanvasChromeFrameOutputForTests {
+        shape: retained_layout_shape(engine, retained_root),
+        projection: retained_layout_projection(engine, retained_root),
+        bounds: retained_layout_bounds_tree(engine, retained_root, spec.scale_factor),
+        canvas_chain_sizes: (
+            retained_node_size(engine, panel),
+            retained_node_size(engine, flex_child),
+            retained_node_size(engine, canvas_host),
+            canvas_size,
+        ),
+        canvas_is_paintable: (canvas_size.width > 0.0, canvas_size.height > 0.0),
+    }
+}
+
 fn request_measured(engine: &mut LayoutEngine, width: f32) -> LayoutId {
-    engine.request_measured_layout(style_with_width(width), px(16.0), 1.0, move |_, _, _, _| {
+    engine.request_measured_layout(style_with_width(width), px(16.0), 1.0, move |_, _, _| {
         size(px(width), px(10.0))
     })
 }
 
 fn request_auto_measured(engine: &mut LayoutEngine, width: f32) -> LayoutId {
-    engine.request_measured_layout(Style::default(), px(16.0), 1.0, move |_, _, _, _| {
+    engine.request_measured_layout(Style::default(), px(16.0), 1.0, move |_, _, _| {
         size(px(width), px(10.0))
     })
 }
@@ -436,7 +492,7 @@ impl Drop for DropCounter {
 
 fn request_counted_measured(engine: &mut LayoutEngine, drops: Rc<Cell<usize>>) -> LayoutId {
     let counter = DropCounter(drops);
-    engine.request_measured_layout(Style::default(), px(16.0), 1.0, move |_, _, _, _| {
+    engine.request_measured_layout(Style::default(), px(16.0), 1.0, move |_, _, _| {
         let _keep_counter_alive = &counter;
         size(px(10.0), px(10.0))
     })
@@ -507,7 +563,7 @@ fn request_text_measured_with_style(
         1.0,
         key.clone(),
         |_| {},
-        move |known_dimensions, available_space, _, _| {
+        move |known_dimensions, available_space, _| {
             TextLayoutArtifact::for_tests(
                 key.clone(),
                 text_artifact_size_for_query(size, known_dimensions, available_space),
@@ -618,6 +674,27 @@ enum GeneratedTree {
 #[derive(Clone, Debug, PartialEq)]
 struct GeneratedFrame {
     roots: Vec<GeneratedTree>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+struct GeneratedCanvasChromeFrameSpec {
+    root_width: u16,
+    root_height: u16,
+    sidebar_width: u16,
+    sidebar_content_height: u16,
+    content_gap: u8,
+    scale_factor: f32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq)]
+struct CanvasChromeFrameOutputForTests {
+    shape: RetainedLayoutShapeForTests,
+    projection: RetainedLayoutProjectionForTests,
+    bounds: RetainedLayoutBoundsTreeForTests,
+    canvas_chain_sizes: (Size<f32>, Size<f32>, Size<f32>, Size<f32>),
+    canvas_is_paintable: (bool, bool),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -794,6 +871,25 @@ fn draw_generated_frames(
     let frame_count = draw_usize(tc, min_frames, max_frames);
     (0..frame_count)
         .map(|_| draw_generated_frame(tc, allow_opaque, 5))
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_canvas_chrome_frame_specs(
+    tc: &hegel::TestCase,
+    min_frames: usize,
+    max_frames: usize,
+) -> Vec<GeneratedCanvasChromeFrameSpec> {
+    let frame_count = draw_usize(tc, min_frames, max_frames);
+    (0..frame_count)
+        .map(|_| GeneratedCanvasChromeFrameSpec {
+            root_width: draw_u16(tc, 1100, 2400),
+            root_height: draw_u16(tc, 760, 1600),
+            sidebar_width: draw_u16(tc, 0, 640),
+            sidebar_content_height: draw_u16(tc, 0, 360),
+            content_gap: draw_u8(tc, 0, 32),
+            scale_factor: if draw_u8(tc, 0, 1) == 0 { 1.0 } else { 2.0 },
+        })
         .collect()
 }
 
@@ -1031,7 +1127,7 @@ fn request_generated_tree(engine: &mut LayoutEngine, tree: &GeneratedTree) -> La
                 1.0,
                 key.clone(),
                 |_| {},
-                move |known_dimensions, available_space, _, _| {
+                move |known_dimensions, available_space, _| {
                     TextLayoutArtifact::for_tests(
                         key.clone(),
                         text_artifact_size_for_query(
@@ -1049,7 +1145,7 @@ fn request_generated_tree(engine: &mut LayoutEngine, tree: &GeneratedTree) -> La
                 style_with_width(width as f32),
                 px(16.0),
                 1.0,
-                move |_, _, _, _| size(px(width as f32), px(10.0)),
+                move |_, _, _| size(px(width as f32), px(10.0)),
             )
         }
     }
@@ -1398,7 +1494,7 @@ fn request_text_measured_with_hydration_log(
                 });
             }
         },
-        move |known_dimensions, available_space, _, _| {
+        move |known_dimensions, available_space, _| {
             measure_invocations.set(measure_invocations.get() + 1);
             TextLayoutArtifact::for_tests(
                 key.clone(),
@@ -1436,7 +1532,7 @@ fn request_input_sensitive_text_measured(
                     height: size.height.0.round() as u16,
                 });
         },
-        move |known_dimensions, available_space, _, _| {
+        move |known_dimensions, available_space, _| {
             measure_invocations.set(measure_invocations.get() + 1);
             let measured_width = known_dimensions
                 .width
@@ -1488,7 +1584,7 @@ fn request_growing_input_sensitive_text_measured(
                     height: size.height.0.round() as u16,
                 });
         },
-        move |known_dimensions, available_space, _, _| {
+        move |known_dimensions, available_space, _| {
             measure_invocations.set(measure_invocations.get() + 1);
             let measured_width = known_dimensions
                 .width
@@ -1789,6 +1885,277 @@ fn retained_layout_matches_fresh_after_root_constraint_aba_regression(cx: &mut T
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
+fn retained_layout_matches_fresh_after_root_constraint_change_with_full_child_regression(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    let frame = GeneratedFrame {
+        roots: vec![GeneratedTree::Unmeasured {
+            style: GeneratedStyle::FlexRow {
+                gap: 0,
+                wrap: false,
+            },
+            children: vec![GeneratedTree::Unmeasured {
+                style: GeneratedStyle::Default,
+                children: vec![
+                    GeneratedTree::PureSize {
+                        width: 0,
+                        height: 1,
+                    },
+                    GeneratedTree::Unmeasured {
+                        style: GeneratedStyle::Full,
+                        children: Vec::new(),
+                    },
+                ],
+            }],
+        }],
+    };
+    let mut retained = LayoutEngine::new();
+
+    for (available_width, available_height) in [(1, 1), (1, 2), (1, 1)] {
+        let retained_ids = request_generated_frame(&mut retained, &frame);
+        let retained_roots = compute_generated_roots(
+            cx,
+            &mut retained,
+            &retained_ids,
+            available_width,
+            available_height,
+        );
+        for root in &retained_ids {
+            assert_intent_committed_exactly(&retained, *root);
+        }
+
+        let mut fresh = LayoutEngine::new();
+        let fresh_ids = request_generated_frame(&mut fresh, &frame);
+        let fresh_roots = compute_generated_roots(
+            cx,
+            &mut fresh,
+            &fresh_ids,
+            available_width,
+            available_height,
+        );
+        for root in &fresh_ids {
+            assert_intent_committed_exactly(&fresh, *root);
+        }
+
+        assert_eq!(
+            retained_layout_shapes(&retained, &retained_roots),
+            retained_layout_shapes(&fresh, &fresh_roots)
+        );
+        assert_eq!(
+            retained_layout_projections(&retained, &retained_roots),
+            retained_layout_projections(&fresh, &fresh_roots)
+        );
+        assert_eq!(
+            retained_layout_bounds_trees(&mut retained, &retained_roots, 1.0),
+            retained_layout_bounds_trees(&mut fresh, &fresh_roots, 1.0)
+        );
+
+        retained.finish_frame();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn generated_canvas_chrome_frame_sequence_matches_fresh_during_sidebar_changes(
+    _cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let mut specs = vec![
+            GeneratedCanvasChromeFrameSpec {
+                root_width: 2200,
+                root_height: 0,
+                sidebar_width: 0,
+                sidebar_content_height: 0,
+                content_gap: 0,
+                scale_factor: 1.0,
+            },
+            GeneratedCanvasChromeFrameSpec {
+                root_width: 459,
+                root_height: 609,
+                sidebar_width: 480,
+                sidebar_content_height: 240,
+                content_gap: 21,
+                scale_factor: 2.0,
+            },
+            GeneratedCanvasChromeFrameSpec {
+                root_width: 2200,
+                root_height: 1522,
+                sidebar_width: 480,
+                sidebar_content_height: 240,
+                content_gap: 21,
+                scale_factor: 2.0,
+            },
+        ];
+        specs.extend(draw_canvas_chrome_frame_specs(&tc, 2, 6));
+        let mut retained = LayoutEngine::new();
+
+        for spec in specs {
+            let retained_output = compute_canvas_chrome_frame_output(&mut retained, spec);
+
+            let mut fresh = LayoutEngine::new();
+            let fresh_output = compute_canvas_chrome_frame_output(&mut fresh, spec);
+
+            assert_eq!(retained_output, fresh_output);
+            if spec.root_width >= 1100 && spec.root_height >= 760 {
+                assert_eq!(fresh_output.canvas_is_paintable, (true, true));
+            }
+
+            retained.finish_frame();
+        }
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn generated_canvas_chrome_frame_converges_after_distinct_retained_histories(
+    _cx: &mut TestAppContext,
+) {
+    fn retained_output_after_prefix(
+        prefix: &[GeneratedCanvasChromeFrameSpec],
+        current: GeneratedCanvasChromeFrameSpec,
+    ) -> CanvasChromeFrameOutputForTests {
+        let mut engine = LayoutEngine::new();
+        for spec in prefix {
+            compute_canvas_chrome_frame_output(&mut engine, *spec);
+            engine.finish_frame();
+        }
+        compute_canvas_chrome_frame_output(&mut engine, current)
+    }
+
+    hegel::Hegel::new(|tc| {
+        let current = draw_canvas_chrome_frame_specs(&tc, 1, 1)[0];
+        let zero_height_probe = GeneratedCanvasChromeFrameSpec {
+            root_width: 2200,
+            root_height: 0,
+            sidebar_width: 0,
+            sidebar_content_height: 0,
+            content_gap: 0,
+            scale_factor: 1.0,
+        };
+        let narrow_scaled_sidebar = GeneratedCanvasChromeFrameSpec {
+            root_width: 459,
+            root_height: 609,
+            sidebar_width: 480,
+            sidebar_content_height: 240,
+            content_gap: 21,
+            scale_factor: 2.0,
+        };
+        let wide_empty_sidebar = GeneratedCanvasChromeFrameSpec {
+            root_width: current.root_width,
+            root_height: current.root_height,
+            sidebar_width: 0,
+            sidebar_content_height: 0,
+            content_gap: current.content_gap,
+            scale_factor: current.scale_factor,
+        };
+
+        let retained_after_probe =
+            retained_output_after_prefix(&[zero_height_probe, narrow_scaled_sidebar], current);
+        let retained_after_different_sidebar =
+            retained_output_after_prefix(&[wide_empty_sidebar], current);
+        let mut fresh = LayoutEngine::new();
+        let fresh_output = compute_canvas_chrome_frame_output(&mut fresh, current);
+
+        assert_eq!(retained_after_probe, fresh_output);
+        assert_eq!(retained_after_different_sidebar, fresh_output);
+        assert_eq!(fresh_output.canvas_is_paintable, (true, true));
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn taffy_repeated_root_solve_updates_percent_descendant_after_constraint_change() {
+    use taffy::prelude::{Dimension as TaffyDimension, FromPercent};
+    use taffy::{AvailableSpace as TaffyAvailableSpace, Size as TaffySize, Style as TaffyStyle};
+
+    let mut taffy: taffy::TaffyTree<TaffySize<f32>> = taffy::TaffyTree::new();
+    taffy.disable_rounding();
+
+    let measured = taffy
+        .new_leaf_with_context(
+            TaffyStyle::default(),
+            TaffySize {
+                width: 0.0,
+                height: 1.0,
+            },
+        )
+        .unwrap();
+    let full_leaf = taffy
+        .new_leaf(TaffyStyle {
+            size: TaffySize {
+                width: TaffyDimension::from_percent(1.0_f32),
+                height: TaffyDimension::from_percent(1.0_f32),
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    let parent = taffy
+        .new_with_children(TaffyStyle::default(), &[measured, full_leaf])
+        .unwrap();
+    let root = taffy
+        .new_with_children(
+            TaffyStyle {
+                display: taffy::Display::Flex,
+                flex_direction: taffy::FlexDirection::Row,
+                flex_wrap: taffy::FlexWrap::NoWrap,
+                size: TaffySize {
+                    width: TaffyDimension::from_percent(1.0_f32),
+                    height: TaffyDimension::from_percent(1.0_f32),
+                },
+                ..Default::default()
+            },
+            &[parent],
+        )
+        .unwrap();
+
+    for (available_width, available_height, expected_full_height) in
+        [(1.0, 1.0, 1.0), (1.0, 2.0, 2.0), (1.0, 1.0, 1.0)]
+    {
+        taffy
+            .compute_layout_with_measure(
+                root,
+                TaffySize {
+                    width: TaffyAvailableSpace::Definite(available_width),
+                    height: TaffyAvailableSpace::Definite(available_height),
+                },
+                |known_dimensions, available_space, _node_id, node_context, _style| {
+                    let fallback = node_context
+                        .map(|context| (context.width, context.height))
+                        .unwrap_or((0.0, 0.0));
+                    TaffySize {
+                        width: known_dimensions.width.unwrap_or_else(|| {
+                            match available_space.width {
+                                TaffyAvailableSpace::Definite(width) => fallback.0.min(width),
+                                TaffyAvailableSpace::MinContent
+                                | TaffyAvailableSpace::MaxContent => fallback.0,
+                            }
+                        }),
+                        height: known_dimensions.height.unwrap_or_else(|| {
+                            match available_space.height {
+                                TaffyAvailableSpace::Definite(height) => fallback.1.min(height),
+                                TaffyAvailableSpace::MinContent
+                                | TaffyAvailableSpace::MaxContent => fallback.1,
+                            }
+                        }),
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            taffy.layout(full_leaf).unwrap().size.height,
+            expected_full_height
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
 fn retained_layout_matches_fresh_with_opaque_leaf_after_same_root_constraint_repeat(
     cx: &mut TestAppContext,
 ) {
@@ -1992,7 +2359,7 @@ fn same_frame_root_recompute_panics(cx: &mut TestAppContext) {
             window,
             app,
         );
-        let _ = engine.layout_bounds(child, window.scale_factor());
+        let _ = engine.layout_bounds(child);
         engine.compute_layout(
             root,
             size(
@@ -2003,87 +2370,6 @@ fn same_frame_root_recompute_panics(cx: &mut TestAppContext) {
             app,
         );
     });
-}
-
-#[gpui::test]
-#[should_panic(expected = "attached layout requests cannot be computed as detached roots")]
-fn attached_layout_request_cannot_be_solved_as_detached_root(cx: &mut TestAppContext) {
-    struct AttachedThenDetachedRoot;
-
-    impl IntoElement for AttachedThenDetachedRoot {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
-    impl Element for AttachedThenDetachedRoot {
-        type RequestLayoutState = ();
-        type PrepaintState = ();
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> (LayoutId, Self::RequestLayoutState) {
-            (window.request_layout(Style::default(), [], cx), ())
-        }
-
-        fn prepaint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> Self::PrepaintState {
-            let mut element = div().into_any_element();
-            let _attached_layout = element.request_layout(window, cx);
-            element.layout_as_root(
-                size(
-                    AvailableSpace::Definite(px(100.0)),
-                    AvailableSpace::Definite(px(80.0)),
-                ),
-                window,
-                cx,
-            );
-        }
-
-        fn paint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            _prepaint: &mut Self::PrepaintState,
-            _window: &mut Window,
-            _cx: &mut App,
-        ) {
-        }
-    }
-
-    let cx = cx.add_empty_window();
-
-    let _ = cx.draw(
-        point(px(0.0), px(0.0)),
-        size(
-            AvailableSpace::Definite(px(240.0)),
-            AvailableSpace::Definite(px(120.0)),
-        ),
-        |_, _| AttachedThenDetachedRoot,
-    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4290,8 +4576,8 @@ fn fresh_compare_uses_text_measure_key_not_retained_layout_size(cx: &mut TestApp
         1.0,
         key,
         |_| {},
-        move |known_dimensions, available_space, window, app| {
-            measure_key.measure(known_dimensions, available_space, window, app)
+        move |known_dimensions, available_space, measure_cx| {
+            measure_key.measure(known_dimensions, available_space, measure_cx)
         },
     );
 
@@ -4311,7 +4597,7 @@ fn fresh_compare_uses_text_measure_key_not_retained_layout_size(cx: &mut TestApp
 fn fresh_compare_skips_opaque_measured_nodes(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let mut engine = LayoutEngine::new();
-    let root = engine.request_measured_layout(Style::default(), px(16.0), 1.0, |_, _, _, _| {
+    let root = engine.request_measured_layout(Style::default(), px(16.0), 1.0, |_, _, _| {
         size(px(40.0), px(20.0))
     });
 
@@ -4375,117 +4661,6 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
     assert_eq!((measure_invocations.get(), hydrations.get()), (1, 3));
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
-}
-
-#[gpui::test]
-fn window_transact_discards_failed_text_prepaint_state(cx: &mut TestAppContext) {
-    #[derive(Clone)]
-    struct TextTransactionElement {
-        prepaint_log: Rc<RefCell<Vec<&'static str>>>,
-        paint_log: Rc<RefCell<Vec<&'static str>>>,
-    }
-
-    impl IntoElement for TextTransactionElement {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
-    impl Element for TextTransactionElement {
-        type RequestLayoutState = ();
-        type PrepaintState = (Drawable<SharedString>, &'static str);
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> (LayoutId, Self::RequestLayoutState) {
-            (window.request_layout(Style::default(), [], cx), ())
-        }
-
-        fn prepaint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            bounds: Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            window: &mut Window,
-            cx: &mut App,
-        ) -> Self::PrepaintState {
-            let transient: Result<(), ()> = window.transact(|window| {
-                let mut transient = Drawable::new(SharedString::from("transient"));
-                transient.layout_as_root(
-                    bounds.size.into(),
-                    RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-                    window,
-                    cx,
-                );
-                window.with_absolute_element_offset(bounds.origin, |window| {
-                    transient.prepaint(window, cx)
-                });
-                self.prepaint_log.borrow_mut().push("transient");
-                Err(())
-            });
-            assert_eq!(transient, Err(()));
-
-            let mut committed = Drawable::new(SharedString::from("committed"));
-            committed.layout_as_root(
-                bounds.size.into(),
-                RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-                window,
-                cx,
-            );
-            window.with_absolute_element_offset(bounds.origin, |window| {
-                committed.prepaint(window, cx)
-            });
-            self.prepaint_log.borrow_mut().push("committed");
-            (committed, "committed")
-        }
-
-        fn paint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            prepaint: &mut Self::PrepaintState,
-            window: &mut Window,
-            cx: &mut App,
-        ) {
-            self.paint_log.borrow_mut().push(prepaint.1);
-            prepaint.0.paint(window, cx);
-        }
-    }
-
-    let prepaint_log = Rc::new(RefCell::new(Vec::new()));
-    let paint_log = Rc::new(RefCell::new(Vec::new()));
-    let cx = cx.add_empty_window();
-    let _ = cx.draw(
-        point(px(0.0), px(0.0)),
-        size(
-            AvailableSpace::Definite(px(240.0)),
-            AvailableSpace::MaxContent,
-        ),
-        |_, _| TextTransactionElement {
-            prepaint_log: prepaint_log.clone(),
-            paint_log: paint_log.clone(),
-        },
-    );
-
-    assert_eq!(&*prepaint_log.borrow(), &["transient", "committed"]);
-    assert_eq!(&*paint_log.borrow(), &["committed"]);
 }
 
 #[gpui::test]
@@ -4694,8 +4869,8 @@ fn hidden_text_does_not_require_a_measurement_artifact(cx: &mut TestAppContext) 
 }
 
 #[test]
-#[should_panic(expected = "layout intent should appear only once")]
-fn duplicate_intent_references_fail_loudly() {
+#[should_panic(expected = "layout facts should appear only once")]
+fn duplicate_layout_fact_references_fail_loudly() {
     let mut engine = LayoutEngine::new();
     let child = request_leaf(&mut engine, 10.0);
     let root = request_container(&mut engine, &[child, child]);

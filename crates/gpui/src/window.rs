@@ -6,20 +6,21 @@ use crate::{
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutEngine, LayoutId, LayoutWorkSample, LineLayoutIndex, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
-    PaintGroup, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderGroupDrawObservation,
-    RenderGroupDrawOutcome, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
-    SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
-    TextLayoutArtifact, TextMeasureKey, TextRenderingMode, TextStyle, TextStyleRefinement,
-    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point,
+    Hsla, InputHandler, InspectorElementId, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutEngine, LayoutId, LayoutWorkSample, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, PaintGroup, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderGroupDrawObservation, RenderGroupDrawOutcome, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, StyleRefinement, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, Task, TextLayoutArtifact, TextMeasureKey,
+    TextRenderingMode, TextStyle, TextStyleRefinement, TextSystem, ThermalState,
+    TooltipVisibilityFacts, TransformationMatrix, Underline, UnderlineStyle, WeakEntity,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point,
     prelude::*,
     px, rems,
     scene::{LogicalVisualPlan, RenderGroupInput},
@@ -52,6 +53,7 @@ use std::{
     marker::PhantomData,
     mem,
     ops::{DerefMut, Range},
+    panic,
     rc::Rc,
     sync::{
         Arc, Weak,
@@ -63,13 +65,2326 @@ use uuid::Uuid;
 
 mod prompts;
 
-use crate::element::DetachedLayoutRoot;
-use crate::layout::{PureSizeMeasure, RetainedLayoutRoot};
+use crate::elements::{PendingListPrepaint, PrepaintItemsResponse};
+use crate::layout::{PureSizeMeasure, RetainedLayoutRootSite};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
 };
 pub use prompts::*;
+
+/// Narrow build-phase authority for constructing element values.
+///
+/// `BuildCx` is the only capability passed to `Render`, `RenderOnce`, and
+/// item-builder callbacks. It exposes build-time observations and element
+/// construction helpers, but it cannot request layout, solve retained roots,
+/// read layout bounds, prepaint, paint, defer, or expose `Window`.
+pub struct BuildCx<'a> {
+    window: &'a mut Window,
+}
+
+impl<'a> BuildCx<'a> {
+    pub(crate) fn new(window: &'a mut Window) -> Self {
+        Self { window }
+    }
+
+    pub fn current_view(&self) -> EntityId {
+        self.window.current_view()
+    }
+
+    pub fn current_image_cache(&self) -> Option<AnyImageCache> {
+        self.window.image_cache_stack.last().cloned()
+    }
+
+    pub fn is_window_active(&self) -> bool {
+        self.window.is_window_active()
+    }
+
+    pub fn is_maximized(&self) -> bool {
+        self.window.is_maximized()
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.window.is_fullscreen()
+    }
+
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window.handle
+    }
+
+    pub fn window_title(&self) -> String {
+        self.window.window_title()
+    }
+
+    pub fn tabbed_windows(&self) -> Option<Vec<SystemWindowTab>> {
+        self.window.tabbed_windows()
+    }
+
+    pub fn tab_bar_visible(&self) -> bool {
+        self.window.tab_bar_visible()
+    }
+
+    pub fn window_decorations(&self) -> Decorations {
+        self.window.window_decorations()
+    }
+
+    pub fn window_controls(&self) -> WindowControls {
+        self.window.window_controls()
+    }
+
+    pub fn capslock(&self) -> Capslock {
+        self.window.capslock()
+    }
+
+    pub fn modifiers(&self) -> Modifiers {
+        self.window.modifiers()
+    }
+
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    pub fn set_rem_size(&mut self, rem_size: impl Into<Pixels>) {
+        self.window.set_rem_size(rem_size);
+    }
+
+    pub fn set_client_inset(&mut self, inset: Pixels) {
+        self.window.set_client_inset(inset);
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.window.scale_factor()
+    }
+
+    pub fn viewport_size(&self) -> Size<Pixels> {
+        self.window.viewport_size()
+    }
+
+    pub fn text_style(&self) -> TextStyle {
+        self.window.text_style()
+    }
+
+    pub fn line_height(&self) -> Pixels {
+        self.window.line_height()
+    }
+
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    pub fn last_input_was_keyboard(&self) -> bool {
+        self.window.last_input_was_keyboard()
+    }
+
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self.window)
+    }
+
+    pub fn within_focused(&self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
+        focus_handle.within_focused(self.window, cx)
+    }
+
+    pub fn contains_focused(&self, focus_handle: &FocusHandle, cx: &App) -> bool {
+        focus_handle.contains_focused(self.window, cx)
+    }
+
+    pub fn on_blur<T: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        handle: &FocusHandle,
+        listener: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.on_blur(handle, self.window, listener)
+    }
+
+    pub fn on_focus<T: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        handle: &FocusHandle,
+        listener: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.on_focus(handle, self.window, listener)
+    }
+
+    pub fn on_focus_in<T: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        handle: &FocusHandle,
+        listener: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.on_focus_in(handle, self.window, listener)
+    }
+
+    pub fn on_focus_out<T: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        handle: &FocusHandle,
+        listener: impl FnMut(&mut T, FocusOutEvent, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.on_focus_out(handle, self.window, listener)
+    }
+
+    pub fn observe_pending_input<T: 'static>(
+        &mut self,
+        cx: &Context<T>,
+        listener: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.observe_pending_input(self.window, listener)
+    }
+
+    pub fn observe_in<T: 'static, V2: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        observed: &Entity<V2>,
+        on_notify: impl FnMut(&mut T, Entity<V2>, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.observe_in(observed, self.window, on_notify)
+    }
+
+    pub fn subscribe_in<T: 'static, Emitter: EventEmitter<Evt>, Evt: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        emitter: &Entity<Emitter>,
+        on_event: impl FnMut(&mut T, &Entity<Emitter>, &Evt, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.subscribe_in(emitter, self.window, on_event)
+    }
+
+    pub fn observe_global_in<T: 'static, G: Global>(
+        &mut self,
+        cx: &mut Context<T>,
+        on_notify: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.observe_global_in::<G>(self.window, on_notify)
+    }
+
+    pub fn observe_window_activation<T: 'static>(
+        &mut self,
+        cx: &Context<T>,
+        on_activation: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.observe_window_activation(self.window, on_activation)
+    }
+
+    pub fn spawn_in<T, AsyncFn, R>(&self, cx: &Context<T>, f: AsyncFn) -> Task<R>
+    where
+        T: 'static,
+        R: 'static,
+        AsyncFn: AsyncFnOnce(WeakEntity<T>, &mut AsyncWindowContext) -> R + 'static,
+    {
+        cx.spawn_in(self.window, f)
+    }
+
+    pub fn refresh(&mut self) {
+        self.window.refresh();
+    }
+
+    pub fn request_animation_frame(&mut self) {
+        self.window.request_animation_frame();
+    }
+
+    pub fn bindings_for_action_in_context(
+        &self,
+        action: &dyn Action,
+        context: KeyContext,
+    ) -> Vec<KeyBinding> {
+        self.window.bindings_for_action_in_context(action, context)
+    }
+
+    pub fn listener_for<T: 'static, E>(
+        &self,
+        view: &Entity<T>,
+        f: impl Fn(&mut T, &E, &mut Window, &mut Context<T>) + 'static,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        self.window.listener_for(view, f)
+    }
+
+    pub fn handler_for<E: 'static>(
+        &self,
+        entity: &Entity<E>,
+        f: impl Fn(&mut E, &mut Window, &mut Context<E>) + 'static,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        self.window.handler_for(entity, f)
+    }
+
+    pub fn focused(&self, cx: &App) -> Option<FocusHandle> {
+        self.window.focused(cx)
+    }
+
+    pub fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
+        hitbox_id.is_hovered(self.window)
+    }
+
+    pub fn is_inspector_picking(&self, cx: &App) -> bool {
+        self.window.is_inspector_picking(cx)
+    }
+
+    pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
+    where
+        R: 'static,
+        AsyncFn: AsyncFnOnce(&mut AsyncWindowContext) -> R + 'static,
+    {
+        self.window.spawn(cx, f)
+    }
+
+    pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.window.use_asset::<A>(source, cx)
+    }
+
+    pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.window.get_asset::<A>(source, cx)
+    }
+
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_id_stack.push(element_id.into());
+        let result = f(self);
+        self.window.element_id_stack.pop();
+        result
+    }
+
+    pub fn with_global_id<R>(
+        &mut self,
+        element_id: ElementId,
+        f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
+    ) -> R {
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.window.element_id_stack));
+            f(&global_id, this)
+        })
+    }
+
+    pub fn with_element_state<S, R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
+    ) -> R
+    where
+        S: 'static,
+    {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.window
+            .next_frame
+            .accessed_element_states
+            .push(key.clone());
+
+        if let Some(any) = self
+            .window
+            .next_frame
+            .element_states
+            .remove(&key)
+            .or_else(|| self.window.rendered_frame.element_states.remove(&key))
+        {
+            let ElementStateBox {
+                inner,
+                #[cfg(debug_assertions)]
+                type_name,
+            } = any;
+            let mut state_box = inner
+                .downcast::<Option<S>>()
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}, actual: {:?}",
+                            std::any::type_name::<S>(),
+                            type_name
+                        )
+                    }
+
+                    #[cfg(not(debug_assertions))]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}",
+                            std::any::type_name::<S>(),
+                        )
+                    }
+                })
+                .unwrap();
+
+            let state = state_box.take().expect(
+                "reentrant call to with_element_state for the same state type and element id",
+            );
+            let (result, state) = f(Some(state), self);
+            state_box.replace(state);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: state_box,
+                    #[cfg(debug_assertions)]
+                    type_name,
+                },
+            );
+            result
+        } else {
+            let (result, state) = f(None, self);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: Box::new(Some(state)),
+                    #[cfg(debug_assertions)]
+                    type_name: std::any::type_name::<S>(),
+                },
+            );
+            result
+        }
+    }
+
+    pub fn use_keyed_state<S: 'static>(
+        &mut self,
+        key: impl Into<ElementId>,
+        cx: &mut App,
+        init: impl FnOnce(&mut Self, &mut Context<S>) -> S,
+    ) -> Entity<S> {
+        let current_view = self.current_view();
+        self.with_global_id(key.into(), |global_id, window| {
+            window.with_element_state(global_id, |state: Option<Entity<S>>, window| {
+                if let Some(state) = state {
+                    (state.clone(), state)
+                } else {
+                    let new_state = cx.new(|cx| init(window, cx));
+                    cx.observe(&new_state, move |_, cx| {
+                        cx.notify(current_view);
+                    })
+                    .detach();
+                    (new_state.clone(), new_state)
+                }
+            })
+        })
+    }
+
+    /// Use a piece of build-time element state identified by this call site.
+    ///
+    /// This is the `BuildCx` form of [`Window::use_state`]: it can create
+    /// element state while building elements, but the initializer only receives
+    /// build authority.
+    #[track_caller]
+    pub fn use_state<S: 'static>(
+        &mut self,
+        cx: &mut App,
+        init: impl FnOnce(&mut Self, &mut Context<S>) -> S,
+    ) -> Entity<S> {
+        self.use_keyed_state(
+            ElementId::CodeLocation(*core::panic::Location::caller()),
+            cx,
+            init,
+        )
+    }
+
+    pub fn highest_precedence_binding_for_action(&self, action: &dyn Action) -> Option<KeyBinding> {
+        self.window.highest_precedence_binding_for_action(action)
+    }
+
+    pub fn highest_precedence_binding_for_action_in_context(
+        &self,
+        action: &dyn Action,
+        context: KeyContext,
+    ) -> Option<KeyBinding> {
+        self.window
+            .highest_precedence_binding_for_action_in_context(action, context)
+    }
+
+    pub fn highest_precedence_binding_for_action_in(
+        &self,
+        action: &dyn Action,
+        focus_handle: &FocusHandle,
+    ) -> Option<KeyBinding> {
+        self.window
+            .highest_precedence_binding_for_action_in(action, focus_handle)
+    }
+}
+
+/// Narrow layout-request phase authority for element implementations.
+///
+/// `LayoutRequestCx` lets elements describe current-frame layout facts. It is
+/// intentionally not a `Window`: requesting layout cannot prepaint, paint, or
+/// solve an independent retained root.
+pub struct LayoutRequestCx<'a> {
+    window: &'a mut Window,
+}
+
+impl<'a> LayoutRequestCx<'a> {
+    pub(crate) fn new(window: &'a mut Window) -> Self {
+        Self { window }
+    }
+
+    pub fn build<R>(&mut self, f: impl FnOnce(&mut BuildCx<'_>) -> R) -> R {
+        let mut build = BuildCx::new(self.window);
+        f(&mut build)
+    }
+
+    pub(crate) fn push_element_id(&mut self, element_id: ElementId) -> GlobalElementId {
+        self.window.element_id_stack.push(element_id);
+        GlobalElementId(Arc::from(&*self.window.element_id_stack))
+    }
+
+    pub(crate) fn pop_element_id(&mut self) {
+        self.window.element_id_stack.pop();
+    }
+
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub(crate) fn build_inspector_element_id(
+        &mut self,
+        source: &'static panic::Location<'static>,
+    ) -> InspectorElementId {
+        let path = crate::InspectorElementPath {
+            global_id: GlobalElementId(Arc::from(&*self.window.element_id_stack)),
+            source_location: source,
+        };
+        self.window.build_inspector_element_id(path)
+    }
+
+    #[inline]
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_id_stack.push(element_id.into());
+        let result = f(self);
+        self.window.element_id_stack.pop();
+        result
+    }
+
+    pub fn with_global_id<R>(
+        &mut self,
+        element_id: ElementId,
+        f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
+    ) -> R {
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.window.element_id_stack));
+            f(&global_id, this)
+        })
+    }
+
+    #[inline]
+    pub fn with_text_style<R>(
+        &mut self,
+        style: Option<TextStyleRefinement>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(style) = style {
+            self.window.text_style_stack.push(style);
+            let result = f(self);
+            self.window.text_style_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    #[inline]
+    pub fn with_rem_size<R>(
+        &mut self,
+        rem_size: Option<impl Into<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(rem_size) = rem_size {
+            self.window.rem_size_override_stack.push(rem_size.into());
+            let result = f(self);
+            self.window.rem_size_override_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub fn with_rendered_view<R>(&mut self, id: EntityId, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.window.rendered_entity_stack.push(id);
+        let result = f(self);
+        self.window.rendered_entity_stack.pop();
+        result
+    }
+
+    pub fn with_image_cache<R>(
+        &mut self,
+        image_cache: Option<AnyImageCache>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(image_cache) = image_cache {
+            self.window.image_cache_stack.push(image_cache);
+            let result = f(self);
+            self.window.image_cache_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub fn with_element_state<S, R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
+    ) -> R
+    where
+        S: 'static,
+    {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.window
+            .next_frame
+            .accessed_element_states
+            .push(key.clone());
+
+        if let Some(any) = self
+            .window
+            .next_frame
+            .element_states
+            .remove(&key)
+            .or_else(|| self.window.rendered_frame.element_states.remove(&key))
+        {
+            let ElementStateBox {
+                inner,
+                #[cfg(debug_assertions)]
+                type_name,
+            } = any;
+            let mut state_box = inner
+                .downcast::<Option<S>>()
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}, actual: {:?}",
+                            std::any::type_name::<S>(),
+                            type_name
+                        )
+                    }
+
+                    #[cfg(not(debug_assertions))]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}",
+                            std::any::type_name::<S>(),
+                        )
+                    }
+                })
+                .unwrap();
+
+            let state = state_box.take().expect(
+                "reentrant call to with_element_state for the same state type and element id",
+            );
+            let (result, state) = f(Some(state), self);
+            state_box.replace(state);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: state_box,
+                    #[cfg(debug_assertions)]
+                    type_name,
+                },
+            );
+            result
+        } else {
+            let (result, state) = f(None, self);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: Box::new(Some(state)),
+                    #[cfg(debug_assertions)]
+                    type_name: std::any::type_name::<S>(),
+                },
+            );
+            result
+        }
+    }
+
+    /// A variant of `with_element_state` for elements whose id is optional.
+    ///
+    /// Layout may create/update element state that affects layout facts, such as
+    /// focus handles and scroll offsets, but it still cannot paint or solve.
+    pub fn with_optional_element_state<S, R>(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        f: impl FnOnce(Option<Option<S>>, &mut Self) -> (R, Option<S>),
+    ) -> R
+    where
+        S: 'static,
+    {
+        if let Some(global_id) = global_id {
+            self.with_element_state(global_id, |state, this| {
+                let (result, state) = f(Some(state), this);
+                let state =
+                    state.expect("you must return some state when you pass some element id");
+                (result, state)
+            })
+        } else {
+            let (result, state) = f(None, self);
+            debug_assert!(
+                state.is_none(),
+                "you must not return an element state when passing None for the global id"
+            );
+            result
+        }
+    }
+
+    /// Use element-scoped state while constructing current-frame layout facts.
+    pub fn use_keyed_state<S: 'static>(
+        &mut self,
+        key: impl Into<ElementId>,
+        cx: &mut App,
+        init: impl FnOnce(&mut Self, &mut Context<S>) -> S,
+    ) -> Entity<S> {
+        let current_view = self.current_view();
+        self.with_global_id(key.into(), |global_id, window| {
+            window.with_element_state(global_id, |state: Option<Entity<S>>, window| {
+                if let Some(state) = state {
+                    (state.clone(), state)
+                } else {
+                    let new_state = cx.new(|cx| init(window, cx));
+                    cx.observe(&new_state, move |_, cx| {
+                        cx.notify(current_view);
+                    })
+                    .detach();
+                    (new_state.clone(), new_state)
+                }
+            })
+        })
+    }
+
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub(crate) fn with_inspector_state<T: 'static, R>(
+        &mut self,
+        inspector_id: Option<&InspectorElementId>,
+        cx: &mut App,
+        f: impl FnOnce(&mut Option<T>) -> R,
+    ) -> R {
+        self.window
+            .with_inspector_state(inspector_id, cx, |state, _window| f(state))
+    }
+
+    pub fn request_animation_frame(&mut self) {
+        self.window.request_animation_frame();
+    }
+
+    #[must_use]
+    pub fn request_layout(
+        &mut self,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.window.request_layout(style, children, cx)
+    }
+
+    pub fn request_layout_with_global_id(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.window
+            .request_layout_with_global_id(global_id, style, children, cx)
+    }
+
+    pub fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
+    where
+        F: FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut MeasureCx<'_>) -> Size<Pixels>
+            + 'static,
+    {
+        self.window.request_measured_layout(style, measure)
+    }
+
+    pub(crate) fn request_pure_measured_layout(
+        &mut self,
+        style: Style,
+        measure: PureSizeMeasure,
+    ) -> LayoutId {
+        self.window.request_pure_measured_layout(style, measure)
+    }
+
+    pub fn request_content_size_measured_layout(
+        &mut self,
+        style: Style,
+        content_size: Size<Pixels>,
+    ) -> LayoutId {
+        self.window
+            .request_content_size_measured_layout(style, content_size)
+    }
+
+    pub(crate) fn request_text_measured_layout<F, H>(
+        &mut self,
+        style: Style,
+        measure_key: TextMeasureKey,
+        hydrate: H,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: FnMut(
+                Size<Option<Pixels>>,
+                Size<AvailableSpace>,
+                &mut MeasureCx<'_>,
+            ) -> TextLayoutArtifact
+            + 'static,
+        H: Fn(&TextLayoutArtifact) + 'static,
+    {
+        self.window
+            .request_text_measured_layout(style, measure_key, hydrate, measure)
+    }
+
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.window.scale_factor()
+    }
+
+    pub fn line_height(&self) -> Pixels {
+        self.window.line_height()
+    }
+
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    pub fn pixel_snap(&self, value: Pixels) -> Pixels {
+        self.window.pixel_snap(value)
+    }
+
+    pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.window.use_asset::<A>(source, cx)
+    }
+
+    pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.window.get_asset::<A>(source, cx)
+    }
+
+    pub fn current_view(&self) -> EntityId {
+        self.window.current_view()
+    }
+
+    pub fn current_image_cache(&self) -> Option<AnyImageCache> {
+        self.window.image_cache_stack.last().cloned()
+    }
+
+    pub fn is_window_active(&self) -> bool {
+        self.window.is_window_active()
+    }
+
+    pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
+    where
+        R: 'static,
+        AsyncFn: AsyncFnOnce(&mut AsyncWindowContext) -> R + 'static,
+    {
+        self.window.spawn(cx, f)
+    }
+
+    pub fn last_input_was_keyboard(&self) -> bool {
+        self.window.last_input_was_keyboard()
+    }
+
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self.window)
+    }
+
+    pub fn within_focused(&self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
+        focus_handle.within_focused(self.window, cx)
+    }
+
+    pub fn contains_focused(&self, focus_handle: &FocusHandle, cx: &App) -> bool {
+        focus_handle.contains_focused(self.window, cx)
+    }
+
+    pub fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
+        hitbox_id.is_hovered(self.window)
+    }
+
+    pub fn bindings_for_action_in_context(
+        &self,
+        action: &dyn Action,
+        context: KeyContext,
+    ) -> Vec<KeyBinding> {
+        self.window.bindings_for_action_in_context(action, context)
+    }
+
+    pub fn text_style(&self) -> TextStyle {
+        self.window.text_style()
+    }
+
+    pub fn is_inspector_picking(&self, cx: &App) -> bool {
+        self.window.is_inspector_picking(cx)
+    }
+}
+
+/// Restricted phase capability for solver measurement callbacks.
+///
+/// `MeasureCx` is intentionally narrower than `Window`, `App`,
+/// `LayoutRequestCx`, `PrepaintCx`, and `PaintCx`. A measured callback may answer
+/// the solver's size query and use text measurement services, but it cannot
+/// request layout, schedule roots, solve, prepaint, paint, register hitboxes,
+/// dispatch actions, or mutate application state.
+pub struct MeasureCx<'a> {
+    window: &'a Window,
+    cx: &'a App,
+}
+
+impl<'a> MeasureCx<'a> {
+    pub(crate) fn new(window: &'a Window, cx: &'a App) -> Self {
+        Self { window, cx }
+    }
+
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.window.scale_factor()
+    }
+
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    pub fn app_text_system(&self) -> &Arc<TextSystem> {
+        self.cx.text_system()
+    }
+}
+
+/// Narrow prepaint phase authority for element implementations.
+///
+/// `PrepaintCx` lets elements consume solved geometry and register frame
+/// metadata or visible-root intents. It must not expose retained solve
+/// authority.
+pub struct PrepaintCx<'a> {
+    window: &'a mut Window,
+}
+
+impl<'a> PrepaintCx<'a> {
+    pub(crate) fn new(window: &'a mut Window) -> Self {
+        Self { window }
+    }
+
+    pub fn build<R>(&mut self, f: impl FnOnce(&mut BuildCx<'_>) -> R) -> R {
+        let mut build = BuildCx::new(self.window);
+        f(&mut build)
+    }
+
+    pub(crate) fn push_element_id(&mut self, element_id: ElementId) -> GlobalElementId {
+        self.window.element_id_stack.push(element_id);
+        GlobalElementId(Arc::from(&*self.window.element_id_stack))
+    }
+
+    pub(crate) fn pop_element_id(&mut self) {
+        self.window.element_id_stack.pop();
+    }
+
+    pub(crate) fn push_dispatch_node(&mut self) -> DispatchNodeId {
+        self.window.next_frame.dispatch_tree.push_node()
+    }
+
+    pub(crate) fn pop_dispatch_node(&mut self) {
+        self.window.next_frame.dispatch_tree.pop_node();
+    }
+
+    pub(crate) fn focus_is_assigned(&self) -> bool {
+        self.window.next_frame.focus.is_some()
+    }
+
+    pub(crate) fn focus_assigned_since(
+        &self,
+        focus_was_assigned: bool,
+        cx: &App,
+    ) -> Option<FocusHandle> {
+        if !focus_was_assigned && let Some(focus_id) = self.window.next_frame.focus {
+            return FocusHandle::for_id(focus_id, &cx.focus_handles);
+        }
+
+        None
+    }
+
+    #[inline]
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_id_stack.push(element_id.into());
+        let result = f(self);
+        self.window.element_id_stack.pop();
+        result
+    }
+
+    pub fn with_global_id<R>(
+        &mut self,
+        element_id: ElementId,
+        f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
+    ) -> R {
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.window.element_id_stack));
+            f(&global_id, this)
+        })
+    }
+
+    pub fn with_rendered_view<R>(&mut self, id: EntityId, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.window.rendered_entity_stack.push(id);
+        let result = f(self);
+        self.window.rendered_entity_stack.pop();
+        result
+    }
+
+    pub fn with_image_cache<R>(
+        &mut self,
+        image_cache: Option<AnyImageCache>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(image_cache) = image_cache {
+            self.window.image_cache_stack.push(image_cache);
+            let result = f(self);
+            self.window.image_cache_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub fn with_element_state<S, R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
+    ) -> R
+    where
+        S: 'static,
+    {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.window
+            .next_frame
+            .accessed_element_states
+            .push(key.clone());
+
+        if let Some(any) = self
+            .window
+            .next_frame
+            .element_states
+            .remove(&key)
+            .or_else(|| self.window.rendered_frame.element_states.remove(&key))
+        {
+            let ElementStateBox {
+                inner,
+                #[cfg(debug_assertions)]
+                type_name,
+            } = any;
+            let mut state_box = inner
+                .downcast::<Option<S>>()
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}, actual: {:?}",
+                            std::any::type_name::<S>(),
+                            type_name
+                        )
+                    }
+
+                    #[cfg(not(debug_assertions))]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}",
+                            std::any::type_name::<S>(),
+                        )
+                    }
+                })
+                .unwrap();
+
+            let state = state_box.take().expect(
+                "reentrant call to with_element_state for the same state type and element id",
+            );
+            let (result, state) = f(Some(state), self);
+            state_box.replace(state);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: state_box,
+                    #[cfg(debug_assertions)]
+                    type_name,
+                },
+            );
+            result
+        } else {
+            let (result, state) = f(None, self);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: Box::new(Some(state)),
+                    #[cfg(debug_assertions)]
+                    type_name: std::any::type_name::<S>(),
+                },
+            );
+            result
+        }
+    }
+
+    pub fn with_optional_element_state<S, R>(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        f: impl FnOnce(Option<Option<S>>, &mut Self) -> (R, Option<S>),
+    ) -> R
+    where
+        S: 'static,
+    {
+        if let Some(global_id) = global_id {
+            self.with_element_state(global_id, |state, this| {
+                let (result, state) = f(Some(state), this);
+                let state =
+                    state.expect("you must return some state when you pass some element id");
+                (result, state)
+            })
+        } else {
+            let (result, state) = f(None, self);
+            debug_assert!(
+                state.is_none(),
+                "you must not return an element state when passing None for the global id"
+            );
+            result
+        }
+    }
+
+    #[inline]
+    pub fn with_text_style<R>(
+        &mut self,
+        style: Option<TextStyleRefinement>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(style) = style {
+            self.window.text_style_stack.push(style);
+            let result = f(self);
+            self.window.text_style_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    #[inline]
+    pub fn with_content_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(mask) = mask {
+            let mask = mask.intersect(&self.window.content_mask());
+            self.window.content_mask_stack.push(mask);
+            let result = f(self);
+            self.window.content_mask_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    #[inline]
+    pub fn with_rem_size<R>(
+        &mut self,
+        rem_size: Option<impl Into<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(rem_size) = rem_size {
+            self.window.rem_size_override_stack.push(rem_size.into());
+            let result = f(self);
+            self.window.rem_size_override_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub fn with_element_offset<R>(
+        &mut self,
+        offset: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if offset.is_zero() {
+            return f(self);
+        }
+        let abs_offset = self.window.element_offset() + offset;
+        self.with_absolute_element_offset(abs_offset, f)
+    }
+
+    pub fn with_absolute_element_offset<R>(
+        &mut self,
+        offset: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_offset_stack.push(offset);
+        let result = f(self);
+        self.window.element_offset_stack.pop();
+        result
+    }
+
+    pub fn layout_bounds(&self, layout_id: LayoutId) -> Bounds<Pixels> {
+        self.window.layout_bounds(layout_id)
+    }
+
+    pub fn window_bounds(&self) -> WindowBounds {
+        self.window.window_bounds()
+    }
+
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window.handle
+    }
+
+    pub fn viewport_size(&self) -> Size<Pixels> {
+        self.window.viewport_size()
+    }
+
+    pub fn client_inset(&self) -> Option<Pixels> {
+        self.window.client_inset()
+    }
+
+    pub fn is_inspector_picking(&self, cx: &App) -> bool {
+        self.window.is_inspector_picking(cx)
+    }
+
+    pub fn element_offset(&self) -> Point<Pixels> {
+        self.window.element_offset()
+    }
+
+    /// Provides a nested element-id namespace for custom element prepaint state.
+    pub fn with_element_namespace<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_id_stack.push(element_id.into());
+        let result = f(self);
+        self.window.element_id_stack.pop();
+        result
+    }
+
+    pub fn content_mask(&self) -> ContentMask<Pixels> {
+        self.window.content_mask()
+    }
+
+    pub fn text_style(&self) -> TextStyle {
+        self.window.text_style()
+    }
+
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.window.scale_factor()
+    }
+
+    pub fn modifiers(&self) -> Modifiers {
+        self.window.modifiers()
+    }
+
+    pub fn mouse_position(&self) -> Point<Pixels> {
+        self.window.mouse_position()
+    }
+
+    /// f64 variant of [`Self::pixel_snap`].
+    #[inline]
+    pub fn pixel_snap_f64(&self, value: f64) -> f64 {
+        self.window.pixel_snap_f64(value)
+    }
+
+    pub fn line_height(&self) -> Pixels {
+        self.window.line_height()
+    }
+
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    pub fn last_input_was_keyboard(&self) -> bool {
+        self.window.last_input_was_keyboard()
+    }
+
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self.window)
+    }
+
+    pub fn within_focused(&self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
+        focus_handle.within_focused(self.window, cx)
+    }
+
+    pub fn contains_focused(&self, focus_handle: &FocusHandle, cx: &App) -> bool {
+        focus_handle.contains_focused(self.window, cx)
+    }
+
+    pub fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
+        hitbox_id.is_hovered(self.window)
+    }
+
+    pub fn set_view_id(&mut self, view_id: EntityId) {
+        self.window.set_view_id(view_id);
+    }
+
+    pub fn current_view(&self) -> EntityId {
+        self.window.current_view()
+    }
+
+    pub fn current_image_cache(&self) -> Option<AnyImageCache> {
+        self.window.image_cache_stack.last().cloned()
+    }
+
+    pub fn is_window_active(&self) -> bool {
+        self.window.is_window_active()
+    }
+
+    pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
+    where
+        R: 'static,
+        AsyncFn: AsyncFnOnce(&mut AsyncWindowContext) -> R + 'static,
+    {
+        self.window.spawn(cx, f)
+    }
+
+    pub fn is_view_dirty(&self, view_id: EntityId) -> bool {
+        self.window.dirty_views.contains(&view_id)
+    }
+
+    pub fn spawn_in<T, AsyncFn, R>(&self, cx: &Context<T>, f: AsyncFn) -> Task<R>
+    where
+        T: 'static,
+        R: 'static,
+        AsyncFn: AsyncFnOnce(WeakEntity<T>, &mut AsyncWindowContext) -> R + 'static,
+    {
+        cx.spawn_in(self.window, f)
+    }
+
+    pub fn request_animation_frame(&mut self) {
+        self.window.request_animation_frame();
+    }
+
+    pub fn is_refreshing(&self) -> bool {
+        self.window.refreshing
+    }
+
+    pub(crate) fn with_refreshing<R>(
+        &mut self,
+        refreshing: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = mem::replace(&mut self.window.refreshing, refreshing);
+        let result = f(self);
+        self.window.refreshing = previous;
+        result
+    }
+
+    pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
+        self.window.prepaint_index()
+    }
+
+    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        self.window.reuse_prepaint(range);
+    }
+
+    pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
+        self.window.insert_hitbox(bounds, behavior)
+    }
+
+    pub fn request_autoscroll(&mut self, bounds: Bounds<Pixels>) {
+        self.window.request_autoscroll(bounds);
+    }
+
+    pub fn set_focus_handle(&mut self, focus_handle: &FocusHandle, cx: &App) {
+        self.window.set_focus_handle(focus_handle, cx);
+    }
+
+    pub fn set_tooltip(&mut self, tooltip: AnyTooltip) -> TooltipId {
+        self.window.set_tooltip_with_hover_state(tooltip, false)
+    }
+
+    pub(crate) fn set_tooltip_with_hover_state(
+        &mut self,
+        tooltip: AnyTooltip,
+        tooltip_hovered: bool,
+    ) -> TooltipId {
+        self.window
+            .set_tooltip_with_hover_state(tooltip, tooltip_hovered)
+    }
+
+    pub(crate) fn is_tooltip_hovered(&self, tooltip_id: TooltipId) -> bool {
+        tooltip_id.is_hovered(self.window)
+    }
+
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub(crate) fn with_inspector_state<T: 'static, R>(
+        &mut self,
+        inspector_id: Option<&InspectorElementId>,
+        cx: &mut App,
+        f: impl FnOnce(&mut Option<T>) -> R,
+    ) -> R {
+        self.window
+            .with_inspector_state(inspector_id, cx, |state, _window| f(state))
+    }
+
+    pub(crate) fn defer_draw(
+        &mut self,
+        element: AnyElement,
+        absolute_offset: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+    ) {
+        self.window
+            .defer_draw(element, absolute_offset, priority, content_mask);
+    }
+
+    /// Registers variable-height list work for the private frame drain.
+    ///
+    /// The work is a closed list primitive, not arbitrary frame code. It cannot
+    /// run until the window-owned drain supplies private layout/prepaint
+    /// authority.
+    pub(crate) fn register_list_prepaint(
+        &mut self,
+        work: PendingListPrepaint,
+    ) -> FramePrepaintOutput<PrepaintItemsResponse> {
+        self.window.register_list_prepaint(work)
+    }
+
+    /// Registers a detached root that will be painted by the caller in local
+    /// paint order after the private frame drain solves and prepaints it.
+    ///
+    /// This records a visible-root intent only. It does not solve layout and
+    /// the returned handle cannot expose or mutate solver state.
+    #[track_caller]
+    pub fn owner_painted_visible_root(
+        &mut self,
+        element: AnyElement,
+        available_space: Size<AvailableSpace>,
+        place: impl FnOnce(Size<Pixels>) -> Point<Pixels> + 'static,
+        _cx: &mut App,
+    ) -> OwnerPaintedVisibleRoot {
+        let root_site = RetainedLayoutRootSite::caller(core::panic::Location::caller());
+        let index = self.window.push_pending_visible_root(
+            element,
+            available_space,
+            VisibleRootPlacement::FromSolvedSize(Box::new(move |size, _| place(size))),
+            VisibleRootPaint::OwnerPainted,
+            root_site,
+            None,
+        );
+        OwnerPaintedVisibleRoot { index }
+    }
+
+    /// Registers a closed group of deferred visible roots.
+    ///
+    /// The returned output is resolved by the private frame drain after it
+    /// solves every root in the group and runs `place` with the solved sizes.
+    /// This method does not solve layout synchronously.
+    #[track_caller]
+    pub fn defer_visible_root_group<T: 'static>(
+        &mut self,
+        roots: Vec<(AnyElement, Size<AvailableSpace>)>,
+        place: impl FnOnce(
+            &[Size<Pixels>],
+            &mut VisibleRootGroupCx<'_>,
+            &mut App,
+        ) -> VisibleRootGroupPlacement<T>
+        + 'static,
+        _cx: &mut App,
+    ) -> FramePrepaintOutput<T> {
+        let root_site = RetainedLayoutRootSite::caller(core::panic::Location::caller());
+        self.window
+            .register_visible_root_group(roots, root_site, place)
+    }
+}
+
+/// Narrow authority for prepaint work that depends on a resolved visible root.
+///
+/// This context is created only by the private owner-painted visible-root drain
+/// after a root has been solved and prepainted. It intentionally does not expose
+/// scratch measurement or frame-work scheduling, so feedback cannot reintroduce
+/// distributed solve authority.
+pub struct VisibleRootFeedbackCx<'a> {
+    window: &'a mut Window,
+}
+
+impl<'a> VisibleRootFeedbackCx<'a> {
+    pub(crate) fn new(window: &'a mut Window) -> Self {
+        Self { window }
+    }
+
+    /// Current rem size while handling visible-root feedback.
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    /// Text system for feedback code that needs to build follow-up elements.
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    /// Returns whether the given focus handle is currently focused.
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self.window)
+    }
+}
+
+/// Narrow paint phase authority for element implementations.
+///
+/// `PaintCx` lets elements emit scene commands and consume prepainted handles.
+/// It cannot request layout, schedule roots, or solve.
+pub struct PaintCx<'a> {
+    window: &'a mut Window,
+}
+
+impl<'a> PaintCx<'a> {
+    pub(crate) fn new(window: &'a mut Window) -> Self {
+        Self { window }
+    }
+
+    /// Reads a typed frame output after the private frame drain has resolved it.
+    ///
+    /// Reading an unresolved output is a lifecycle bug. Paint cannot force the
+    /// producer to run.
+    pub(crate) fn frame_output<T: 'static>(&self, output: FramePrepaintOutput<T>) -> &T {
+        self.window.frame_output(output)
+    }
+
+    /// Consumes a typed frame output after the private frame drain resolves it.
+    ///
+    /// This is for outputs that own paintable elements. Paint cannot force the
+    /// producer to run; unresolved or already-taken outputs fail loudly.
+    pub fn take_frame_output<T: 'static>(&mut self, output: FramePrepaintOutput<T>) -> T {
+        self.window.take_frame_output(output)
+    }
+
+    pub(crate) fn push_element_id(&mut self, element_id: ElementId) -> GlobalElementId {
+        self.window.element_id_stack.push(element_id);
+        GlobalElementId(Arc::from(&*self.window.element_id_stack))
+    }
+
+    pub(crate) fn pop_element_id(&mut self) {
+        self.window.element_id_stack.pop();
+    }
+
+    pub(crate) fn set_active_dispatch_node(&mut self, node_id: DispatchNodeId) {
+        self.window
+            .next_frame
+            .dispatch_tree
+            .set_active_node(node_id);
+    }
+
+    #[inline]
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_id_stack.push(element_id.into());
+        let result = f(self);
+        self.window.element_id_stack.pop();
+        result
+    }
+
+    pub fn with_global_id<R>(
+        &mut self,
+        element_id: ElementId,
+        f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
+    ) -> R {
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.window.element_id_stack));
+            f(&global_id, this)
+        })
+    }
+
+    pub fn with_rendered_view<R>(&mut self, id: EntityId, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.window.rendered_entity_stack.push(id);
+        let result = f(self);
+        self.window.rendered_entity_stack.pop();
+        result
+    }
+
+    pub fn with_image_cache<R>(
+        &mut self,
+        image_cache: Option<AnyImageCache>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(image_cache) = image_cache {
+            self.window.image_cache_stack.push(image_cache);
+            let result = f(self);
+            self.window.image_cache_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub fn with_element_state<S, R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
+    ) -> R
+    where
+        S: 'static,
+    {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.window
+            .next_frame
+            .accessed_element_states
+            .push(key.clone());
+
+        if let Some(any) = self
+            .window
+            .next_frame
+            .element_states
+            .remove(&key)
+            .or_else(|| self.window.rendered_frame.element_states.remove(&key))
+        {
+            let ElementStateBox {
+                inner,
+                #[cfg(debug_assertions)]
+                type_name,
+            } = any;
+            let mut state_box = inner
+                .downcast::<Option<S>>()
+                .map_err(|_| {
+                    #[cfg(debug_assertions)]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}, actual: {:?}",
+                            std::any::type_name::<S>(),
+                            type_name
+                        )
+                    }
+
+                    #[cfg(not(debug_assertions))]
+                    {
+                        anyhow!(
+                            "invalid element state type for id, requested {:?}",
+                            std::any::type_name::<S>(),
+                        )
+                    }
+                })
+                .unwrap();
+
+            let state = state_box.take().expect(
+                "reentrant call to with_element_state for the same state type and element id",
+            );
+            let (result, state) = f(Some(state), self);
+            state_box.replace(state);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: state_box,
+                    #[cfg(debug_assertions)]
+                    type_name,
+                },
+            );
+            result
+        } else {
+            let (result, state) = f(None, self);
+            self.window.next_frame.element_states.insert(
+                key,
+                ElementStateBox {
+                    inner: Box::new(Some(state)),
+                    #[cfg(debug_assertions)]
+                    type_name: std::any::type_name::<S>(),
+                },
+            );
+            result
+        }
+    }
+
+    pub fn with_optional_element_state<S, R>(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        f: impl FnOnce(Option<Option<S>>, &mut Self) -> (R, Option<S>),
+    ) -> R
+    where
+        S: 'static,
+    {
+        if let Some(global_id) = global_id {
+            self.with_element_state(global_id, |state, this| {
+                let (result, state) = f(Some(state), this);
+                let state =
+                    state.expect("you must return some state when you pass some element id");
+                (result, state)
+            })
+        } else {
+            let (result, state) = f(None, self);
+            debug_assert!(
+                state.is_none(),
+                "you must not return an element state when passing None for the global id"
+            );
+            result
+        }
+    }
+
+    #[inline]
+    pub fn with_text_style<R>(
+        &mut self,
+        style: Option<TextStyleRefinement>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(style) = style {
+            self.window.text_style_stack.push(style);
+            let result = f(self);
+            self.window.text_style_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    #[inline]
+    pub fn with_content_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(mask) = mask {
+            let mask = mask.intersect(&self.window.content_mask());
+            self.window.content_mask_stack.push(mask);
+            let result = f(self);
+            self.window.content_mask_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    #[inline]
+    pub fn with_rem_size<R>(
+        &mut self,
+        rem_size: Option<impl Into<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(rem_size) = rem_size {
+            self.window.rem_size_override_stack.push(rem_size.into());
+            let result = f(self);
+            self.window.rem_size_override_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub fn text_style(&self) -> TextStyle {
+        self.window.text_style()
+    }
+
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.window.scale_factor()
+    }
+
+    pub fn current_view(&self) -> EntityId {
+        self.window.current_view()
+    }
+
+    pub fn current_image_cache(&self) -> Option<AnyImageCache> {
+        self.window.image_cache_stack.last().cloned()
+    }
+
+    pub fn is_window_active(&self) -> bool {
+        self.window.is_window_active()
+    }
+
+    pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
+    where
+        R: 'static,
+        AsyncFn: AsyncFnOnce(&mut AsyncWindowContext) -> R + 'static,
+    {
+        self.window.spawn(cx, f)
+    }
+
+    pub fn mouse_position(&self) -> Point<Pixels> {
+        self.window.mouse_position()
+    }
+
+    /// Provides a nested element-id namespace for custom element paint state.
+    pub fn with_element_namespace<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_id_stack.push(element_id.into());
+        let result = f(self);
+        self.window.element_id_stack.pop();
+        result
+    }
+
+    pub fn window_bounds(&self) -> WindowBounds {
+        self.window.window_bounds()
+    }
+
+    pub(crate) fn paint_index(&self) -> PaintIndex {
+        self.window.paint_index()
+    }
+
+    pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.window.reuse_paint(range);
+    }
+
+    pub(crate) fn with_refreshing<R>(
+        &mut self,
+        refreshing: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = mem::replace(&mut self.window.refreshing, refreshing);
+        let result = f(self);
+        self.window.refreshing = previous;
+        result
+    }
+
+    pub fn is_inspector_picking(&self, cx: &App) -> bool {
+        self.window.is_inspector_picking(cx)
+    }
+
+    pub fn last_input_was_keyboard(&self) -> bool {
+        self.window.last_input_was_keyboard()
+    }
+
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self.window)
+    }
+
+    pub fn within_focused(&self, focus_handle: &FocusHandle, cx: &mut App) -> bool {
+        focus_handle.within_focused(self.window, cx)
+    }
+
+    pub fn contains_focused(&self, focus_handle: &FocusHandle, cx: &App) -> bool {
+        focus_handle.contains_focused(self.window, cx)
+    }
+
+    pub fn hitbox_id_is_hovered(&self, hitbox_id: HitboxId) -> bool {
+        hitbox_id.is_hovered(self.window)
+    }
+
+    pub fn paint_quad(&mut self, quad: PaintQuad) {
+        self.window.paint_quad(quad);
+    }
+
+    pub fn paint_path(&mut self, path: Path<Pixels>, color: impl Into<Background>) {
+        self.window.paint_path(path, color);
+    }
+
+    pub fn pixel_snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        self.window.pixel_snap_bounds(bounds)
+    }
+
+    pub fn paint_shadows(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+    ) {
+        self.window.paint_shadows(bounds, corner_radii, shadows);
+    }
+
+    pub fn set_cursor_style(&mut self, style: CursorStyle, hitbox: &Hitbox) {
+        self.window.set_cursor_style(style, hitbox);
+    }
+
+    pub fn prevent_default(&mut self) {
+        self.window.prevent_default();
+    }
+
+    pub fn set_window_cursor_style(&mut self, style: CursorStyle) {
+        self.window.set_window_cursor_style(style);
+    }
+
+    pub fn set_key_context(&mut self, context: KeyContext) {
+        self.window.set_key_context(context);
+    }
+
+    pub fn handle_input(
+        &mut self,
+        focus_handle: &FocusHandle,
+        input_handler: impl InputHandler,
+        cx: &App,
+    ) {
+        self.window.handle_input(focus_handle, input_handler, cx);
+    }
+
+    pub fn with_tab_group<R>(&mut self, index: Option<isize>, f: impl FnOnce(&mut Self) -> R) -> R {
+        if let Some(index) = index {
+            self.window.next_frame.tab_stops.begin_group(index);
+            let result = f(self);
+            self.window.next_frame.tab_stops.end_group();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    pub(crate) fn with_element_opacity<R>(
+        &mut self,
+        opacity: Option<f32>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(opacity) = opacity else {
+            return f(self);
+        };
+
+        let previous_opacity = self.window.element_opacity;
+        self.window.element_opacity = previous_opacity * opacity;
+        let result = f(self);
+        self.window.element_opacity = previous_opacity;
+        result
+    }
+
+    pub(crate) fn paint_group<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        input: RenderGroupInput,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let boundary_opacity = self.window.element_opacity;
+        let has_active_effect =
+            (boundary_opacity - 1.).abs() > f32::EPSILON || input.has_active_effect();
+        if !has_active_effect {
+            return f(self);
+        }
+
+        let parent_scene = mem::take(&mut self.window.next_frame.scene);
+        let previous_opacity = mem::replace(&mut self.window.element_opacity, 1.);
+
+        let result = f(self);
+
+        let mut group_scene = mem::take(&mut self.window.next_frame.scene);
+        group_scene.finish();
+        self.window.next_frame.scene = parent_scene;
+        self.window.element_opacity = previous_opacity;
+
+        let content_mask = self.window.snapped_content_mask();
+        let bounds = self.window.cover_bounds(bounds);
+        let plan =
+            LogicalVisualPlan::from_input(self.window.scale_factor(), boundary_opacity, &input);
+        if !plan.planning_rejections().is_empty() {
+            crate::scene::log_planning_rejections_once(plan.planning_rejections());
+        }
+        let effect_outset = plan.requirements().output_outset;
+        let capture_bounds = group_scene
+            .visual_bounds()
+            .unwrap_or(bounds)
+            .union(&bounds)
+            .dilate(effect_outset)
+            .intersect(&content_mask.bounds);
+
+        if !capture_bounds.is_empty() {
+            self.window
+                .next_frame
+                .scene
+                .insert_primitive(PaintGroup::new(
+                    0,
+                    bounds,
+                    capture_bounds,
+                    content_mask,
+                    plan,
+                    group_scene,
+                ));
+        }
+
+        result
+    }
+
+    pub fn paint_image(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+    ) -> Result<()> {
+        self.window
+            .paint_image(bounds, corner_radii, data, frame_index, grayscale)
+    }
+
+    pub fn content_mask(&self) -> ContentMask<Pixels> {
+        self.window.content_mask()
+    }
+
+    pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.window.invalidator.debug_assert_paint();
+
+        let content_mask = self.window.content_mask();
+        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        if !clipped_bounds.is_empty() {
+            let covered = self.window.cover_bounds(clipped_bounds);
+            self.window.next_frame.scene.push_layer(covered);
+        }
+
+        let result = f(self);
+
+        if !clipped_bounds.is_empty() {
+            self.window.next_frame.scene.pop_layer();
+        }
+
+        result
+    }
+
+    pub fn paint_underline(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        style: &UnderlineStyle,
+    ) {
+        self.window.paint_underline(origin, width, style);
+    }
+
+    pub fn paint_strikethrough(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        style: &StrikethroughStyle,
+    ) {
+        self.window.paint_strikethrough(origin, width, style);
+    }
+
+    pub fn paint_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> Result<()> {
+        self.window
+            .paint_glyph(origin, font_id, glyph_id, font_size, color)
+    }
+
+    pub fn paint_emoji(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+    ) -> Result<()> {
+        self.window
+            .paint_emoji(origin, font_id, glyph_id, font_size)
+    }
+
+    pub fn paint_svg(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
+        bytes: Option<&[u8]>,
+        transformation: TransformationMatrix,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
+        self.window
+            .paint_svg(bounds, path, bytes, transformation, color, cx)
+    }
+
+    pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.window.use_asset::<A>(source, cx)
+    }
+
+    pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.window.get_asset::<A>(source, cx)
+    }
+
+    /// Paints a previously registered owner-painted visible root.
+    ///
+    /// The handle must have been resolved by the private frame drain before
+    /// paint. This method consumes prepainted state; it never solves layout.
+    pub fn paint_visible_root(&mut self, handle: OwnerPaintedVisibleRoot, cx: &mut App) {
+        self.window.paint_visible_root(handle, cx);
+    }
+
+    /// Paints a detached root already prepainted by the private frame layout phase.
+    ///
+    /// This consumes a prepainted root value. It cannot schedule layout or
+    /// recover a solver-backed element state.
+    pub(crate) fn paint_prepainted_visible_root(
+        &mut self,
+        mut root: PrepaintedVisibleRoot,
+        cx: &mut App,
+    ) {
+        root.element.paint(self, cx);
+    }
+
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    pub fn modifiers(&self) -> Modifiers {
+        self.window.modifiers()
+    }
+
+    pub fn line_height(&self) -> Pixels {
+        self.window.line_height()
+    }
+
+    pub fn refresh(&mut self) {
+        self.window.refresh();
+    }
+
+    pub fn evaluate_drop_predicate(
+        &mut self,
+        value: &dyn Any,
+        predicate: &dyn Fn(&dyn Any, &mut Window, &mut App) -> bool,
+        cx: &mut App,
+    ) -> bool {
+        predicate(value, self.window, cx)
+    }
+
+    pub fn build_drag_over_style(
+        &mut self,
+        value: &dyn Any,
+        build: &dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement,
+        cx: &mut App,
+    ) -> StyleRefinement {
+        build(value, self.window, cx)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    ) {
+        self.window.paint_surface(bounds, image_buffer);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn paint_metal_texture(&mut self, bounds: Bounds<Pixels>, texture: metal::Texture) {
+        self.window.paint_metal_texture(bounds, texture);
+    }
+
+    pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: Hitbox) {
+        self.window.insert_window_control_hitbox(area, hitbox);
+    }
+
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub fn insert_inspector_hitbox(
+        &mut self,
+        hitbox_id: HitboxId,
+        inspector_id: Option<&InspectorElementId>,
+        cx: &App,
+    ) {
+        self.window
+            .insert_inspector_hitbox(hitbox_id, inspector_id, cx);
+    }
+
+    pub fn is_hovered(&self, hitbox: &Hitbox) -> bool {
+        hitbox.is_hovered(self.window)
+    }
+
+    pub fn insert_tab_stop(&mut self, focus_handle: &FocusHandle) {
+        self.window.next_frame.tab_stops.insert(focus_handle);
+    }
+
+    #[cfg(any(feature = "test-support", test))]
+    pub fn insert_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
+        self.window.next_frame.debug_bounds.insert(selector, bounds);
+    }
+
+    pub fn on_mouse_event<Event: MouseEvent>(
+        &mut self,
+        listener: impl FnMut(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.window.on_mouse_event(listener);
+    }
+
+    pub fn on_key_event<Event: KeyEvent>(
+        &mut self,
+        listener: impl Fn(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.window.on_key_event(listener);
+    }
+
+    pub fn on_modifiers_changed(
+        &mut self,
+        listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.window.on_modifiers_changed(listener);
+    }
+
+    pub fn on_action(
+        &mut self,
+        action_type: TypeId,
+        listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.window.on_action(action_type, listener);
+    }
+}
+
+/// Private layout-phase owner for retained root solve authority.
+///
+/// Retained root solves are executed here, not by broad `Window` helpers or
+/// caller-visible tokens. Detached visible roots are registered as intents and
+/// drained by `Window` through this frame owner.
+pub(crate) struct LayoutFrame {
+    _private: (),
+}
+
+/// Private capability proving detached-root layout is running under `LayoutFrame`.
+///
+/// Element draw state may request and mark detached-root layout facts only while
+/// this value is borrowed from the frame owner. The capability carries no data;
+/// it exists to prevent broad element code from becoming retained solve
+/// authority.
+pub(crate) struct DetachedRootLayoutPass {
+    _private: (),
+}
+
+/// A detached visible root whose layout has been solved in the current frame.
+///
+/// The value owns the element that was solved, so callers cannot accidentally
+/// solve one root and prepaint a different element. It is consumed by prepaint.
+pub(crate) struct LaidOutVisibleRoot {
+    element: AnyElement,
+    size: Size<Pixels>,
+}
+
+impl LaidOutVisibleRoot {
+    pub(crate) fn size(&self) -> Size<Pixels> {
+        self.size
+    }
+
+    pub(crate) fn prepaint_at(
+        mut self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (PrepaintedVisibleRoot, Option<FocusHandle>) {
+        let focus = self.element.prepaint_at(origin, window, cx);
+        (PrepaintedVisibleRoot::new(self.element), focus)
+    }
+}
+
+/// Narrow capability for frame-owned custom layout work.
+///
+/// Custom layout work may need to solve visible child roots while iterating
+/// over already-solved owner bounds. This context is created only by the
+/// private frame drain. It exposes the minimum operations that closed frame
+/// work needs without handing out `LayoutFrame` itself.
+pub(crate) struct CustomLayoutCx<'a> {
+    window: &'a mut Window,
+    layout_frame: &'a mut LayoutFrame,
+}
+
+impl<'a> CustomLayoutCx<'a> {
+    fn new(window: &'a mut Window, layout_frame: &'a mut LayoutFrame) -> Self {
+        Self {
+            window,
+            layout_frame,
+        }
+    }
+
+    pub(crate) fn build<R>(&mut self, f: impl FnOnce(&mut BuildCx<'_>) -> R) -> R {
+        self.window.build(f)
+    }
+
+    pub(crate) fn layout_visible_root(
+        &mut self,
+        element: AnyElement,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> LaidOutVisibleRoot {
+        self.layout_frame
+            .layout_visible_root(self.window, element, available_space, cx)
+    }
+
+    pub(crate) fn prepaint_visible_root_at(
+        &mut self,
+        root: LaidOutVisibleRoot,
+        origin: Point<Pixels>,
+        content_mask: Option<ContentMask<Pixels>>,
+        cx: &mut App,
+    ) -> (PrepaintedVisibleRoot, Option<FocusHandle>) {
+        self.window
+            .with_content_mask(content_mask, |window| root.prepaint_at(origin, window, cx))
+    }
+
+    pub(crate) fn take_autoscroll(&mut self) -> Option<Bounds<Pixels>> {
+        self.window.take_autoscroll()
+    }
+}
+
+impl LayoutFrame {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+
+    fn layout_detached_root_size(
+        &mut self,
+        window: &mut Window,
+        element: &mut AnyElement,
+        root_site: crate::layout::RetainedLayoutRootSite,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        let mut pass = DetachedRootLayoutPass { _private: () };
+        let request = element.request_detached_root_layout(available_space, &mut pass, window, cx);
+        let layout_id = request.layout_id();
+
+        if request.needs_solve() {
+            self.compute_detached_root_layout(
+                window,
+                layout_id,
+                root_site,
+                request.global_id(),
+                available_space,
+                cx,
+            );
+            element.mark_detached_root_layout_computed(layout_id, available_space, &mut pass);
+        }
+
+        window.layout_bounds(layout_id).size
+    }
+
+    #[track_caller]
+    fn layout_visible_root(
+        &mut self,
+        window: &mut Window,
+        mut element: AnyElement,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> LaidOutVisibleRoot {
+        let size = self.layout_detached_root_size(
+            window,
+            &mut element,
+            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            available_space,
+            cx,
+        );
+        LaidOutVisibleRoot { element, size }
+    }
+
+    #[track_caller]
+    fn prepaint_detached_root_at(
+        &mut self,
+        window: &mut Window,
+        element: &mut AnyElement,
+        origin: Point<Pixels>,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Option<FocusHandle> {
+        self.layout_detached_root_size(
+            window,
+            element,
+            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            available_space,
+            cx,
+        );
+        element.prepaint_at(origin, window, cx)
+    }
+
+    fn compute_detached_root_layout(
+        &mut self,
+        window: &mut Window,
+        layout_id: LayoutId,
+        root_site: RetainedLayoutRootSite,
+        global_id: Option<&GlobalElementId>,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) {
+        window.invalidator.debug_assert_prepaint();
+        let retained_root = window
+            .layout_engine
+            .as_mut()
+            .unwrap()
+            .retained_root(layout_id, root_site, global_id);
+        let mut layout_engine = window.layout_engine.take().unwrap();
+        layout_engine.compute_retained_layout(retained_root, available_space, window, cx);
+        window.layout_engine = Some(layout_engine);
+    }
+}
 
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
@@ -797,6 +3112,8 @@ pub(crate) struct TooltipBounds {
 pub(crate) struct TooltipRequest {
     id: TooltipId,
     tooltip: AnyTooltip,
+    tooltip_hovered: bool,
+    context: VisibleRootContext,
 }
 
 pub(crate) struct DeferredDraw {
@@ -807,10 +3124,389 @@ pub(crate) struct DeferredDraw {
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
     rem_size: Pixels,
-    element: Option<AnyElement>,
-    absolute_offset: Point<Pixels>,
+    root: DeferredDrawRoot,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+}
+
+pub(crate) enum DeferredDrawRoot {
+    Prelaid {
+        element: Option<AnyElement>,
+        absolute_offset: Point<Pixels>,
+    },
+}
+
+/// Opaque handle for a visible detached root owned by a caller's paint order.
+///
+/// Prepaint code may register a root and keep this handle in its prepaint
+/// state. The private frame drain performs the root solve and prepaint before
+/// the paint phase; paint code can then consume the handle to paint the root at
+/// the caller's chosen point in local paint order.
+#[derive(Debug, Eq, PartialEq)]
+pub struct OwnerPaintedVisibleRoot {
+    index: usize,
+}
+
+impl OwnerPaintedVisibleRoot {
+    /// Returns a read-only handle for the visible root's published geometry.
+    ///
+    /// This handle is not layout authority. It can only observe bounds after
+    /// the frame lifecycle has solved and prepainted the registered root.
+    pub fn geometry(&self) -> VisibleRootGeometry {
+        VisibleRootGeometry { index: self.index }
+    }
+}
+
+/// Read-only handle for geometry published by a visible detached root.
+///
+/// A geometry handle cannot create, mutate, or solve a root. It only names the
+/// frame output slot for a root that was already registered through the visible
+/// root intent API.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct VisibleRootGeometry {
+    index: usize,
+}
+
+/// Typed value produced by the private frame drain.
+///
+/// `FramePrepaintOutput` is a read handle, not a computation handle. It cannot schedule
+/// work or solve layout. A value becomes available only after the retained
+/// frame lifecycle has drained the closed job that owns the output.
+#[derive(Debug, Eq, PartialEq, Hash)]
+pub struct FramePrepaintOutput<T> {
+    index: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Copy for FramePrepaintOutput<T> {}
+
+impl<T> Clone for FramePrepaintOutput<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Deferred paint placement for one root in a closed visible-root group.
+///
+/// The fields are private so callers can ask for a root to be deferred, but
+/// cannot recover or mutate a solved root. The frame-owned group primitive owns
+/// the actual layout/prepaint lifecycle.
+pub struct DeferredVisibleRootPlacement {
+    origin: Point<Pixels>,
+    priority: usize,
+    content_mask: Option<ContentMask<Pixels>>,
+}
+
+impl DeferredVisibleRootPlacement {
+    /// Paint this visible root later at `origin` using normal deferred-draw
+    /// ordering.
+    pub fn at(
+        origin: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+    ) -> Self {
+        Self {
+            origin,
+            priority,
+            content_mask,
+        }
+    }
+}
+
+/// A deferred visible root requested by grouped placement.
+///
+/// This is a fact for the private frame owner to drain, not a solved root. It
+/// carries an element, its available space, and the final deferred placement
+/// chosen from already-solved group sizes.
+pub struct DeferredVisibleRootIntent {
+    element: AnyElement,
+    available_space: Size<AvailableSpace>,
+    placement: DeferredVisibleRootPlacement,
+}
+
+impl DeferredVisibleRootIntent {
+    /// Registers an additional deferred root to be solved and prepainted by the
+    /// private frame owner after its containing group resolves.
+    pub fn new(
+        element: AnyElement,
+        available_space: Size<AvailableSpace>,
+        placement: DeferredVisibleRootPlacement,
+    ) -> Self {
+        Self {
+            element,
+            available_space,
+            placement,
+        }
+    }
+}
+
+/// Result of placing a closed visible-root group.
+///
+/// The frame owner solves the group, calls the placement function with solved
+/// sizes, and consumes this value. Callers can choose which group roots are
+/// painted and can request additional deferred roots whose layout depends on
+/// the group sizes. They cannot observe or mutate solver state.
+pub struct VisibleRootGroupPlacement<T> {
+    output: T,
+    placements: Vec<DeferredVisibleRootPlacement>,
+    followups: Vec<DeferredVisibleRootIntent>,
+}
+
+impl<T> VisibleRootGroupPlacement<T> {
+    /// Creates a group result with one placement per grouped visible root.
+    pub fn new(output: T, placements: Vec<DeferredVisibleRootPlacement>) -> Self {
+        Self {
+            output,
+            placements,
+            followups: Vec::new(),
+        }
+    }
+
+    /// Adds roots that should be deferred after the group sizes are known.
+    pub fn with_followups(
+        mut self,
+        followups: impl IntoIterator<Item = DeferredVisibleRootIntent>,
+    ) -> Self {
+        self.followups.extend(followups);
+        self
+    }
+}
+
+struct UntypedVisibleRootGroupPlacement {
+    output: Box<dyn Any>,
+    placements: Vec<DeferredVisibleRootPlacement>,
+    followups: Vec<DeferredVisibleRootIntent>,
+}
+
+/// Read-only placement-phase facts owned by the private frame drain.
+///
+/// This context can observe frame outputs that were already resolved by earlier
+/// private-frame work. It cannot schedule roots, request layout, mutate the
+/// retained forest, or call the solver.
+pub struct VisibleRootPlacementCx<'a> {
+    window: &'a Window,
+}
+
+impl<'a> VisibleRootPlacementCx<'a> {
+    fn new(window: &'a Window) -> Self {
+        Self { window }
+    }
+
+    /// Reads a typed frame output resolved earlier in the same private frame
+    /// drain.
+    pub fn frame_output<T: 'static>(&self, output: FramePrepaintOutput<T>) -> &T {
+        self.window.frame_output(output)
+    }
+}
+
+/// Drain-owned context for grouped visible-root placement.
+///
+/// Group placement runs after the private frame owner has solved all roots in a
+/// closed group. This context permits element construction and resolved-output
+/// reads needed to describe follow-up visible roots, but it intentionally cannot
+/// request layout, solve, prepaint, paint, or expose `Window`.
+pub struct VisibleRootGroupCx<'a> {
+    window: &'a mut Window,
+}
+
+impl<'a> VisibleRootGroupCx<'a> {
+    fn new(window: &'a mut Window) -> Self {
+        Self { window }
+    }
+
+    /// Builds element values for follow-up visible roots.
+    pub fn build<R>(&mut self, f: impl FnOnce(&mut BuildCx<'_>) -> R) -> R {
+        self.window.build(f)
+    }
+
+    /// Reads a typed frame output resolved earlier in the same private frame
+    /// drain.
+    pub fn frame_output<T: 'static>(&self, output: FramePrepaintOutput<T>) -> &T {
+        self.window.frame_output(output)
+    }
+
+    /// Current rem size while resolving group placement.
+    pub fn rem_size(&self) -> Pixels {
+        self.window.rem_size()
+    }
+
+    /// Text system for code that needs to build follow-up elements.
+    pub fn text_system(&self) -> &Arc<WindowTextSystem> {
+        self.window.text_system()
+    }
+
+    /// Returns whether the given focus handle is currently focused.
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self.window)
+    }
+}
+
+/// Visible detached root that has already been prepainted by a frame plan.
+///
+/// The root is ready for paint, but it no longer carries solve authority.
+/// Only `PaintCx` can consume it to emit drawing commands.
+pub(crate) struct PrepaintedVisibleRoot {
+    element: AnyElement,
+}
+
+impl PrepaintedVisibleRoot {
+    pub(crate) fn new(element: AnyElement) -> Self {
+        Self { element }
+    }
+}
+
+/// Facts produced when the private frame drain prepaints an owner-painted
+/// visible root.
+///
+/// This is feedback from the frame lifecycle, not solve authority. Callers can
+/// observe the root's final bounds and focused child after the private drain
+/// has solved and prepainted the root; they cannot execute layout themselves.
+#[derive(Clone)]
+pub struct VisibleRootPrepaint {
+    bounds: Bounds<Pixels>,
+    focus: Option<FocusHandle>,
+}
+
+impl VisibleRootPrepaint {
+    /// Final absolute bounds published for the visible root.
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.bounds
+    }
+
+    /// Focus handle assigned while prepainting the visible root, if any.
+    pub fn focus(&self) -> Option<&FocusHandle> {
+        self.focus.as_ref()
+    }
+
+    /// Consumes the prepaint facts and returns the focus handle, if any.
+    pub fn into_focus(self) -> Option<FocusHandle> {
+        self.focus
+    }
+}
+
+#[derive(Clone)]
+struct VisibleRootContext {
+    current_view: EntityId,
+    parent_node: DispatchNodeId,
+    element_id_stack: SmallVec<[ElementId; 32]>,
+    text_style_stack: Vec<TextStyleRefinement>,
+    content_mask_stack: Vec<ContentMask<Pixels>>,
+    rem_size: Pixels,
+}
+
+type VisibleRootPlace = Box<dyn FnOnce(Size<Pixels>, VisibleRootPlacementCx<'_>) -> Point<Pixels>>;
+
+fn tooltip_origin(
+    mouse_position: Point<Pixels>,
+    window_bounds: Bounds<Pixels>,
+    size: Size<Pixels>,
+) -> Point<Pixels> {
+    let mut tooltip_bounds = Bounds::new(mouse_position + point(px(1.), px(1.)), size);
+
+    if tooltip_bounds.right() > window_bounds.right() {
+        let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
+        if new_x >= Pixels::ZERO {
+            tooltip_bounds.origin.x = new_x;
+        } else {
+            tooltip_bounds.origin.x = cmp::max(
+                Pixels::ZERO,
+                tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
+            );
+        }
+    }
+
+    if tooltip_bounds.bottom() > window_bounds.bottom() {
+        let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
+        if new_y >= Pixels::ZERO {
+            tooltip_bounds.origin.y = new_y;
+        } else {
+            tooltip_bounds.origin.y = cmp::max(
+                Pixels::ZERO,
+                tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+            );
+        }
+    }
+
+    tooltip_bounds.origin
+}
+
+enum VisibleRootPlacement {
+    FromSolvedSize(VisibleRootPlace),
+}
+
+impl VisibleRootPlacement {
+    fn place(self, size: Size<Pixels>, cx: VisibleRootPlacementCx<'_>) -> Point<Pixels> {
+        match self {
+            VisibleRootPlacement::FromSolvedSize(place) => place(size, cx),
+        }
+    }
+}
+
+enum VisibleRootPaint {
+    OwnerPainted,
+    Deferred {
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+    },
+    Tooltip {
+        id: TooltipId,
+    },
+}
+
+struct PendingVisibleRoot {
+    element: AnyElement,
+    available_space: Size<AvailableSpace>,
+    placement: VisibleRootPlacement,
+    on_prepaint:
+        Option<Box<dyn FnOnce(VisibleRootPrepaint, &mut VisibleRootFeedbackCx<'_>, &mut App)>>,
+}
+
+struct ReadyVisibleRoot {
+    element: Option<AnyElement>,
+    bounds: Bounds<Pixels>,
+    focus: Option<FocusHandle>,
+    paint_range: Range<PaintIndex>,
+}
+
+enum VisibleRootState {
+    Pending(PendingVisibleRoot),
+    Prepainting,
+    Ready(ReadyVisibleRoot),
+}
+
+struct VisibleRootIntent {
+    context: VisibleRootContext,
+    root_site: RetainedLayoutRootSite,
+    paint: VisibleRootPaint,
+    state: VisibleRootState,
+}
+
+type VisibleRootGroupRun = Box<
+    dyn FnOnce(
+        &[Size<Pixels>],
+        &mut VisibleRootGroupCx<'_>,
+        &mut App,
+    ) -> UntypedVisibleRootGroupPlacement,
+>;
+
+struct ListPrepaintIntent {
+    context: VisibleRootContext,
+    work: Option<PendingListPrepaint>,
+    output_index: usize,
+}
+
+struct VisibleRootGroupIntent {
+    context: VisibleRootContext,
+    root_site: RetainedLayoutRootSite,
+    roots: Vec<(AnyElement, Size<AvailableSpace>)>,
+    place: Option<VisibleRootGroupRun>,
+    output_index: usize,
+}
+
+enum FramePrepaintOutputSlot {
+    Pending,
+    Ready(Box<dyn Any>),
+    Taken,
 }
 
 pub(crate) struct Frame {
@@ -824,6 +3520,10 @@ pub(crate) struct Frame {
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
+    visible_roots: Vec<VisibleRootIntent>,
+    visible_root_groups: Vec<Option<VisibleRootGroupIntent>>,
+    list_prepaints: Vec<Option<ListPrepaintIntent>>,
+    frame_prepaint_outputs: Vec<FramePrepaintOutputSlot>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -841,6 +3541,10 @@ pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
+    visible_roots_index: usize,
+    visible_root_groups_index: usize,
+    list_prepaints_index: usize,
+    frame_prepaint_outputs_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -870,6 +3574,10 @@ impl Frame {
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
+            visible_roots: Vec::new(),
+            visible_root_groups: Vec::new(),
+            list_prepaints: Vec::new(),
+            frame_prepaint_outputs: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -898,6 +3606,10 @@ impl Frame {
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
+        self.visible_roots.clear();
+        self.visible_root_groups.clear();
+        self.list_prepaints.clear();
+        self.frame_prepaint_outputs.clear();
         self.tab_stops.clear();
         self.focus = None;
 
@@ -1828,6 +4540,16 @@ impl Window {
         self.handle
     }
 
+    /// Temporarily view this window through build-only authority.
+    ///
+    /// This is a one-way narrowing operation for code that needs to construct
+    /// element values from a window callback without gaining layout/prepaint/
+    /// paint authority.
+    pub fn build<R>(&mut self, f: impl FnOnce(&mut BuildCx<'_>) -> R) -> R {
+        let mut build = BuildCx::new(self);
+        f(&mut build)
+    }
+
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {
@@ -1835,36 +4557,6 @@ impl Window {
             self.invalidator.set_dirty(true);
             self.platform_window.request_frame();
         }
-    }
-
-    /// Draw and present this window immediately.
-    ///
-    /// Normal application code should prefer [`Window::refresh`] or
-    /// [`Window::request_animation_frame`]. This method is for cases where the
-    /// caller is already executing on a window turn and has an explicit
-    /// presentable frame, but the platform will not deliver a display-link
-    /// callback, such as deterministic inactive-window automation.
-    pub fn draw_and_present_immediately(&mut self, cx: &mut App) {
-        let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
-        self.present();
-        arena_clear_needed.clear();
-        self.complete_frame();
-    }
-
-    /// Draw, present, and capture this window's rendered scene immediately.
-    ///
-    /// This is for deterministic automation in inactive/background windows.
-    /// The normal platform window is still presented, and the returned image is
-    /// rendered from the same full GPUI scene without depending on OS window
-    /// capture state.
-    pub fn draw_present_and_capture_immediately(&mut self, cx: &mut App) -> Result<SceneCapture> {
-        let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
-        self.platform_window.request_frame_capture();
-        self.present();
-        let capture = self.platform_window.capture_presented_frame();
-        arena_clear_needed.clear();
-        self.complete_frame();
-        capture
     }
 
     /// Returns whether the current draw is expected to be presented.
@@ -2299,6 +4991,22 @@ impl Window {
         self.viewport_size
     }
 
+    /// Returns published bounds for a visible detached root from rendered frame output.
+    ///
+    /// This is a geometry read, not layout authority. If the handle names a
+    /// root that has not been solved and prepainted by the frame lifecycle, or
+    /// no longer belongs to the rendered frame, this returns `None` rather than
+    /// performing layout.
+    pub fn visible_root_bounds(&self, geometry: VisibleRootGeometry) -> Option<Bounds<Pixels>> {
+        self.rendered_frame
+            .visible_roots
+            .get(geometry.index)
+            .and_then(|root| match root.state {
+                VisibleRootState::Ready(ref ready) => Some(ready.bounds),
+                VisibleRootState::Pending(_) | VisibleRootState::Prepainting => None,
+            })
+    }
+
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
@@ -2456,6 +5164,11 @@ impl Window {
             .last()
             .copied()
             .unwrap_or(self.rem_size)
+    }
+
+    /// Returns whether the given focus handle is focused in this window.
+    pub fn is_focused(&self, focus_handle: &FocusHandle) -> bool {
+        focus_handle.is_focused(self)
     }
 
     /// Sets the size of an em for the base font of the application. Adjusting this value allows the
@@ -2681,10 +5394,24 @@ impl Window {
         result
     }
 
+    /// Produces a new frame for the app runtime.
+    ///
+    /// This is crate-visible only as an app-owned capability method. The actual
+    /// frame implementation stays private to `window.rs`, so other GPUI modules
+    /// cannot initiate layout/draw work with only `&mut Window`.
+    #[profiling::function]
+    pub(crate) fn draw_for_app(
+        &mut self,
+        _authority: &mut crate::app::WindowFrameAuthority,
+        cx: &mut App,
+    ) -> ArenaClearNeeded {
+        self.draw(cx)
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
-    pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+    fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
         let draw_id = crate::nobie_platform_trace::next_draw_id();
         let draw_reason = crate::nobie_platform_trace::current_draw_reason();
         self.nobie_trace_last_draw_id.set(draw_id);
@@ -2707,6 +5434,7 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
         self.layout_engine.as_mut().unwrap().begin_frame();
+        let mut layout_frame = LayoutFrame::new();
 
         {
             profiling::scope!("gpui::window::draw_invalidate_entities");
@@ -2736,7 +5464,7 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             profiling::scope!("gpui::window::draw_roots");
-            self.draw_roots(cx);
+            self.draw_roots(cx, &mut layout_frame);
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
@@ -2905,9 +5633,8 @@ impl Window {
         self.input_latency_tracker.snapshot()
     }
 
-    fn draw_roots(&mut self, cx: &mut App) {
+    fn draw_roots(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
-        self.tooltip_bounds.take();
 
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
         let root_size = {
@@ -2929,55 +5656,299 @@ impl Window {
 
         // Layout all root elements.
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
-        root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        layout_frame.prepaint_detached_root_at(
+            self,
+            &mut root_element,
+            Point::default(),
+            root_size.into(),
+            cx,
+        );
 
         #[cfg(any(feature = "inspector", debug_assertions))]
-        let inspector_element = self.prepaint_inspector(_inspector_width, cx);
+        let inspector_element = self.prepaint_inspector(_inspector_width, layout_frame, cx);
 
+        self.drain_frame_prepaint_phase(cx, layout_frame);
         self.prepaint_deferred_draws(cx);
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
-        let mut tooltip_element = None;
+        let mut tooltip_root = None;
         if let Some(prompt) = self.prompt.take() {
+            self.tooltip_bounds.take();
             let mut element = prompt.view.any_view().into_any();
-            element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+            layout_frame.prepaint_detached_root_at(
+                self,
+                &mut element,
+                Point::default(),
+                root_size.into(),
+                cx,
+            );
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
+            self.tooltip_bounds.take();
             let mut element = active_drag.view.clone().into_any();
             let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+            layout_frame.prepaint_detached_root_at(
+                self,
+                &mut element,
+                offset,
+                AvailableSpace::min_size(),
+                cx,
+            );
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
         } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            tooltip_root = self.register_tooltip_visible_root(cx);
+            if tooltip_root.is_none() {
+                self.tooltip_bounds.take();
+            }
         }
+
+        self.drain_frame_prepaint_phase(cx, layout_frame);
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
-        root_element.paint(self, cx);
+        {
+            let mut paint_cx = PaintCx::new(self);
+            root_element.paint(&mut paint_cx, cx);
+        }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
         self.paint_deferred_draws(cx);
+        self.paint_deferred_visible_roots(cx);
 
         if let Some(mut prompt_element) = prompt_element {
-            prompt_element.paint(self, cx);
+            let mut paint_cx = PaintCx::new(self);
+            prompt_element.paint(&mut paint_cx, cx);
         } else if let Some(mut drag_element) = active_drag_element {
-            drag_element.paint(self, cx);
-        } else if let Some(mut tooltip_element) = tooltip_element {
-            tooltip_element.paint(self, cx);
+            let mut paint_cx = PaintCx::new(self);
+            drag_element.paint(&mut paint_cx, cx);
+        } else if let Some(tooltip_root) = tooltip_root {
+            self.paint_tooltip_visible_root(tooltip_root, cx);
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
     }
 
-    fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
+    fn drain_frame_prepaint_phase(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
+        loop {
+            let list_prepaint_len = self.next_frame.list_prepaints.len();
+            let visible_root_group_len = self.next_frame.visible_root_groups.len();
+            let visible_root_len = self.next_frame.visible_roots.len();
+
+            self.drain_list_prepaints(cx, layout_frame);
+            self.drain_visible_root_groups(cx, layout_frame);
+            self.prepaint_visible_roots(cx, layout_frame);
+
+            let no_new_list_prepaints = self.next_frame.list_prepaints.len() == list_prepaint_len;
+            let no_new_groups = self.next_frame.visible_root_groups.len() == visible_root_group_len;
+            let no_new_roots = self.next_frame.visible_roots.len() == visible_root_len;
+            if no_new_list_prepaints && no_new_groups && no_new_roots {
+                break;
+            }
+        }
+    }
+
+    fn drain_list_prepaints(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
+        let mut index = 0;
+        while index < self.next_frame.list_prepaints.len() {
+            let Some(mut plan) = self.next_frame.list_prepaints[index].take() else {
+                index += 1;
+                continue;
+            };
+
+            let context = plan.context.clone();
+            self.element_id_stack.clone_from(&context.element_id_stack);
+            self.text_style_stack.clone_from(&context.text_style_stack);
+            self.content_mask_stack
+                .clone_from(&context.content_mask_stack);
+            self.next_frame
+                .dispatch_tree
+                .set_active_node(context.parent_node);
+
+            let value = self.with_rendered_view(context.current_view, |window| {
+                window.with_rem_size(Some(context.rem_size), |window| {
+                    let mut frame = CustomLayoutCx::new(window, layout_frame);
+                    let value = plan
+                        .work
+                        .take()
+                        .expect("list prepaint should own its work")
+                        .run(&mut frame, cx);
+                    Box::new(value) as Box<dyn Any>
+                })
+            });
+
+            self.element_id_stack.clear();
+            self.text_style_stack.clear();
+            self.content_mask_stack.clear();
+
+            let output = self
+                .next_frame
+                .frame_prepaint_outputs
+                .get_mut(plan.output_index)
+                .expect("list prepaint references a missing frame output");
+            match output {
+                FramePrepaintOutputSlot::Pending => *output = FramePrepaintOutputSlot::Ready(value),
+                FramePrepaintOutputSlot::Ready(_) => {
+                    panic!("list prepaint resolved the same frame output twice")
+                }
+                FramePrepaintOutputSlot::Taken => {
+                    panic!("list prepaint output was taken before resolve")
+                }
+            }
+
+            index += 1;
+        }
+    }
+
+    fn drain_visible_root_groups(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
+        let mut index = 0;
+        while index < self.next_frame.visible_root_groups.len() {
+            let Some(mut group) = self.next_frame.visible_root_groups[index].take() else {
+                index += 1;
+                continue;
+            };
+
+            let context = group.context.clone();
+            self.element_id_stack.clone_from(&context.element_id_stack);
+            self.text_style_stack.clone_from(&context.text_style_stack);
+            self.content_mask_stack
+                .clone_from(&context.content_mask_stack);
+            self.next_frame
+                .dispatch_tree
+                .set_active_node(context.parent_node);
+
+            let mut sizes = Vec::with_capacity(group.roots.len());
+            for (element, available_space) in &mut group.roots {
+                sizes.push(layout_frame.layout_detached_root_size(
+                    self,
+                    element,
+                    group.root_site,
+                    *available_space,
+                    cx,
+                ));
+            }
+
+            let mut group_cx = VisibleRootGroupCx::new(self);
+            let placement = group
+                .place
+                .take()
+                .expect("visible root group should own its placement function")(
+                &sizes,
+                &mut group_cx,
+                cx,
+            );
+            let UntypedVisibleRootGroupPlacement {
+                output: value,
+                placements,
+                followups,
+            } = placement;
+            assert_eq!(
+                placements.len(),
+                group.roots.len(),
+                "visible root group placement count must match root count"
+            );
+
+            for (((mut element, _), placement), root_size) in
+                group.roots.into_iter().zip(placements).zip(sizes)
+            {
+                self.element_id_stack.clone_from(&context.element_id_stack);
+                self.text_style_stack.clone_from(&context.text_style_stack);
+                self.content_mask_stack
+                    .clone_from(&context.content_mask_stack);
+                self.next_frame
+                    .dispatch_tree
+                    .set_active_node(context.parent_node);
+
+                let origin = placement.origin;
+                let bounds = Bounds::new(origin, root_size);
+                let previous_content_mask_stack = mem::replace(
+                    &mut self.content_mask_stack,
+                    context.content_mask_stack.clone(),
+                );
+                let (element, focus) = self.with_rendered_view(context.current_view, |window| {
+                    window.with_rem_size(Some(context.rem_size), |window| {
+                        let focus = element.prepaint_at(origin, window, cx);
+                        (element, focus)
+                    })
+                });
+                self.content_mask_stack = previous_content_mask_stack;
+
+                self.next_frame.visible_roots.push(VisibleRootIntent {
+                    context: context.clone(),
+                    root_site: group.root_site,
+                    paint: VisibleRootPaint::Deferred {
+                        priority: placement.priority,
+                        content_mask: placement.content_mask,
+                    },
+                    state: VisibleRootState::Ready(ReadyVisibleRoot {
+                        element: Some(element),
+                        bounds,
+                        focus,
+                        paint_range: PaintIndex::default()..PaintIndex::default(),
+                    }),
+                });
+            }
+
+            for followup in followups {
+                let DeferredVisibleRootIntent {
+                    element,
+                    available_space,
+                    placement,
+                } = followup;
+                let DeferredVisibleRootPlacement {
+                    origin,
+                    priority,
+                    content_mask,
+                } = placement;
+                self.next_frame.visible_roots.push(VisibleRootIntent {
+                    context: context.clone(),
+                    root_site: group.root_site,
+                    paint: VisibleRootPaint::Deferred {
+                        priority,
+                        content_mask,
+                    },
+                    state: VisibleRootState::Pending(PendingVisibleRoot {
+                        element,
+                        available_space,
+                        placement: VisibleRootPlacement::FromSolvedSize(Box::new(move |_, _| {
+                            origin
+                        })),
+                        on_prepaint: None,
+                    }),
+                });
+            }
+
+            self.element_id_stack.clear();
+            self.text_style_stack.clear();
+            self.content_mask_stack.clear();
+
+            let output = self
+                .next_frame
+                .frame_prepaint_outputs
+                .get_mut(group.output_index)
+                .expect("visible root group references a missing frame output");
+            match output {
+                FramePrepaintOutputSlot::Pending => *output = FramePrepaintOutputSlot::Ready(value),
+                FramePrepaintOutputSlot::Ready(_) => {
+                    panic!("visible root group resolved the same frame output twice")
+                }
+                FramePrepaintOutputSlot::Taken => {
+                    panic!("visible root group output was taken before resolve")
+                }
+            }
+
+            index += 1;
+        }
+    }
+
+    fn register_tooltip_visible_root(&mut self, cx: &mut App) -> Option<usize> {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
         for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
             let Some(Some(tooltip_request)) = self
@@ -2989,69 +5960,37 @@ impl Window {
                 log::error!("Unexpectedly absent TooltipRequest");
                 continue;
             };
-            let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = tooltip_request
-                .tooltip
-                .view
-                .clone()
-                .into_any()
-                .measure_as_root(AvailableSpace::min_size(), self, cx);
-
-            let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
+            let mouse_position = tooltip_request.tooltip.mouse_position();
             let window_bounds = Bounds {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
-
-            if tooltip_bounds.right() > window_bounds.right() {
-                let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
-                    tooltip_bounds.origin.x = new_x;
-                } else {
-                    tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
-                    );
-                }
+            let tooltip_view = tooltip_request.tooltip.view().clone();
+            let tooltip_facts = TooltipVisibilityFacts::new(tooltip_request.tooltip_hovered);
+            if !tooltip_request
+                .tooltip
+                .check_visible_and_update(tooltip_facts, self, cx)
+            {
+                return None;
             }
 
-            if tooltip_bounds.bottom() > window_bounds.bottom() {
-                let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= Pixels::ZERO {
-                    tooltip_bounds.origin.y = new_y;
-                } else {
-                    tooltip_bounds.origin.y = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
-                    );
-                }
-            }
-
-            // It's possible for an element to have an active tooltip while not being painted (e.g.
-            // via the `visible_on_hover` method). Since mouse listeners are not active in this
-            // case, instead update the tooltip's visibility here.
-            let is_visible =
-                (tooltip_request.tooltip.check_visible_and_update)(tooltip_bounds, self, cx);
-            if !is_visible {
-                continue;
-            }
-
-            let mut element = tooltip_request.tooltip.view.clone().into_any();
-            let visible_tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
-            debug_assert_eq!(
-                visible_tooltip_size, tooltip_size,
-                "tooltip scratch measurement should match the visible tooltip root"
-            );
-            self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
-                element.prepaint(window, cx)
+            let index = self.next_frame.visible_roots.len();
+            self.next_frame.visible_roots.push(VisibleRootIntent {
+                context: tooltip_request.context,
+                root_site: RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+                paint: VisibleRootPaint::Tooltip {
+                    id: tooltip_request.id,
+                },
+                state: VisibleRootState::Pending(PendingVisibleRoot {
+                    element: tooltip_view.into_any(),
+                    available_space: AvailableSpace::min_size(),
+                    placement: VisibleRootPlacement::FromSolvedSize(Box::new(move |size, _| {
+                        tooltip_origin(mouse_position, window_bounds, size)
+                    })),
+                    on_prepaint: None,
+                }),
             });
-
-            self.tooltip_bounds = Some(TooltipBounds {
-                id: tooltip_request.id,
-                bounds: tooltip_bounds,
-            });
-            return Some(element);
+            return Some(index);
         }
         None
     }
@@ -3088,19 +6027,27 @@ impl Window {
                     .set_active_node(deferred_draw.parent_node);
 
                 let prepaint_start = self.prepaint_index();
-                if let Some(element) = deferred_draw.element.as_mut() {
-                    self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            window.with_absolute_element_offset(
-                                deferred_draw.absolute_offset,
-                                |window| {
-                                    element.prepaint(window, cx);
-                                },
-                            );
-                        });
-                    })
-                } else {
-                    self.reuse_prepaint(deferred_draw.prepaint_range.clone());
+                match &mut deferred_draw.root {
+                    DeferredDrawRoot::Prelaid {
+                        element,
+                        absolute_offset,
+                    } => {
+                        if let Some(element) = element.as_mut() {
+                            self.with_rendered_view(deferred_draw.current_view, |window| {
+                                window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                    window.with_absolute_element_offset(
+                                        *absolute_offset,
+                                        |window| {
+                                            let mut prepaint_cx = PrepaintCx::new(window);
+                                            element.prepaint(&mut prepaint_cx, cx);
+                                        },
+                                    );
+                                });
+                            })
+                        } else {
+                            self.reuse_prepaint(deferred_draw.prepaint_range.clone());
+                        }
+                    }
                 }
                 let prepaint_end = self.prepaint_index();
                 deferred_draw.prepaint_range = prepaint_start..prepaint_end;
@@ -3138,21 +6085,258 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
-            if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
-                        });
-                    })
-                })
-            } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
+            match &mut deferred_draw.root {
+                DeferredDrawRoot::Prelaid { element, .. } => {
+                    if let Some(element) = element.as_mut() {
+                        self.with_rendered_view(deferred_draw.current_view, |window| {
+                            window.with_content_mask(content_mask, |window| {
+                                window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                    let mut paint_cx = PaintCx::new(window);
+                                    element.paint(&mut paint_cx, cx);
+                                });
+                            })
+                        })
+                    } else {
+                        self.reuse_paint(deferred_draw.paint_range.clone());
+                    }
+                }
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
         }
         self.next_frame.deferred_draws = deferred_draws;
+        self.element_id_stack.clear();
+    }
+
+    fn paint_deferred_visible_roots(&mut self, cx: &mut App) {
+        let mut indices = self
+            .next_frame
+            .visible_roots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, root)| match root.paint {
+                VisibleRootPaint::Deferred { priority, .. } => Some((index, priority)),
+                VisibleRootPaint::OwnerPainted | VisibleRootPaint::Tooltip { .. } => None,
+            })
+            .collect::<SmallVec<[_; 8]>>();
+        indices.sort_by_key(|(_, priority)| *priority);
+
+        for (index, _) in indices {
+            let paint_start = self.paint_index();
+            let (context, content_mask, mut element) = {
+                let root = &mut self.next_frame.visible_roots[index];
+                let content_mask = match root.paint {
+                    VisibleRootPaint::Deferred { content_mask, .. } => content_mask,
+                    VisibleRootPaint::OwnerPainted | VisibleRootPaint::Tooltip { .. } => continue,
+                };
+                let ready = match &mut root.state {
+                    VisibleRootState::Ready(ready) => ready,
+                    VisibleRootState::Prepainting => {
+                        panic!("deferred visible root is already being prepainted")
+                    }
+                    VisibleRootState::Pending(_) => {
+                        panic!("deferred visible root must be prepainted before paint");
+                    }
+                };
+                (
+                    VisibleRootContext {
+                        current_view: root.context.current_view,
+                        parent_node: root.context.parent_node,
+                        element_id_stack: root.context.element_id_stack.clone(),
+                        text_style_stack: root.context.text_style_stack.clone(),
+                        content_mask_stack: root.context.content_mask_stack.clone(),
+                        rem_size: root.context.rem_size,
+                    },
+                    content_mask,
+                    ready
+                        .element
+                        .take()
+                        .expect("deferred visible root should own an element before paint"),
+                )
+            };
+
+            self.element_id_stack.clone_from(&context.element_id_stack);
+            self.next_frame
+                .dispatch_tree
+                .set_active_node(context.parent_node);
+            self.with_rendered_view(context.current_view, |window| {
+                window.with_content_mask(content_mask, |window| {
+                    window.with_rem_size(Some(context.rem_size), |window| {
+                        let mut paint_cx = PaintCx::new(window);
+                        element.paint(&mut paint_cx, cx);
+                    });
+                })
+            });
+            let paint_end = self.paint_index();
+            let VisibleRootState::Ready(ready) = &mut self.next_frame.visible_roots[index].state
+            else {
+                unreachable!("deferred visible root state changed during paint");
+            };
+            ready.element = Some(element);
+            ready.paint_range = paint_start..paint_end;
+        }
+
+        self.element_id_stack.clear();
+    }
+
+    fn prepaint_visible_roots(&mut self, cx: &mut App, layout_frame: &mut LayoutFrame) {
+        assert_eq!(self.element_id_stack.len(), 0);
+
+        let mut index = 0;
+        loop {
+            if index >= self.next_frame.visible_roots.len() {
+                break;
+            }
+
+            if matches!(
+                self.next_frame.visible_roots[index].state,
+                VisibleRootState::Ready(_)
+            ) {
+                index += 1;
+                continue;
+            }
+
+            let (
+                current_view,
+                parent_node,
+                element_id_stack,
+                text_style_stack,
+                content_mask_stack,
+                rem_size,
+                root_site,
+                pending,
+            ) = {
+                let intent = &mut self.next_frame.visible_roots[index];
+                let pending = match mem::replace(&mut intent.state, VisibleRootState::Prepainting) {
+                    VisibleRootState::Pending(pending) => pending,
+                    VisibleRootState::Prepainting => {
+                        panic!("visible root was re-entered while prepainting")
+                    }
+                    VisibleRootState::Ready(_) => {
+                        unreachable!("visible root pending state checked above")
+                    }
+                };
+                (
+                    intent.context.current_view,
+                    intent.context.parent_node,
+                    intent.context.element_id_stack.clone(),
+                    intent.context.text_style_stack.clone(),
+                    intent.context.content_mask_stack.clone(),
+                    intent.context.rem_size,
+                    intent.root_site,
+                    pending,
+                )
+            };
+
+            self.element_id_stack.clone_from(&element_id_stack);
+            self.text_style_stack.clone_from(&text_style_stack);
+            self.next_frame.dispatch_tree.set_active_node(parent_node);
+
+            let PendingVisibleRoot {
+                mut element,
+                available_space,
+                placement,
+                on_prepaint,
+            } = pending;
+            let root_size = layout_frame.layout_detached_root_size(
+                self,
+                &mut element,
+                root_site,
+                available_space,
+                cx,
+            );
+            let placement_cx = VisibleRootPlacementCx::new(self);
+            let origin = placement.place(root_size, placement_cx);
+            let bounds = Bounds::new(origin, root_size);
+
+            let previous_content_mask_stack =
+                mem::replace(&mut self.content_mask_stack, content_mask_stack);
+            let (element, bounds, focus) = self.with_rendered_view(current_view, |window| {
+                window.with_rem_size(Some(rem_size), |window| {
+                    let focus = element.prepaint_at(origin, window, cx);
+                    (element, bounds, focus)
+                })
+            });
+            self.content_mask_stack = previous_content_mask_stack;
+
+            let on_prepaint = {
+                let intent = &mut self.next_frame.visible_roots[index];
+                intent.state = VisibleRootState::Ready(ReadyVisibleRoot {
+                    element: Some(element),
+                    bounds,
+                    focus,
+                    paint_range: PaintIndex::default()..PaintIndex::default(),
+                });
+                if let VisibleRootPaint::Tooltip { id } = intent.paint {
+                    self.tooltip_bounds = Some(TooltipBounds { id, bounds });
+                }
+                on_prepaint
+            };
+
+            if let Some(on_prepaint) = on_prepaint {
+                let VisibleRootState::Ready(ready) = &self.next_frame.visible_roots[index].state
+                else {
+                    unreachable!("visible root was just marked ready");
+                };
+                let focus = ready.focus.clone();
+                let mut feedback_cx = VisibleRootFeedbackCx::new(self);
+                on_prepaint(VisibleRootPrepaint { bounds, focus }, &mut feedback_cx, cx);
+            }
+
+            index += 1;
+        }
+
+        self.element_id_stack.clear();
+        self.text_style_stack.clear();
+    }
+
+    fn paint_tooltip_visible_root(&mut self, index: usize, cx: &mut App) {
+        let (context, mut element) = {
+            let root = self
+                .next_frame
+                .visible_roots
+                .get_mut(index)
+                .expect("tooltip visible root handle is invalid");
+            assert!(matches!(root.paint, VisibleRootPaint::Tooltip { .. }));
+            let ready = match &mut root.state {
+                VisibleRootState::Ready(ready) => ready,
+                VisibleRootState::Prepainting => {
+                    panic!("tooltip visible root is already being prepainted")
+                }
+                VisibleRootState::Pending(_) => {
+                    panic!("tooltip visible root must be prepainted before paint");
+                }
+            };
+            (
+                VisibleRootContext {
+                    current_view: root.context.current_view,
+                    parent_node: root.context.parent_node,
+                    element_id_stack: root.context.element_id_stack.clone(),
+                    text_style_stack: root.context.text_style_stack.clone(),
+                    content_mask_stack: root.context.content_mask_stack.clone(),
+                    rem_size: root.context.rem_size,
+                },
+                ready
+                    .element
+                    .take()
+                    .expect("tooltip visible root should own an element before paint"),
+            )
+        };
+
+        self.element_id_stack.clone_from(&context.element_id_stack);
+        self.next_frame
+            .dispatch_tree
+            .set_active_node(context.parent_node);
+        self.with_rendered_view(context.current_view, |window| {
+            window.with_rem_size(Some(context.rem_size), |window| {
+                let mut paint_cx = PaintCx::new(window);
+                element.paint(&mut paint_cx, cx);
+            })
+        });
+        let VisibleRootState::Ready(ready) = &mut self.next_frame.visible_roots[index].state else {
+            unreachable!("tooltip visible root state changed during paint");
+        };
+        ready.element = Some(element);
         self.element_id_stack.clear();
     }
 
@@ -3168,6 +6352,10 @@ impl Window {
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
+            visible_roots_index: self.next_frame.visible_roots.len(),
+            visible_root_groups_index: self.next_frame.visible_root_groups.len(),
+            list_prepaints_index: self.next_frame.list_prepaints.len(),
+            frame_prepaint_outputs_index: self.next_frame.frame_prepaint_outputs.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
@@ -3217,8 +6405,14 @@ impl Window {
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
-                    element: None,
-                    absolute_offset: deferred_draw.absolute_offset,
+                    root: match &deferred_draw.root {
+                        DeferredDrawRoot::Prelaid {
+                            absolute_offset, ..
+                        } => DeferredDrawRoot::Prelaid {
+                            element: None,
+                            absolute_offset: *absolute_offset,
+                        },
+                    },
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -3318,11 +6512,23 @@ impl Window {
     /// Sets a tooltip to be rendered for the upcoming frame. This method should only be called
     /// during the paint phase of element drawing.
     pub fn set_tooltip(&mut self, tooltip: AnyTooltip) -> TooltipId {
+        self.set_tooltip_with_hover_state(tooltip, false)
+    }
+
+    fn set_tooltip_with_hover_state(
+        &mut self,
+        tooltip: AnyTooltip,
+        tooltip_hovered: bool,
+    ) -> TooltipId {
         self.invalidator.debug_assert_prepaint();
         let id = TooltipId(post_inc(&mut self.next_tooltip_id.0));
-        self.next_frame
-            .tooltip_requests
-            .push(Some(TooltipRequest { id, tooltip }));
+        let context = self.visible_root_context();
+        self.next_frame.tooltip_requests.push(Some(TooltipRequest {
+            id,
+            tooltip,
+            tooltip_hovered,
+            context,
+        }));
         id
     }
 
@@ -3459,7 +6665,10 @@ impl Window {
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
     /// element offset and prepaint again. See [`crate::List`] for an example. This method should only be
     /// called during the prepaint phase of element drawing.
-    pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
+    pub(crate) fn transact<T, U>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, U>,
+    ) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
         let layout_checkpoint = self
@@ -3479,6 +6688,18 @@ impl Window {
             self.next_frame
                 .deferred_draws
                 .truncate(index.deferred_draws_index);
+            self.next_frame
+                .visible_roots
+                .truncate(index.visible_roots_index);
+            self.next_frame
+                .visible_root_groups
+                .truncate(index.visible_root_groups_index);
+            self.next_frame
+                .list_prepaints
+                .truncate(index.list_prepaints_index);
+            self.next_frame
+                .frame_prepaint_outputs
+                .truncate(index.frame_prepaint_outputs_index);
             self.next_frame
                 .dispatch_tree
                 .truncate(index.dispatch_tree_index);
@@ -3770,7 +6991,7 @@ impl Window {
     /// both prepaint and paint. When `None`, no additional clipping is applied.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
-    pub fn defer_draw(
+    pub(crate) fn defer_draw(
         &mut self,
         element: AnyElement,
         absolute_offset: Point<Pixels>,
@@ -3787,11 +7008,184 @@ impl Window {
             content_mask,
             rem_size: self.rem_size(),
             priority,
-            element: Some(element),
-            absolute_offset,
+            root: DeferredDrawRoot::Prelaid {
+                element: Some(element),
+                absolute_offset,
+            },
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
+    }
+
+    fn reserve_frame_output<T: 'static>(&mut self) -> FramePrepaintOutput<T> {
+        self.invalidator.debug_assert_prepaint();
+        let index = self.next_frame.frame_prepaint_outputs.len();
+        self.next_frame
+            .frame_prepaint_outputs
+            .push(FramePrepaintOutputSlot::Pending);
+        FramePrepaintOutput {
+            index,
+            _marker: PhantomData,
+        }
+    }
+
+    fn register_list_prepaint(
+        &mut self,
+        work: PendingListPrepaint,
+    ) -> FramePrepaintOutput<PrepaintItemsResponse> {
+        self.invalidator.debug_assert_prepaint();
+        let output = self.reserve_frame_output();
+        let context = self.visible_root_context();
+        self.next_frame
+            .list_prepaints
+            .push(Some(ListPrepaintIntent {
+                context,
+                work: Some(work),
+                output_index: output.index,
+            }));
+        output
+    }
+
+    fn register_visible_root_group<T: 'static>(
+        &mut self,
+        roots: Vec<(AnyElement, Size<AvailableSpace>)>,
+        root_site: RetainedLayoutRootSite,
+        place: impl FnOnce(
+            &[Size<Pixels>],
+            &mut VisibleRootGroupCx<'_>,
+            &mut App,
+        ) -> VisibleRootGroupPlacement<T>
+        + 'static,
+    ) -> FramePrepaintOutput<T> {
+        self.invalidator.debug_assert_prepaint();
+        let output = self.reserve_frame_output();
+        let context = self.visible_root_context();
+        let run: VisibleRootGroupRun = Box::new(move |sizes, group_cx, cx| {
+            let placement = place(sizes, group_cx, cx);
+            UntypedVisibleRootGroupPlacement {
+                output: Box::new(placement.output),
+                placements: placement.placements,
+                followups: placement.followups,
+            }
+        });
+        self.next_frame
+            .visible_root_groups
+            .push(Some(VisibleRootGroupIntent {
+                context,
+                root_site,
+                roots,
+                place: Some(run),
+                output_index: output.index,
+            }));
+        output
+    }
+
+    fn push_pending_visible_root(
+        &mut self,
+        element: AnyElement,
+        available_space: Size<AvailableSpace>,
+        placement: VisibleRootPlacement,
+        paint: VisibleRootPaint,
+        root_site: RetainedLayoutRootSite,
+        on_prepaint: Option<
+            Box<dyn FnOnce(VisibleRootPrepaint, &mut VisibleRootFeedbackCx<'_>, &mut App)>,
+        >,
+    ) -> usize {
+        self.invalidator.debug_assert_prepaint();
+        let context = self.visible_root_context();
+        let index = self.next_frame.visible_roots.len();
+        self.next_frame.visible_roots.push(VisibleRootIntent {
+            context,
+            root_site,
+            paint,
+            state: VisibleRootState::Pending(PendingVisibleRoot {
+                element,
+                available_space,
+                placement,
+                on_prepaint,
+            }),
+        });
+        index
+    }
+
+    fn visible_root_context(&self) -> VisibleRootContext {
+        let parent_node = self
+            .next_frame
+            .dispatch_tree
+            .active_node_id()
+            .expect("visible root registration requires an active prepaint dispatch node");
+        VisibleRootContext {
+            current_view: self.current_view(),
+            parent_node,
+            element_id_stack: self.element_id_stack.clone(),
+            text_style_stack: self.text_style_stack.clone(),
+            content_mask_stack: self.content_mask_stack.clone(),
+            rem_size: self.rem_size(),
+        }
+    }
+
+    fn frame_output<T: 'static>(&self, output: FramePrepaintOutput<T>) -> &T {
+        match self
+            .next_frame
+            .frame_prepaint_outputs
+            .get(output.index)
+            .expect("frame output handle is invalid")
+        {
+            FramePrepaintOutputSlot::Pending => {
+                panic!("frame output was read before it was resolved")
+            }
+            FramePrepaintOutputSlot::Ready(value) => value
+                .downcast_ref::<T>()
+                .expect("frame output handle was used with the wrong type"),
+            FramePrepaintOutputSlot::Taken => panic!("frame output was read after it was taken"),
+        }
+    }
+
+    fn take_frame_output<T: 'static>(&mut self, output: FramePrepaintOutput<T>) -> T {
+        match mem::replace(
+            self.next_frame
+                .frame_prepaint_outputs
+                .get_mut(output.index)
+                .expect("frame output handle is invalid"),
+            FramePrepaintOutputSlot::Taken,
+        ) {
+            FramePrepaintOutputSlot::Pending => {
+                panic!("frame output was taken before it was resolved")
+            }
+            FramePrepaintOutputSlot::Ready(value) => *value
+                .downcast::<T>()
+                .expect("frame output handle was used with the wrong type"),
+            FramePrepaintOutputSlot::Taken => panic!("frame output was taken twice"),
+        }
+    }
+
+    /// Paints a visible root registered by [`PrepaintCx::owner_painted_visible_root`].
+    ///
+    /// The handle is one-shot. If paint reaches this method before the private
+    /// frame drain has prepainted the root, the frame lifecycle is broken and
+    /// GPUI fails loud rather than silently solving during paint.
+    fn paint_visible_root(&mut self, handle: OwnerPaintedVisibleRoot, cx: &mut App) {
+        self.invalidator.debug_assert_paint();
+        let mut element = self
+            .next_frame
+            .visible_roots
+            .get_mut(handle.index)
+            .and_then(|intent| {
+                assert!(matches!(intent.paint, VisibleRootPaint::OwnerPainted));
+                let ready = match &mut intent.state {
+                    VisibleRootState::Ready(ready) => ready,
+                    VisibleRootState::Prepainting => {
+                        panic!("owner-painted visible root is already being prepainted")
+                    }
+                    VisibleRootState::Pending(_) => {
+                        panic!("owner-painted visible root must be prepainted before paint")
+                    }
+                };
+                ready.element.take()
+            })
+            .expect("owner-painted visible root handle is invalid or already painted");
+        let mut paint_cx = PaintCx::new(self);
+        element.paint(&mut paint_cx, cx);
     }
 
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
@@ -4237,6 +7631,29 @@ impl Window {
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    ) {
+        use crate::{PaintSurface, PaintSurfaceSource};
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            source: PaintSurfaceSource::Surface(image_buffer),
+        });
+    }
+
+    /// Paint a Metal texture into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
     pub fn paint_metal_texture(&mut self, bounds: Bounds<Pixels>, texture: metal::Texture) {
         use crate::{PaintSurface, PaintSurfaceSource};
 
@@ -4322,7 +7739,7 @@ impl Window {
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
     #[must_use]
-    pub fn request_layout(
+    fn request_layout(
         &mut self,
         style: Style,
         children: impl IntoIterator<Item = LayoutId>,
@@ -4331,7 +7748,7 @@ impl Window {
         self.request_layout_with_global_id(None, style, children, cx)
     }
 
-    pub(crate) fn request_layout_with_global_id(
+    fn request_layout_with_global_id(
         &mut self,
         global_id: Option<&GlobalElementId>,
         style: Style,
@@ -4365,9 +7782,9 @@ impl Window {
     /// returns a `Size`.
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
-    pub fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
+    fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
     where
-        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+        F: FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut MeasureCx<'_>) -> Size<Pixels>
             + 'static,
     {
         self.invalidator.debug_assert_prepaint();
@@ -4380,11 +7797,7 @@ impl Window {
             .request_measured_layout(style, rem_size, scale_factor, measure)
     }
 
-    pub(crate) fn request_pure_measured_layout(
-        &mut self,
-        style: Style,
-        measure: PureSizeMeasure,
-    ) -> LayoutId {
+    fn request_pure_measured_layout(&mut self, style: Style, measure: PureSizeMeasure) -> LayoutId {
         self.invalidator.debug_assert_prepaint();
 
         let rem_size = self.rem_size();
@@ -4403,7 +7816,7 @@ impl Window {
     /// supplies known dimensions and available space at measurement time, but
     /// the measurement can be retained across frames because GPUI can compare
     /// the explicit `content_size` input.
-    pub fn request_content_size_measured_layout(
+    fn request_content_size_measured_layout(
         &mut self,
         style: Style,
         content_size: Size<Pixels>,
@@ -4423,7 +7836,7 @@ impl Window {
             )
     }
 
-    pub(crate) fn request_text_measured_layout<F, H>(
+    fn request_text_measured_layout<F, H>(
         &mut self,
         style: Style,
         measure_key: TextMeasureKey,
@@ -4434,8 +7847,7 @@ impl Window {
         F: FnMut(
                 Size<Option<Pixels>>,
                 Size<AvailableSpace>,
-                &mut Window,
-                &mut App,
+                &mut MeasureCx<'_>,
             ) -> TextLayoutArtifact
             + 'static,
         H: Fn(&TextLayoutArtifact) + 'static,
@@ -4457,48 +7869,68 @@ impl Window {
             )
     }
 
-    pub(crate) fn compute_detached_root_layout(
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn draw_test_element<E: crate::element::Element>(
         &mut self,
-        root: DetachedLayoutRoot<'_>,
+        origin: Point<Pixels>,
         available_space: Size<AvailableSpace>,
+        element: E,
         cx: &mut App,
-    ) {
-        let retained_root = self.layout_engine.as_mut().unwrap().retained_root(
-            root.layout_id(),
-            root.root_site(),
-            root.global_id(),
-        );
-        self.compute_layout_in_root(retained_root, available_space, cx);
-    }
+    ) -> (E::RequestLayoutState, E::PrepaintState) {
+        self.layout_engine.as_mut().unwrap().begin_frame();
+        let mut layout_frame = LayoutFrame::new();
 
-    pub(crate) fn with_scratch_layout_engine<R>(
-        &mut self,
-        cx: &mut App,
-        f: impl FnOnce(&mut Self, &mut App) -> R,
-    ) -> R {
-        self.invalidator.debug_assert_prepaint();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.invalidator.set_phase(DrawPhase::Prepaint);
+            let mut element = crate::element::Drawable::new(element);
+            let mut pass = DetachedRootLayoutPass { _private: () };
+            let request =
+                element.request_detached_root_layout(available_space, &mut pass, self, cx);
+            let layout_id = request.layout_id();
 
-        let retained_layout_engine = self.layout_engine.take().unwrap();
-        self.layout_engine = Some(LayoutEngine::new());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, cx)));
-        self.layout_engine = Some(retained_layout_engine);
+            if request.needs_solve() {
+                layout_frame.compute_detached_root_layout(
+                    self,
+                    layout_id,
+                    RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+                    request.global_id(),
+                    available_space,
+                    cx,
+                );
+                element.mark_detached_root_layout_computed(layout_id, available_space, &mut pass);
+            }
+
+            self.with_absolute_element_offset(origin, |window| {
+                let mut prepaint_cx = crate::PrepaintCx::new(window);
+                element.prepaint(&mut prepaint_cx, cx);
+            });
+
+            self.drain_frame_prepaint_phase(cx, &mut layout_frame);
+
+            self.invalidator.set_phase(DrawPhase::Paint);
+            let (request_layout_state, prepaint_state) = {
+                let mut paint_cx = crate::PaintCx::new(self);
+                element.paint(&mut paint_cx, cx)
+            };
+
+            self.invalidator.set_phase(DrawPhase::None);
+            self.refresh();
+
+            drop(element);
+            cx.element_arena.borrow_mut().clear();
+
+            (request_layout_state, prepaint_state)
+        }));
+        let mut layout_work_sample = self.layout_engine.as_mut().unwrap().finish_frame();
+        layout_work_sample.draw_index = self.next_layout_work_draw_index;
+        self.next_layout_work_draw_index = self.next_layout_work_draw_index.saturating_add(1);
+        self.last_layout_work_sample = Some(layout_work_sample);
+        self.text_system().finish_frame();
+
         match result {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         }
-    }
-
-    fn compute_layout_in_root(
-        &mut self,
-        root: RetainedLayoutRoot,
-        available_space: Size<AvailableSpace>,
-        cx: &mut App,
-    ) {
-        self.invalidator.debug_assert_prepaint();
-
-        let mut layout_engine = self.layout_engine.take().unwrap();
-        layout_engine.compute_retained_layout(root, available_space, self, cx);
-        self.layout_engine = Some(layout_engine);
     }
 
     /// Returns the layout work sample for the most recently completed draw.
@@ -4540,15 +7972,14 @@ impl Window {
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///
     /// This method should only be called as part of element drawing.
-    pub fn layout_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
+    fn layout_bounds(&self, layout_id: LayoutId) -> Bounds<Pixels> {
         self.invalidator.debug_assert_prepaint();
 
-        let scale_factor = self.scale_factor();
         let mut bounds = self
             .layout_engine
-            .as_mut()
+            .as_ref()
             .unwrap()
-            .layout_bounds(layout_id, scale_factor)
+            .layout_bounds(layout_id)
             .map(Into::into);
         let snapped_offset = self.pixel_snap_point(self.element_offset());
         bounds.origin += snapped_offset;
@@ -5839,12 +9270,13 @@ impl Window {
 
     /// Toggles the inspector mode on this window.
     #[cfg(any(feature = "inspector", debug_assertions))]
-    pub fn toggle_inspector(&mut self, cx: &mut App) {
-        self.inspector = match self.inspector {
+    pub fn toggle_inspector(&mut self, cx: &mut App) -> Option<Entity<Inspector>> {
+        self.inspector = match self.inspector.take() {
             None => Some(cx.new(|_| Inspector::new())),
             Some(_) => None,
         };
         self.refresh();
+        self.inspector.clone()
     }
 
     /// Returns true if the window is in inspector mode.
@@ -5881,7 +9313,9 @@ impl Window {
             let active_element_id = inspector.read(cx).active_element_id();
             if Some(inspector_id) == active_element_id {
                 return inspector.update(cx, |inspector, _cx| {
-                    inspector.with_active_element_state(self, f)
+                    let result = inspector.with_active_element_state(self, f);
+                    inspector.sync_active_element_state::<T>(self, _cx);
+                    result
                 });
             }
         }
@@ -5923,13 +9357,19 @@ impl Window {
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]
-    fn prepaint_inspector(&mut self, inspector_width: Pixels, cx: &mut App) -> Option<AnyElement> {
+    fn prepaint_inspector(
+        &mut self,
+        inspector_width: Pixels,
+        layout_frame: &mut LayoutFrame,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
         if let Some(inspector) = self.inspector.take() {
             let mut inspector_element = AnyView::from(inspector.clone()).into_any_element();
-            inspector_element.prepaint_as_root(
+            layout_frame.prepaint_detached_root_at(
+                self,
+                &mut inspector_element,
                 point(self.viewport_size.width - inspector_width, px(0.0)),
                 size(inspector_width, self.viewport_size.height).into(),
-                self,
                 cx,
             );
             self.inspector = Some(inspector);
@@ -5942,7 +9382,8 @@ impl Window {
     #[cfg(any(feature = "inspector", debug_assertions))]
     fn paint_inspector(&mut self, mut inspector_element: Option<AnyElement>, cx: &mut App) {
         if let Some(mut inspector_element) = inspector_element {
-            inspector_element.paint(self, cx);
+            let mut paint_cx = PaintCx::new(self);
+            inspector_element.paint(&mut paint_cx, cx);
         };
     }
 
@@ -6583,7 +10024,11 @@ mod tests {
     struct LayoutTelemetryTestView;
 
     impl Render for LayoutTelemetryTestView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(
+            &mut self,
+            _: &mut crate::BuildCx<'_>,
+            _: &mut Context<Self>,
+        ) -> impl IntoElement {
             div().child(div()).child(div())
         }
     }
@@ -6655,38 +10100,5 @@ mod tests {
         assert_eq!(second_sample.measured_layout_node_requests, 0);
         assert_eq!(second_sample.child_edges, 2);
         assert_eq!(second_sample.compute_layout_calls, 1);
-    }
-
-    #[test]
-    fn scratch_layout_engine_restores_retained_engine_after_panic() {
-        let mut test_app = TestAppContext::single();
-        let window = test_app.add_window(|_, _| crate::Empty);
-
-        let (panicked, retained_sample) = test_app
-            .update_window(*window.deref(), |_, window, cx| {
-                window.invalidator.set_phase(DrawPhase::Prepaint);
-                window.layout_engine.as_mut().unwrap().begin_frame();
-
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    window.with_scratch_layout_engine(cx, |window, cx| {
-                        let _ = window.request_layout(Style::default(), [], cx);
-                        panic!("scratch layout probe");
-                    });
-                }));
-
-                window.invalidator.set_phase(DrawPhase::None);
-                (
-                    result.is_err(),
-                    window.layout_engine.as_mut().unwrap().finish_frame(),
-                )
-            })
-            .unwrap();
-
-        assert!(panicked);
-        assert_eq!(retained_sample.layout_node_requests, 0);
-        assert_eq!(retained_sample.measured_layout_node_requests, 0);
-        assert_eq!(retained_sample.child_edges, 0);
-        assert_eq!(retained_sample.compute_layout_calls, 0);
-        assert_eq!(retained_sample.solver_compute_layout_calls, 0);
     }
 }

@@ -31,8 +31,9 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    FontStyle, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout,
-    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderGroupDrawOutcome, RenderImage,
+    FontStyle, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageLoadCx, ImageSource, Keymap,
+    LineLayout, Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderGroupDrawOutcome,
+    RenderImage,
     RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
     SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point,
     px, size,
@@ -2880,8 +2881,9 @@ impl Image {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Arc<RenderImage>> {
+        let mut image_cx = ImageLoadCx::from_window(window);
         ImageSource::Image(self)
-            .use_data(None, window, cx)
+            .use_data(None, &mut image_cx, cx)
             .and_then(|result| result.ok())
     }
 
@@ -2891,8 +2893,9 @@ impl Image {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Arc<RenderImage>> {
+        let mut image_cx = ImageLoadCx::from_window(window);
         ImageSource::Image(self)
-            .get_data(None, window, cx)
+            .get_data(None, &mut image_cx, cx)
             .and_then(|result| result.ok())
     }
 

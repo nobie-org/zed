@@ -159,6 +159,13 @@ impl BackendMeasureObservation {
             available_space_from_taffy(self.0.available_space().height, scale_factor),
         )
     }
+
+    pub(super) fn measured_size(&self, scale_factor: f32) -> Size<Pixels> {
+        size(
+            Pixels(self.0.measured_size().width / scale_factor),
+            Pixels(self.0.measured_size().height / scale_factor),
+        )
+    }
 }
 
 #[derive(Clone)]

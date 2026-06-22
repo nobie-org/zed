@@ -1,9 +1,9 @@
 use super::super::{LayoutId, RetainedLayoutRootId, RetainedLayoutRootSite};
 use super::{
-    bounds_cache::BoundsCache,
     committed::CommittedLayoutState,
-    facts::{LayoutArtifactPolicy, LayoutIntent, LayoutIntentKind},
-    frame::FrameIntents,
+    facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind, LayoutArtifactPolicy},
+    frame::CurrentLayoutFactsLog,
+    geometry::FrameLayoutOutput,
     measurement::{
         CurrentMeasurement, LayoutMeasureContext, MeasuredLayoutFacts, MeasuredLayoutResult,
         MeasurementStore, PureSizeMeasure,
@@ -39,21 +39,21 @@ fn global_id(id: u8) -> GlobalElementId {
     GlobalElementId(Arc::from([ElementId::Integer(id.into())]))
 }
 
-fn unmeasured_intent(children: Vec<LayoutId>) -> LayoutIntent {
-    LayoutIntent {
+fn unmeasured_facts(children: Vec<LayoutId>) -> CurrentLayoutNodeFacts {
+    CurrentLayoutNodeFacts {
         global_id: None,
         style: SolverStyle::default(),
         artifact_policy: LayoutArtifactPolicy::CanProduceArtifacts,
-        kind: LayoutIntentKind::Unmeasured { children },
+        kind: CurrentLayoutNodeKind::Unmeasured { children },
     }
 }
 
-fn measured_intent(measured_facts: MeasuredLayoutFacts) -> LayoutIntent {
-    LayoutIntent {
+fn measured_facts(measured_facts: MeasuredLayoutFacts) -> CurrentLayoutNodeFacts {
+    CurrentLayoutNodeFacts {
         global_id: None,
         style: SolverStyle::default(),
         artifact_policy: LayoutArtifactPolicy::CanProduceArtifacts,
-        kind: LayoutIntentKind::Measured(measured_facts),
+        kind: CurrentLayoutNodeKind::Measured(measured_facts),
     }
 }
 
@@ -74,7 +74,7 @@ fn occurrence(node_id: SolverNodeId) -> RetainedLayoutOccurrence {
 
 fn producer_context(width: f32, height: f32) -> LayoutMeasureContext {
     LayoutMeasureContext {
-        measure: StackSafe::new(Box::new(move |_, _, _, _| {
+        measure: StackSafe::new(Box::new(move |_, _, _| {
             MeasuredLayoutResult::Size(size(px(width), px(height)))
         })),
         text_hydrator: None,
@@ -151,22 +151,22 @@ fn root_registry_matches_generated_identity_model(_cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn frame_intents_checkpoint_restores_exact_intent_log(_cx: &mut TestAppContext) {
+fn frame_facts_checkpoint_restores_exact_facts_log(_cx: &mut TestAppContext) {
     hegel::Hegel::new(|tc| {
         let before_count = draw_usize(&tc, 0, 16);
         let after_count = draw_usize(&tc, 0, 16);
-        let mut frame = FrameIntents::new();
+        let mut frame = CurrentLayoutFactsLog::new();
         let mut expected = Vec::new();
 
         for _ in 0..before_count {
-            let intent = unmeasured_intent(Vec::new());
-            let id = frame.push_intent(intent.clone());
-            expected.push((id, intent));
+            let facts = unmeasured_facts(Vec::new());
+            let id = frame.push_facts(facts.clone());
+            expected.push((id, facts));
         }
 
         let checkpoint = frame.checkpoint();
         for _ in 0..after_count {
-            let _ = frame.push_intent(measured_intent(MeasuredLayoutFacts::opaque()));
+            let _ = frame.push_facts(measured_facts(MeasuredLayoutFacts::opaque()));
         }
         frame.rollback_to_checkpoint(checkpoint);
 
@@ -177,11 +177,11 @@ fn frame_intents_checkpoint_restores_exact_intent_log(_cx: &mut TestAppContext) 
         assert_eq!(
             expected
                 .iter()
-                .map(|(id, _)| (*id, frame.intent(*id).clone()))
+                .map(|(id, _)| (*id, frame.facts(*id).clone()))
                 .collect::<Vec<_>>(),
             expected
         );
-        let next = frame.push_intent(unmeasured_intent(Vec::new()));
+        let next = frame.push_facts(unmeasured_facts(Vec::new()));
         assert_eq!(next, LayoutId(before_count));
     })
     .settings(hegel_settings(128))
@@ -301,50 +301,56 @@ fn root_slots_checkpoint_restores_current_roots_and_detached_removals(_cx: &mut 
 }
 
 #[gpui::test]
-fn bounds_cache_checkpoint_restores_cached_absolute_bounds(_cx: &mut TestAppContext) {
+fn frame_layout_output_checkpoint_restores_captured_absolute_bounds(_cx: &mut TestAppContext) {
     hegel::Hegel::new(|tc| {
         let width = draw_u8(&tc, 0, 200) as f32;
         let height = draw_u8(&tc, 0, 200) as f32;
         let scale_factor = draw_u8(&tc, 1, 4) as f32;
+        let available_space = size(
+            super::super::AvailableSpace::Definite(px(width.max(1.0))),
+            super::super::AvailableSpace::Definite(px(height.max(1.0))),
+        );
         let mut solver = LayoutSolver::new();
         let child = solver.new_leaf(SolverStyle::test_with_size(width, height));
         let root = solver.new_with_children(SolverStyle::default(), &[child]);
         solver.compute_layout_with_measure_and_cache_events(
             root,
-            size(
-                super::super::AvailableSpace::Definite(px(width.max(1.0))),
-                super::super::AvailableSpace::Definite(px(height.max(1.0))),
-            ),
+            available_space,
             1.0,
             |_node_id, _has_measure_context, _query| size(0.0, 0.0),
             |_| {},
         );
-        let layouts = solver
-            .capture_layout_tree(root)
-            .into_iter()
-            .collect::<HashMap<_, _>>();
 
-        let mut cache = BoundsCache::new();
-        let first = cache.layout_bounds_for_node(
-            child,
-            scale_factor,
-            |node_id| layouts[&node_id],
-            |node_id| solver.parent(node_id),
-        );
-        let checkpoint = cache.checkpoint();
-        let _ = cache.layout_bounds_for_node(
+        let mut output = FrameLayoutOutput::new();
+        let root_id = RetainedLayoutRootId::new(1);
+        output.begin_solve(root_id, root, available_space, scale_factor);
+        output.capture_from_solver(
+            root_id,
             root,
+            available_space,
             scale_factor,
-            |node_id| layouts[&node_id],
+            solver.capture_layout_tree(root),
             |node_id| solver.parent(node_id),
+            |node_id| {
+                if node_id == root {
+                    Some(LayoutId(1))
+                } else if node_id == child {
+                    Some(LayoutId(2))
+                } else {
+                    None
+                }
+            },
         );
-        cache.rollback_to_checkpoint(checkpoint);
-        let second = cache.layout_bounds_for_node(
-            child,
-            scale_factor,
-            |node_id| layouts[&node_id],
-            |node_id| solver.parent(node_id),
-        );
+
+        let first = output
+            .bounds(LayoutId(2))
+            .expect("captured frame output should contain child bounds");
+        let checkpoint = output.checkpoint();
+        output.begin_frame();
+        output.rollback_to_checkpoint(checkpoint);
+        let second = output
+            .bounds(LayoutId(2))
+            .expect("rollback should restore captured child bounds");
 
         assert_eq!(second, first);
         assert_eq!(

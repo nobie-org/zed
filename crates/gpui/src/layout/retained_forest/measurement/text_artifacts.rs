@@ -11,7 +11,7 @@ use collections::FxHashMap;
 pub(super) struct TextArtifactStore {
     current_artifacts: FxHashMap<SolverNodeId, TextLayoutArtifact>,
     current_query_artifacts: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
-    pending_queries: Vec<PendingTextArtifactQuery>,
+    pending_proofs: Vec<TextArtifactProof>,
     query_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
 }
 
@@ -19,16 +19,23 @@ pub(super) struct TextArtifactStore {
 pub(super) struct TextArtifactStoreCheckpoint {
     current_artifacts: FxHashMap<SolverNodeId, TextLayoutArtifact>,
     current_query_artifacts: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
-    pending_queries: Vec<PendingTextArtifactQuery>,
+    pending_proofs: Vec<TextArtifactProof>,
     query_cache: FxHashMap<TextArtifactCacheKey, TextLayoutArtifact>,
 }
 
+/// Solver-observed proof that a text node used one exact measurement result.
+///
+/// `TextMeasureKey` alone is insufficient because wrapping and truncation also
+/// depend on the solver query. The measured size is part of the proof so a
+/// cached artifact with the same facts and query cannot silently stand in for a
+/// different solver result.
 #[derive(Clone)]
-pub(super) struct PendingTextArtifactQuery {
+pub(super) struct TextArtifactProof {
     pub(super) node_id: SolverNodeId,
     pub(super) text_key: TextMeasureKey,
     pub(super) known_dimensions: Size<Option<Pixels>>,
     pub(super) available_space: Size<AvailableSpace>,
+    pub(super) measured_size: Size<Pixels>,
 }
 
 impl TextArtifactStore {
@@ -36,7 +43,7 @@ impl TextArtifactStore {
         Self {
             current_artifacts: FxHashMap::default(),
             current_query_artifacts: FxHashMap::default(),
-            pending_queries: Vec::new(),
+            pending_proofs: Vec::new(),
             query_cache: FxHashMap::default(),
         }
     }
@@ -44,21 +51,21 @@ impl TextArtifactStore {
     pub(super) fn begin_frame(&mut self) {
         self.current_artifacts.clear();
         self.current_query_artifacts.clear();
-        self.pending_queries.clear();
+        self.pending_proofs.clear();
     }
 
     pub(super) fn finish_frame(&mut self) {
         self.retain_current_query_cache();
         self.current_artifacts.clear();
         self.current_query_artifacts.clear();
-        self.pending_queries.clear();
+        self.pending_proofs.clear();
     }
 
     pub(super) fn checkpoint(&self) -> TextArtifactStoreCheckpoint {
         TextArtifactStoreCheckpoint {
             current_artifacts: self.current_artifacts.clone(),
             current_query_artifacts: self.current_query_artifacts.clone(),
-            pending_queries: self.pending_queries.clone(),
+            pending_proofs: self.pending_proofs.clone(),
             query_cache: self.query_cache.clone(),
         }
     }
@@ -66,16 +73,16 @@ impl TextArtifactStore {
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: TextArtifactStoreCheckpoint) {
         self.current_artifacts = checkpoint.current_artifacts;
         self.current_query_artifacts = checkpoint.current_query_artifacts;
-        self.pending_queries = checkpoint.pending_queries;
+        self.pending_proofs = checkpoint.pending_proofs;
         self.query_cache = checkpoint.query_cache;
     }
 
-    pub(super) fn push_pending_query(&mut self, query: PendingTextArtifactQuery) {
-        self.pending_queries.push(query);
+    pub(super) fn push_pending_proof(&mut self, proof: TextArtifactProof) {
+        self.pending_proofs.push(proof);
     }
 
-    pub(super) fn take_pending_queries(&mut self) -> Vec<PendingTextArtifactQuery> {
-        std::mem::take(&mut self.pending_queries)
+    pub(super) fn take_pending_proofs(&mut self) -> Vec<TextArtifactProof> {
+        std::mem::take(&mut self.pending_proofs)
     }
 
     pub(super) fn current_artifacts(&self) -> Vec<(SolverNodeId, TextLayoutArtifact)> {
@@ -143,7 +150,7 @@ impl TextArtifactStore {
     }
 }
 
-impl PendingTextArtifactQuery {
+impl TextArtifactProof {
     pub(super) fn from_solver_measure_observation(
         text_key: TextMeasureKey,
         observation: SolverMeasureObservation,
@@ -155,6 +162,7 @@ impl PendingTextArtifactQuery {
             text_key,
             known_dimensions: query.known_dimensions,
             available_space: query.available_space,
+            measured_size: observation.measured_size(scale_factor),
         }
     }
 

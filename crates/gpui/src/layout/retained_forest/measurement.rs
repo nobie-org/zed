@@ -6,32 +6,36 @@
 //! never stores GPUI paint or hit-test state.
 
 mod producer_registry;
+#[cfg(test)]
+mod tests;
 mod text_artifacts;
 
 use super::super::LayoutId;
 use super::AvailableSpace;
 use super::solver::{SolverCacheEvent, SolverMeasureObservation, SolverNodeId};
-use crate::{App, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size};
+use crate::{
+    App, MeasureCx, Pixels, Size, TextLayoutArtifact, TextMeasureKey, Window, size,
+    util::ceil_to_device_pixel,
+};
 use collections::FxHashMap;
 use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
 use stacksafe::StackSafe;
 use std::rc::Rc;
 use text_artifacts::{
-    PendingTextArtifactQuery, TextArtifactCacheKey, TextArtifactStore, TextArtifactStoreCheckpoint,
+    TextArtifactCacheKey, TextArtifactProof, TextArtifactStore, TextArtifactStoreCheckpoint,
 };
 
 /// Current-frame executable producer for measured layout.
 ///
-/// This callback can call into GPUI/window state while the solver asks for a size. It
-/// is not comparable retained meaning; opaque producers are intentionally
-/// conservative unless a call site supplies an explicit pure measure key.
+/// The producer answers one solver size query through `MeasureCx`. It is not
+/// comparable retained meaning; opaque producers are intentionally conservative
+/// unless a call site supplies an explicit pure measure key.
 pub(super) type NodeMeasureFn = StackSafe<
     Box<
         dyn FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
+            &mut MeasureCx<'_>,
         ) -> MeasuredLayoutResult,
     >,
 >;
@@ -45,7 +49,7 @@ pub(super) struct NodeContext;
 
 type TextHydrator = Rc<dyn Fn(&TextLayoutArtifact)>;
 
-/// Current-frame producer bundle registered for a measured intent.
+/// Current-frame producer bundle registered for a measured facts.
 ///
 /// Text measured nodes also carry a hydrator that installs an artifact into the
 /// current element state when the current compute invokes the text producer.
@@ -73,7 +77,7 @@ impl MeasuredLayoutResult {
     }
 }
 
-/// Measurement-owned request data for one measured layout intent.
+/// Measurement-owned request data for one measured layout facts.
 ///
 /// The retained forest treats this as a generic measured node. This type owns
 /// the distinction between opaque producers, pure size facts, and text artifact
@@ -93,19 +97,17 @@ impl MeasuredLayoutRequest {
         mut measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
+            &mut MeasureCx<'_>,
         ) -> Size<Pixels>
         + 'static,
     ) -> Self {
         Self::Opaque(LayoutMeasureContext {
             measure: StackSafe::new(Box::new(
-                move |known_dimensions, available_space, window, cx| {
+                move |known_dimensions, available_space, measure_cx| {
                     MeasuredLayoutResult::Size(measure(
                         known_dimensions,
                         available_space,
-                        window,
-                        cx,
+                        measure_cx,
                     ))
                 },
             )),
@@ -123,8 +125,7 @@ impl MeasuredLayoutRequest {
         mut measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
+            &mut MeasureCx<'_>,
         ) -> TextLayoutArtifact
         + 'static,
     ) -> Self {
@@ -132,12 +133,11 @@ impl MeasuredLayoutRequest {
             key: measure_key,
             context: LayoutMeasureContext {
                 measure: StackSafe::new(Box::new(
-                    move |known_dimensions, available_space, window, cx| {
+                    move |known_dimensions, available_space, measure_cx| {
                         MeasuredLayoutResult::Text(measure(
                             known_dimensions,
                             available_space,
-                            window,
-                            cx,
+                            measure_cx,
                         ))
                     },
                 )),
@@ -343,7 +343,7 @@ impl MeasuredLayoutFacts {
         known_dimensions: Size<Option<Pixels>>,
         available_space: Size<AvailableSpace>,
         window: &mut Window,
-        cx: &mut App,
+        cx: &App,
     ) -> Size<Pixels> {
         match &self.0 {
             MeasuredLayoutFactsRepr::Opaque => {
@@ -353,7 +353,11 @@ impl MeasuredLayoutFacts {
                 measure.measure(known_dimensions, available_space)
             }
             MeasuredLayoutFactsRepr::Text(key) => key
-                .measure(known_dimensions, available_space, window, cx)
+                .measure(
+                    known_dimensions,
+                    available_space,
+                    &mut MeasureCx::new(window, cx),
+                )
                 .size(),
         }
     }
@@ -389,31 +393,69 @@ pub(super) enum CurrentMeasurement {
     Text { key: TextMeasureKey, measure: usize },
 }
 
-/// Telemetry classification for one measured callback.
+/// Telemetry classification for one measured solver query.
 ///
-/// The measurement owner decides how callback work should be counted. Subtree
+/// The measurement owner decides whether the query required GPUI measurement
+/// work or was answered from an exact retained artifact/cache proof. Subtree
 /// proof instrumentation should not know whether the producer is text, a list,
 /// or any future measured kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct MeasuredCallbackTelemetry {
     no_work_exempt: bool,
+    counts_layout_work: bool,
 }
 
 impl MeasuredCallbackTelemetry {
     fn hard_work() -> Self {
         Self {
             no_work_exempt: false,
+            counts_layout_work: true,
         }
     }
 
     fn no_work_exempt() -> Self {
         Self {
             no_work_exempt: true,
+            counts_layout_work: false,
         }
     }
 
     pub(super) fn is_no_work_exempt(self) -> bool {
         self.no_work_exempt
+    }
+
+    pub(super) fn counts_layout_work(self) -> bool {
+        self.counts_layout_work
+    }
+}
+
+/// Size answer for one measured solver query plus GPUI work attribution.
+pub(super) struct MeasuredQueryAnswer {
+    size: Size<Pixels>,
+    telemetry: MeasuredCallbackTelemetry,
+}
+
+impl MeasuredQueryAnswer {
+    fn hard_work(size: Size<Pixels>) -> Self {
+        Self {
+            size,
+            telemetry: MeasuredCallbackTelemetry::hard_work(),
+        }
+    }
+
+    fn no_work(size: Size<Pixels>) -> Self {
+        Self {
+            size,
+            telemetry: MeasuredCallbackTelemetry::no_work_exempt(),
+        }
+    }
+
+    pub(super) fn size(&self) -> Size<Pixels> {
+        self.size
+    }
+
+    pub(super) fn telemetry(&self) -> MeasuredCallbackTelemetry {
+        self.telemetry
     }
 }
 
@@ -569,7 +611,7 @@ impl MeasurementStore {
             .expect("measured layout id should have a registered current measurement request");
         assert_eq!(
             &measured.facts, facts,
-            "registered measured request facts should match the committed intent"
+            "registered measured request facts should match the committed facts"
         );
         self.current_measurements
             .insert(node_id, measured.measurement);
@@ -646,7 +688,7 @@ impl MeasurementStore {
                 Some(CurrentMeasurement::Text { key: actual, .. }),
             ) => assert_eq!(actual, expected),
             _ => {
-                panic!("measured intent should have matching current measurement state")
+                panic!("measured facts should have matching current measurement state")
             }
         }
     }
@@ -661,16 +703,17 @@ impl MeasurementStore {
     pub(super) fn finish_completed_solve(
         &mut self,
         observer: &MeasurementSolveObserver,
+        scale_factor: f32,
         window: &mut Window,
         cx: &mut App,
     ) {
-        for query in self.text_artifacts.take_pending_queries() {
-            let cache_key = query.cache_key();
+        for proof in self.text_artifacts.take_pending_proofs() {
+            let cache_key = proof.cache_key();
             if let Some(artifact) = self.text_artifacts.current_artifact_for_query(&cache_key) {
-                text_artifact_matches_query(&artifact, &query);
+                assert_text_artifact_matches_proof(&artifact, &proof, scale_factor);
                 continue;
             }
-            self.hydrate_text_query_from_current_producer(query, window, cx);
+            self.hydrate_text_artifact_from_current_producer(proof, scale_factor, window, cx);
         }
 
         self.assert_solved_root_text_artifacts_selected(observer);
@@ -710,29 +753,35 @@ impl MeasurementStore {
     }
 
     #[stacksafe::stacksafe]
-    fn hydrate_text_query_from_current_producer(
+    fn hydrate_text_artifact_from_current_producer(
         &mut self,
-        query: PendingTextArtifactQuery,
+        proof: TextArtifactProof,
+        scale_factor: f32,
         window: &mut Window,
-        cx: &mut App,
+        cx: &App,
     ) {
         let Some(CurrentMeasurement::Text { key, measure }) =
-            self.current_measurements.get(&query.node_id).cloned()
+            self.current_measurements.get(&proof.node_id).cloned()
         else {
             panic!("solver cache-hit text query should refer to a current text measurement");
         };
         assert_eq!(
-            &key, &query.text_key,
+            &key, &proof.text_key,
             "solver cache-hit text query should match the current text measure key"
         );
 
         let artifact = {
+            let mut measure_cx = MeasureCx::new(window, cx);
             let measure = &mut self
                 .producers
                 .context_mut(measure)
                 .expect("text measured layout should have a current producer and hydrator")
                 .measure;
-            match measure(query.known_dimensions, query.available_space, window, cx) {
+            match measure(
+                proof.known_dimensions,
+                proof.available_space,
+                &mut measure_cx,
+            ) {
                 MeasuredLayoutResult::Text(artifact) => artifact,
                 MeasuredLayoutResult::Size(_) => {
                     panic!("text measured layout producer returned a size-only result");
@@ -744,11 +793,11 @@ impl MeasurementStore {
             &key,
             "hydrated solver cache-hit text artifact should match the current text measure key"
         );
-        text_artifact_matches_query(&artifact, &query);
+        assert_text_artifact_matches_proof(&artifact, &proof, scale_factor);
 
-        let cache_key = query.cache_key();
+        let cache_key = proof.cache_key();
         self.text_artifacts
-            .record_for_query(query.node_id, cache_key.clone(), &artifact);
+            .record_for_query(proof.node_id, cache_key.clone(), &artifact);
         self.text_artifacts.cache_artifact(cache_key, artifact);
     }
 
@@ -802,20 +851,6 @@ impl<'a> ComputeMeasurementState<'a> {
         self.current_measurements.contains_key(&node_id)
     }
 
-    pub(super) fn callback_telemetry(
-        &self,
-        node_id: SolverNodeId,
-    ) -> Option<MeasuredCallbackTelemetry> {
-        match self.current_measurements.get(&node_id) {
-            Some(CurrentMeasurement::Opaque(_)) => Some(MeasuredCallbackTelemetry::hard_work()),
-            Some(CurrentMeasurement::PureSize(_)) => Some(MeasuredCallbackTelemetry::hard_work()),
-            Some(CurrentMeasurement::Text { .. }) => {
-                Some(MeasuredCallbackTelemetry::no_work_exempt())
-            }
-            None => None,
-        }
-    }
-
     #[stacksafe::stacksafe]
     pub(super) fn measure(
         &mut self,
@@ -823,11 +858,12 @@ impl<'a> ComputeMeasurementState<'a> {
         known_dimensions: Size<Option<Pixels>>,
         available_space: Size<AvailableSpace>,
         window: &mut Window,
-        cx: &mut App,
-    ) -> Size<Pixels> {
+        cx: &App,
+    ) -> MeasuredQueryAnswer {
         let Some(current_measurement) = self.current_measurements.get(&node_id).cloned() else {
             panic!("measured layout mirror node should have a current GPUI measurement producer");
         };
+        let mut measure_cx = MeasureCx::new(window, cx);
 
         match current_measurement {
             CurrentMeasurement::Opaque(measure) => {
@@ -836,10 +872,12 @@ impl<'a> ComputeMeasurementState<'a> {
                     .context_mut(measure)
                     .expect("opaque measured layout should have a current producer")
                     .measure;
-                measure(known_dimensions, available_space, window, cx).size()
+                MeasuredQueryAnswer::hard_work(
+                    measure(known_dimensions, available_space, &mut measure_cx).size(),
+                )
             }
             CurrentMeasurement::PureSize(measure) => {
-                measure.measure(known_dimensions, available_space)
+                MeasuredQueryAnswer::hard_work(measure.measure(known_dimensions, available_space))
             }
             CurrentMeasurement::Text { key, measure, .. } => {
                 let cache_key = TextArtifactCacheKey::new(
@@ -851,7 +889,7 @@ impl<'a> ComputeMeasurementState<'a> {
                 if let Some(artifact) = self.text_artifacts.artifact_for_query(&cache_key) {
                     let size = artifact.size();
                     self.record_text_artifact_for_query(node_id, cache_key, &artifact);
-                    return size;
+                    return MeasuredQueryAnswer::no_work(size);
                 }
 
                 let measure_id = measure;
@@ -861,7 +899,7 @@ impl<'a> ComputeMeasurementState<'a> {
                         .context_mut(measure_id)
                         .expect("text measured layout should have a current producer and hydrator")
                         .measure;
-                    match measure(known_dimensions, available_space, window, cx) {
+                    match measure(known_dimensions, available_space, &mut measure_cx) {
                         MeasuredLayoutResult::Text(artifact) => artifact,
                         MeasuredLayoutResult::Size(_) => {
                             panic!("text measured layout producer returned a size-only result");
@@ -876,7 +914,7 @@ impl<'a> ComputeMeasurementState<'a> {
                 let size = artifact.size();
                 self.record_text_artifact_for_query(node_id, cache_key.clone(), &artifact);
                 self.text_artifacts.cache_artifact(cache_key, artifact);
-                size
+                MeasuredQueryAnswer::hard_work(size)
             }
         }
     }
@@ -906,14 +944,14 @@ impl<'a> ComputeMeasurementState<'a> {
             return;
         };
         let key = key.clone();
-        let pending_query = PendingTextArtifactQuery::from_solver_measure_observation(
+        let proof = TextArtifactProof::from_solver_measure_observation(
             key.clone(),
             observation,
             scale_factor,
         );
-        let query_key = pending_query.cache_key();
+        let query_key = proof.cache_key();
         let Some(artifact) = self.text_artifacts.artifact_for_query(&query_key) else {
-            self.text_artifacts.push_pending_query(pending_query);
+            self.text_artifacts.push_pending_proof(proof);
             return;
         };
         assert_eq!(
@@ -921,7 +959,7 @@ impl<'a> ComputeMeasurementState<'a> {
             &key,
             "solver measure observation text artifact should match the current text measure key"
         );
-        text_artifact_matches_query(&artifact, &pending_query);
+        assert_text_artifact_matches_proof(&artifact, &proof, scale_factor);
         self.record_text_artifact_for_query(node_id, query_key, &artifact);
     }
 
@@ -936,14 +974,28 @@ impl<'a> ComputeMeasurementState<'a> {
     }
 }
 
-fn text_artifact_matches_query(
+fn assert_text_artifact_matches_proof(
     artifact: &TextLayoutArtifact,
-    query: &PendingTextArtifactQuery,
-) -> bool {
+    proof: &TextArtifactProof,
+    scale_factor: f32,
+) {
     assert_eq!(
         artifact.key(),
-        &query.text_key,
+        &proof.text_key,
         "current text artifact should match the exact solver query text key"
     );
-    true
+    assert_eq!(
+        snap_text_artifact_size_to_solver_measurement(artifact.size(), scale_factor),
+        proof.measured_size,
+        "current text artifact should match the exact solver query measured size"
+    );
+}
+
+fn snap_text_artifact_size_to_solver_measurement(
+    size: Size<Pixels>,
+    scale_factor: f32,
+) -> Size<Pixels> {
+    size.map(|dimension| {
+        Pixels(ceil_to_device_pixel(dimension.0.max(0.0), scale_factor) / scale_factor)
+    })
 }

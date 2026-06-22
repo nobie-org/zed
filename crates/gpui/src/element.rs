@@ -32,9 +32,12 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, ContentMask, Context, DispatchNodeId, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    layout::RetainedLayoutRootSite, util::FluentBuilder, window::with_element_arena,
+    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
+    InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
+    util::FluentBuilder,
+    window::{
+        BuildCx, DetachedRootLayoutPass, LayoutRequestCx, PaintCx, PrepaintCx, with_element_arena,
+    },
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -74,7 +77,7 @@ pub trait Element: 'static + IntoElement {
         &mut self,
         id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState);
 
@@ -86,7 +89,7 @@ pub trait Element: 'static + IntoElement {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState;
 
@@ -99,7 +102,7 @@ pub trait Element: 'static + IntoElement {
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     );
 
@@ -130,11 +133,11 @@ impl<T: IntoElement> FluentBuilder for T {}
 /// other entities. Views are `Entity`'s which `impl Render` and drawn to the screen.
 pub trait Render: 'static + Sized {
     /// Render this view into an element tree.
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement;
+    fn render(&mut self, window: &mut BuildCx<'_>, cx: &mut Context<Self>) -> impl IntoElement;
 }
 
 impl Render for Empty {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut BuildCx<'_>, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
 }
@@ -148,7 +151,7 @@ pub trait RenderOnce: 'static {
     /// Render this component into an element tree. Note that this method
     /// takes ownership of self, as compared to [`Render::render()`] method
     /// which takes a mutable reference.
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
+    fn render(self, window: &mut BuildCx<'_>, cx: &mut App) -> impl IntoElement;
 }
 
 /// This is a helper trait to provide a uniform interface for constructing elements that
@@ -199,7 +202,7 @@ impl<C: RenderOnce> Component<C> {
 
 fn prepaint_component(
     (element, name): &mut (AnyElement, &'static str),
-    window: &mut Window,
+    window: &mut PrepaintCx<'_>,
     cx: &mut App,
 ) {
     window.with_id(ElementId::Name(SharedString::new_static(name)), |window| {
@@ -209,7 +212,7 @@ fn prepaint_component(
 
 fn paint_component(
     (element, name): &mut (AnyElement, &'static str),
-    window: &mut Window,
+    window: &mut PaintCx<'_>,
     cx: &mut App,
 ) {
     window.with_id(ElementId::Name(SharedString::new_static(name)), |window| {
@@ -236,16 +239,17 @@ impl<C: RenderOnce> Element for Component<C> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         window.with_id(ElementId::Name(type_name::<C>().into()), |window| {
-            let mut element = self
-                .component
-                .take()
-                .unwrap()
-                .render(window, cx)
-                .into_any_element();
+            let mut element = window.build(|window| {
+                self.component
+                    .take()
+                    .unwrap()
+                    .render(window, cx)
+                    .into_any_element()
+            });
 
             let layout_id = element.request_layout(window, cx);
             (layout_id, (element, type_name::<C>()))
@@ -258,7 +262,7 @@ impl<C: RenderOnce> Element for Component<C> {
         _inspector_id: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
         state: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) {
         prepaint_component(state, window, cx);
@@ -271,7 +275,7 @@ impl<C: RenderOnce> Element for Component<C> {
         _: Bounds<Pixels>,
         state: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         paint_component(state, window, cx);
@@ -305,56 +309,26 @@ impl Display for GlobalElementId {
 trait ElementObject {
     fn inner_element(&mut self) -> &mut dyn Any;
 
-    fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId;
+    fn request_layout(&mut self, window: &mut LayoutRequestCx<'_>, cx: &mut App) -> LayoutId;
 
-    fn prepaint(&mut self, window: &mut Window, cx: &mut App);
+    fn prepaint(&mut self, window: &mut PrepaintCx<'_>, cx: &mut App);
 
-    fn paint(&mut self, window: &mut Window, cx: &mut App);
+    fn paint(&mut self, window: &mut PaintCx<'_>, cx: &mut App);
 
-    fn layout_as_root(
+    fn request_detached_root_layout(
         &mut self,
         available_space: Size<AvailableSpace>,
-        root_site: RetainedLayoutRootSite,
+        pass: &mut DetachedRootLayoutPass,
         window: &mut Window,
         cx: &mut App,
-    ) -> Size<Pixels>;
-}
+    ) -> DetachedRootLayoutRequest;
 
-/// Capability proving that a layout request belongs to a detached root.
-///
-/// A raw `LayoutId` is not authority to compute an independent root. Only the
-/// `Drawable::layout_as_root` path can construct this token, so ordinary
-/// attached child layout requests cannot be accidentally solved as roots.
-pub(crate) struct DetachedLayoutRoot<'a> {
-    layout_id: LayoutId,
-    root_site: RetainedLayoutRootSite,
-    global_id: Option<&'a GlobalElementId>,
-}
-
-impl<'a> DetachedLayoutRoot<'a> {
-    fn new(
+    fn mark_detached_root_layout_computed(
+        &mut self,
         layout_id: LayoutId,
-        root_site: RetainedLayoutRootSite,
-        global_id: Option<&'a GlobalElementId>,
-    ) -> Self {
-        Self {
-            layout_id,
-            root_site,
-            global_id,
-        }
-    }
-
-    pub(crate) fn layout_id(&self) -> LayoutId {
-        self.layout_id
-    }
-
-    pub(crate) fn root_site(&self) -> RetainedLayoutRootSite {
-        self.root_site
-    }
-
-    pub(crate) fn global_id(&self) -> Option<&GlobalElementId> {
-        self.global_id
-    }
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+    );
 }
 
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
@@ -407,6 +381,31 @@ enum LayoutRequestOwner {
     DetachedRoot,
 }
 
+/// Layout fact requested for a detached root by the frame owner.
+///
+/// This is not solve authority. It only reports the layout id and retained
+/// identity produced by the element's normal `request_layout` path. The
+/// private frame owner decides whether and when that root is solved.
+pub(crate) struct DetachedRootLayoutRequest {
+    layout_id: LayoutId,
+    global_id: Option<GlobalElementId>,
+    needs_solve: bool,
+}
+
+impl DetachedRootLayoutRequest {
+    pub(crate) fn layout_id(&self) -> LayoutId {
+        self.layout_id
+    }
+
+    pub(crate) fn global_id(&self) -> Option<&GlobalElementId> {
+        self.global_id.as_ref()
+    }
+
+    pub(crate) fn needs_solve(&self) -> bool {
+        self.needs_solve
+    }
+}
+
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
 impl<E: Element> Drawable<E> {
     pub(crate) fn new(element: E) -> Self {
@@ -416,33 +415,30 @@ impl<E: Element> Drawable<E> {
         }
     }
 
-    fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
+    fn request_layout(&mut self, window: &mut LayoutRequestCx<'_>, cx: &mut App) -> LayoutId {
         self.request_layout_owned_by(LayoutRequestOwner::AttachedChild, window, cx)
     }
 
     fn request_layout_owned_by(
         &mut self,
         owner: LayoutRequestOwner,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
-                let global_id = self.element.id().map(|element_id| {
-                    window.element_id_stack.push(element_id);
-                    GlobalElementId(Arc::from(&*window.element_id_stack))
-                });
+                let global_id = self
+                    .element
+                    .id()
+                    .map(|element_id| window.push_element_id(element_id));
 
                 let inspector_id;
                 #[cfg(any(feature = "inspector", debug_assertions))]
                 {
-                    inspector_id = self.element.source_location().map(|source| {
-                        let path = crate::InspectorElementPath {
-                            global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
-                            source_location: source,
-                        };
-                        window.build_inspector_element_id(path)
-                    });
+                    inspector_id = self
+                        .element
+                        .source_location()
+                        .map(|source| window.build_inspector_element_id(source));
                 }
                 #[cfg(not(any(feature = "inspector", debug_assertions)))]
                 {
@@ -457,7 +453,7 @@ impl<E: Element> Drawable<E> {
                 );
 
                 if global_id.is_some() {
-                    window.element_id_stack.pop();
+                    window.pop_element_id();
                 }
 
                 self.phase = ElementDrawPhase::RequestLayout {
@@ -473,7 +469,7 @@ impl<E: Element> Drawable<E> {
         }
     }
 
-    pub(crate) fn prepaint(&mut self, window: &mut Window, cx: &mut App) {
+    pub(crate) fn prepaint(&mut self, window: &mut PrepaintCx<'_>, cx: &mut App) {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
@@ -490,12 +486,12 @@ impl<E: Element> Drawable<E> {
                 ..
             } => {
                 if let Some(element_id) = self.element.id() {
-                    window.element_id_stack.push(element_id);
-                    debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*window.element_id_stack);
+                    let current_global_id = window.push_element_id(element_id);
+                    debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*current_global_id.0);
                 }
 
                 let bounds = window.layout_bounds(layout_id);
-                let node_id = window.next_frame.dispatch_tree.push_node();
+                let node_id = window.push_dispatch_node();
                 let prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -504,10 +500,10 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
-                window.next_frame.dispatch_tree.pop_node();
+                window.pop_dispatch_node();
 
                 if global_id.is_some() {
-                    window.element_id_stack.pop();
+                    window.pop_element_id();
                 }
 
                 self.phase = ElementDrawPhase::Prepaint {
@@ -525,7 +521,7 @@ impl<E: Element> Drawable<E> {
 
     pub(crate) fn paint(
         &mut self,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) -> (E::RequestLayoutState, E::PrepaintState) {
         match mem::take(&mut self.phase) {
@@ -539,11 +535,11 @@ impl<E: Element> Drawable<E> {
                 ..
             } => {
                 if let Some(element_id) = self.element.id() {
-                    window.element_id_stack.push(element_id);
-                    debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*window.element_id_stack);
+                    let current_global_id = window.push_element_id(element_id);
+                    debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*current_global_id.0);
                 }
 
-                window.next_frame.dispatch_tree.set_active_node(node_id);
+                window.set_active_dispatch_node(node_id);
                 self.element.paint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -555,7 +551,7 @@ impl<E: Element> Drawable<E> {
                 );
 
                 if global_id.is_some() {
-                    window.element_id_stack.pop();
+                    window.pop_element_id();
                 }
 
                 self.phase = ElementDrawPhase::Painted;
@@ -565,18 +561,62 @@ impl<E: Element> Drawable<E> {
         }
     }
 
-    pub(crate) fn layout_as_root(
+    pub(crate) fn request_detached_root_layout(
         &mut self,
         available_space: Size<AvailableSpace>,
-        root_site: RetainedLayoutRootSite,
+        _pass: &mut DetachedRootLayoutPass,
         window: &mut Window,
         cx: &mut App,
-    ) -> Size<Pixels> {
+    ) -> DetachedRootLayoutRequest {
         if matches!(&self.phase, ElementDrawPhase::Start) {
-            self.request_layout_owned_by(LayoutRequestOwner::DetachedRoot, window, cx);
+            let mut layout_cx = LayoutRequestCx::new(window);
+            self.request_layout_owned_by(LayoutRequestOwner::DetachedRoot, &mut layout_cx, cx);
         }
 
-        let layout_id = match mem::take(&mut self.phase) {
+        match &self.phase {
+            ElementDrawPhase::RequestLayout {
+                layout_id,
+                owner,
+                global_id,
+                ..
+            } => {
+                assert_eq!(
+                    *owner,
+                    LayoutRequestOwner::DetachedRoot,
+                    "attached layout requests cannot be computed as detached roots"
+                );
+                DetachedRootLayoutRequest {
+                    layout_id: *layout_id,
+                    global_id: global_id.clone(),
+                    needs_solve: true,
+                }
+            }
+            ElementDrawPhase::LayoutComputed {
+                layout_id,
+                available_space: prev_available_space,
+                ..
+            } => {
+                assert_eq!(
+                    available_space, *prev_available_space,
+                    "cannot compute one layout root with two available-space values in one frame"
+                );
+                DetachedRootLayoutRequest {
+                    layout_id: *layout_id,
+                    global_id: None,
+                    needs_solve: false,
+                }
+            }
+            _ => panic!("cannot layout detached root after prepaint"),
+        }
+    }
+
+    pub(crate) fn mark_detached_root_layout_computed(
+        &mut self,
+        computed_layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        _pass: &mut DetachedRootLayoutPass,
+    ) {
+        match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
                 owner,
@@ -587,32 +627,11 @@ impl<E: Element> Drawable<E> {
                 assert_eq!(
                     owner,
                     LayoutRequestOwner::DetachedRoot,
-                    "attached layout requests cannot be computed as detached roots"
+                    "attached layout requests cannot be marked as detached-root layouts"
                 );
-                window.compute_detached_root_layout(
-                    DetachedLayoutRoot::new(layout_id, root_site, global_id.as_ref()),
-                    available_space,
-                    cx,
-                );
-                self.phase = ElementDrawPhase::LayoutComputed {
-                    layout_id,
-                    global_id,
-                    inspector_id,
-                    available_space,
-                    request_layout,
-                };
-                layout_id
-            }
-            ElementDrawPhase::LayoutComputed {
-                layout_id,
-                global_id,
-                inspector_id,
-                available_space: prev_available_space,
-                request_layout,
-            } => {
                 assert_eq!(
-                    available_space, prev_available_space,
-                    "cannot compute one layout root with two available-space values in one frame"
+                    layout_id, computed_layout_id,
+                    "detached root layout id must match the solved retained root"
                 );
                 self.phase = ElementDrawPhase::LayoutComputed {
                     layout_id,
@@ -621,12 +640,9 @@ impl<E: Element> Drawable<E> {
                     available_space,
                     request_layout,
                 };
-                layout_id
             }
-            _ => panic!("cannot measure after painting"),
-        };
-
-        window.layout_bounds(layout_id).size
+            _ => panic!("must request detached-root layout before marking it computed"),
+        }
     }
 }
 
@@ -640,79 +656,44 @@ where
     }
 
     #[inline]
-    fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
+    fn request_layout(&mut self, window: &mut LayoutRequestCx<'_>, cx: &mut App) -> LayoutId {
         Drawable::request_layout(self, window, cx)
     }
 
     #[inline]
-    fn prepaint(&mut self, window: &mut Window, cx: &mut App) {
+    fn prepaint(&mut self, window: &mut PrepaintCx<'_>, cx: &mut App) {
         Drawable::prepaint(self, window, cx);
     }
 
     #[inline]
-    fn paint(&mut self, window: &mut Window, cx: &mut App) {
+    fn paint(&mut self, window: &mut PaintCx<'_>, cx: &mut App) {
         Drawable::paint(self, window, cx);
     }
 
     #[inline]
-    fn layout_as_root(
+    fn request_detached_root_layout(
         &mut self,
         available_space: Size<AvailableSpace>,
-        root_site: RetainedLayoutRootSite,
+        pass: &mut DetachedRootLayoutPass,
         window: &mut Window,
         cx: &mut App,
-    ) -> Size<Pixels> {
-        Drawable::layout_as_root(self, available_space, root_site, window, cx)
+    ) -> DetachedRootLayoutRequest {
+        Drawable::request_detached_root_layout(self, available_space, pass, window, cx)
+    }
+
+    #[inline]
+    fn mark_detached_root_layout_computed(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
+    ) {
+        Drawable::mark_detached_root_layout_computed(self, layout_id, available_space, pass)
     }
 }
 
 /// A dynamically typed element that can be used to store any element type.
 pub struct AnyElement(ArenaBox<dyn ElementObject>);
-
-/// A detached root that has been laid out for the current prepaint phase.
-///
-/// This is for placement algorithms that need the solved size of visible detached roots before
-/// choosing their origins. The token owns the element so callers cannot run a retained root solve
-/// and then casually keep using a raw element. Use [`AnyElement::measure_as_root`] for size-only
-/// probes that might not render.
-#[must_use = "a laid-out root should be consumed by `prepaint_at` or `defer` so it is painted"]
-pub struct RootPrepaintElement {
-    element: AnyElement,
-    size: Size<Pixels>,
-}
-
-impl RootPrepaintElement {
-    /// Returns the solved size of this detached root.
-    pub fn size(&self) -> Size<Pixels> {
-        self.size
-    }
-
-    /// Prepaints this laid-out root at the given absolute origin.
-    pub fn prepaint_at(
-        self,
-        origin: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (AnyElement, Bounds<Pixels>, Option<FocusHandle>) {
-        let mut element = self.element;
-        let bounds = Bounds::new(origin, self.size);
-        let focus = element.prepaint_at(origin, window, cx);
-        (element, bounds, focus)
-    }
-
-    /// Defers this laid-out root at the given absolute origin.
-    pub fn defer(
-        self,
-        origin: Point<Pixels>,
-        window: &mut Window,
-        priority: usize,
-        content_mask: Option<ContentMask<Pixels>>,
-    ) -> Bounds<Pixels> {
-        let bounds = Bounds::new(origin, self.size);
-        window.defer_draw(self.element, origin, priority, content_mask);
-        bounds
-    }
-}
 
 impl AnyElement {
     pub(crate) fn new<E>(element: E) -> Self
@@ -732,147 +713,58 @@ impl AnyElement {
 
     /// Request the layout ID of the element stored in this `AnyElement`.
     /// Used for laying out child elements in a parent element.
-    pub fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
+    pub fn request_layout(&mut self, window: &mut LayoutRequestCx<'_>, cx: &mut App) -> LayoutId {
         self.0.request_layout(window, cx)
     }
 
     /// Prepares the element to be painted by storing its bounds, giving it a chance to draw hitboxes and
     /// request autoscroll before the final paint pass is confirmed.
-    pub fn prepaint(&mut self, window: &mut Window, cx: &mut App) -> Option<FocusHandle> {
-        let focus_assigned = window.next_frame.focus.is_some();
+    pub fn prepaint(&mut self, window: &mut PrepaintCx<'_>, cx: &mut App) -> Option<FocusHandle> {
+        let focus_assigned = window.focus_is_assigned();
 
         self.0.prepaint(window, cx);
 
-        if !focus_assigned && let Some(focus_id) = window.next_frame.focus {
-            return FocusHandle::for_id(focus_id, &cx.focus_handles);
-        }
-
-        None
+        window.focus_assigned_since(focus_assigned, cx)
     }
 
     /// Paints the element stored in this `AnyElement`.
-    pub fn paint(&mut self, window: &mut Window, cx: &mut App) {
+    pub fn paint(&mut self, window: &mut PaintCx<'_>, cx: &mut App) {
         self.0.paint(window, cx);
     }
 
-    /// Performs layout for this element within the given available space and returns its size.
-    #[track_caller]
-    pub(crate) fn layout_as_root(
+    pub(crate) fn request_detached_root_layout(
         &mut self,
         available_space: Size<AvailableSpace>,
+        pass: &mut DetachedRootLayoutPass,
         window: &mut Window,
         cx: &mut App,
-    ) -> Size<Pixels> {
-        self.0.layout_as_root(
-            available_space,
-            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
-            window,
-            cx,
-        )
+    ) -> DetachedRootLayoutRequest {
+        self.0
+            .request_detached_root_layout(available_space, pass, window, cx)
     }
 
-    /// Measures this element in an isolated scratch layout engine and returns its size.
-    ///
-    /// This consumes the element so a caller cannot later prepaint it with
-    /// layout ids from the scratch solve. Use [`AnyElement::layout_for_prepaint`]
-    /// for detached roots that will be prepainted or painted in the current frame.
-    #[track_caller]
-    pub fn measure_as_root(
-        mut self,
+    pub(crate) fn mark_detached_root_layout_computed(
+        &mut self,
+        layout_id: LayoutId,
         available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Size<Pixels> {
-        let root_site = RetainedLayoutRootSite::caller(core::panic::Location::caller());
-        window.with_scratch_layout_engine(cx, |window, cx| {
-            self.0
-                .layout_as_root(available_space, root_site, window, cx)
-        })
-    }
-
-    /// Performs root layout for an element that will be prepainted in the current frame.
-    ///
-    /// This consumes the element and returns a must-use token exposing only its solved size and
-    /// visible-root consumption paths. Prefer [`AnyElement::prepaint_as_root_with_origin`] or
-    /// [`AnyElement::defer_as_root_with_origin`] when one element's origin can be computed directly
-    /// from its own solved size.
-    #[track_caller]
-    pub fn layout_for_prepaint(
-        mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> RootPrepaintElement {
-        let size = self.layout_as_root(available_space, window, cx);
-        RootPrepaintElement {
-            element: self,
-            size,
-        }
+        pass: &mut DetachedRootLayoutPass,
+    ) {
+        self.0
+            .mark_detached_root_layout_computed(layout_id, available_space, pass)
     }
 
     /// Prepaints this element at the given absolute origin.
     /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
-    pub fn prepaint_at(
+    pub(crate) fn prepaint_at(
         &mut self,
         origin: Point<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<FocusHandle> {
-        window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx))
-    }
-
-    /// Performs layout on this element in the available space, then prepaints it at the given absolute origin.
-    /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
-    #[track_caller]
-    pub fn prepaint_as_root(
-        &mut self,
-        origin: Point<Pixels>,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<FocusHandle> {
-        self.layout_as_root(available_space, window, cx);
-        window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx))
-    }
-
-    /// Performs root layout, derives the element's absolute origin from the solved size, then prepaints it.
-    ///
-    /// Use this when a detached root will be visible in this frame and its placement depends on its
-    /// solved size. Use [`AnyElement::measure_as_root`] for size-only probes that might not render.
-    #[track_caller]
-    pub fn prepaint_as_root_with_origin(
-        &mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-        origin_for_size: impl FnOnce(Size<Pixels>) -> Point<Pixels>,
-    ) -> (Bounds<Pixels>, Option<FocusHandle>) {
-        let size = self.layout_as_root(available_space, window, cx);
-        let origin = origin_for_size(size);
-        let bounds = Bounds::new(origin, size);
-        let focus = window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx));
-        (bounds, focus)
-    }
-
-    /// Performs root layout, derives the element's absolute origin from the solved size, then defers drawing it.
-    ///
-    /// This consumes the element so callers cannot perform a retained root solve and then decide not
-    /// to paint the same solved element. Use [`AnyElement::measure_as_root`] for size-only probes.
-    #[track_caller]
-    pub fn defer_as_root_with_origin(
-        mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-        priority: usize,
-        content_mask: Option<ContentMask<Pixels>>,
-        origin_for_size: impl FnOnce(Size<Pixels>) -> Point<Pixels>,
-    ) -> Bounds<Pixels> {
-        let size = self.layout_as_root(available_space, window, cx);
-        let origin = origin_for_size(size);
-        let bounds = Bounds::new(origin, size);
-        window.defer_draw(self, origin, priority, content_mask);
-        bounds
+        window.with_absolute_element_offset(origin, |window| {
+            let mut prepaint_cx = PrepaintCx::new(window);
+            self.prepaint(&mut prepaint_cx, cx)
+        })
     }
 }
 
@@ -892,7 +784,7 @@ impl Element for AnyElement {
         &mut self,
         _: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let layout_id = self.request_layout(window, cx);
@@ -905,7 +797,7 @@ impl Element for AnyElement {
         _inspector_id: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) {
         self.prepaint(window, cx);
@@ -918,7 +810,7 @@ impl Element for AnyElement {
         _: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         self.paint(window, cx);
@@ -964,7 +856,7 @@ impl Element for Empty {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         (
@@ -986,7 +878,7 @@ impl Element for Empty {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _state: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        _window: &mut PrepaintCx<'_>,
         _cx: &mut App,
     ) {
     }
@@ -998,7 +890,7 @@ impl Element for Empty {
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        _window: &mut Window,
+        _window: &mut PaintCx<'_>,
         _cx: &mut App,
     ) {
     }

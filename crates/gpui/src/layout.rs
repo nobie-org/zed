@@ -5,7 +5,8 @@
 //! mirror. This module is the only facade GPUI code should use for layout.
 
 use crate::{
-    App, Bounds, GlobalElementId, Pixels, Size, Style, TextLayoutArtifact, TextMeasureKey, Window,
+    App, Bounds, GlobalElementId, MeasureCx, Pixels, Size, Style, TextLayoutArtifact,
+    TextMeasureKey, Window,
 };
 use core::panic::Location;
 use stacksafe::stacksafe;
@@ -34,7 +35,6 @@ pub use telemetry::RetainedSubtreeWorkSample;
 pub(crate) struct LayoutEngine {
     forest: RetainedLayoutForest,
     layout_work: LayoutWorkSample,
-    mode: LayoutEngineMode,
 }
 
 /// Stable framework identity for one legal root compute site.
@@ -50,34 +50,6 @@ pub(crate) struct RetainedLayoutRootSite(&'static Location<'static>);
 impl RetainedLayoutRootSite {
     pub(crate) fn caller(location: &'static Location<'static>) -> Self {
         Self(location)
-    }
-}
-
-/// Retained-layout execution policy.
-///
-/// `Retained` is the production path. `Immediate` rebuilds the forest and its
-/// private solver mirror at the start of every frame, which gives GPUI a
-/// same-user-code baseline for debugging and correctness oracles.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LayoutEngineMode {
-    Retained,
-    Immediate,
-}
-
-impl LayoutEngineMode {
-    fn from_env() -> Self {
-        if let Ok(mode) = std::env::var("GPUI_LAYOUT_MODE") {
-            match mode.to_ascii_lowercase().as_str() {
-                "immediate" | "fresh" => return Self::Immediate,
-                _ => {}
-            }
-        }
-
-        if std::env::var_os("GPUI_DISABLE_RETAINED_LAYOUT").is_some() {
-            Self::Immediate
-        } else {
-            Self::Retained
-        }
     }
 }
 
@@ -123,7 +95,6 @@ impl LayoutEngine {
         LayoutEngine {
             forest: RetainedLayoutForest::new(),
             layout_work: LayoutWorkSample::default(),
-            mode: LayoutEngineMode::from_env(),
         }
     }
 
@@ -139,12 +110,7 @@ impl LayoutEngine {
     /// Reset frame-local request/measurement state before a new render pass.
     pub fn begin_frame(&mut self) {
         self.layout_work = LayoutWorkSample::default();
-        match self.mode {
-            LayoutEngineMode::Retained => self.forest.begin_frame(),
-            LayoutEngineMode::Immediate => {
-                self.forest = RetainedLayoutForest::new();
-            }
-        }
+        self.forest.begin_frame();
     }
 
     /// Allocate or look up a retained root id for a root compute site.
@@ -253,11 +219,10 @@ impl LayoutEngine {
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
-        mut measure: impl FnMut(
+        measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
+            &mut MeasureCx<'_>,
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
@@ -306,11 +271,10 @@ impl LayoutEngine {
         scale_factor: f32,
         measure_key: TextMeasureKey,
         hydrate: impl Fn(&TextLayoutArtifact) + 'static,
-        mut measure: impl FnMut(
+        measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
-            &mut Window,
-            &mut App,
+            &mut MeasureCx<'_>,
         ) -> TextLayoutArtifact
         + 'static,
     ) -> LayoutId {
@@ -470,8 +434,8 @@ impl LayoutEngine {
     // 1dp residual into descendants.
 
     /// Return post-layout bounds for a committed current-frame intent.
-    pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
-        self.forest.layout_bounds(id, scale_factor)
+    pub fn layout_bounds(&self, id: LayoutId) -> Bounds<Pixels> {
+        self.forest.layout_bounds(id)
     }
 
     #[cfg(test)]
@@ -558,7 +522,7 @@ impl LayoutEngine {
 
     #[cfg(test)]
     fn assert_intent_committed_exactly_for_tests(&self, id: LayoutId) {
-        self.forest.assert_intent_committed_exactly_for_tests(id);
+        self.forest.assert_facts_committed_exactly_for_tests(id);
     }
 
     #[cfg(test)]

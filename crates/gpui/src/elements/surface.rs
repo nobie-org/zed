@@ -1,7 +1,10 @@
 use crate::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
+    LayoutRequestCx, ObjectFit, PaintCx, Pixels, PrepaintCx, Style, StyleRefinement, Styled,
+    Window,
 };
+#[cfg(target_os = "macos")]
+use core_video::pixel_buffer::CVPixelBuffer;
 #[cfg(target_os = "macos")]
 use metal::Texture;
 use refineable::Refineable;
@@ -9,9 +12,19 @@ use refineable::Refineable;
 /// A source of a surface's content.
 #[derive(Clone, Debug)]
 pub enum SurfaceSource {
+    /// A macOS image buffer from CoreVideo.
+    #[cfg(target_os = "macos")]
+    Surface(CVPixelBuffer),
     /// A macOS Metal texture.
     #[cfg(target_os = "macos")]
     MetalTexture(Texture),
+}
+
+#[cfg(target_os = "macos")]
+impl From<CVPixelBuffer> for SurfaceSource {
+    fn from(value: CVPixelBuffer) -> Self {
+        SurfaceSource::Surface(value)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -62,7 +75,7 @@ impl Element for Surface {
         &mut self,
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
@@ -77,7 +90,7 @@ impl Element for Surface {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        _window: &mut PrepaintCx<'_>,
         _cx: &mut App,
     ) -> Self::PrepaintState {
     }
@@ -89,10 +102,17 @@ impl Element for Surface {
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut PaintCx<'_>,
         _: &mut App,
     ) {
         match &self.source {
+            #[cfg(target_os = "macos")]
+            SurfaceSource::Surface(surface) => {
+                let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
+                // TODO: Add support for corner_radii
+                window.paint_surface(new_bounds, surface.clone());
+            }
             #[cfg(target_os = "macos")]
             SurfaceSource::MetalTexture(texture) => {
                 let size = crate::size(texture.width().into(), texture.height().into());

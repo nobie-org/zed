@@ -160,6 +160,10 @@ impl<'a> BuildCx<'a> {
         self.window.viewport_size()
     }
 
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.window.bounds()
+    }
+
     pub fn text_style(&self) -> TextStyle {
         self.window.text_style()
     }

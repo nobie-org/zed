@@ -235,7 +235,7 @@ fn subtree_probe_attributes_measured_callbacks_to_tagged_parent() {
 }
 
 #[test]
-fn subtree_probe_reports_conservative_text_callbacks_separately() {
+fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
     let mut test_app = crate::TestAppContext::single();
     let window = test_app.add_window(|_, _| crate::Empty);
     let global_id = global_id("tracked-text-parent");
@@ -286,7 +286,7 @@ fn subtree_probe_reports_conservative_text_callbacks_separately() {
     assert_eq!(samples[0].global_id, "tracked-text-parent");
     assert_eq!(samples[0].node_count, 2);
     assert_eq!(samples[0].measured_callbacks, 1);
-    assert_eq!(samples[0].conservative_text_measured_callbacks, 1);
+    assert_eq!(samples[0].conservative_text_measured_callbacks, 0);
     assert_eq!(
         samples[0].no_work_total(),
         samples[0].retained_misses
@@ -295,5 +295,6 @@ fn subtree_probe_reports_conservative_text_callbacks_separately() {
             + samples[0].mirror_set_style
             + samples[0].mirror_set_children
             + samples[0].mirror_measured_context_clears
+            + 1
     );
 }

@@ -13,7 +13,11 @@ struct ExampleWindow {
 }
 
 impl Render for ExampleWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .on_action(|_: &CloseWindow, window, _| {
                 window.remove_window();

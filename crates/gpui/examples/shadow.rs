@@ -87,7 +87,11 @@ fn example(label: impl Into<SharedString>, example: impl IntoElement) -> impl In
 }
 
 impl Render for Shadow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .id("shadow-example")
             .overflow_y_scroll()

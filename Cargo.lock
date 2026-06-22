@@ -7800,6 +7800,7 @@ dependencies = [
  "raw-window-handle",
  "refineable",
  "regex",
+ "reqwest_client",
  "resvg",
  "scheduler",
  "schemars 1.0.4",

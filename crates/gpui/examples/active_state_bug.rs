@@ -5,7 +5,11 @@ use gpui_platform::application;
 struct Example;
 
 impl Render for Example {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Colors from Zed's default dark theme
         let bg = hsla(215. / 360., 0.12, 0.15, 1.);
         let text = hsla(221. / 360., 0.11, 0.86, 1.);

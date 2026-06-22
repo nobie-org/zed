@@ -78,7 +78,11 @@ impl Focusable for Counter {
 }
 
 impl Render for Counter {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .id("counter")
             .key_context("Counter")

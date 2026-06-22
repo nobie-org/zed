@@ -76,9 +76,10 @@ pub use prompts::*;
 /// Narrow build-phase authority for constructing element values.
 ///
 /// `BuildCx` is the only capability passed to `Render`, `RenderOnce`, and
-/// item-builder callbacks. It exposes build-time observations and element
-/// construction helpers, but it cannot request layout, solve retained roots,
-/// read layout bounds, prepaint, paint, defer, or expose `Window`.
+/// item-builder callbacks. It exposes build-time observations, element
+/// construction helpers, and narrow next-frame scheduling, but it cannot
+/// request layout, solve retained roots, read layout bounds, prepaint, paint,
+/// or expose `Window`.
 pub struct BuildCx<'a> {
     window: &'a mut Window,
 }
@@ -281,6 +282,22 @@ impl<'a> BuildCx<'a> {
 
     pub fn request_animation_frame(&mut self) {
         self.window.request_animation_frame();
+    }
+
+    /// Schedule an update for `view` on the next frame without exposing
+    /// render-time access to [`Window`].
+    pub fn on_next_frame_for<T: 'static>(
+        &self,
+        view: Entity<T>,
+        f: impl FnOnce(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) {
+        self.window
+            .on_next_frame(move |window, cx| view.update(cx, |view, cx| f(view, window, cx)));
+    }
+
+    /// Returns the layout work sample for the most recently completed draw.
+    pub fn last_layout_work_sample(&self) -> Option<LayoutWorkSample> {
+        self.window.last_layout_work_sample()
     }
 
     pub fn bindings_for_action_in_context(

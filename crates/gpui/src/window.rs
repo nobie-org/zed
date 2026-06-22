@@ -1996,6 +1996,33 @@ impl<'a> PaintCx<'a> {
         self.window.content_mask()
     }
 
+    pub fn with_element_offset<R>(
+        &mut self,
+        offset: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if offset.is_zero() {
+            return f(self);
+        }
+        let abs_offset = self.window.element_offset() + offset;
+        self.with_absolute_element_offset(abs_offset, f)
+    }
+
+    pub fn with_absolute_element_offset<R>(
+        &mut self,
+        offset: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.window.element_offset_stack.push(offset);
+        let result = f(self);
+        self.window.element_offset_stack.pop();
+        result
+    }
+
+    pub fn element_offset(&self) -> Point<Pixels> {
+        self.window.element_offset()
+    }
+
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.window.invalidator.debug_assert_paint();
 
@@ -2143,6 +2170,13 @@ impl<'a> PaintCx<'a> {
     #[cfg(target_os = "macos")]
     pub fn paint_metal_texture(&mut self, bounds: Bounds<Pixels>, texture: metal::Texture) {
         self.window.paint_metal_texture(bounds, texture);
+    }
+
+    /// Paint a wgpu texture view into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_wgpu_texture(&mut self, bounds: Bounds<Pixels>, texture: wgpu::TextureView) {
+        self.window.paint_wgpu_texture(bounds, texture);
     }
 
     pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: Hitbox) {

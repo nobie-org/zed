@@ -5008,6 +5008,25 @@ impl Window {
         self.platform_window.bounds()
     }
 
+    /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
+    /// This does not present the frame to screen - useful for visual testing where we want
+    /// to capture what would be rendered without displaying it or requiring the window to be visible.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+        self.platform_window
+            .render_to_image(&self.rendered_frame.scene)
+    }
+
+    /// Captures the currently rendered frame's scene without initiating a new draw.
+    ///
+    /// This is intentionally not layout or draw authority. Callers that need a
+    /// fresh frame must go through the app-owned frame lifecycle before reading
+    /// this capture.
+    pub fn capture_rendered_scene(&self) -> anyhow::Result<crate::SceneCapture> {
+        self.platform_window
+            .capture_scene(&self.rendered_frame.scene)
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);

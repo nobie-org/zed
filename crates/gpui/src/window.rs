@@ -2352,12 +2352,34 @@ impl LayoutFrame {
         Self { _private: () }
     }
 
+    #[track_caller]
+    fn prepaint_window_root_at(
+        &mut self,
+        window: &mut Window,
+        element: &mut AnyElement,
+        origin: Point<Pixels>,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Option<FocusHandle> {
+        let global_id = window.main_window_root_global_id();
+        self.prepaint_detached_root_at_with_identity(
+            window,
+            element,
+            origin,
+            available_space,
+            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            Some(&global_id),
+            cx,
+        )
+    }
+
     fn layout_detached_root_size(
         &mut self,
         window: &mut Window,
         element: &mut AnyElement,
         root_site: crate::layout::RetainedLayoutRootSite,
         available_space: Size<AvailableSpace>,
+        global_id_override: Option<&GlobalElementId>,
         cx: &mut App,
     ) -> Size<Pixels> {
         let mut pass = DetachedRootLayoutPass { _private: () };
@@ -2369,7 +2391,7 @@ impl LayoutFrame {
                 window,
                 layout_id,
                 root_site,
-                request.global_id(),
+                global_id_override.or_else(|| request.global_id()),
                 available_space,
                 cx,
             );
@@ -2392,6 +2414,7 @@ impl LayoutFrame {
             &mut element,
             RetainedLayoutRootSite::caller(core::panic::Location::caller()),
             available_space,
+            None,
             cx,
         );
         LaidOutVisibleRoot { element, size }
@@ -2406,11 +2429,33 @@ impl LayoutFrame {
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) -> Option<FocusHandle> {
+        self.prepaint_detached_root_at_with_identity(
+            window,
+            element,
+            origin,
+            available_space,
+            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            None,
+            cx,
+        )
+    }
+
+    fn prepaint_detached_root_at_with_identity(
+        &mut self,
+        window: &mut Window,
+        element: &mut AnyElement,
+        origin: Point<Pixels>,
+        available_space: Size<AvailableSpace>,
+        root_site: RetainedLayoutRootSite,
+        global_id_override: Option<&GlobalElementId>,
+        cx: &mut App,
+    ) -> Option<FocusHandle> {
         self.layout_detached_root_size(
             window,
             element,
-            RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            root_site,
             available_space,
+            global_id_override,
             cx,
         );
         element.prepaint_at(origin, window, cx)
@@ -5261,6 +5306,13 @@ impl Window {
         })
     }
 
+    fn main_window_root_global_id(&self) -> GlobalElementId {
+        GlobalElementId(Arc::from([ElementId::NamedInteger(
+            SharedString::new_static("window-root"),
+            self.handle.id.as_u64(),
+        )]))
+    }
+
     /// Calls the provided closure with the element ID pushed on the stack.
     #[inline]
     pub fn with_id<R>(
@@ -5726,7 +5778,7 @@ impl Window {
 
         // Layout all root elements.
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
-        layout_frame.prepaint_detached_root_at(
+        layout_frame.prepaint_window_root_at(
             self,
             &mut root_element,
             Point::default(),
@@ -5901,6 +5953,7 @@ impl Window {
                     element,
                     group.root_site,
                     *available_space,
+                    None,
                     cx,
                 ));
             }
@@ -6313,6 +6366,7 @@ impl Window {
                 &mut element,
                 root_site,
                 available_space,
+                None,
                 cx,
             );
             let placement_cx = VisibleRootPlacementCx::new(self);

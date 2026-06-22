@@ -9,7 +9,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, ScaledPixels, Size, Surface, point,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, ScaledPixels, Size, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
         PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
@@ -529,6 +529,17 @@ impl Renderer {
         match self {
             Self::Metal(renderer) => renderer.take_presented_capture(),
             Self::Wgpu { renderer, .. } => renderer.take_presented_capture(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture_scene(&mut self, scene: &Scene) -> Result<SceneCapture> {
+        self.request_frame_capture();
+        match self.draw(scene) {
+            RenderGroupDrawOutcome::Completed { .. } => self.take_presented_capture(),
+            RenderGroupDrawOutcome::NotCompleted => {
+                anyhow::bail!("scene capture draw did not complete")
+            }
         }
     }
 }

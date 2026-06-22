@@ -1690,6 +1690,19 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene)
     }
 
+    fn capture_scene(&self, scene: &Scene) -> gpui::Result<gpui::SceneCapture> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut this = self.0.lock();
+            this.renderer.capture_scene(scene)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = scene;
+            anyhow::bail!("scene capture is not available without test-support")
+        }
+    }
+
     fn request_frame_capture(&self) {
         #[cfg(any(test, feature = "test-support"))]
         {

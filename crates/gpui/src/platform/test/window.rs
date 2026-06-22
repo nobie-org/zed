@@ -331,6 +331,10 @@ impl PlatformWindow for TestWindow {
         }
     }
 
+    fn capture_scene(&self, scene: &Scene) -> anyhow::Result<SceneCapture> {
+        self.draw_presented_frame_to_capture(scene)
+    }
+
     fn capture_presented_frame(&self) -> anyhow::Result<SceneCapture> {
         let mut state = self.0.lock();
         match state.presented_capture.take() {

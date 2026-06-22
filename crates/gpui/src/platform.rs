@@ -695,6 +695,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome;
+    fn capture_scene(&self, _scene: &Scene) -> Result<SceneCapture> {
+        anyhow::bail!("scene capture is not implemented for this platform window")
+    }
     fn request_frame_capture(&self) {}
     fn capture_presented_frame(&self) -> Result<SceneCapture> {
         anyhow::bail!("presented-frame capture is not implemented for this platform window")

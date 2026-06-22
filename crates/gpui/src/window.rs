@@ -13,14 +13,14 @@ use crate::{
     PlatformInputHandler, PlatformInputSimulator, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderGroupDrawObservation, RenderGroupDrawOutcome, RenderImage, RenderImageParams,
-    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
-    Style, StyleRefinement, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, Task, TextLayoutArtifact, TextMeasureKey,
-    TextRenderingMode, TextStyle, TextStyleRefinement, TextSystem, ThermalState,
-    TooltipVisibilityFacts, TransformationMatrix, Underline, UnderlineStyle, WeakEntity,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point,
+    RenderSvgParams, Replay, ResizeEdge, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels,
+    Scene, SceneCapture, Shadow, SharedString, Size, StrikethroughStyle, Style, StyleRefinement,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, Task, TextLayoutArtifact, TextMeasureKey, TextRenderingMode, TextStyle,
+    TextStyleRefinement, TextSystem, ThermalState, TooltipVisibilityFacts, TransformationMatrix,
+    Underline, UnderlineStyle, WeakEntity, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point,
     prelude::*,
     px, rems,
     scene::{LogicalVisualPlan, RenderGroupInput},
@@ -4861,6 +4861,23 @@ impl Window {
         }
     }
 
+    /// Draw, present, and capture this window through the app-owned frame lifecycle.
+    ///
+    /// This is intentionally crate-private so screenshot harnesses can exercise
+    /// the real frame path without exposing raw draw authority as public API.
+    pub(crate) fn draw_app_frame_present_and_capture(
+        &mut self,
+        cx: &mut App,
+    ) -> Result<SceneCapture> {
+        let arena_clear_needed = self.draw_with_presentation_intent(cx, true);
+        self.platform_window.request_frame_capture();
+        self.present();
+        let capture = self.platform_window.capture_presented_frame();
+        arena_clear_needed.clear();
+        self.complete_frame();
+        capture
+    }
+
     /// Returns whether the current draw is expected to be presented.
     pub fn current_draw_will_present(&self) -> bool {
         self.draw_will_present.get()
@@ -5259,20 +5276,12 @@ impl Window {
         self.platform_window.bounds()
     }
 
-    /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
-    /// This does not present the frame to screen - useful for visual testing where we want
-    /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
-        self.platform_window
-            .render_to_image(&self.rendered_frame.scene)
-    }
-
-    /// Captures the currently rendered frame's scene without initiating a new draw.
+    /// Captures the currently rendered frame's scene without initiating layout.
     ///
-    /// This is intentionally not layout or draw authority. Callers that need a
-    /// fresh frame must go through the app-owned frame lifecycle before reading
-    /// this capture.
+    /// This is intentionally not layout or frame authority. Callers that need
+    /// fresh frame contents must go through the app-owned frame lifecycle before
+    /// reading this capture. The platform may render the already-built scene to
+    /// produce readback pixels.
     pub fn capture_rendered_scene(&self) -> anyhow::Result<crate::SceneCapture> {
         self.platform_window
             .capture_scene(&self.rendered_frame.scene)

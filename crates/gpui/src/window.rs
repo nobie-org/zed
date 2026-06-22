@@ -294,6 +294,20 @@ impl<'a> BuildCx<'a> {
             .on_next_frame(move |window, cx| view.update(cx, |view, cx| f(view, window, cx)));
     }
 
+    /// Schedule an entity update after the current effect cycle without
+    /// exposing raw [`Window`] or retained-layout solve authority to build
+    /// code.
+    pub fn defer_for<T: 'static>(
+        &self,
+        view: Entity<T>,
+        cx: &mut App,
+        f: impl FnOnce(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) {
+        self.window.defer(cx, move |window, cx| {
+            view.update(cx, |view, cx| f(view, window, cx)).ok()
+        });
+    }
+
     /// Returns the layout work sample for the most recently completed draw.
     pub fn last_layout_work_sample(&self) -> Option<LayoutWorkSample> {
         self.window.last_layout_work_sample()

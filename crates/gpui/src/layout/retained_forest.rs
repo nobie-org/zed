@@ -642,13 +642,24 @@ impl RetainedLayoutForest {
 
         let facts = self.facts(id);
         let current = Self::layout_facts_summary(facts);
-        let previous = previous
+        let previous_summary = previous
             .map(Self::retained_node_summary)
+            .unwrap_or_else(|| "none".to_string());
+        let current_tree = self.layout_facts_tree_summary(id);
+        let previous_tree = previous
+            .map(Self::retained_tree_summary)
             .unwrap_or_else(|| "none".to_string());
         let detail = detail();
         eprintln!(
-            "gpui retained_layout match_miss_sample sample={} layout_id={} reason={} current={} previous={} detail={}",
-            miss_trace_sample, id.0, reason, current, previous, detail,
+            "gpui retained_layout match_miss_sample sample={} layout_id={} reason={} current={} previous={} detail={} current_tree={} previous_tree={}",
+            miss_trace_sample,
+            id.0,
+            reason,
+            current,
+            previous_summary,
+            detail,
+            current_tree,
+            previous_tree,
         );
     }
 
@@ -694,6 +705,44 @@ impl RetainedLayoutForest {
         )
     }
 
+    fn layout_facts_tree_summary(&self, id: LayoutId) -> String {
+        let mut lines = Vec::new();
+        self.push_layout_facts_tree_summary(id, 0, &mut lines);
+        format!("[{}]", lines.join(" | "))
+    }
+
+    fn push_layout_facts_tree_summary(&self, id: LayoutId, depth: usize, lines: &mut Vec<String>) {
+        const MAX_DEPTH: usize = 5;
+        const MAX_CHILDREN: usize = 8;
+
+        let facts = self.facts(id);
+        lines.push(format!(
+            "{}layout_id={} {}",
+            "  ".repeat(depth),
+            id.0,
+            Self::layout_facts_summary(facts)
+        ));
+
+        if depth >= MAX_DEPTH {
+            return;
+        }
+
+        let CurrentLayoutNodeKind::Unmeasured { children } = &facts.kind else {
+            return;
+        };
+
+        for child in children.iter().take(MAX_CHILDREN) {
+            self.push_layout_facts_tree_summary(*child, depth + 1, lines);
+        }
+        if children.len() > MAX_CHILDREN {
+            lines.push(format!(
+                "{}... {} more children",
+                "  ".repeat(depth + 1),
+                children.len() - MAX_CHILDREN
+            ));
+        }
+    }
+
     fn layout_node_kind_summary(kind: &CurrentLayoutNodeKind) -> String {
         match kind {
             CurrentLayoutNodeKind::Unmeasured { children } => {
@@ -716,6 +765,43 @@ impl RetainedLayoutForest {
             node.children().len(),
             Self::debug_fingerprint(&node.style)
         )
+    }
+
+    fn retained_tree_summary(node: &RetainedLayoutOccurrence) -> String {
+        let mut lines = Vec::new();
+        Self::push_retained_tree_summary(node, 0, &mut lines);
+        format!("[{}]", lines.join(" | "))
+    }
+
+    fn push_retained_tree_summary(
+        node: &RetainedLayoutOccurrence,
+        depth: usize,
+        lines: &mut Vec<String>,
+    ) {
+        const MAX_DEPTH: usize = 5;
+        const MAX_CHILDREN: usize = 8;
+
+        lines.push(format!(
+            "{}{}",
+            "  ".repeat(depth),
+            Self::retained_node_summary(node)
+        ));
+
+        if depth >= MAX_DEPTH {
+            return;
+        }
+
+        let children = node.children();
+        for child in children.iter().take(MAX_CHILDREN) {
+            Self::push_retained_tree_summary(child, depth + 1, lines);
+        }
+        if children.len() > MAX_CHILDREN {
+            lines.push(format!(
+                "{}... {} more children",
+                "  ".repeat(depth + 1),
+                children.len() - MAX_CHILDREN
+            ));
+        }
     }
 
     fn debug_fingerprint(value: &impl Debug) -> String {

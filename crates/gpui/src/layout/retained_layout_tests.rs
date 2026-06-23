@@ -2308,6 +2308,76 @@ fn generated_canvas_chrome_frame_converges_after_distinct_retained_histories(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn canvas_chrome_frame_after_zero_and_scaled_sidebar_history_matches_fresh_layout() {
+    let zero_height_probe = GeneratedCanvasChromeFrameSpec {
+        root_width: 2200,
+        root_height: 0,
+        sidebar_width: 0,
+        sidebar_content_height: 0,
+        content_gap: 0,
+        scale_factor: 1.0,
+    };
+    let narrow_scaled_sidebar = GeneratedCanvasChromeFrameSpec {
+        root_width: 459,
+        root_height: 609,
+        sidebar_width: 480,
+        sidebar_content_height: 240,
+        content_gap: 21,
+        scale_factor: 2.0,
+    };
+    let current = GeneratedCanvasChromeFrameSpec {
+        root_width: 1100,
+        root_height: 760,
+        sidebar_width: 0,
+        sidebar_content_height: 1,
+        content_gap: 0,
+        scale_factor: 1.0,
+    };
+
+    let mut retained = LayoutEngine::new();
+    compute_canvas_chrome_frame_output(&mut retained, zero_height_probe);
+    retained.finish_frame();
+    compute_canvas_chrome_frame_output(&mut retained, narrow_scaled_sidebar);
+    retained.finish_frame();
+    let retained_output = compute_canvas_chrome_frame_output(&mut retained, current);
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_output = compute_canvas_chrome_frame_output(&mut fresh, current);
+
+    assert_eq!(retained_output, fresh_output);
+    assert_eq!(fresh_output.canvas_is_paintable, (true, true));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn canvas_chrome_frame_after_sidebar_content_height_change_matches_fresh_layout() {
+    let previous = GeneratedCanvasChromeFrameSpec {
+        root_width: 1100,
+        root_height: 760,
+        sidebar_width: 0,
+        sidebar_content_height: 0,
+        content_gap: 0,
+        scale_factor: 1.0,
+    };
+    let current = GeneratedCanvasChromeFrameSpec {
+        sidebar_content_height: 1,
+        ..previous
+    };
+
+    let mut retained = LayoutEngine::new();
+    compute_canvas_chrome_frame_output(&mut retained, previous);
+    retained.finish_frame();
+    let retained_output = compute_canvas_chrome_frame_output(&mut retained, current);
+
+    let mut fresh = LayoutEngine::new();
+    let fresh_output = compute_canvas_chrome_frame_output(&mut fresh, current);
+
+    assert_eq!(retained_output, fresh_output);
+    assert_eq!(fresh_output.canvas_is_paintable, (true, true));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
 fn taffy_repeated_root_solve_updates_percent_descendant_after_constraint_change() {
     use taffy::prelude::{Dimension as TaffyDimension, FromPercent};

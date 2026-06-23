@@ -158,6 +158,8 @@ pub(super) struct RetainedLayoutForest {
     committed: CommittedLayoutState,
     root_slots: RootSlots,
     subtree_probe: SubtreeProbe,
+    #[cfg(test)]
+    compare_with_fresh_for_tests: bool,
     work: RetainedWorkState,
 }
 
@@ -207,6 +209,8 @@ impl RetainedLayoutForest {
             committed: CommittedLayoutState::new(),
             root_slots: RootSlots::new(),
             subtree_probe: SubtreeProbe::new(),
+            #[cfg(test)]
+            compare_with_fresh_for_tests: false,
             work: RetainedWorkState::new(),
         }
     }
@@ -226,8 +230,14 @@ impl RetainedLayoutForest {
     /// path, but there are no previous retained roots or mirror nodes to reuse.
     pub(super) fn reset_retained_state_for_fresh_frame(&mut self) {
         let subtree_probe = self.subtree_probe.clone();
+        #[cfg(test)]
+        let compare_with_fresh_for_tests = self.compare_with_fresh_for_tests;
         *self = Self::new();
         self.subtree_probe = subtree_probe;
+        #[cfg(test)]
+        {
+            self.compare_with_fresh_for_tests = compare_with_fresh_for_tests;
+        }
     }
 
     /// Snapshot every retained and mirror field affected by speculative layout.
@@ -361,6 +371,11 @@ impl RetainedLayoutForest {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn set_retained_subtree_probe_targets_for_tests(&mut self, targets: Vec<String>) {
         self.subtree_probe.set_targets_for_tests(targets);
+    }
+
+    #[cfg(test)]
+    pub(super) fn compare_with_fresh_for_tests(&mut self) {
+        self.compare_with_fresh_for_tests = true;
     }
 
     #[cfg(test)]
@@ -522,7 +537,16 @@ impl RetainedLayoutForest {
         }
 
         let (fresh_layout_comparison, fresh_compare_duration) =
-            if retained_layout_fresh_compare_enabled() {
+            if retained_layout_fresh_compare_enabled() || {
+                #[cfg(test)]
+                {
+                    self.compare_with_fresh_for_tests
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            } {
                 let fresh_compare_start = std::time::Instant::now();
                 let target_layout_ids = trace::target_layout_ids();
                 let comparison = self.trace_retained_fresh_layout_comparison(

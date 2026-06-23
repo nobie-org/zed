@@ -1488,6 +1488,25 @@ fn assert_retained_frame_sample(sample: LayoutWorkSample) {
     );
 }
 
+fn assert_runtime_fresh_compare_proved(sample: LayoutWorkSample) {
+    assert!(
+        sample.retained_layout_fresh_compare_nodes > 0,
+        "retained frame should perform a non-vacuous fresh-layout comparison: {sample:?}"
+    );
+    assert_eq!(
+        sample.retained_layout_fresh_compare_skipped_roots, 0,
+        "retained frame fresh-layout comparison should not skip roots: {sample:?}"
+    );
+    assert_eq!(
+        sample.retained_layout_fresh_compare_mismatches, 0,
+        "retained frame should match fresh layout: {sample:?}"
+    );
+    assert_eq!(
+        sample.retained_layout_fresh_compare_target_mismatches, 0,
+        "retained frame targeted fresh-layout comparison should match fresh layout: {sample:?}"
+    );
+}
+
 fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
     assert_retained_frame_sample(sample);
     assert_eq!(
@@ -1665,6 +1684,7 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
                     AvailableSpace::MinContent | AvailableSpace::MaxContent => px(240.0),
                 }),
                 |window, _| {
+                    window.compare_retained_layout_with_fresh_for_tests();
                     window.set_retained_subtree_probe_targets_for_tests(vec![
                         "generated-framework-retained-root".to_string(),
                     ]);
@@ -1713,6 +1733,7 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
             first_retained_bounds, second_retained_bounds,
             "stable retained framework redraw should publish identical bounds"
         );
+        assert_runtime_fresh_compare_proved(stable_sample);
         assert_no_retained_writes_or_measurement(stable_sample);
         assert_solver_cache_did_not_churn(stable_sample, false, false);
         assert_stable_subtree_preserved_without_solver_churn(
@@ -1733,8 +1754,9 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
         let available_size = size(px(draw_u8(&tc, 100, 240) as f32), px(240.0));
 
         let (first_retained_bounds, second_retained_bounds, stable_sample) = {
-            let retained = cx.open_window(available_size, |_, _| GeneratedFrameworkTextView {
-                tree: tree.clone(),
+            let retained = cx.open_window(available_size, |window, _| {
+                window.compare_retained_layout_with_fresh_for_tests();
+                GeneratedFrameworkTextView { tree: tree.clone() }
             });
             cx.run_until_parked();
             let window = *retained.deref();
@@ -1765,6 +1787,7 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
             first_retained_bounds, second_retained_bounds,
             "stable retained framework text redraw should publish identical bounds"
         );
+        assert_runtime_fresh_compare_proved(stable_sample);
         assert_no_retained_writes_or_measurement(stable_sample);
         assert_solver_cache_did_not_churn(stable_sample, true, true);
     })
@@ -1785,6 +1808,7 @@ fn generated_framework_styled_tree_matches_fresh_and_stable_repeat_preserves_sol
 
         let (first_retained_bounds, second_retained_bounds, stable_sample, stable_subtree_samples) = {
             let retained = cx.open_window(window_size, |window, _| {
+                window.compare_retained_layout_with_fresh_for_tests();
                 window.set_retained_subtree_probe_targets_for_tests(vec![
                     "generated-framework-styled-retained-root".to_string(),
                 ]);
@@ -1820,10 +1844,7 @@ fn generated_framework_styled_tree_matches_fresh_and_stable_repeat_preserves_sol
             first_retained_bounds, second_retained_bounds,
             "stable retained generated styled tree redraw should publish identical bounds"
         );
-        assert_eq!(
-            stable_sample.retained_layout_fresh_compare_mismatches, 0,
-            "runtime retained-vs-fresh comparison should not report styled stable-repeat mismatches"
-        );
+        assert_runtime_fresh_compare_proved(stable_sample);
         assert_no_retained_writes_or_measurement(stable_sample);
         assert_solver_cache_did_not_churn(stable_sample, true, true);
         assert_stable_subtree_preserved_without_solver_churn(
@@ -1853,6 +1874,7 @@ fn generated_framework_styled_sibling_churn_matches_fresh_and_preserves_stable_s
             stable_subtree_samples,
         ) = {
             let retained = cx.open_window(size(px(640.0), px(420.0)), |window, _| {
+                window.compare_retained_layout_with_fresh_for_tests();
                 window.set_retained_subtree_probe_targets_for_tests(vec![
                     "generated-styled-stable-panel".to_string(),
                 ]);
@@ -1899,10 +1921,7 @@ fn generated_framework_styled_sibling_churn_matches_fresh_and_preserves_stable_s
             second_retained_bounds, second_fresh_bounds,
             "retained generated styled sibling-churn frame should match fresh layout"
         );
-        assert_eq!(
-            second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
-            "runtime retained-vs-fresh comparison should not report mismatches"
-        );
+        assert_runtime_fresh_compare_proved(second_retained_sample);
         assert_retained_frame_sample(second_retained_sample);
         assert_stable_subtree_preserved_without_solver_churn(
             &stable_subtree_samples,
@@ -1926,6 +1945,7 @@ fn generated_styled_sibling_frame_sequence_matches_fresh_and_preserves_stable_su
             .collect::<Vec<_>>();
 
         let retained = cx.open_window(size(px(640.0), px(420.0)), |window, _| {
+            window.compare_retained_layout_with_fresh_for_tests();
             window.set_retained_subtree_probe_targets_for_tests(vec![
                 "generated-styled-stable-panel".to_string(),
             ]);
@@ -1974,10 +1994,7 @@ fn generated_styled_sibling_frame_sequence_matches_fresh_and_preserves_stable_su
                 retained_bounds, fresh_bounds,
                 "retained styled generated frame should match fresh layout after {change:?}"
             );
-            assert_eq!(
-                sample.retained_layout_fresh_compare_mismatches, 0,
-                "runtime retained-vs-fresh comparison should not report mismatches after {change:?}"
-            );
+            assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
             assert_stable_subtree_preserved_without_solver_churn(
                 &subtree_samples,
@@ -2009,6 +2026,7 @@ fn generated_parent_resize_preserves_fixed_stable_subtree_retention(cx: &mut Tes
             stable_subtree_samples,
         ) = {
             let retained = cx.open_window(first_window_size, |window, _| {
+                window.compare_retained_layout_with_fresh_for_tests();
                 window.set_retained_subtree_probe_targets_for_tests(vec![
                     "generated-styled-stable-panel".to_string(),
                 ]);
@@ -2046,10 +2064,7 @@ fn generated_parent_resize_preserves_fixed_stable_subtree_retention(cx: &mut Tes
             second_retained_bounds, second_fresh_bounds,
             "retained fixed stable subtree under parent resize should match fresh layout"
         );
-        assert_eq!(
-            second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
-            "runtime retained-vs-fresh comparison should not report parent-resize mismatches"
-        );
+        assert_runtime_fresh_compare_proved(second_retained_sample);
         assert_retained_frame_sample(second_retained_sample);
         assert_stable_subtree_retained_without_gpui_work(
             &stable_subtree_samples,
@@ -2076,6 +2091,7 @@ fn minimized_parent_resize_preserves_fixed_stable_text_subtree_retention(cx: &mu
 
     let (second_retained_bounds, second_retained_sample, stable_subtree_samples) = {
         let retained = cx.open_window(first_window_size, |window, _| {
+            window.compare_retained_layout_with_fresh_for_tests();
             window.set_retained_subtree_probe_targets_for_tests(vec![
                 "generated-styled-stable-panel".to_string(),
             ]);
@@ -2108,10 +2124,7 @@ fn minimized_parent_resize_preserves_fixed_stable_text_subtree_retention(cx: &mu
         second_retained_bounds, second_fresh_bounds,
         "retained minimized parent-resize frame should match fresh layout"
     );
-    assert_eq!(
-        second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
-        "runtime retained-vs-fresh comparison should not report minimized parent-resize mismatches"
-    );
+    assert_runtime_fresh_compare_proved(second_retained_sample);
     assert_retained_frame_sample(second_retained_sample);
     assert_stable_subtree_retained_without_gpui_work(
         &stable_subtree_samples,
@@ -2134,6 +2147,7 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
             stable_subtree_samples,
         ) = {
             let retained = cx.open_window(available_size, |window, _| {
+                window.compare_retained_layout_with_fresh_for_tests();
                 window.set_retained_subtree_probe_targets_for_tests(vec![
                     "generated-stable-panel".to_string(),
                 ]);
@@ -2183,10 +2197,7 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
             "changing fixed-width dynamic text should not move the stable sibling tree"
         );
         assert_stable_subtree_did_no_work(&stable_subtree_samples, "generated-stable-panel");
-        assert_eq!(
-            second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
-            "runtime retained-vs-fresh comparison should not report mismatches"
-        );
+        assert_runtime_fresh_compare_proved(second_retained_sample);
         assert_retained_frame_sample(second_retained_sample);
     })
     .settings(hegel_settings(60))
@@ -2206,6 +2217,7 @@ fn generated_dynamic_text_frame_sequence_matches_fresh_and_keeps_stable_subtree_
             .collect::<Vec<_>>();
 
         let retained = cx.open_window(state.window_size(), |window, _| {
+            window.compare_retained_layout_with_fresh_for_tests();
             window.set_retained_subtree_probe_targets_for_tests(vec![
                 "generated-stable-panel".to_string(),
             ]);
@@ -2251,10 +2263,7 @@ fn generated_dynamic_text_frame_sequence_matches_fresh_and_keeps_stable_subtree_
                 retained_bounds, fresh_bounds,
                 "retained generated dynamic frame should match fresh layout after {change:?}"
             );
-            assert_eq!(
-                sample.retained_layout_fresh_compare_mismatches, 0,
-                "runtime retained-vs-fresh comparison should not report mismatches after {change:?}"
-            );
+            assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
             if change.keeps_stable_subtree_constraints() {
                 assert_stable_subtree_did_no_work(&subtree_samples, "generated-stable-panel");
@@ -2279,6 +2288,7 @@ fn generated_sibling_churn_matches_fresh_and_preserves_stable_subtree(cx: &mut T
             .clone();
 
         let retained = cx.open_window(first_frame.window_size(), |window, _| {
+            window.compare_retained_layout_with_fresh_for_tests();
             window.set_retained_subtree_probe_targets_for_tests(vec![
                 "generated-sibling-churn-stable-panel".to_string(),
             ]);
@@ -2316,10 +2326,7 @@ fn generated_sibling_churn_matches_fresh_and_preserves_stable_subtree(cx: &mut T
                 retained_bounds, fresh_bounds,
                 "retained sibling-churn frame should match fresh layout for {frame:?}"
             );
-            assert_eq!(
-                sample.retained_layout_fresh_compare_mismatches, 0,
-                "runtime retained-vs-fresh comparison should not report mismatches for {frame:?}"
-            );
+            assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
             assert_stable_subtree_preserved_without_solver_churn(
                 &subtree_samples,
@@ -2345,6 +2352,7 @@ fn generated_keyed_sibling_churn_preserves_arbitrary_styled_subtree(cx: &mut Tes
             .clone();
 
         let retained = cx.open_window(first_frame.window_size(), |window, _| {
+            window.compare_retained_layout_with_fresh_for_tests();
             window.set_retained_subtree_probe_targets_for_tests(vec![
                 "generated-styled-sibling-churn-stable-panel".to_string(),
             ]);
@@ -2382,10 +2390,7 @@ fn generated_keyed_sibling_churn_preserves_arbitrary_styled_subtree(cx: &mut Tes
                 retained_bounds, fresh_bounds,
                 "retained styled sibling-churn frame should match fresh layout for {frame:?}"
             );
-            assert_eq!(
-                sample.retained_layout_fresh_compare_mismatches, 0,
-                "runtime retained-vs-fresh comparison should not report styled sibling-churn mismatches for {frame:?}"
-            );
+            assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
             assert_stable_subtree_preserved_without_solver_churn(
                 &subtree_samples,
@@ -2414,6 +2419,7 @@ fn generated_internal_edit_matches_fresh_and_preserves_unchanged_sibling_subtree
             .clone();
 
         let retained = cx.open_window(first_frame.window_size(), |window, _| {
+            window.compare_retained_layout_with_fresh_for_tests();
             window.set_retained_subtree_probe_targets_for_tests(vec![
                 "generated-internal-edit-stable-before".to_string(),
                 "generated-internal-edit-stable-after".to_string(),
@@ -2459,10 +2465,7 @@ fn generated_internal_edit_matches_fresh_and_preserves_unchanged_sibling_subtree
                 retained_bounds, fresh_bounds,
                 "retained internal-edit frame should match fresh layout for {frame:?}"
             );
-            assert_eq!(
-                sample.retained_layout_fresh_compare_mismatches, 0,
-                "runtime retained-vs-fresh comparison should not report mismatches for {frame:?}"
-            );
+            assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
             assert_stable_subtree_preserved_without_solver_churn(
                 &subtree_samples,

@@ -228,6 +228,11 @@ impl LayoutEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn compare_with_fresh_for_tests(&mut self) {
+        self.forest.compare_with_fresh_for_tests();
+    }
+
+    #[cfg(test)]
     fn retained_subtree_work_samples_for_tests(&self) -> &[RetainedSubtreeWorkSample] {
         self.forest.retained_subtree_work_samples_for_tests()
     }

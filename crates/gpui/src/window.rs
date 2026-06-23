@@ -8468,6 +8468,19 @@ impl Window {
         self.layout_engine = Some(LayoutEngine::new_force_fresh_for_tests());
     }
 
+    /// Compare each retained root solve against a freshly built solver tree.
+    ///
+    /// This is a test-only oracle for retained-layout property tests. It keeps
+    /// the window in retained mode, then records non-vacuous retained-vs-fresh
+    /// comparison telemetry for every comparable root solve.
+    #[cfg(test)]
+    pub(crate) fn compare_retained_layout_with_fresh_for_tests(&mut self) {
+        self.layout_engine
+            .as_mut()
+            .expect("window layout engine should exist before enabling fresh comparison")
+            .compare_with_fresh_for_tests();
+    }
+
     /// Returns the render-group work observation for the most recently completed draw.
     pub fn last_render_group_draw_observation(&self) -> Option<&RenderGroupDrawObservation> {
         self.last_render_group_draw_observation.as_ref()

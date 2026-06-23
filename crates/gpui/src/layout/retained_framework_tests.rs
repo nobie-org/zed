@@ -241,6 +241,257 @@ impl GeneratedTextNode {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum GeneratedStyledContainerKind {
+    Block,
+    FlexRow,
+    FlexColumn,
+    FlexWrap,
+    Grid,
+    RelativeOverlay,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GeneratedStyledNodeFacts {
+    Fixed {
+        width: u8,
+        height: u8,
+    },
+    Full {
+        min_width: u8,
+        min_height: u8,
+    },
+    ClampedWidth {
+        width: u8,
+        min_width: u8,
+        max_width: u8,
+        height: u8,
+    },
+    MarginBorder {
+        width: u8,
+        height: u8,
+        margin: u8,
+        padding: u8,
+    },
+    Absolute {
+        left: u8,
+        top: u8,
+        width: u8,
+        height: u8,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum GeneratedStyledNode {
+    Container {
+        facts: GeneratedStyledNodeFacts,
+        kind: GeneratedStyledContainerKind,
+        padding: u8,
+        gap: u8,
+        children: Vec<GeneratedStyledNode>,
+    },
+    Text {
+        facts: GeneratedStyledNodeFacts,
+        padding: u8,
+        text_size: u8,
+        text: String,
+    },
+}
+
+impl GeneratedStyledNodeFacts {
+    fn draw(tc: &hegel::TestCase, allow_absolute: bool) -> Self {
+        match draw_u8(tc, 0, if allow_absolute { 4 } else { 3 }) {
+            0 => Self::Fixed {
+                width: draw_u8(tc, 20, 220),
+                height: draw_u8(tc, 16, 180),
+            },
+            1 => Self::Full {
+                min_width: draw_u8(tc, 0, 48),
+                min_height: draw_u8(tc, 0, 48),
+            },
+            2 => {
+                let min_width = draw_u8(tc, 0, 90);
+                let max_width = draw_u8(tc, min_width.max(20), 240);
+                Self::ClampedWidth {
+                    width: draw_u8(tc, 20, 240),
+                    min_width,
+                    max_width,
+                    height: draw_u8(tc, 16, 180),
+                }
+            }
+            3 => Self::MarginBorder {
+                width: draw_u8(tc, 20, 220),
+                height: draw_u8(tc, 16, 180),
+                margin: draw_u8(tc, 0, 8),
+                padding: draw_u8(tc, 0, 8),
+            },
+            _ => Self::Absolute {
+                left: draw_u8(tc, 0, 24),
+                top: draw_u8(tc, 0, 24),
+                width: draw_u8(tc, 16, 120),
+                height: draw_u8(tc, 16, 120),
+            },
+        }
+    }
+}
+
+impl GeneratedStyledContainerKind {
+    fn draw(tc: &hegel::TestCase) -> Self {
+        match draw_u8(tc, 0, 5) {
+            0 => Self::Block,
+            1 => Self::FlexRow,
+            2 => Self::FlexColumn,
+            3 => Self::FlexWrap,
+            4 => Self::Grid,
+            _ => Self::RelativeOverlay,
+        }
+    }
+}
+
+impl GeneratedStyledNode {
+    fn draw(tc: &hegel::TestCase, depth: u8, allow_absolute: bool) -> Self {
+        let draw_text = depth == 0 || tc.draw(generators::booleans());
+        if draw_text {
+            return Self::Text {
+                facts: GeneratedStyledNodeFacts::draw(tc, allow_absolute),
+                padding: draw_u8(tc, 0, 8),
+                text_size: draw_u8(tc, 10, 22),
+                text: draw_ascii_words(tc),
+            };
+        }
+
+        let kind = GeneratedStyledContainerKind::draw(tc);
+        let child_count = draw_u8(tc, 1, 4);
+        let children_allow_absolute =
+            allow_absolute || matches!(kind, GeneratedStyledContainerKind::RelativeOverlay);
+        let children = (0..child_count)
+            .map(|_| Self::draw(tc, depth.saturating_sub(1), children_allow_absolute))
+            .collect();
+
+        Self::Container {
+            facts: GeneratedStyledNodeFacts::draw(tc, allow_absolute),
+            kind,
+            padding: draw_u8(tc, 0, 8),
+            gap: draw_u8(tc, 0, 10),
+            children,
+        }
+    }
+
+    fn selectors_at(&self, root: &str) -> Vec<String> {
+        let mut selectors = Vec::new();
+        self.push_selectors(root.to_string(), &mut selectors);
+        selectors
+    }
+
+    fn push_selectors(&self, selector: String, selectors: &mut Vec<String>) {
+        selectors.push(selector.clone());
+        if let Self::Container { children, .. } = self {
+            for (index, child) in children.iter().enumerate() {
+                child.push_selectors(format!("{selector}/{index}"), selectors);
+            }
+        }
+    }
+
+    fn build_at(&self, selector: &str) -> AnyElement {
+        let selector_for_debug = selector.to_string();
+        match self {
+            Self::Container {
+                facts,
+                kind,
+                padding,
+                gap,
+                children,
+            } => {
+                let children = children
+                    .iter()
+                    .enumerate()
+                    .map(|(index, child)| child.build_at(&format!("{selector}/{index}")))
+                    .collect::<Vec<_>>();
+                let mut element = div()
+                    .debug_selector(move || selector_for_debug)
+                    .p(px(*padding as f32))
+                    .gap(px(*gap as f32));
+
+                element = apply_generated_styled_facts(element, *facts);
+                element = match kind {
+                    GeneratedStyledContainerKind::Block => element,
+                    GeneratedStyledContainerKind::FlexRow => element.flex().flex_row(),
+                    GeneratedStyledContainerKind::FlexColumn => element.flex().flex_col(),
+                    GeneratedStyledContainerKind::FlexWrap => element.flex().flex_row().flex_wrap(),
+                    GeneratedStyledContainerKind::Grid => element.grid().grid_cols(2).grid_rows(2),
+                    GeneratedStyledContainerKind::RelativeOverlay => element.relative(),
+                };
+
+                element.children(children).into_any_element()
+            }
+            Self::Text {
+                facts,
+                padding,
+                text_size,
+                text,
+            } => {
+                let element = div()
+                    .debug_selector(move || selector_for_debug)
+                    .p(px(*padding as f32))
+                    .text_size(px(*text_size as f32))
+                    .child(text.clone());
+                apply_generated_styled_facts(element, *facts).into_any_element()
+            }
+        }
+    }
+}
+
+fn apply_generated_styled_facts(
+    element: crate::elements::Div,
+    facts: GeneratedStyledNodeFacts,
+) -> crate::elements::Div {
+    match facts {
+        GeneratedStyledNodeFacts::Fixed { width, height } => {
+            element.w(px(width as f32)).h(px(height as f32))
+        }
+        GeneratedStyledNodeFacts::Full {
+            min_width,
+            min_height,
+        } => element
+            .w_full()
+            .h_full()
+            .min_w(px(min_width as f32))
+            .min_h(px(min_height as f32)),
+        GeneratedStyledNodeFacts::ClampedWidth {
+            width,
+            min_width,
+            max_width,
+            height,
+        } => element
+            .w(px(width as f32))
+            .min_w(px(min_width as f32))
+            .max_w(px(max_width as f32))
+            .h(px(height as f32)),
+        GeneratedStyledNodeFacts::MarginBorder {
+            width,
+            height,
+            margin,
+            padding,
+        } => element
+            .w(px(width as f32))
+            .h(px(height as f32))
+            .m(px(margin as f32))
+            .p(px(padding as f32))
+            .border_1(),
+        GeneratedStyledNodeFacts::Absolute {
+            left,
+            top,
+            width,
+            height,
+        } => element
+            .absolute()
+            .left(px(left as f32))
+            .top(px(top as f32))
+            .w(px(width as f32))
+            .h(px(height as f32)),
+    }
+}
+
 fn draw_ascii_words(tc: &hegel::TestCase) -> String {
     let word_count = draw_u8(tc, 1, 10);
     (0..word_count)
@@ -360,6 +611,55 @@ fn draw_dynamic_sibling_text_tree(
     )
 }
 
+fn draw_generated_styled_sibling_tree(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    stable_tree: &GeneratedStyledNode,
+) -> (
+    Vec<(String, Bounds<Pixels>)>,
+    LayoutWorkSample,
+    Vec<crate::RetainedSubtreeWorkSample>,
+) {
+    let mut selectors = vec![
+        "styled-root".to_string(),
+        "styled-dynamic".to_string(),
+        "styled-stable-panel".to_string(),
+    ];
+    selectors.extend(stable_tree.selectors_at("styled-stable/root"));
+
+    let bounds = selectors
+        .into_iter()
+        .map(|selector| {
+            let bounds = cx
+                .update_window(window, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(&selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("missing debug bounds for generated styled selector {selector}")
+                });
+            (selector, bounds)
+        })
+        .collect::<Vec<_>>();
+
+    let (sample, subtree_samples) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.last_layout_work_sample(),
+                window
+                    .last_retained_subtree_work_samples_for_tests()
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+
+    (
+        bounds,
+        sample.expect("generated styled draw should publish layout work"),
+        subtree_samples,
+    )
+}
+
 fn draw_fresh_dynamic_sibling_text_tree(
     cx: &mut TestAppContext,
     stable_tree: &GeneratedTextNode,
@@ -375,6 +675,26 @@ fn draw_fresh_dynamic_sibling_text_tree(
     });
     cx.run_until_parked();
     let (bounds, sample, _) = draw_dynamic_sibling_text_tree(cx, *fresh.deref(), stable_tree);
+    assert_fresh_oracle_sample(sample);
+    bounds
+}
+
+fn draw_fresh_generated_styled_sibling_tree(
+    cx: &mut TestAppContext,
+    stable_tree: &GeneratedStyledNode,
+    tick: u8,
+    dynamic_width: u8,
+) -> Vec<(String, Bounds<Pixels>)> {
+    let fresh = cx.open_window(size(px(640.0), px(420.0)), |window, _| {
+        window.force_fresh_layout_for_tests();
+        GeneratedStyledSiblingView {
+            stable_tree: stable_tree.clone(),
+            tick,
+            dynamic_width,
+        }
+    });
+    cx.run_until_parked();
+    let (bounds, sample, _) = draw_generated_styled_sibling_tree(cx, *fresh.deref(), stable_tree);
     assert_fresh_oracle_sample(sample);
     bounds
 }
@@ -439,6 +759,50 @@ impl Render for GeneratedDynamicSiblingTextView {
                     .id("generated-stable-panel")
                     .debug_selector(|| "stable-panel".into())
                     .child(self.stable_tree.build_at("stable/root", false)),
+            )
+    }
+}
+
+struct GeneratedStyledSiblingView {
+    stable_tree: GeneratedStyledNode,
+    tick: u8,
+    dynamic_width: u8,
+}
+
+impl Render for GeneratedStyledSiblingView {
+    fn render(
+        &mut self,
+        _window: &mut BuildCx<'_>,
+        _cx: &mut crate::Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("generated-styled-sibling-root")
+            .debug_selector(|| "styled-root".into())
+            .flex()
+            .flex_row()
+            .gap(px(10.0))
+            .w_full()
+            .h_full()
+            .child(
+                div()
+                    .id("generated-styled-dynamic")
+                    .debug_selector(|| "styled-dynamic".into())
+                    .flex_none()
+                    .w(px(self.dynamic_width as f32))
+                    .h(px(88.0))
+                    .p(px(6.0))
+                    .text_size(px(14.0))
+                    .child(format!("dynamic styled {}", self.tick)),
+            )
+            .child(
+                div()
+                    .id("generated-styled-stable-panel")
+                    .debug_selector(|| "styled-stable-panel".into())
+                    .relative()
+                    .flex_none()
+                    .w(px(360.0))
+                    .h(px(340.0))
+                    .child(self.stable_tree.build_at("styled-stable/root")),
             )
     }
 }
@@ -955,6 +1319,14 @@ fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample
         0,
         "stable subtree {target} should not have retained work: {sample:?}"
     );
+    assert_eq!(
+        sample.measured_callbacks, 0,
+        "stable subtree {target} should not run measured callbacks: {sample:?}"
+    );
+    assert_eq!(
+        sample.conservative_text_measured_callbacks, 0,
+        "stable subtree {target} should not hide measured callbacks behind exemptions: {sample:?}"
+    );
     assert!(
         sample.retained_reuses > 0,
         "stable subtree {target} should reuse retained nodes: {sample:?}"
@@ -982,6 +1354,14 @@ fn assert_stable_subtree_preserved_without_solver_churn(
         sample.no_work_total(),
         0,
         "stable subtree {target} should not have retained or solver churn: {sample:?}"
+    );
+    assert_eq!(
+        sample.measured_callbacks, 0,
+        "stable subtree {target} should not run measured callbacks: {sample:?}"
+    );
+    assert_eq!(
+        sample.conservative_text_measured_callbacks, 0,
+        "stable subtree {target} should not hide measured callbacks behind exemptions: {sample:?}"
     );
     assert_subtree_solver_preservation_observed(sample, target);
 }
@@ -1108,6 +1488,84 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
         assert_solver_cache_did_not_churn(stable_sample, true, true);
     })
     .settings(hegel_settings(50))
+    .run();
+}
+
+#[gpui::test]
+fn generated_framework_styled_sibling_churn_matches_fresh_and_preserves_stable_subtree(
+    cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let stable_tree = GeneratedStyledNode::draw(&tc, 3, false);
+        let first_tick = draw_u8(&tc, 0, 120);
+        let second_tick = first_tick.wrapping_add(draw_u8(&tc, 1, 16));
+        let first_dynamic_width = draw_u8(&tc, 48, 180);
+        let second_dynamic_width = draw_u8(&tc, 48, 180);
+
+        let (
+            first_retained_bounds,
+            second_retained_bounds,
+            second_retained_sample,
+            stable_subtree_samples,
+        ) = {
+            let retained = cx.open_window(size(px(640.0), px(420.0)), |window, _| {
+                window.set_retained_subtree_probe_targets_for_tests(vec![
+                    "generated-styled-stable-panel".to_string(),
+                ]);
+                GeneratedStyledSiblingView {
+                    stable_tree: stable_tree.clone(),
+                    tick: first_tick,
+                    dynamic_width: first_dynamic_width,
+                }
+            });
+            cx.run_until_parked();
+            let window = *retained.deref();
+            let (first_bounds, _, _) = draw_generated_styled_sibling_tree(cx, window, &stable_tree);
+            retained
+                .update(cx, |view, _, cx| {
+                    view.tick = second_tick;
+                    view.dynamic_width = second_dynamic_width;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let (second_bounds, sample, subtree_samples) =
+                draw_generated_styled_sibling_tree(cx, window, &stable_tree);
+            (first_bounds, second_bounds, sample, subtree_samples)
+        };
+
+        let first_fresh_bounds = draw_fresh_generated_styled_sibling_tree(
+            cx,
+            &stable_tree,
+            first_tick,
+            first_dynamic_width,
+        );
+        let second_fresh_bounds = draw_fresh_generated_styled_sibling_tree(
+            cx,
+            &stable_tree,
+            second_tick,
+            second_dynamic_width,
+        );
+
+        assert_eq!(
+            first_retained_bounds, first_fresh_bounds,
+            "initial retained generated styled frame should match fresh layout"
+        );
+        assert_eq!(
+            second_retained_bounds, second_fresh_bounds,
+            "retained generated styled sibling-churn frame should match fresh layout"
+        );
+        assert_eq!(
+            second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
+            "runtime retained-vs-fresh comparison should not report mismatches"
+        );
+        assert_retained_frame_sample(second_retained_sample);
+        assert_stable_subtree_preserved_without_solver_churn(
+            &stable_subtree_samples,
+            "generated-styled-stable-panel",
+        );
+    })
+    .settings(hegel_settings(60))
     .run();
 }
 

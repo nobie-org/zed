@@ -997,13 +997,18 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
             AvailableSpace::Definite(px(draw_u8(&tc, 80, 240) as f32)),
         );
 
-        let (first_retained_bounds, second_retained_bounds, stable_sample) = {
+        let (first_retained_bounds, second_retained_bounds, stable_sample, stable_subtree_samples) = {
             let retained = cx.open_window(
                 available_space.map(|space| match space {
                     AvailableSpace::Definite(value) => value,
                     AvailableSpace::MinContent | AvailableSpace::MaxContent => px(240.0),
                 }),
-                |_, _| GeneratedFrameworkView { tree: tree.clone() },
+                |window, _| {
+                    window.set_retained_subtree_probe_targets_for_tests(vec![
+                        "generated-framework-retained-root".to_string(),
+                    ]);
+                    GeneratedFrameworkView { tree: tree.clone() }
+                },
             );
             cx.run_until_parked();
             let window = *retained.deref();
@@ -1012,7 +1017,14 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
                 .unwrap();
             cx.run_until_parked();
             let (second_bounds, sample) = draw_generated_div_tree(cx, window, &tree);
-            (first_bounds, second_bounds, sample)
+            let subtree_samples = cx
+                .update_window(window, |_, window, _| {
+                    window
+                        .last_retained_subtree_work_samples_for_tests()
+                        .to_vec()
+                })
+                .unwrap();
+            (first_bounds, second_bounds, sample, subtree_samples)
         };
 
         let fresh_bounds = {
@@ -1042,6 +1054,10 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
         );
         assert_no_retained_writes_or_measurement(stable_sample);
         assert_solver_cache_did_not_churn(stable_sample, false, false);
+        assert_stable_subtree_preserved_without_solver_churn(
+            &stable_subtree_samples,
+            "generated-framework-retained-root",
+        );
     })
     .settings(hegel_settings(80))
     .run();

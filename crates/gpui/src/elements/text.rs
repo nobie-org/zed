@@ -377,6 +377,97 @@ impl IntoElement for StyledText {
     }
 }
 
+/// Construct text whose layout contribution is an explicit fixed size.
+///
+/// This is for diagnostic/HUD/readout-style text that paints inside a known box
+/// and must not make changing glyph payloads look like intrinsic layout facts.
+/// Ordinary string children remain intrinsic measured text.
+pub fn fixed_text(text: impl Into<SharedString>, content_size: Size<Pixels>) -> FixedSizeText {
+    FixedSizeText::new(text, content_size)
+}
+
+/// Text painted inside a fixed layout box.
+///
+/// The retained layout tree sees this as a generic measured node with a pure
+/// size answer. Text shaping remains a GPUI artifact validated from the exact
+/// solver query, so changing the text can update pixels without dirtying layout
+/// when the fixed size is unchanged.
+pub struct FixedSizeText {
+    text: SharedString,
+    content_size: Size<Pixels>,
+    layout: TextLayout,
+}
+
+impl FixedSizeText {
+    /// Create fixed-layout text with an explicit content size.
+    pub fn new(text: impl Into<SharedString>, content_size: Size<Pixels>) -> Self {
+        Self {
+            text: text.into(),
+            content_size,
+            layout: TextLayout::default(),
+        }
+    }
+}
+
+impl Element for FixedSizeText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut LayoutRequestCx<'_>,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let layout_id =
+            self.layout
+                .layout_fixed_size(self.text.clone(), self.content_size, window, cx);
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _window: &mut PrepaintCx<'_>,
+        _cx: &mut App,
+    ) {
+        self.layout.prepaint(bounds, &self.text)
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut PaintCx<'_>,
+        cx: &mut App,
+    ) {
+        self.layout.paint(&self.text, window, cx)
+    }
+}
+
+impl IntoElement for FixedSizeText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 /// The frame-local layout state for a text element.
 ///
 /// Paint, prepaint, and hit testing need shaped lines in this handle. Retained
@@ -608,6 +699,46 @@ impl TextLayout {
 
         window.request_text_measured_layout(
             Default::default(),
+            measure_key,
+            move |artifact| layout.hydrate(artifact),
+            move |known_dimensions, available_space, measure_cx| {
+                measure_key_for_measure.measure(known_dimensions, available_space, measure_cx)
+            },
+        )
+    }
+
+    /// Request fixed-size layout for text while keeping text shaping as an artifact.
+    fn layout_fixed_size(
+        &self,
+        text: SharedString,
+        content_size: Size<Pixels>,
+        window: &mut LayoutRequestCx<'_>,
+        _cx: &mut App,
+    ) -> LayoutId {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = window.pixel_snap(
+            text_style
+                .line_height
+                .to_pixels(font_size.into(), window.rem_size()),
+        );
+
+        let runs = vec![text_style.to_run(text.len())];
+        let measure_key = TextMeasureKey::new(
+            text,
+            runs,
+            &text_style,
+            font_size,
+            line_height,
+            window.scale_factor(),
+            window.text_system().shaping_epoch(),
+        );
+        let measure_key_for_measure = measure_key.clone();
+        let layout = self.clone();
+
+        window.request_fixed_size_text_measured_layout(
+            Default::default(),
+            content_size,
             measure_key,
             move |artifact| layout.hydrate(artifact),
             move |known_dimensions, available_space, measure_cx| {

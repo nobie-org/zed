@@ -869,6 +869,32 @@ impl<'a> LayoutRequestCx<'a> {
             .request_text_measured_layout(style, measure_key, hydrate, measure)
     }
 
+    pub(crate) fn request_fixed_size_text_measured_layout<F, H>(
+        &mut self,
+        style: Style,
+        content_size: Size<Pixels>,
+        measure_key: TextMeasureKey,
+        hydrate: H,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: FnMut(
+                Size<Option<Pixels>>,
+                Size<AvailableSpace>,
+                &mut MeasureCx<'_>,
+            ) -> TextLayoutArtifact
+            + 'static,
+        H: Fn(&TextLayoutArtifact) + 'static,
+    {
+        self.window.request_fixed_size_text_measured_layout(
+            style,
+            content_size,
+            measure_key,
+            hydrate,
+            measure,
+        )
+    }
+
     pub fn rem_size(&self) -> Pixels {
         self.window.rem_size()
     }
@@ -8330,6 +8356,41 @@ impl Window {
                 style,
                 rem_size,
                 scale_factor,
+                measure_key,
+                hydrate,
+                measure,
+            )
+    }
+
+    fn request_fixed_size_text_measured_layout<F, H>(
+        &mut self,
+        style: Style,
+        content_size: Size<Pixels>,
+        measure_key: TextMeasureKey,
+        hydrate: H,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: FnMut(
+                Size<Option<Pixels>>,
+                Size<AvailableSpace>,
+                &mut MeasureCx<'_>,
+            ) -> TextLayoutArtifact
+            + 'static,
+        H: Fn(&TextLayoutArtifact) + 'static,
+    {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_fixed_size_text_measured_layout(
+                style,
+                rem_size,
+                scale_factor,
+                content_size,
                 measure_key,
                 hydrate,
                 measure,

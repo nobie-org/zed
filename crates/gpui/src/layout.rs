@@ -321,6 +321,52 @@ impl LayoutEngine {
         )
     }
 
+    /// Record text whose layout answer is explicit and whose glyphs are an artifact.
+    ///
+    /// This is for text drawn inside a layout-stable box. The fixed content size
+    /// is the measured layout fact; the `TextMeasureKey` is only artifact
+    /// validity. Changing the text can therefore hydrate a new artifact without
+    /// dirtying the solver as long as the fixed measured answer is unchanged.
+    pub(crate) fn request_fixed_size_text_measured_layout(
+        &mut self,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        content_size: Size<Pixels>,
+        measure_key: TextMeasureKey,
+        hydrate: impl Fn(&TextLayoutArtifact) + 'static,
+        mut measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut MeasureCx<'_>,
+        ) -> TextLayoutArtifact
+        + 'static,
+    ) -> LayoutId {
+        self.layout_work.measured_layout_node_requests += 1;
+        let layout_measure = PureSizeMeasure::content_size(content_size, scale_factor);
+        let artifact_key = text_layout_artifact_key(measure_key);
+        self.forest.request_measured_layout(
+            style,
+            rem_size,
+            scale_factor,
+            MeasuredLayoutRequest::artifact_with_pure_size(
+                layout_measure,
+                artifact_key,
+                move |artifact| {
+                    let artifact = artifact
+                        .downcast_ref::<TextLayoutArtifact>()
+                        .expect("fixed-size text measured layout should hydrate a text artifact");
+                    hydrate(artifact)
+                },
+                move |known_dimensions, available_space, measure_cx| {
+                    let artifact = measure(known_dimensions, available_space, measure_cx);
+                    let artifact_key = text_layout_artifact_key(artifact.key().clone());
+                    LayoutArtifact::new(artifact_key, content_size, artifact)
+                },
+            ),
+        )
+    }
+
     /// Test-only anonymous root compute helper.
     ///
     /// Production callers go through `Window`, which allocates retained root

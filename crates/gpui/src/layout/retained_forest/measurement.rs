@@ -74,6 +74,7 @@ enum MeasuredLayoutRequestRepr {
     Opaque(LayoutMeasureContext),
     PureSize(PureSizeMeasure),
     Artifact {
+        facts: MeasuredLayoutFacts,
         key: LayoutArtifactKey,
         context: LayoutMeasureContext,
     },
@@ -111,7 +112,46 @@ impl MeasuredLayoutRequest {
         ) -> LayoutArtifact
         + 'static,
     ) -> Self {
+        Self::artifact_with_facts(
+            MeasuredLayoutFacts::artifact(key.clone()),
+            key,
+            hydrate,
+            measure,
+        )
+    }
+
+    pub(in crate::layout) fn artifact_with_pure_size(
+        layout_measure: PureSizeMeasure,
+        key: LayoutArtifactKey,
+        hydrate: impl Fn(&LayoutArtifact) + 'static,
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut MeasureCx<'_>,
+        ) -> LayoutArtifact
+        + 'static,
+    ) -> Self {
+        Self::artifact_with_facts(
+            MeasuredLayoutFacts::pure_size(layout_measure),
+            key,
+            hydrate,
+            measure,
+        )
+    }
+
+    fn artifact_with_facts(
+        facts: MeasuredLayoutFacts,
+        key: LayoutArtifactKey,
+        hydrate: impl Fn(&LayoutArtifact) + 'static,
+        mut measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut MeasureCx<'_>,
+        ) -> LayoutArtifact
+        + 'static,
+    ) -> Self {
         Self(MeasuredLayoutRequestRepr::Artifact {
+            facts,
             key,
             context: LayoutMeasureContext::Artifact(ArtifactMeasureContext {
                 measure: StackSafe::new(Box::new(
@@ -365,6 +405,7 @@ pub(super) enum CurrentMeasurement {
     Opaque(usize),
     PureSize(PureSizeMeasure),
     Artifact {
+        facts: MeasuredLayoutFacts,
         key: LayoutArtifactKey,
         measure: usize,
     },
@@ -534,11 +575,16 @@ impl MeasurementStore {
                 MeasuredLayoutFacts::pure_size(measure.clone()),
                 CurrentMeasurement::PureSize(measure),
             ),
-            MeasuredLayoutRequestRepr::Artifact { key, context } => {
+            MeasuredLayoutRequestRepr::Artifact {
+                facts,
+                key,
+                context,
+            } => {
                 let producer = self.producers.push(context);
                 (
-                    MeasuredLayoutFacts::artifact(key.clone()),
+                    facts.clone(),
                     CurrentMeasurement::Artifact {
+                        facts,
                         key,
                         measure: producer,
                     },
@@ -655,16 +701,16 @@ impl MeasurementStore {
         node_id: SolverNodeId,
         facts: &MeasuredLayoutFacts,
     ) {
-        match (&facts.0, self.current_measurement(node_id)) {
-            (MeasuredLayoutFactsRepr::Opaque, Some(CurrentMeasurement::Opaque(_))) => {}
+        match (&facts.0, facts, self.current_measurement(node_id)) {
+            (MeasuredLayoutFactsRepr::Opaque, _, Some(CurrentMeasurement::Opaque(_))) => {}
             (
                 MeasuredLayoutFactsRepr::PureSize(expected),
+                _,
                 Some(CurrentMeasurement::PureSize(actual)),
             ) => assert_eq!(actual, expected),
-            (
-                MeasuredLayoutFactsRepr::Artifact(expected),
-                Some(CurrentMeasurement::Artifact { key: actual, .. }),
-            ) => assert_eq!(actual, expected),
+            (_, expected, Some(CurrentMeasurement::Artifact { facts: actual, .. })) => {
+                assert_eq!(actual, expected)
+            }
             _ => {
                 panic!("measured facts should have matching current measurement state")
             }
@@ -743,7 +789,7 @@ impl MeasurementStore {
         window: &mut Window,
         cx: &App,
     ) {
-        let Some(CurrentMeasurement::Artifact { key, measure }) =
+        let Some(CurrentMeasurement::Artifact { key, measure, .. }) =
             self.current_measurements.get(&proof.node_id).cloned()
         else {
             panic!("solver cache-hit text query should refer to a current text measurement");
@@ -781,7 +827,7 @@ impl MeasurementStore {
     }
 
     fn hydrate_artifact_node(&mut self, node_id: SolverNodeId, artifact: &LayoutArtifact) {
-        let Some(CurrentMeasurement::Artifact { key, measure }) =
+        let Some(CurrentMeasurement::Artifact { key, measure, .. }) =
             self.current_measurements.get_mut(&node_id)
         else {
             panic!("selected artifact should hydrate a current text measurement");

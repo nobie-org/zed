@@ -1528,6 +1528,38 @@ fn request_text_measured_with_hydration_log(
     )
 }
 
+fn request_fixed_size_text_measured_with_hydration_log(
+    engine: &mut LayoutEngine,
+    key: TextMeasureKey,
+    layout_size: Size<Pixels>,
+    artifact_size: Size<Pixels>,
+    measure_invocations: Rc<Cell<usize>>,
+    hydrations: Rc<Cell<usize>>,
+    hydrated_artifacts: Rc<RefCell<Vec<HydratedTextArtifact>>>,
+) -> LayoutId {
+    engine.request_fixed_size_text_measured_layout(
+        Style::default(),
+        px(16.0),
+        1.0,
+        layout_size,
+        key.clone(),
+        move |artifact| {
+            hydrations.set(hydrations.get() + 1);
+            hydrated_artifacts.borrow_mut().push(HydratedTextArtifact {
+                key: artifact.key().clone(),
+                size: artifact.size(),
+            });
+        },
+        move |known_dimensions, available_space, _| {
+            measure_invocations.set(measure_invocations.get() + 1);
+            TextLayoutArtifact::for_tests(
+                key.clone(),
+                text_artifact_size_for_query(artifact_size, known_dimensions, available_space),
+            )
+        },
+    )
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn request_input_sensitive_text_measured(
     engine: &mut LayoutEngine,
@@ -4805,6 +4837,75 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
             HydratedTextArtifact {
                 key: second_key,
                 size: size(px(60.0), px(20.0)),
+            },
+        ]
+    );
+}
+
+#[gpui::test]
+fn fixed_size_text_artifact_change_does_not_dirty_layout(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    let first_key = text_measure_key("draw     17");
+    let second_key = text_measure_key("draw     18");
+    let layout_size = size(px(120.0), px(20.0));
+    let measure_invocations = Rc::new(Cell::new(0));
+    let hydrations = Rc::new(Cell::new(0));
+    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = LayoutEngine::new();
+
+    let root = request_fixed_size_text_measured_with_hydration_log(
+        &mut engine,
+        first_key.clone(),
+        layout_size,
+        size(px(40.0), px(20.0)),
+        measure_invocations.clone(),
+        hydrations.clone(),
+        hydrated_artifacts.clone(),
+    );
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
+    engine.finish_frame();
+
+    engine.reset_retained_mutation_sample_for_tests();
+    let root = request_fixed_size_text_measured_with_hydration_log(
+        &mut engine,
+        second_key.clone(),
+        layout_size,
+        size(px(50.0), px(20.0)),
+        measure_invocations.clone(),
+        hydrations.clone(),
+        hydrated_artifacts.clone(),
+    );
+    compute_stable_test_root(
+        cx,
+        &mut engine,
+        root,
+        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+    );
+
+    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
+    assert_eq!(
+        engine.retained_mutation_sample_for_tests(),
+        RetainedForestMutationSample {
+            reuses: 1,
+            ..RetainedForestMutationSample::default()
+        }
+    );
+    assert_eq!((measure_invocations.get(), hydrations.get()), (2, 2));
+    assert_eq!(
+        hydrated_artifacts.borrow().as_slice(),
+        [
+            HydratedTextArtifact {
+                key: first_key,
+                size: size(px(40.0), px(20.0)),
+            },
+            HydratedTextArtifact {
+                key: second_key,
+                size: size(px(50.0), px(20.0)),
             },
         ]
     );

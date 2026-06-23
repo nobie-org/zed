@@ -233,10 +233,10 @@ fn committed_layout_state_checkpoint_restores_unique_current_mapping(_cx: &mut T
         let after_count = draw_usize(&tc, 0, 12);
         let mut state = CommittedLayoutState::new();
         let mut before = Vec::new();
+        let mut after = Vec::new();
 
         for index in 0..before_count {
             let node = new_test_node(&mut solver);
-            state.mark_solver_node_committed(node);
             state.insert(LayoutId(index), node);
             before.push((LayoutId(index), node));
         }
@@ -244,8 +244,8 @@ fn committed_layout_state_checkpoint_restores_unique_current_mapping(_cx: &mut T
         let checkpoint = state.checkpoint();
         for index in before_count..(before_count + after_count) {
             let node = new_test_node(&mut solver);
-            state.mark_solver_node_committed(node);
             state.insert(LayoutId(index), node);
+            after.push((LayoutId(index), node));
         }
         state.rollback_to_checkpoint(checkpoint);
 
@@ -259,14 +259,57 @@ fn committed_layout_state_checkpoint_restores_unique_current_mapping(_cx: &mut T
                 .map(|(id, node)| (*id, Some(*node)))
                 .collect::<Vec<_>>()
         );
+        assert_eq!(
+            before
+                .iter()
+                .map(|(_, node)| (*node, state.layout_id_for_node(*node)))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|(id, node)| (*node, Some(*id)))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(state.try_node(LayoutId(before_count)), None);
+        for (id, node) in after {
+            assert_eq!(state.try_node(id), None);
+            assert_eq!(state.layout_id_for_node(node), None);
+        }
         let next_node = new_test_node(&mut solver);
-        state.mark_solver_node_committed(next_node);
         state.insert(LayoutId(before_count), next_node);
         assert_eq!(state.try_node(LayoutId(before_count)), Some(next_node));
+        assert_eq!(
+            state.layout_id_for_node(next_node),
+            Some(LayoutId(before_count))
+        );
+        state.clear();
+        assert_eq!(state.try_node(LayoutId(before_count)), None);
+        assert_eq!(state.layout_id_for_node(next_node), None);
     })
     .settings(hegel_settings(128))
     .run();
+}
+
+#[gpui::test]
+#[should_panic(expected = "layout facts should appear only once in a committed layout tree")]
+fn committed_layout_state_rejects_duplicate_layout_id(_cx: &mut TestAppContext) {
+    let mut solver = LayoutSolver::new();
+    let mut state = CommittedLayoutState::new();
+    let first = new_test_node(&mut solver);
+    let second = new_test_node(&mut solver);
+
+    state.insert(LayoutId(1), first);
+    state.insert(LayoutId(1), second);
+}
+
+#[gpui::test]
+#[should_panic(expected = "committed solver node should map to only one current layout id")]
+fn committed_layout_state_rejects_duplicate_solver_node(_cx: &mut TestAppContext) {
+    let mut solver = LayoutSolver::new();
+    let mut state = CommittedLayoutState::new();
+    let node = new_test_node(&mut solver);
+
+    state.insert(LayoutId(1), node);
+    state.insert(LayoutId(2), node);
 }
 
 #[gpui::test]

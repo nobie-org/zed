@@ -11,14 +11,14 @@ use collections::{FxHashMap, FxHashSet};
 /// Current-frame map from GPUI layout ids to private mirror nodes.
 pub(super) struct CommittedLayoutState {
     layout_nodes: FxHashMap<LayoutId, SolverNodeId>,
-    solver_nodes: FxHashSet<SolverNodeId>,
+    node_layouts: FxHashMap<SolverNodeId, LayoutId>,
     dirty_solver_nodes: FxHashSet<SolverNodeId>,
 }
 
 /// Transaction checkpoint for committed-node state.
 pub(super) struct CommittedLayoutCheckpoint {
     layout_nodes: FxHashMap<LayoutId, SolverNodeId>,
-    solver_nodes: FxHashSet<SolverNodeId>,
+    node_layouts: FxHashMap<SolverNodeId, LayoutId>,
     dirty_solver_nodes: FxHashSet<SolverNodeId>,
 }
 
@@ -26,7 +26,7 @@ impl CommittedLayoutState {
     pub(super) fn new() -> Self {
         Self {
             layout_nodes: FxHashMap::default(),
-            solver_nodes: FxHashSet::default(),
+            node_layouts: FxHashMap::default(),
             dirty_solver_nodes: FxHashSet::default(),
         }
     }
@@ -34,20 +34,20 @@ impl CommittedLayoutState {
     pub(super) fn checkpoint(&self) -> CommittedLayoutCheckpoint {
         CommittedLayoutCheckpoint {
             layout_nodes: self.layout_nodes.clone(),
-            solver_nodes: self.solver_nodes.clone(),
+            node_layouts: self.node_layouts.clone(),
             dirty_solver_nodes: self.dirty_solver_nodes.clone(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: CommittedLayoutCheckpoint) {
         self.layout_nodes = checkpoint.layout_nodes;
-        self.solver_nodes = checkpoint.solver_nodes;
+        self.node_layouts = checkpoint.node_layouts;
         self.dirty_solver_nodes = checkpoint.dirty_solver_nodes;
     }
 
     pub(super) fn clear(&mut self) {
         self.layout_nodes.clear();
-        self.solver_nodes.clear();
+        self.node_layouts.clear();
         self.dirty_solver_nodes.clear();
     }
 
@@ -67,33 +67,27 @@ impl CommittedLayoutState {
     }
 
     pub(super) fn layout_id_for_node(&self, node_id: SolverNodeId) -> Option<LayoutId> {
-        self.layout_nodes
-            .iter()
-            .find_map(|(layout_id, committed_node_id)| {
-                (*committed_node_id == node_id).then_some(*layout_id)
-            })
+        self.node_layouts.get(&node_id).copied()
     }
 
     pub(super) fn node_layout_ids_for_trace(&self) -> Vec<(SolverNodeId, LayoutId)> {
-        self.layout_nodes
+        self.node_layouts
             .iter()
-            .map(|(layout_id, node_id)| (*node_id, *layout_id))
+            .map(|(node_id, layout_id)| (*node_id, *layout_id))
             .collect()
     }
 
     pub(super) fn insert(&mut self, id: LayoutId, node_id: SolverNodeId) {
-        let previous = self.layout_nodes.insert(id, node_id);
         assert!(
-            previous.is_none(),
+            !self.layout_nodes.contains_key(&id),
             "layout facts should appear only once in a committed layout tree"
         );
-    }
-
-    pub(super) fn mark_solver_node_committed(&mut self, node_id: SolverNodeId) {
         assert!(
-            self.solver_nodes.insert(node_id),
-            "committed solver node should appear at only one current frame position"
+            !self.node_layouts.contains_key(&node_id),
+            "committed solver node should map to only one current layout id"
         );
+        self.layout_nodes.insert(id, node_id);
+        self.node_layouts.insert(node_id, id);
     }
 
     pub(super) fn mark_solver_node_dirty(&mut self, node_id: SolverNodeId) -> bool {

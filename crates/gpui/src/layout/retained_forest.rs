@@ -1462,7 +1462,6 @@ impl RetainedLayoutForest {
                 .new_with_children(style.clone(), &child_node_ids)
         };
         self.work.record_create();
-        self.mark_solver_node_committed(node_id);
         self.committed.insert(id, node_id);
         RetainedLayoutNode {
             node_id,
@@ -1488,7 +1487,6 @@ impl RetainedLayoutForest {
 
         let node_id = self.solver.new_measured(style.clone());
         self.work.record_create();
-        self.mark_solver_node_committed(node_id);
         self.measurements
             .insert_current_measurement_for_layout(node_id, id, &measured_facts);
         self.committed.insert(id, node_id);
@@ -1565,7 +1563,6 @@ impl RetainedLayoutForest {
         let mut previous_children = previous_children.into_iter().map(Some).collect::<Vec<_>>();
         let style_changed = previous_style != style;
         self.work.record_reuse();
-        self.mark_solver_node_committed(node_id);
         self.committed.insert(id, node_id);
 
         let mut assigned_previous_children =
@@ -1924,7 +1921,6 @@ impl RetainedLayoutForest {
             unreachable!("unmeasured previous node handled by compatibility check")
         };
         self.work.record_reuse();
-        self.mark_solver_node_committed(node_id);
         self.committed.insert(id, node_id);
 
         let style_changed = previous_style != style;
@@ -2081,11 +2077,6 @@ impl RetainedLayoutForest {
                     .debug_assert_current_measurement_matches(node_id, measured);
             }
         }
-    }
-
-    /// Mark a mirror node as used at one current-frame position.
-    fn mark_solver_node_committed(&mut self, node_id: SolverNodeId) {
-        self.committed.mark_solver_node_committed(node_id);
     }
 
     /// Mark a private mirror node dirty at most once in the current frame.

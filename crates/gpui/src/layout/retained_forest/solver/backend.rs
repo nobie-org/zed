@@ -9,8 +9,8 @@ use super::super::super::{AvailableSpace, EXPECT_MESSAGE};
 use super::super::measurement::NodeContext;
 use super::{
     FreshSolverNodeId, SolverBackend, SolverCacheClear, SolverCacheEntry, SolverCacheEntryId,
-    SolverCacheEntryTraceDetails, SolverCacheEvent, SolverLayout, SolverMeasureObservation,
-    SolverMeasureQuery, SolverNodeId, SolverStyle,
+    SolverCacheEntryTraceDetails, SolverCacheEvent, SolverCacheMiss, SolverCacheMissTraceDetails,
+    SolverLayout, SolverMeasureObservation, SolverMeasureQuery, SolverNodeId, SolverStyle,
 };
 use crate::{
     AbsoluteLength, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size, Style, point,
@@ -20,7 +20,8 @@ use crate::{
 use std::fmt::{self, Debug};
 use std::ops::Range;
 use taffy::{
-    LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutMeasureObservation, TaffyTree,
+    LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutCacheMiss,
+    LayoutMeasureObservation, TaffyTree,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
     prelude::{TaffyGridLine, TaffyGridSpan, max_content, min_content},
     style::AvailableSpace as TaffyAvailableSpace,
@@ -89,6 +90,35 @@ pub(super) struct BackendCacheClear(NodeId);
 impl BackendCacheClear {
     pub(super) fn node_id(&self) -> SolverNodeId {
         SolverNodeId(BackendNodeId(self.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct BackendCacheMiss(LayoutCacheMiss);
+
+impl BackendCacheMiss {
+    pub(super) fn node_id(&self) -> SolverNodeId {
+        SolverNodeId(BackendNodeId(self.0.node_id()))
+    }
+
+    pub(super) fn trace_details(&self) -> SolverCacheMissTraceDetails {
+        let requested_input = self.0.requested_input();
+        let cache_input = self.0.cache_input();
+        SolverCacheMissTraceDetails {
+            reason: format!("{:?}", self.0.reason()),
+            requested_run_mode: format!("{:?}", requested_input.run_mode),
+            cache_run_mode: format!("{:?}", cache_input.run_mode),
+            cache_sizing_mode: format!("{:?}", cache_input.sizing_mode),
+            cache_axis: format!("{:?}", cache_input.axis),
+            requested_known_dimensions: format!("{:?}", requested_input.known_dimensions),
+            cache_known_dimensions: format!("{:?}", cache_input.known_dimensions),
+            requested_parent_size: format!("{:?}", requested_input.parent_size),
+            cache_parent_size: format!("{:?}", cache_input.parent_size),
+            requested_available_space: format!("{:?}", requested_input.available_space),
+            cache_available_space: format!("{:?}", cache_input.available_space),
+            descendant_layout_generation: self.0.descendant_layout_generation(),
+            cached_descendant_layout_generation: self.0.cached_descendant_layout_generation(),
+        }
     }
 }
 
@@ -456,6 +486,9 @@ fn solver_cache_event_from_taffy(event: LayoutCacheEvent) -> Option<SolverCacheE
         }
         LayoutCacheEvent::Stored(entry) => {
             SolverCacheEvent::Stored(SolverCacheEntry(BackendCacheEntry(entry)))
+        }
+        LayoutCacheEvent::Miss(miss) => {
+            SolverCacheEvent::Miss(SolverCacheMiss(BackendCacheMiss(miss)))
         }
         LayoutCacheEvent::Cleared(clear) => {
             SolverCacheEvent::Cleared(SolverCacheClear(BackendCacheClear(clear.node_id())))

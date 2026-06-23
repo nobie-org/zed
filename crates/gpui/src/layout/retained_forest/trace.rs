@@ -3,7 +3,7 @@
 //! Tracing observes retained layout and solver events for debugging. It must not
 //! decide retained identity, dirtying, measurement validity, or solve policy.
 
-use super::solver::{SolverCacheEntry, SolverCacheEvent, SolverNodeId};
+use super::solver::{SolverCacheEntry, SolverCacheEvent, SolverCacheMiss, SolverNodeId};
 use crate::layout::LayoutId;
 use std::sync::{
     OnceLock,
@@ -32,6 +32,9 @@ impl CacheEventTracer {
             SolverCacheEvent::Stored(entry) => {
                 self.trace_layout_cache_entry("stored", entry);
             }
+            SolverCacheEvent::Miss(miss) => {
+                self.trace_layout_cache_miss(miss);
+            }
             SolverCacheEvent::Cleared(clear) => {
                 let node_id = clear.node_id();
                 let layout_id = self.layout_id_for_node(node_id);
@@ -44,6 +47,35 @@ impl CacheEventTracer {
             }
             SolverCacheEvent::Measure(_) => {}
         }
+    }
+
+    fn trace_layout_cache_miss(&self, miss: SolverCacheMiss) {
+        let node_id = miss.node_id();
+        let layout_id = self.layout_id_for_node(node_id);
+
+        if !layout_id_is_targeted(layout_id) || !should_trace_all_cache_events() {
+            return;
+        }
+
+        let details = miss.trace_details();
+        eprintln!(
+            "gpui retained_layout cache_event kind=miss layout_id={:?} node_id={:?} reason={:?} requested_run_mode={:?} cache_run_mode={:?} cache_sizing_mode={:?} cache_axis={:?} requested_known_dimensions={:?} cache_known_dimensions={:?} requested_parent_size={:?} cache_parent_size={:?} requested_available_space={:?} cache_available_space={:?} descendant_layout_generation={} cached_descendant_layout_generation={:?}",
+            layout_id,
+            node_id,
+            details.reason,
+            details.requested_run_mode,
+            details.cache_run_mode,
+            details.cache_sizing_mode,
+            details.cache_axis,
+            details.requested_known_dimensions,
+            details.cache_known_dimensions,
+            details.requested_parent_size,
+            details.cache_parent_size,
+            details.requested_available_space,
+            details.cache_available_space,
+            details.descendant_layout_generation,
+            details.cached_descendant_layout_generation
+        );
     }
 
     fn trace_layout_cache_entry(&self, kind: &'static str, entry: SolverCacheEntry) {

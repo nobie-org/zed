@@ -949,7 +949,7 @@ impl<'a> ComputeMeasurementState<'a> {
             SolverCacheEvent::Measure(observation) => {
                 self.record_artifact_for_measure_observation(observation, scale_factor);
             }
-            SolverCacheEvent::Hit(_) | SolverCacheEvent::Stored(_) => {}
+            SolverCacheEvent::Hit(_) | SolverCacheEvent::Stored(_) | SolverCacheEvent::Miss(_) => {}
             SolverCacheEvent::Cleared(_) => {}
         }
     }

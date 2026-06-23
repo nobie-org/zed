@@ -3355,6 +3355,92 @@ fn duplicate_global_id_is_not_semantic_identity() {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_duplicate_global_id_uses_exact_current_facts_not_scan_order_identity() {
+    hegel::Hegel::new(|tc| {
+        let sentinel_width = draw_u16(&tc, 1, 160);
+        let first_duplicate_width = draw_u16(&tc, 1, 160);
+        let second_duplicate_width_candidate = draw_u16(&tc, 1, 160);
+        let second_duplicate_width = if second_duplicate_width_candidate == first_duplicate_width {
+            if first_duplicate_width == 160 {
+                159
+            } else {
+                first_duplicate_width + 1
+            }
+        } else {
+            second_duplicate_width_candidate
+        };
+        let root_width = draw_u16(&tc, 240, 900) as f32;
+
+        let mut retained = LayoutEngine::new();
+        let sentinel = request_keyed_leaf(&mut retained, 40_001, sentinel_width as f32);
+        let first_duplicate =
+            request_keyed_leaf(&mut retained, 40_900, first_duplicate_width as f32);
+        let second_duplicate =
+            request_keyed_leaf(&mut retained, 40_900, second_duplicate_width as f32);
+        let first_root =
+            request_flex_container(&mut retained, &[sentinel, first_duplicate, second_duplicate]);
+        let first_root_node =
+            compute_layout_without_measure(&mut retained, first_root, root_width, 80.0);
+        let first_duplicate_node = retained.retained_node_token_for_tests(first_duplicate);
+        let second_duplicate_node = retained.retained_node_token_for_tests(second_duplicate);
+        retained.finish_frame();
+
+        retained.reset_retained_mutation_sample_for_tests();
+        let current_duplicate =
+            request_keyed_leaf(&mut retained, 40_900, second_duplicate_width as f32);
+        let second_root = request_flex_container(&mut retained, &[current_duplicate]);
+        let second_root_node =
+            compute_layout_without_measure(&mut retained, second_root, root_width, 80.0);
+        assert_facts_committed_exactly(&retained, second_root);
+
+        let current_duplicate_node = retained.retained_node_token_for_tests(current_duplicate);
+        assert_eq!(second_root_node, first_root_node);
+        assert_eq!(
+            current_duplicate_node, second_duplicate_node,
+            "duplicate ids are not semantic proof; the exact current facts should select the matching retained node"
+        );
+        assert_ne!(
+            current_duplicate_node, first_duplicate_node,
+            "duplicate ids must not preserve the first same-key sibling by scan order"
+        );
+        assert_eq!(
+            retained.retained_child_tokens_for_tests(second_root_node),
+            vec![current_duplicate_node]
+        );
+        assert_eq!(
+            retained.retained_parent_token_for_tests(current_duplicate_node),
+            Some(second_root_node)
+        );
+        assert_eq!(
+            retained.retained_mutation_sample_for_tests(),
+            RetainedForestMutationSample {
+                reuses: 2,
+                child_list_updates: 1,
+                removes: 2,
+                ..RetainedForestMutationSample::default()
+            }
+        );
+
+        let mut fresh = LayoutEngine::new();
+        let fresh_duplicate =
+            request_keyed_leaf(&mut fresh, 40_900, second_duplicate_width as f32);
+        let fresh_root = request_flex_container(&mut fresh, &[fresh_duplicate]);
+        let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, root_width, 80.0);
+        assert_eq!(
+            retained_layout_projection(&retained, second_root_node),
+            retained_layout_projection(&fresh, fresh_root)
+        );
+        assert_eq!(
+            retained_layout_bounds_tree(&mut retained, second_root_node, 1.0),
+            retained_layout_bounds_tree(&mut fresh, fresh_root, 1.0)
+        );
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
 #[test]
 fn changed_measured_child_is_not_an_exact_reordered_match() {
     let mut engine = LayoutEngine::new();

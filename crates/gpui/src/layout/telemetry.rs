@@ -49,8 +49,6 @@ pub struct RetainedSubtreeWorkSample {
     pub solver_cache_hits: u64,
     /// Passive private-solver cache stores attributed to this subtree.
     pub solver_cache_stores: u64,
-    /// Passive private-solver cache misses attributed to this subtree.
-    pub solver_cache_misses: u64,
     /// Passive private-solver cache clears attributed to this subtree.
     pub solver_cache_clears: u64,
     /// Passive private-solver measurement observations attributed to this subtree.
@@ -71,7 +69,6 @@ impl RetainedSubtreeWorkSample {
             + self.mirror_dirty_marks
             + self.mirror_measured_context_clears
             + self.solver_cache_stores
-            + self.solver_cache_misses
             + self.solver_cache_clears
             + hard_measured_callbacks
     }
@@ -106,8 +103,6 @@ pub struct LayoutWorkSample {
     pub solver_cache_hits: u64,
     /// Passive private-solver cache stores observed while computing legal roots.
     pub solver_cache_stores: u64,
-    /// Passive private-solver cache misses observed while computing legal roots.
-    pub solver_cache_misses: u64,
     /// Passive private-solver cache clears observed while computing legal roots.
     pub solver_cache_clears: u64,
     /// Passive private-solver measurement cache observations.

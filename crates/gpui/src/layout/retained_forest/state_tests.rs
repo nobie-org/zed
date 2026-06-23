@@ -163,9 +163,9 @@ fn solver_cache_events_report_stable_repeat_reuse(_cx: &mut TestAppContext) {
     assert!(
         !second_events.iter().any(|event| matches!(
             event,
-            SolverCacheEvent::Stored(_) | SolverCacheEvent::Miss(_) | SolverCacheEvent::Cleared(_)
+            SolverCacheEvent::Stored(_) | SolverCacheEvent::Cleared(_)
         )),
-        "stable repeat should not store, miss, or clear solver cache entries: {second_events:?}"
+        "stable repeat should not store or clear solver cache entries: {second_events:?}"
     );
 }
 

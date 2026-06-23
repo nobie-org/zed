@@ -76,7 +76,6 @@ pub(super) struct SolverCacheEntryId(backend::BackendCacheEntryId);
 pub(super) enum SolverCacheEvent {
     Hit(SolverCacheEntry),
     Stored(SolverCacheEntry),
-    Miss(SolverCacheMiss),
     Cleared(SolverCacheClear),
     Measure(SolverMeasureObservation),
 }
@@ -89,37 +88,6 @@ impl SolverCacheClear {
     pub(super) fn node_id(&self) -> SolverNodeId {
         self.0.node_id()
     }
-}
-
-/// Passive observation that the solver did not reuse a cache entry.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct SolverCacheMiss(backend::BackendCacheMiss);
-
-impl SolverCacheMiss {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        self.0.node_id()
-    }
-
-    pub(super) fn trace_details(&self) -> SolverCacheMissTraceDetails {
-        self.0.trace_details()
-    }
-}
-
-/// Debug-only cache-miss facts used by retained-layout tracing.
-pub(super) struct SolverCacheMissTraceDetails {
-    pub(super) reason: String,
-    pub(super) requested_run_mode: String,
-    pub(super) cache_run_mode: String,
-    pub(super) cache_sizing_mode: String,
-    pub(super) cache_axis: String,
-    pub(super) requested_known_dimensions: String,
-    pub(super) cache_known_dimensions: String,
-    pub(super) requested_parent_size: String,
-    pub(super) cache_parent_size: String,
-    pub(super) requested_available_space: String,
-    pub(super) cache_available_space: String,
-    pub(super) descendant_layout_generation: u64,
-    pub(super) cached_descendant_layout_generation: Option<u64>,
 }
 
 /// Passive observation of one cache entry selected or stored by the solver.

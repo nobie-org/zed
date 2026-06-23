@@ -2509,10 +2509,9 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
         assert_eq!(
             [
                 stable_sample.solver_cache_stores,
-                stable_sample.solver_cache_misses,
                 stable_sample.solver_cache_clears,
             ],
-            [0; 3],
+            [0; 2],
             "stable generated facts should not churn private solver cache entries on the repeat frame: {stable_sample:?}"
         );
     })

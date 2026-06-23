@@ -1527,12 +1527,8 @@ fn assert_solver_cache_did_not_churn(
         );
     }
     assert_eq!(
-        [
-            sample.solver_cache_stores,
-            sample.solver_cache_misses,
-            sample.solver_cache_clears,
-        ],
-        [0; 3],
+        [sample.solver_cache_stores, sample.solver_cache_clears,],
+        [0; 2],
         "stable generated framework frame should not observe solver cache churn: {sample:?}"
     );
     if expect_measure_observations {

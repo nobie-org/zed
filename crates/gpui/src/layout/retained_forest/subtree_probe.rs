@@ -51,7 +51,6 @@ struct SubtreeProbeComputeDelta {
     no_work_exempt_measured_callbacks: u64,
     solver_cache_hits: u64,
     solver_cache_stores: u64,
-    solver_cache_misses: u64,
     solver_cache_clears: u64,
     solver_cache_measure_observations: u64,
 }
@@ -146,7 +145,6 @@ impl SubtreeProbe {
                     delta.no_work_exempt_measured_callbacks;
                 sample.solver_cache_hits += delta.solver_cache_hits;
                 sample.solver_cache_stores += delta.solver_cache_stores;
-                sample.solver_cache_misses += delta.solver_cache_misses;
                 sample.solver_cache_clears += delta.solver_cache_clears;
                 sample.solver_cache_measure_observations += delta.solver_cache_measure_observations;
             }
@@ -173,7 +171,7 @@ impl SubtreeProbe {
             }
             self.emitted_samples += 1;
             eprintln!(
-                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} dirty_marks={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={} solver_cache_hits={} solver_cache_stores={} solver_cache_misses={} solver_cache_clears={} solver_cache_measure_observations={}",
+                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} dirty_marks={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={} solver_cache_hits={} solver_cache_stores={} solver_cache_clears={} solver_cache_measure_observations={}",
                 sample.global_id,
                 sample.layout_id,
                 sample.node_count,
@@ -190,7 +188,6 @@ impl SubtreeProbe {
                 sample.conservative_text_measured_callbacks,
                 sample.solver_cache_hits,
                 sample.solver_cache_stores,
-                sample.solver_cache_misses,
                 sample.solver_cache_clears,
                 sample.solver_cache_measure_observations,
             );
@@ -244,9 +241,6 @@ impl SubtreeProbeComputeRecorder {
             }),
             SolverCacheEvent::Stored(entry) => self.record_node(entry.node_id(), |delta| {
                 delta.solver_cache_stores += 1;
-            }),
-            SolverCacheEvent::Miss(miss) => self.record_node(miss.node_id(), |delta| {
-                delta.solver_cache_misses += 1;
             }),
             SolverCacheEvent::Cleared(clear) => self.record_node(clear.node_id(), |delta| {
                 delta.solver_cache_clears += 1;

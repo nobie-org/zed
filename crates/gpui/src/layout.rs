@@ -475,7 +475,6 @@ impl LayoutEngine {
         self.layout_work.solver_compute_layout_calls += compute_work.solver_compute_layout_calls;
         self.layout_work.solver_cache_hits += compute_work.solver_cache_events.hits;
         self.layout_work.solver_cache_stores += compute_work.solver_cache_events.stores;
-        self.layout_work.solver_cache_misses += compute_work.solver_cache_events.misses;
         self.layout_work.solver_cache_clears += compute_work.solver_cache_events.clears;
         self.layout_work.solver_cache_measure_observations +=
             compute_work.solver_cache_events.measure_observations;

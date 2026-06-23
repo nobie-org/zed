@@ -2461,7 +2461,11 @@ fn retained_layout_matches_fresh_with_opaque_leaf_after_same_root_constraint_rep
 fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppContext) {
     hegel::Hegel::new(|tc| {
         let mut cx = cx.add_empty_window();
-        let frame = draw_generated_frame(&tc, false, 3);
+        let frame = GeneratedFrame {
+            roots: (0..draw_usize(&tc, 1, 3))
+                .map(|_| draw_generated_tree(&tc, 3, false))
+                .collect(),
+        };
         let available_width = draw_u16(&tc, 1, 360);
         let available_height = draw_u16(&tc, 1, 240);
         let mut engine = LayoutEngine::new();
@@ -2501,6 +2505,15 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
             ],
             [0; 13],
             "stable generated facts should not mutate retained layout on the repeat frame"
+        );
+        assert_eq!(
+            [
+                stable_sample.solver_cache_stores,
+                stable_sample.solver_cache_misses,
+                stable_sample.solver_cache_clears,
+            ],
+            [0; 3],
+            "stable generated facts should not churn private solver cache entries on the repeat frame: {stable_sample:?}"
         );
     })
     .settings(hegel_settings(100))

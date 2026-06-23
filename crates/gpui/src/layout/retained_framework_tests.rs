@@ -828,6 +828,54 @@ impl Render for GeneratedStyledSiblingView {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GeneratedStyledSiblingFrameState {
+    tick: u8,
+    dynamic_width: u8,
+}
+
+impl GeneratedStyledSiblingFrameState {
+    fn draw(tc: &hegel::TestCase) -> Self {
+        Self {
+            tick: draw_u8(tc, 0, 120),
+            dynamic_width: draw_u8(tc, 48, 180),
+        }
+    }
+
+    fn apply(self, change: GeneratedStyledSiblingFrameChange) -> Self {
+        match change {
+            GeneratedStyledSiblingFrameChange::Tick { delta } => Self {
+                tick: self.tick.wrapping_add(delta),
+                ..self
+            },
+            GeneratedStyledSiblingFrameChange::DynamicWidth { width } => Self {
+                dynamic_width: width,
+                ..self
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GeneratedStyledSiblingFrameChange {
+    Tick { delta: u8 },
+    DynamicWidth { width: u8 },
+}
+
+impl GeneratedStyledSiblingFrameChange {
+    fn draw(tc: &hegel::TestCase) -> Self {
+        if tc.draw(generators::booleans()) {
+            Self::Tick {
+                delta: draw_u8(tc, 1, 16),
+            }
+        } else {
+            Self::DynamicWidth {
+                width: draw_u8(tc, 48, 180),
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GeneratedChurnSibling {
     key: u8,
@@ -1620,6 +1668,82 @@ fn generated_framework_styled_sibling_churn_matches_fresh_and_preserves_stable_s
         );
     })
     .settings(hegel_settings(60))
+    .run();
+}
+
+#[gpui::test]
+fn generated_styled_sibling_frame_sequence_matches_fresh_and_preserves_stable_subtree(
+    cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let stable_tree = GeneratedStyledNode::draw(&tc, 3, false);
+        let mut state = GeneratedStyledSiblingFrameState::draw(&tc);
+        let frame_count = draw_u8(&tc, 2, 6);
+        let changes = (0..frame_count)
+            .map(|_| GeneratedStyledSiblingFrameChange::draw(&tc))
+            .collect::<Vec<_>>();
+
+        let retained = cx.open_window(size(px(640.0), px(420.0)), |window, _| {
+            window.set_retained_subtree_probe_targets_for_tests(vec![
+                "generated-styled-stable-panel".to_string(),
+            ]);
+            GeneratedStyledSiblingView {
+                stable_tree: stable_tree.clone(),
+                tick: state.tick,
+                dynamic_width: state.dynamic_width,
+            }
+        });
+        cx.run_until_parked();
+        let retained_window = *retained.deref();
+        let (initial_retained_bounds, _, _) =
+            draw_generated_styled_sibling_tree(cx, retained_window, &stable_tree);
+        let initial_fresh_bounds = draw_fresh_generated_styled_sibling_tree(
+            cx,
+            &stable_tree,
+            state.tick,
+            state.dynamic_width,
+        );
+        assert_eq!(
+            initial_retained_bounds, initial_fresh_bounds,
+            "initial retained styled generated frame should match fresh layout"
+        );
+
+        for change in changes {
+            state = state.apply(change);
+            retained
+                .update(cx, |view, _, cx| {
+                    view.tick = state.tick;
+                    view.dynamic_width = state.dynamic_width;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+
+            let (retained_bounds, sample, subtree_samples) =
+                draw_generated_styled_sibling_tree(cx, retained_window, &stable_tree);
+            let fresh_bounds = draw_fresh_generated_styled_sibling_tree(
+                cx,
+                &stable_tree,
+                state.tick,
+                state.dynamic_width,
+            );
+
+            assert_eq!(
+                retained_bounds, fresh_bounds,
+                "retained styled generated frame should match fresh layout after {change:?}"
+            );
+            assert_eq!(
+                sample.retained_layout_fresh_compare_mismatches, 0,
+                "runtime retained-vs-fresh comparison should not report mismatches after {change:?}"
+            );
+            assert_retained_frame_sample(sample);
+            assert_stable_subtree_preserved_without_solver_churn(
+                &subtree_samples,
+                "generated-styled-stable-panel",
+            );
+        }
+    })
+    .settings(hegel_settings(40))
     .run();
 }
 

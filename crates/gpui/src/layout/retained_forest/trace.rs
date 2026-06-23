@@ -10,32 +10,61 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+/// Passive solver cache-event counts observed during one legal root solve.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::layout) struct CacheEventCounts {
+    pub(in crate::layout) hits: u64,
+    pub(in crate::layout) stores: u64,
+    pub(in crate::layout) misses: u64,
+    pub(in crate::layout) clears: u64,
+    pub(in crate::layout) measure_observations: u64,
+}
+
 /// Cache-event trace sink for one legal root solve.
 pub(super) struct CacheEventTracer {
     node_layout_ids: Vec<(SolverNodeId, LayoutId)>,
+    counts: CacheEventCounts,
 }
 
 impl CacheEventTracer {
     pub(super) fn new(node_layout_ids: Vec<(SolverNodeId, LayoutId)>) -> Self {
-        Self { node_layout_ids }
+        Self {
+            node_layout_ids,
+            counts: CacheEventCounts::default(),
+        }
+    }
+
+    pub(super) fn counts(&self) -> CacheEventCounts {
+        self.counts
     }
 
     pub(super) fn record(&mut self, event: SolverCacheEvent) {
-        if trace_layout_ids().is_none() {
-            return;
-        }
+        let should_trace = trace_layout_ids().is_some();
 
         match event {
             SolverCacheEvent::Hit(entry) => {
-                self.trace_layout_cache_entry("hit", entry);
+                self.counts.hits += 1;
+                if should_trace {
+                    self.trace_layout_cache_entry("hit", entry);
+                }
             }
             SolverCacheEvent::Stored(entry) => {
-                self.trace_layout_cache_entry("stored", entry);
+                self.counts.stores += 1;
+                if should_trace {
+                    self.trace_layout_cache_entry("stored", entry);
+                }
             }
             SolverCacheEvent::Miss(miss) => {
-                self.trace_layout_cache_miss(miss);
+                self.counts.misses += 1;
+                if should_trace {
+                    self.trace_layout_cache_miss(miss);
+                }
             }
             SolverCacheEvent::Cleared(clear) => {
+                self.counts.clears += 1;
+                if !should_trace {
+                    return;
+                }
                 let node_id = clear.node_id();
                 let layout_id = self.layout_id_for_node(node_id);
                 if layout_id_is_targeted(layout_id) {
@@ -45,7 +74,9 @@ impl CacheEventTracer {
                     );
                 }
             }
-            SolverCacheEvent::Measure(_) => {}
+            SolverCacheEvent::Measure(_) => {
+                self.counts.measure_observations += 1;
+            }
         }
     }
 

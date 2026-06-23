@@ -43,6 +43,16 @@ pub struct RetainedSubtreeWorkSample {
     /// The field keeps its historical name for existing diagnostics. The
     /// retained subtree probe no longer decides this from text identity.
     pub conservative_text_measured_callbacks: u64,
+    /// Passive private-solver cache hits attributed to this subtree.
+    pub solver_cache_hits: u64,
+    /// Passive private-solver cache stores attributed to this subtree.
+    pub solver_cache_stores: u64,
+    /// Passive private-solver cache misses attributed to this subtree.
+    pub solver_cache_misses: u64,
+    /// Passive private-solver cache clears attributed to this subtree.
+    pub solver_cache_clears: u64,
+    /// Passive private-solver measurement observations attributed to this subtree.
+    pub solver_cache_measure_observations: u64,
 }
 
 impl RetainedSubtreeWorkSample {
@@ -57,6 +67,9 @@ impl RetainedSubtreeWorkSample {
             + self.mirror_set_style
             + self.mirror_set_children
             + self.mirror_measured_context_clears
+            + self.solver_cache_stores
+            + self.solver_cache_misses
+            + self.solver_cache_clears
             + hard_measured_callbacks
     }
 }
@@ -82,6 +95,23 @@ pub struct LayoutWorkSample {
     pub compute_layout_calls: u64,
     /// Root layout computations that invoked the private solver.
     pub solver_compute_layout_calls: u64,
+    /// Passive private-solver cache hits observed while computing legal roots.
+    ///
+    /// This is observability only: GPUI does not use this value for retained
+    /// policy. It proves whether the backend reported reusing cached layout
+    /// work after GPUI kept the retained mirror stable.
+    pub solver_cache_hits: u64,
+    /// Passive private-solver cache stores observed while computing legal roots.
+    pub solver_cache_stores: u64,
+    /// Passive private-solver cache misses observed while computing legal roots.
+    pub solver_cache_misses: u64,
+    /// Passive private-solver cache clears observed while computing legal roots.
+    pub solver_cache_clears: u64,
+    /// Passive private-solver measurement cache observations.
+    ///
+    /// These identify the exact measured query/result the solver used, including
+    /// cached measurements where it did not call GPUI's producer.
+    pub solver_cache_measure_observations: u64,
     /// Measured layout queries that required GPUI measurement work.
     ///
     /// Exact retained artifact/cache answers are excluded. The private solver may

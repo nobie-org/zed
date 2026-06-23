@@ -48,7 +48,7 @@ use std::{
     time::Duration,
 };
 use subtree_probe::{SubtreeProbe, SubtreeProbeCheckpoint, SubtreeProbeComputeRecorder};
-use trace::CacheEventTracer;
+use trace::{CacheEventCounts, CacheEventTracer};
 #[cfg(test)]
 pub(super) use work::RetainedForestMutationSample;
 pub(super) use work::{RetainedLayoutMissWork, RetainedLayoutWork};
@@ -58,6 +58,7 @@ use work::{RetainedWorkCheckpoint, RetainedWorkState};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ComputeLayoutWork {
     pub(super) solver_compute_layout_calls: u64,
+    pub(super) solver_cache_events: CacheEventCounts,
     pub(super) measured_layout_calls: u64,
     pub(super) retained_layout_commit_duration: Duration,
     pub(super) solver_observation_setup_duration: Duration,
@@ -478,6 +479,7 @@ impl RetainedLayoutForest {
             &mut cache_event_tracer,
         );
         let solver_layout_duration = solver_start.elapsed();
+        let solver_cache_events = cache_event_tracer.counts();
         self.subtree_probe.record_compute(subtree_compute_recorder);
 
         let geometry_start = std::time::Instant::now();
@@ -536,6 +538,7 @@ impl RetainedLayoutForest {
         let compute_layout_duration = compute_start.elapsed();
         let work = ComputeLayoutWork {
             solver_compute_layout_calls: 1,
+            solver_cache_events,
             measured_layout_calls,
             retained_layout_commit_duration,
             solver_observation_setup_duration,
@@ -668,6 +671,9 @@ impl RetainedLayoutForest {
                 scale_factor,
                 &mut measure,
                 |event| {
+                    subtree_compute_recorder
+                        .borrow_mut()
+                        .record_cache_event(event);
                     cache_event_tracer.record(event);
                     compute_measurements
                         .borrow_mut()

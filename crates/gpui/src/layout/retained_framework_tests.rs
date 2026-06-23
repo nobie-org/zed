@@ -540,6 +540,34 @@ fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
     );
 }
 
+fn assert_solver_cache_did_not_churn(
+    sample: LayoutWorkSample,
+    require_hits: bool,
+    expect_measure_observations: bool,
+) {
+    if require_hits {
+        assert!(
+            sample.solver_cache_hits > 0,
+            "stable generated framework frame should observe solver cache hits: {sample:?}"
+        );
+    }
+    assert_eq!(
+        [
+            sample.solver_cache_stores,
+            sample.solver_cache_misses,
+            sample.solver_cache_clears,
+        ],
+        [0; 3],
+        "stable generated framework frame should not observe solver cache churn: {sample:?}"
+    );
+    if expect_measure_observations {
+        assert!(
+            sample.solver_cache_measure_observations > 0,
+            "stable generated framework text frame should observe cached measurement queries: {sample:?}"
+        );
+    }
+}
+
 fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample], target: &str) {
     let sample = samples
         .iter()
@@ -553,6 +581,10 @@ fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample
     assert!(
         sample.retained_reuses > 0,
         "stable subtree {target} should reuse retained nodes: {sample:?}"
+    );
+    assert!(
+        sample.solver_cache_hits > 0 || sample.solver_cache_measure_observations > 0,
+        "stable subtree {target} should observe solver cache reuse or cached measurement proofs: {sample:?}"
     );
 }
 
@@ -609,6 +641,7 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
             "stable retained framework redraw should publish identical bounds"
         );
         assert_no_retained_writes_or_measurement(stable_sample);
+        assert_solver_cache_did_not_churn(stable_sample, false, false);
     })
     .settings(hegel_settings(80))
     .run();
@@ -654,6 +687,7 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
             "stable retained framework text redraw should publish identical bounds"
         );
         assert_no_retained_writes_or_measurement(stable_sample);
+        assert_solver_cache_did_not_churn(stable_sample, true, true);
     })
     .settings(hegel_settings(50))
     .run();

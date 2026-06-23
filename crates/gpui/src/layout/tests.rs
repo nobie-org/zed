@@ -351,6 +351,9 @@ fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
             + samples[0].mirror_set_style
             + samples[0].mirror_set_children
             + samples[0].mirror_measured_context_clears
+            + samples[0].solver_cache_stores
+            + samples[0].solver_cache_misses
+            + samples[0].solver_cache_clears
             + 1
     );
 }

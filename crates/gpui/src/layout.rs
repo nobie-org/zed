@@ -34,8 +34,35 @@ pub use telemetry::RetainedSubtreeWorkSample;
 /// telemetry. It intentionally exposes `LayoutId` and bounds, not solver node
 /// handles, so callers cannot mutate or depend on the mirror directly.
 pub(crate) struct LayoutEngine {
+    mode: LayoutEngineMode,
     forest: RetainedLayoutForest,
     layout_work: LayoutWorkSample,
+}
+
+/// Runtime layout retention mode.
+///
+/// This is a diagnostic switch, not a second layout authority. Both modes use
+/// the same GPUI frame lifecycle and private root solve path. `Immediate`
+/// discards retained state at frame start so the app can be run against a
+/// fresh-tree baseline while still exercising the retained-layout facade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutEngineMode {
+    Retained,
+    Immediate,
+}
+
+impl LayoutEngineMode {
+    fn from_env() -> Self {
+        static MODE: std::sync::OnceLock<LayoutEngineMode> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("GPUI_LAYOUT_MODE") {
+            Ok(mode) if mode == "retained" => Self::Retained,
+            Ok(mode) if mode == "immediate" || mode == "fresh" => Self::Immediate,
+            Ok(mode) => panic!(
+                "unsupported GPUI_LAYOUT_MODE={mode:?}; expected `retained`, `immediate`, or `fresh`"
+            ),
+            Err(_) => Self::Retained,
+        })
+    }
 }
 
 /// Stable framework identity for one legal root compute site.
@@ -112,10 +139,20 @@ const EXPECT_MESSAGE: &str = "we should avoid layout solver errors by constructi
 impl LayoutEngine {
     /// Create an empty retained layout engine.
     pub fn new() -> Self {
+        Self::new_with_mode(LayoutEngineMode::from_env())
+    }
+
+    fn new_with_mode(mode: LayoutEngineMode) -> Self {
         LayoutEngine {
+            mode,
             forest: RetainedLayoutForest::new(),
             layout_work: LayoutWorkSample::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn new_force_fresh_for_tests() -> Self {
+        Self::new_with_mode(LayoutEngineMode::Immediate)
     }
 
     /// End the frame, promote successfully computed roots, and return work telemetry.
@@ -133,6 +170,10 @@ impl LayoutEngine {
     /// Reset frame-local request/measurement state before a new render pass.
     pub fn begin_frame(&mut self) {
         self.layout_work = LayoutWorkSample::default();
+        if self.mode == LayoutEngineMode::Immediate {
+            self.forest.reset_retained_state_for_fresh_frame();
+            self.layout_work.force_fresh_frame_resets = 1;
+        }
         self.forest.begin_frame();
     }
 

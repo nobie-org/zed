@@ -208,6 +208,17 @@ impl RetainedLayoutForest {
         self.work.begin_frame();
     }
 
+    /// Drop retained layout authority while preserving diagnostic configuration.
+    ///
+    /// Immediate-mode proof runs use this before a frame starts. The next frame
+    /// still goes through the same retained-layout facade and private solver
+    /// path, but there are no previous retained roots or mirror nodes to reuse.
+    pub(super) fn reset_retained_state_for_fresh_frame(&mut self) {
+        let subtree_probe = self.subtree_probe.clone();
+        *self = Self::new();
+        self.subtree_probe = subtree_probe;
+    }
+
     /// Snapshot every retained and mirror field affected by speculative layout.
     pub(super) fn checkpoint(&self) -> RetainedLayoutForestCheckpoint {
         RetainedLayoutForestCheckpoint {

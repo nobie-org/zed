@@ -33,7 +33,15 @@ fn layout_work_sample_counts_requests_and_finish_frame_resets() {
         ..LayoutWorkSample::default()
     };
     assert_eq!(engine.layout_work_sample(), expected_sample);
-    assert_eq!(engine.finish_frame(), expected_sample);
+    let finish_sample = engine.finish_frame();
+    assert_eq!(
+        finish_sample,
+        LayoutWorkSample {
+            retained_layout_finish_frame_duration: finish_sample
+                .retained_layout_finish_frame_duration,
+            ..expected_sample
+        }
+    );
     assert_eq!(engine.layout_work_sample(), LayoutWorkSample::default());
 }
 
@@ -124,12 +132,47 @@ fn layout_work_sample_reports_retained_layout_miss_reasons() {
     let root = request_leaf(&mut engine, 20.0);
     engine.commit_layout(root);
 
+    let sample = engine.finish_frame();
     assert_eq!(
-        engine.finish_frame(),
+        sample,
         LayoutWorkSample {
             layout_node_requests: 1,
+            retained_layout_finish_frame_duration: sample.retained_layout_finish_frame_duration,
             retained_layout_reuses: 1,
             retained_layout_style_updates: 1,
+            ..LayoutWorkSample::default()
+        }
+    );
+}
+
+#[test]
+fn immediate_mode_rebuilds_retained_state_each_frame() {
+    let request_leaf = |engine: &mut LayoutEngine, width| {
+        let mut style = Style::default();
+        style.size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(
+            Pixels(width),
+        )));
+        engine.request_layout(style, Pixels(16.0), 1.0, &[])
+    };
+
+    let mut engine = LayoutEngine::new_force_fresh_for_tests();
+    let root = request_leaf(&mut engine, 10.0);
+    engine.commit_layout(root);
+    engine.finish_frame();
+
+    engine.begin_frame();
+    let root = request_leaf(&mut engine, 10.0);
+    engine.commit_layout(root);
+
+    let sample = engine.finish_frame();
+    assert_eq!(
+        sample,
+        LayoutWorkSample {
+            layout_node_requests: 1,
+            force_fresh_frame_resets: 1,
+            retained_layout_finish_frame_duration: sample.retained_layout_finish_frame_duration,
+            retained_layout_creates: 1,
+            retained_layout_miss_no_previous: 1,
             ..LayoutWorkSample::default()
         }
     );

@@ -73,6 +73,11 @@ pub struct LayoutWorkSample {
     pub measured_layout_node_requests: u64,
     /// Parent-to-child layout edges requested by GPUI.
     pub child_edges: u64,
+    /// Frames where diagnostic immediate mode discarded retained layout state.
+    ///
+    /// This proves the frame used a fresh retained facade baseline. It is
+    /// expected to be zero in normal retained operation.
+    pub force_fresh_frame_resets: u64,
     /// Root layout computations requested for the draw.
     pub compute_layout_calls: u64,
     /// Root layout computations that invoked the private solver.

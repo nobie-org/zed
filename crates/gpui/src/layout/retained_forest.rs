@@ -653,7 +653,6 @@ impl RetainedLayoutForest {
             .solve_input_changed(root_id, root_solve_input)
         {
             self.trace_retained_dirty_mark(layout_id, node_id, "root_solve_input_changed");
-            self.mark_solver_subtree_dirty(node_id);
         }
         self.geometry
             .begin_solve(root_id, node_id, available_space, scale_factor);
@@ -2107,23 +2106,6 @@ impl RetainedLayoutForest {
                 self.measurements
                     .debug_assert_current_measurement_matches(node_id, measured);
             }
-        }
-    }
-
-    /// Dirty every node in a solved retained subtree.
-    ///
-    /// A root available-space or scale-factor change can alter every descendant
-    /// solver query without a retained-tree fact mutation. The forest dirties the
-    /// whole root subtree before solving so cached ancestors cannot leave
-    /// descendant layout slots from the previous root input.
-    fn mark_solver_subtree_dirty(&mut self, root: SolverNodeId) {
-        let mut stack = vec![root];
-        while let Some(node_id) = stack.pop() {
-            if self.committed.mark_solver_node_dirty(node_id) {
-                self.solver.mark_dirty(node_id);
-                self.work.record_dirty_mark();
-            }
-            stack.extend(self.solver.children(node_id));
         }
     }
 

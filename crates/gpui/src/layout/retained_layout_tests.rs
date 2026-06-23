@@ -5575,7 +5575,6 @@ fn retained_layout_recomputes_when_root_scale_factor_changes() {
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 2,
-            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -5888,7 +5887,6 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
         RetainedForestMutationSample {
             reuses: 14,
             style_updates: 1,
-            dirty_marks: 14,
             ..RetainedForestMutationSample::default()
         }
     );

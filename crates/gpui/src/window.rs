@@ -2442,7 +2442,13 @@ impl LayoutFrame {
         cx: &mut App,
     ) -> Size<Pixels> {
         let mut pass = DetachedRootLayoutPass { _private: () };
+        let layout_request_start = std::time::Instant::now();
         let request = element.request_detached_root_layout(available_space, &mut pass, window, cx);
+        window
+            .layout_engine
+            .as_mut()
+            .unwrap()
+            .record_layout_request_duration(layout_request_start.elapsed());
         let layout_id = request.layout_id();
 
         if request.needs_solve() {

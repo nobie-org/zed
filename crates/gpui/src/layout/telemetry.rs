@@ -73,6 +73,13 @@ pub struct LayoutWorkSample {
     pub measured_layout_node_requests: u64,
     /// Parent-to-child layout edges requested by GPUI.
     pub child_edges: u64,
+    /// Wall time spent asking elements to build current-frame layout facts.
+    ///
+    /// This covers the bottom-up `request_layout` phase that creates layout
+    /// intents for the retained tree. It is intentionally separate from
+    /// retained commit and solver time: this is current fact construction, not
+    /// private solver work.
+    pub layout_request_duration: Duration,
     /// Frames where diagnostic immediate mode discarded retained layout state.
     ///
     /// This proves the frame used a fresh retained facade baseline. It is

@@ -211,6 +211,11 @@ impl LayoutEngine {
         self.layout_work
     }
 
+    /// Record wall time spent building current-frame layout facts.
+    pub(crate) fn record_layout_request_duration(&mut self, duration: std::time::Duration) {
+        self.layout_work.layout_request_duration += duration;
+    }
+
     #[cfg(test)]
     fn reset_retained_mutation_sample_for_tests(&mut self) {
         self.forest.reset_retained_mutation_sample_for_tests();

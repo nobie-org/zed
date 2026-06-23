@@ -90,10 +90,8 @@ fn layout_work_sample_counts_compute_and_measure() {
             solver_compute_layout_calls: 1,
             measured_layout_calls: 1,
             retained_layout_commit_duration: sample.retained_layout_commit_duration,
-            solver_observation_setup_duration: sample.solver_observation_setup_duration,
             solver_layout_duration: sample.solver_layout_duration,
             geometry_capture_duration: sample.geometry_capture_duration,
-            artifact_completion_duration: sample.artifact_completion_duration,
             fresh_compare_duration: sample.fresh_compare_duration,
             retained_layout_finish_frame_duration: sample.retained_layout_finish_frame_duration,
             compute_layout_duration: sample.compute_layout_duration,
@@ -108,8 +106,6 @@ fn layout_work_sample_counts_compute_and_measure() {
     assert!(sample.compute_layout_duration >= sample.retained_layout_commit_duration);
     assert!(sample.compute_layout_duration >= sample.solver_layout_duration);
     assert!(sample.compute_layout_duration >= sample.geometry_capture_duration);
-    assert!(sample.compute_layout_duration >= sample.artifact_completion_duration);
-    assert!(sample.compute_layout_duration >= sample.solver_observation_setup_duration);
     assert!(sample.solver_layout_duration >= sample.measured_layout_duration);
     assert!(sample.measured_layout_duration > Duration::default());
 }
@@ -235,8 +231,6 @@ fn stable_subtree_probe_reports_zero_write_work_after_admission() {
         layout_id: 0,
         node_count: 1,
         retained_reuses: 1,
-        solver_cache_hits: 1,
-        solver_cache_measure_observations: 1,
         ..RetainedSubtreeWorkSample::default()
     };
     assert_eq!(samples, std::slice::from_ref(&expected_sample));
@@ -353,8 +347,6 @@ fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
             + samples[0].mirror_set_children
             + samples[0].mirror_dirty_marks
             + samples[0].mirror_measured_context_clears
-            + samples[0].solver_cache_stores
-            + samples[0].solver_cache_clears
             + 1
     );
 }

@@ -30,7 +30,7 @@ use collections::{FxHashMap, FxHashSet};
 use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
 use facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind};
 use frame::{CurrentLayoutFactsLog, CurrentLayoutFactsLogCheckpoint};
-use geometry::{FrameLayoutOutput, FrameLayoutOutputCheckpoint};
+use geometry::{FrameLayoutOutput, FrameLayoutOutputCheckpoint, RootSolveInput};
 pub(crate) use measurement::PureSizeMeasure;
 pub(super) use measurement::{LayoutArtifact, LayoutArtifactKey, MeasuredLayoutRequest};
 use measurement::{MeasuredLayoutFacts, MeasurementStore, MeasurementStoreCheckpoint};
@@ -48,7 +48,6 @@ use std::{
     time::Duration,
 };
 use subtree_probe::{SubtreeProbe, SubtreeProbeCheckpoint, SubtreeProbeComputeRecorder};
-use trace::{CacheEventCounts, CacheEventTracer};
 #[cfg(test)]
 pub(super) use work::RetainedForestMutationSample;
 pub(super) use work::{RetainedLayoutMissWork, RetainedLayoutWork};
@@ -58,13 +57,10 @@ use work::{RetainedWorkCheckpoint, RetainedWorkState};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct ComputeLayoutWork {
     pub(super) solver_compute_layout_calls: u64,
-    pub(super) solver_cache_events: CacheEventCounts,
     pub(super) measured_layout_calls: u64,
     pub(super) retained_layout_commit_duration: Duration,
-    pub(super) solver_observation_setup_duration: Duration,
     pub(super) solver_layout_duration: Duration,
     pub(super) geometry_capture_duration: Duration,
-    pub(super) artifact_completion_duration: Duration,
     pub(super) fresh_compare_duration: Duration,
     pub(super) compute_layout_duration: Duration,
     pub(super) measured_layout_duration: Duration,
@@ -437,8 +433,8 @@ impl RetainedLayoutForest {
         let commit_start = std::time::Instant::now();
         let node_id = self.commit_root_layout(root_id, id);
         let retained_layout_commit_duration = commit_start.elapsed();
-        self.geometry
-            .begin_solve(root_id, node_id, available_space, scale_factor);
+        let root_solve_input =
+            self.prepare_root_solve(root_id, id, node_id, available_space, scale_factor);
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             eprintln!(
@@ -446,29 +442,17 @@ impl RetainedLayoutForest {
                 id.0, node_id, available_space
             );
         }
-        let solver_observation_setup_start = std::time::Instant::now();
-        let mut cache_event_tracer = CacheEventTracer::new(if trace::detail_enabled() {
-            self.committed.node_layout_ids_for_trace()
-        } else {
-            Vec::new()
-        });
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
-        let observe_solver_cache_events =
-            subtree_compute_recorder.has_active_subtrees() || trace::detail_enabled();
-        let solver_observation_setup_duration = solver_observation_setup_start.elapsed();
         let solver_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
             node_id,
             available_space,
             scale_factor,
-            observe_solver_cache_events,
             window,
             cx,
             &mut subtree_compute_recorder,
-            &mut cache_event_tracer,
         );
         let solver_layout_duration = solver_start.elapsed();
-        let solver_cache_events = cache_event_tracer.counts();
         self.subtree_probe.record_compute(subtree_compute_recorder);
 
         let geometry_start = std::time::Instant::now();
@@ -489,11 +473,8 @@ impl RetainedLayoutForest {
                 |node_id| committed.layout_id_for_node(node_id),
             );
         }
+        self.finish_root_solve(root_id, root_solve_input);
         let geometry_capture_duration = geometry_start.elapsed();
-        let artifact_start = std::time::Instant::now();
-        self.measurements
-            .finish_completed_solve(scale_factor, window, cx);
-        let artifact_completion_duration = artifact_start.elapsed();
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -532,13 +513,10 @@ impl RetainedLayoutForest {
         let compute_layout_duration = compute_start.elapsed();
         let work = ComputeLayoutWork {
             solver_compute_layout_calls: 1,
-            solver_cache_events,
             measured_layout_calls,
             retained_layout_commit_duration,
-            solver_observation_setup_duration,
             solver_layout_duration,
             geometry_capture_duration,
-            artifact_completion_duration,
             fresh_compare_duration,
             compute_layout_duration,
             measured_layout_duration,
@@ -609,11 +587,9 @@ impl RetainedLayoutForest {
         node_id: SolverNodeId,
         available_space: Size<AvailableSpace>,
         scale_factor: f32,
-        observe_measurement_cache_events: bool,
         window: &mut Window,
         cx: &mut App,
         subtree_compute_recorder: &mut SubtreeProbeComputeRecorder,
-        cache_event_tracer: &mut CacheEventTracer,
     ) -> (u64, std::time::Duration) {
         let mut measured_layout_calls = 0;
         let mut measured_layout_duration = std::time::Duration::default();
@@ -658,32 +634,39 @@ impl RetainedLayoutForest {
                 snap_measured_size_to_device_pixels(answer.size(), scale_factor)
             };
 
-        if observe_measurement_cache_events {
-            solver.compute_layout_with_measure_and_cache_events(
-                node_id,
-                available_space,
-                scale_factor,
-                &mut measure,
-                |event| {
-                    subtree_compute_recorder
-                        .borrow_mut()
-                        .record_cache_event(event);
-                    cache_event_tracer.record(event);
-                    compute_measurements
-                        .borrow_mut()
-                        .observe_layout_cache_event(event, scale_factor);
-                },
-            );
-        } else {
-            solver.compute_layout_with_measure(
-                node_id,
-                available_space,
-                scale_factor,
-                &mut measure,
-            );
-        }
+        solver.compute_layout_with_measure(node_id, available_space, scale_factor, &mut measure);
 
         (measured_layout_calls, measured_layout_duration)
+    }
+
+    fn prepare_root_solve(
+        &mut self,
+        root_id: RetainedLayoutRootId,
+        layout_id: LayoutId,
+        node_id: SolverNodeId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+    ) -> RootSolveInput {
+        let root_solve_input = RootSolveInput::new(available_space, scale_factor);
+        if self
+            .root_slots
+            .solve_input_changed(root_id, root_solve_input)
+        {
+            self.trace_retained_dirty_mark(layout_id, node_id, "root_solve_input_changed");
+            self.mark_solver_subtree_dirty(node_id);
+        }
+        self.geometry
+            .begin_solve(root_id, node_id, available_space, scale_factor);
+        root_solve_input
+    }
+
+    fn finish_root_solve(
+        &mut self,
+        root_id: RetainedLayoutRootId,
+        root_solve_input: RootSolveInput,
+    ) {
+        self.root_slots
+            .record_solve_input(root_id, root_solve_input);
     }
 
     fn trace_retained_layout_miss(
@@ -1002,14 +985,13 @@ impl RetainedLayoutForest {
         scale_factor: f32,
     ) -> RetainedNodeToken {
         let root_node = self.commit_root_layout(root_id, id);
-        self.geometry
-            .begin_solve(root_id, root_node, available_space, scale_factor);
-        self.solver.compute_layout_with_measure_and_cache_events(
+        let root_solve_input =
+            self.prepare_root_solve(root_id, id, root_node, available_space, scale_factor);
+        self.solver.compute_layout_with_measure(
             root_node,
             available_space,
             scale_factor,
             |_node_id, _has_measure_context, _query| size(0.0_f32, 0.0_f32),
-            |_| {},
         );
         {
             let Self {
@@ -1028,6 +1010,7 @@ impl RetainedLayoutForest {
                 |node_id| committed.layout_id_for_node(node_id),
             );
         }
+        self.finish_root_solve(root_id, root_solve_input);
         RetainedNodeToken(root_node)
     }
 
@@ -1622,14 +1605,14 @@ impl RetainedLayoutForest {
         if style_changed {
             self.trace_retained_style_update(id, node_id, &previous_style, &style);
             self.solver.set_style(node_id, style.clone());
-            self.mark_mirror_path_dirty(node_id);
+            self.mark_solver_path_dirty(node_id);
             self.work.record_style_update();
         }
 
         let children_changed = previous_child_node_ids != child_node_ids;
         if children_changed {
             self.solver.set_children(node_id, &child_node_ids);
-            self.mark_mirror_path_dirty(node_id);
+            self.mark_solver_path_dirty(node_id);
             self.work.record_child_list_update();
         }
 
@@ -1976,7 +1959,7 @@ impl RetainedLayoutForest {
         if style_changed {
             self.trace_retained_style_update(id, node_id, &previous_style, &style);
             self.solver.set_style(node_id, style.clone());
-            self.mark_mirror_path_dirty(node_id);
+            self.mark_solver_path_dirty(node_id);
             self.work.record_style_update();
         }
         if measured_facts_changed && !style_changed {
@@ -2127,22 +2110,40 @@ impl RetainedLayoutForest {
         }
     }
 
-    /// Mark a private mirror node dirty at most once in the current frame.
+    /// Dirty every node in a solved retained subtree.
+    ///
+    /// A root available-space or scale-factor change can alter every descendant
+    /// solver query without a retained-tree fact mutation. The forest dirties the
+    /// whole root subtree before solving so cached ancestors cannot leave
+    /// descendant layout slots from the previous root input.
+    fn mark_solver_subtree_dirty(&mut self, root: SolverNodeId) {
+        let mut stack = vec![root];
+        while let Some(node_id) = stack.pop() {
+            if self.committed.mark_solver_node_dirty(node_id) {
+                self.solver.mark_dirty(node_id);
+                self.work.record_dirty_mark();
+            }
+            stack.extend(self.solver.children(node_id));
+        }
+    }
+
+    /// Mark one mirror node dirty at most once in the current frame.
     fn mark_solver_node_dirty(&mut self, node_id: SolverNodeId) {
         if self.committed.mark_solver_node_dirty(node_id) {
-            self.mark_mirror_path_dirty(node_id);
+            self.mark_solver_path_dirty(node_id);
             self.work.record_dirty_mark();
         }
     }
 
-    /// Make a mirror mutation visible to the next legal root solve.
+    /// Make a mirror mutation visible to the scheduled retained-root solve.
     ///
-    /// The current solver's dirty flag is implemented as cache clearing, so a direct
-    /// `mark_dirty(node)` may stop when that node's cache is already empty.
-    /// The retained forest owns the mutation transaction: once it changes a
-    /// mirror node's style, children, or measurement facts, every ancestor on
-    /// the retained parent path must be eligible for the scheduled root solve.
-    fn mark_mirror_path_dirty(&mut self, node_id: SolverNodeId) {
+    /// The solver backend may represent "dirty" as an empty local cache. A
+    /// descendant can already have an empty cache while an ancestor/root is
+    /// clean, so dirtying only the changed node can fail to reach the legal root.
+    /// The forest owns retained parentage; after changing a node's mirrored
+    /// facts, it explicitly dirties that retained path and lets the solver decide
+    /// how much layout work to reuse below it.
+    fn mark_solver_path_dirty(&mut self, node_id: SolverNodeId) {
         let mut current = Some(node_id);
         while let Some(node_id) = current {
             self.solver.mark_dirty(node_id);

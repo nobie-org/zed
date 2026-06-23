@@ -2507,14 +2507,6 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
             [0; 13],
             "stable generated facts should not mutate retained layout on the repeat frame"
         );
-        assert_eq!(
-            [
-                stable_sample.solver_cache_stores,
-                stable_sample.solver_cache_clears,
-            ],
-            [0; 2],
-            "stable generated facts should not churn private solver cache entries on the repeat frame: {stable_sample:?}"
-        );
     })
     .settings(hegel_settings(100))
     .run();
@@ -4693,7 +4685,7 @@ fn retained_measured_node_recomputes_when_measure_result_changes(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn unchanged_pure_size_measure_reuses_solver_cache(cx: &mut TestAppContext) {
+fn unchanged_pure_size_measure_does_not_invoke_gpui_producer(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let mut engine = LayoutEngine::new();
 
@@ -4727,12 +4719,8 @@ fn unchanged_pure_size_measure_reuses_solver_cache(cx: &mut TestAppContext) {
             retained_layout_commit_duration: engine
                 .layout_work_sample()
                 .retained_layout_commit_duration,
-            solver_observation_setup_duration: engine
-                .layout_work_sample()
-                .solver_observation_setup_duration,
             solver_layout_duration: engine.layout_work_sample().solver_layout_duration,
             geometry_capture_duration: engine.layout_work_sample().geometry_capture_duration,
-            artifact_completion_duration: engine.layout_work_sample().artifact_completion_duration,
             fresh_compare_duration: engine.layout_work_sample().fresh_compare_duration,
             retained_layout_finish_frame_duration: engine
                 .layout_work_sample()
@@ -5517,6 +5505,7 @@ fn retained_layout_recomputes_when_root_scale_factor_changes() {
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
             reuses: 2,
+            dirty_marks: 2,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -5829,6 +5818,7 @@ fn reused_canvas_panel_after_zero_height_probe_matches_fresh_layout() {
         RetainedForestMutationSample {
             reuses: 14,
             style_updates: 1,
+            dirty_marks: 14,
             ..RetainedForestMutationSample::default()
         }
     );

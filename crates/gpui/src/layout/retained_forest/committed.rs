@@ -70,13 +70,6 @@ impl CommittedLayoutState {
         self.node_layouts.get(&node_id).copied()
     }
 
-    pub(super) fn node_layout_ids_for_trace(&self) -> Vec<(SolverNodeId, LayoutId)> {
-        self.node_layouts
-            .iter()
-            .map(|(node_id, layout_id)| (*node_id, *layout_id))
-            .collect()
-    }
-
     pub(super) fn insert(&mut self, id: LayoutId, node_id: SolverNodeId) {
         assert!(
             !self.layout_nodes.contains_key(&id),

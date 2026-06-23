@@ -422,18 +422,10 @@ impl LayoutEngine {
             self.forest
                 .compute_layout(root_id, id, available_space, scale_factor, window, cx);
         self.layout_work.solver_compute_layout_calls += compute_work.solver_compute_layout_calls;
-        self.layout_work.solver_cache_hits += compute_work.solver_cache_events.hits;
-        self.layout_work.solver_cache_stores += compute_work.solver_cache_events.stores;
-        self.layout_work.solver_cache_clears += compute_work.solver_cache_events.clears;
-        self.layout_work.solver_cache_measure_observations +=
-            compute_work.solver_cache_events.measure_observations;
         self.layout_work.retained_layout_commit_duration +=
             compute_work.retained_layout_commit_duration;
-        self.layout_work.solver_observation_setup_duration +=
-            compute_work.solver_observation_setup_duration;
         self.layout_work.solver_layout_duration += compute_work.solver_layout_duration;
         self.layout_work.geometry_capture_duration += compute_work.geometry_capture_duration;
-        self.layout_work.artifact_completion_duration += compute_work.artifact_completion_duration;
         self.layout_work.fresh_compare_duration += compute_work.fresh_compare_duration;
         self.layout_work.compute_layout_duration += compute_work.compute_layout_duration;
         self.layout_work.measured_layout_calls += compute_work.measured_layout_calls;

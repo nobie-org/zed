@@ -10,12 +10,22 @@ use super::solver::{SolverLayout, SolverNodeId};
 use crate::{Bounds, Pixels, Point, Size, size};
 use collections::{FxHashMap, FxHashSet};
 
+/// Layout input used to solve one retained root.
+///
+/// This is a GPUI lifecycle fact, not solver policy. If a retained root is
+/// solved under a different input than its last successful solve, the forest
+/// must dirty that root before calling the private solver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RootSolveInput {
+    available_space: Size<AvailableSpaceKey>,
+    scale_factor_bits: u32,
+}
+
 /// Current-frame proof that one retained root was solved exactly once.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SolvedRoot {
     root_node: SolverNodeId,
-    available_space: Size<AvailableSpaceKey>,
-    scale_factor_bits: u32,
+    input: RootSolveInput,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26,6 +36,18 @@ enum AvailableSpaceKey {
     MaxContent,
 }
 
+impl RootSolveInput {
+    pub(super) fn new(available_space: Size<AvailableSpace>, scale_factor: f32) -> Self {
+        Self {
+            available_space: size(
+                AvailableSpaceKey::from(available_space.width),
+                AvailableSpaceKey::from(available_space.height),
+            ),
+            scale_factor_bits: scale_factor.to_bits(),
+        }
+    }
+}
+
 impl SolvedRoot {
     fn new(
         root_node: SolverNodeId,
@@ -34,11 +56,7 @@ impl SolvedRoot {
     ) -> Self {
         Self {
             root_node,
-            available_space: size(
-                AvailableSpaceKey::from(available_space.width),
-                AvailableSpaceKey::from(available_space.height),
-            ),
-            scale_factor_bits: scale_factor.to_bits(),
+            input: RootSolveInput::new(available_space, scale_factor),
         }
     }
 }

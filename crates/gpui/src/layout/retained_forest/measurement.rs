@@ -12,9 +12,9 @@ mod tests;
 
 use super::super::LayoutId;
 use super::AvailableSpace;
-use super::solver::{SolverCacheEvent, SolverMeasureObservation, SolverNodeId};
+use super::solver::SolverNodeId;
 use crate::{App, MeasureCx, Pixels, Size, Window, size};
-use artifacts::{ArtifactCacheKey, ArtifactProof, ArtifactStore, ArtifactStoreCheckpoint};
+use artifacts::{ArtifactCacheKey, ArtifactStore, ArtifactStoreCheckpoint};
 pub(in crate::layout) use artifacts::{LayoutArtifact, LayoutArtifactKey};
 use collections::FxHashMap;
 use producer_registry::{ProducerRegistry, ProducerRegistryCheckpoint};
@@ -620,80 +620,12 @@ impl MeasurementStore {
         }
     }
 
-    /// Complete artifacts proven by explicit measured-query observations.
-    ///
-    /// The solver may invoke a callback or report a passive cache hit/store event.
-    /// Those events can populate GPUI's query-keyed artifact cache, but they are
-    /// not required for normal text correctness. Text prepaint installs from
-    /// final solved bounds and current text facts; retained layout does not walk
-    /// a whole root to force or prove paint artifacts.
-    pub(super) fn finish_completed_solve(
-        &mut self,
-        scale_factor: f32,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        for proof in self.artifacts.take_pending_proofs() {
-            let cache_key = proof.cache_key();
-            if let Some(artifact) = self.artifacts.current_artifact_for_query(&cache_key) {
-                proof.assert_matches_artifact(&artifact, scale_factor);
-                continue;
-            }
-            self.measure_artifact_from_current_producer(proof, scale_factor, window, cx);
-        }
-    }
-
     pub(super) fn compute_state(&mut self) -> ComputeMeasurementState<'_> {
         ComputeMeasurementState::new(
             &mut self.producers,
             &mut self.current_measurements,
             &mut self.artifacts,
         )
-    }
-
-    #[stacksafe::stacksafe]
-    fn measure_artifact_from_current_producer(
-        &mut self,
-        proof: ArtifactProof,
-        scale_factor: f32,
-        window: &mut Window,
-        cx: &App,
-    ) {
-        let Some(CurrentMeasurement::Artifact { key, measure, .. }) =
-            self.current_measurements.get(&proof.node_id).cloned()
-        else {
-            panic!("solver cache-hit text query should refer to a current text measurement");
-        };
-        assert_eq!(
-            &key, &proof.artifact_key,
-            "solver cache-hit artifact query should match the current artifact key"
-        );
-
-        let artifact = {
-            let mut measure_cx = MeasureCx::new(window, cx);
-            let context = self
-                .producers
-                .context_mut(measure)
-                .expect("artifact measured layout should have a current producer");
-            let LayoutMeasureContext::Artifact(context) = context else {
-                panic!("artifact measured layout should have an artifact producer");
-            };
-            (context.measure)(
-                proof.known_dimensions,
-                proof.available_space,
-                &mut measure_cx,
-            )
-        };
-        key.assert_matches_artifact(
-            &artifact,
-            "solver cache-hit artifact should match the current artifact key",
-        );
-        proof.assert_matches_artifact(&artifact, scale_factor);
-
-        let cache_key = proof.cache_key();
-        self.artifacts
-            .record_for_query(cache_key.clone(), &artifact);
-        self.artifacts.cache_artifact(cache_key, artifact);
     }
 }
 
@@ -787,47 +719,6 @@ impl<'a> ComputeMeasurementState<'a> {
                 MeasuredQueryAnswer::hard_work(size)
             }
         }
-    }
-
-    pub(super) fn observe_layout_cache_event(
-        &mut self,
-        event: SolverCacheEvent,
-        scale_factor: f32,
-    ) {
-        match event {
-            SolverCacheEvent::Measure(observation) => {
-                self.record_artifact_for_measure_observation(observation, scale_factor);
-            }
-            SolverCacheEvent::Hit(_) | SolverCacheEvent::Stored(_) => {}
-            SolverCacheEvent::Cleared(_) => {}
-        }
-    }
-
-    fn record_artifact_for_measure_observation(
-        &mut self,
-        observation: SolverMeasureObservation,
-        scale_factor: f32,
-    ) {
-        let node_id = observation.node_id();
-        let Some(CurrentMeasurement::Artifact { key, .. }) =
-            self.current_measurements.get(&node_id)
-        else {
-            return;
-        };
-        let key = key.clone();
-        let proof =
-            ArtifactProof::from_solver_measure_observation(key.clone(), observation, scale_factor);
-        let query_key = proof.cache_key();
-        let Some(artifact) = self.artifacts.artifact_for_query(&query_key) else {
-            self.artifacts.push_pending_proof(proof);
-            return;
-        };
-        key.assert_matches_artifact(
-            &artifact,
-            "solver measure observation artifact should match the current artifact key",
-        );
-        proof.assert_matches_artifact(&artifact, scale_factor);
-        self.record_artifact_for_query(query_key, &artifact);
     }
 
     fn record_artifact_for_query(

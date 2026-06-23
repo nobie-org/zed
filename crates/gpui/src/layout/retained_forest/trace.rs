@@ -1,120 +1,12 @@
-//! Retained-layout trace sinks.
+//! Retained-layout trace switches.
 //!
-//! Tracing observes retained layout and solver events for debugging. It must not
-//! decide retained identity, dirtying, measurement validity, or solve policy.
+//! Tracing observes retained layout for debugging. It must not decide retained
+//! identity, dirtying, measurement validity, or solve policy.
 
-use super::solver::{SolverCacheEntry, SolverCacheEvent, SolverNodeId};
-use crate::layout::LayoutId;
 use std::sync::{
     OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
-
-/// Passive solver cache-event counts observed during one legal root solve.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(in crate::layout) struct CacheEventCounts {
-    pub(in crate::layout) hits: u64,
-    pub(in crate::layout) stores: u64,
-    pub(in crate::layout) clears: u64,
-    pub(in crate::layout) measure_observations: u64,
-}
-
-/// Cache-event trace sink for one legal root solve.
-pub(super) struct CacheEventTracer {
-    node_layout_ids: Vec<(SolverNodeId, LayoutId)>,
-    counts: CacheEventCounts,
-}
-
-impl CacheEventTracer {
-    pub(super) fn new(node_layout_ids: Vec<(SolverNodeId, LayoutId)>) -> Self {
-        Self {
-            node_layout_ids,
-            counts: CacheEventCounts::default(),
-        }
-    }
-
-    pub(super) fn counts(&self) -> CacheEventCounts {
-        self.counts
-    }
-
-    pub(super) fn record(&mut self, event: SolverCacheEvent) {
-        let should_trace = trace_layout_ids().is_some();
-
-        match event {
-            SolverCacheEvent::Hit(entry) => {
-                self.counts.hits += 1;
-                if should_trace {
-                    self.trace_layout_cache_entry("hit", entry);
-                }
-            }
-            SolverCacheEvent::Stored(entry) => {
-                self.counts.stores += 1;
-                if should_trace {
-                    self.trace_layout_cache_entry("stored", entry);
-                }
-            }
-            SolverCacheEvent::Cleared(clear) => {
-                self.counts.clears += 1;
-                if !should_trace {
-                    return;
-                }
-                let node_id = clear.node_id();
-                let layout_id = self.layout_id_for_node(node_id);
-                if layout_id_is_targeted(layout_id) {
-                    eprintln!(
-                        "gpui retained_layout cache_event kind=cleared layout_id={:?} node_id={:?}",
-                        layout_id, node_id
-                    );
-                }
-            }
-            SolverCacheEvent::Measure(_) => {
-                self.counts.measure_observations += 1;
-            }
-        }
-    }
-
-    fn trace_layout_cache_entry(&self, kind: &'static str, entry: SolverCacheEntry) {
-        let node_id = entry.node_id();
-        let layout_id = self.layout_id_for_node(node_id);
-
-        if !layout_id_is_targeted(layout_id) {
-            return;
-        }
-
-        let details = entry.trace_details();
-        if !should_trace_all_cache_events()
-            && !(details.has_zero_output
-                || details.has_zero_known_dimension
-                || details.has_zero_parent_dimension
-                || details.has_zero_available_space)
-        {
-            return;
-        }
-
-        eprintln!(
-            "gpui retained_layout cache_event kind={} layout_id={:?} node_id={:?} entry_id={:?} run_mode={:?} sizing_mode={:?} axis={:?} known_dimensions={:?} parent_size={:?} available_space={:?} output_size={:?}",
-            kind,
-            layout_id,
-            node_id,
-            details.entry_id,
-            details.run_mode,
-            details.sizing_mode,
-            details.axis,
-            details.known_dimensions,
-            details.parent_size,
-            details.available_space,
-            details.output_size
-        );
-    }
-
-    fn layout_id_for_node(&self, node_id: SolverNodeId) -> Option<usize> {
-        self.node_layout_ids
-            .iter()
-            .find_map(|(candidate_node_id, layout_id)| {
-                (*candidate_node_id == node_id).then_some(layout_id.0)
-            })
-    }
-}
 
 pub(super) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -203,10 +95,4 @@ fn mutation_trace_limit() -> Option<usize> {
         }
         value.parse::<usize>().ok().or(Some(256))
     })
-}
-
-fn should_trace_all_cache_events() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("GPUI_TRACE_RETAINED_LAYOUT_CACHE_EVENTS_ALL").is_some())
 }

@@ -2,8 +2,8 @@
 //!
 //! The retained tree owns GPUI layout facts. This module is the only surface the
 //! retained tree can use to mutate or solve the downstream layout mirror. The
-//! concrete implementation lives in `solver::backend`; callers see
-//! only opaque solver handles, styles, cache observations, and layouts.
+//! concrete implementation lives in `solver::backend`; callers see only opaque
+//! solver handles, styles, measurement queries, and solved layouts.
 
 mod backend;
 
@@ -67,89 +67,11 @@ pub(super) struct SolverLayout {
     pub(super) size: Size<f32>,
 }
 
-/// Opaque identity of one solver cache entry.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct SolverCacheEntryId(backend::BackendCacheEntryId);
-
-/// Passive observation of solver cache activity.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum SolverCacheEvent {
-    Hit(SolverCacheEntry),
-    Stored(SolverCacheEntry),
-    Cleared(SolverCacheClear),
-    Measure(SolverMeasureObservation),
-}
-
-/// Passive observation that the solver cleared one node's cache.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SolverCacheClear(backend::BackendCacheClear);
-
-impl SolverCacheClear {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        self.0.node_id()
-    }
-}
-
-/// Passive observation of one cache entry selected or stored by the solver.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct SolverCacheEntry(backend::BackendCacheEntry);
-
-impl SolverCacheEntry {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        self.0.node_id()
-    }
-
-    pub(super) fn trace_details(&self) -> SolverCacheEntryTraceDetails {
-        self.0.trace_details()
-    }
-}
-
-/// Debug-only cache entry facts used by retained-layout tracing.
-pub(super) struct SolverCacheEntryTraceDetails {
-    pub(super) entry_id: SolverCacheEntryId,
-    pub(super) run_mode: String,
-    pub(super) sizing_mode: String,
-    pub(super) axis: String,
-    pub(super) known_dimensions: String,
-    pub(super) parent_size: String,
-    pub(super) available_space: String,
-    pub(super) output_size: String,
-    pub(super) has_zero_output: bool,
-    pub(super) has_zero_known_dimension: bool,
-    pub(super) has_zero_parent_dimension: bool,
-    pub(super) has_zero_available_space: bool,
-}
-
 /// Exact measurement query the solver asked GPUI to answer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct SolverMeasureQuery {
     pub(super) known_dimensions: Size<Option<Pixels>>,
     pub(super) available_space: Size<AvailableSpace>,
-}
-
-/// Passive observation that the solver used one exact measured-node result.
-///
-/// The observation can come from a real measure callback or from the solver
-/// replaying a cached measured query/result. It is not a dirtying signal and it
-/// does not change solver behavior.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct SolverMeasureObservation(backend::BackendMeasureObservation);
-
-impl SolverMeasureObservation {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        self.0.node_id()
-    }
-
-    pub(super) fn query(&self, scale_factor: f32) -> SolverMeasureQuery {
-        SolverMeasureQuery {
-            known_dimensions: self.0.known_dimensions(scale_factor),
-            available_space: self.0.available_space(scale_factor),
-        }
-    }
-
-    pub(super) fn measured_size(&self, scale_factor: f32) -> Size<Pixels> {
-        self.0.measured_size(scale_factor)
-    }
 }
 
 /// Private layout solver facade used by the retained forest.
@@ -183,14 +105,6 @@ trait SolverBackend: Clone {
         available_space: Size<AvailableSpace>,
         scale_factor: f32,
         measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
-    );
-    fn compute_layout_with_measure_and_cache_events(
-        &mut self,
-        root: SolverNodeId,
-        available_space: Size<AvailableSpace>,
-        scale_factor: f32,
-        measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
-        handle_cache_event: impl FnMut(SolverCacheEvent),
     );
 }
 
@@ -274,23 +188,6 @@ impl LayoutSolver {
     ) {
         self.backend
             .compute_layout_with_measure(root, available_space, scale_factor, measure);
-    }
-
-    pub(super) fn compute_layout_with_measure_and_cache_events(
-        &mut self,
-        root: SolverNodeId,
-        available_space: Size<AvailableSpace>,
-        scale_factor: f32,
-        measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
-        handle_cache_event: impl FnMut(SolverCacheEvent),
-    ) {
-        self.backend.compute_layout_with_measure_and_cache_events(
-            root,
-            available_space,
-            scale_factor,
-            measure,
-            handle_cache_event,
-        );
     }
 }
 

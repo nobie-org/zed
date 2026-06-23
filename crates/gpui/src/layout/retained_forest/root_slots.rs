@@ -6,6 +6,7 @@
 //! cleanup path.
 
 use super::super::RetainedLayoutRootId;
+use super::geometry::RootSolveInput;
 use super::node::RetainedLayoutNode;
 use collections::FxHashMap;
 use std::mem;
@@ -15,6 +16,7 @@ pub(super) struct RootSlots {
     retained_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
     current_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
     detached_subtree_removals: Vec<RetainedLayoutNode>,
+    last_solve_inputs: FxHashMap<RetainedLayoutRootId, RootSolveInput>,
 }
 
 /// Transaction checkpoint for root slot state.
@@ -22,6 +24,7 @@ pub(super) struct RootSlotsCheckpoint {
     retained_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
     current_roots: FxHashMap<RetainedLayoutRootId, RetainedLayoutNode>,
     detached_subtree_removals: Vec<RetainedLayoutNode>,
+    last_solve_inputs: FxHashMap<RetainedLayoutRootId, RootSolveInput>,
 }
 
 impl RootSlots {
@@ -30,6 +33,7 @@ impl RootSlots {
             retained_roots: FxHashMap::default(),
             current_roots: FxHashMap::default(),
             detached_subtree_removals: Vec::new(),
+            last_solve_inputs: FxHashMap::default(),
         }
     }
 
@@ -38,6 +42,7 @@ impl RootSlots {
             retained_roots: self.retained_roots.clone(),
             current_roots: self.current_roots.clone(),
             detached_subtree_removals: self.detached_subtree_removals.clone(),
+            last_solve_inputs: self.last_solve_inputs.clone(),
         }
     }
 
@@ -45,6 +50,7 @@ impl RootSlots {
         self.retained_roots = checkpoint.retained_roots;
         self.current_roots = checkpoint.current_roots;
         self.detached_subtree_removals = checkpoint.detached_subtree_removals;
+        self.last_solve_inputs = checkpoint.last_solve_inputs;
     }
 
     pub(super) fn take_retained_roots(&mut self) -> Vec<RetainedLayoutNode> {
@@ -52,7 +58,10 @@ impl RootSlots {
     }
 
     pub(super) fn promote_current_roots(&mut self) {
-        self.retained_roots = mem::take(&mut self.current_roots);
+        let current_roots = mem::take(&mut self.current_roots);
+        self.last_solve_inputs
+            .retain(|root_id, _| current_roots.contains_key(root_id));
+        self.retained_roots = current_roots;
     }
 
     pub(super) fn has_current_root(&self, root_id: RetainedLayoutRootId) -> bool {
@@ -76,6 +85,28 @@ impl RootSlots {
             previous.is_none(),
             "retained layout root should be committed at most once per frame"
         );
+    }
+
+    pub(super) fn solve_input_changed(
+        &self,
+        root_id: RetainedLayoutRootId,
+        input: RootSolveInput,
+    ) -> bool {
+        self.last_solve_inputs
+            .get(&root_id)
+            .is_some_and(|previous| *previous != input)
+    }
+
+    pub(super) fn record_solve_input(
+        &mut self,
+        root_id: RetainedLayoutRootId,
+        input: RootSolveInput,
+    ) {
+        assert!(
+            self.current_roots.contains_key(&root_id),
+            "retained root solve input should be recorded only for a current root"
+        );
+        self.last_solve_inputs.insert(root_id, input);
     }
 
     pub(super) fn current_root_count(&self) -> usize {

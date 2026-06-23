@@ -1,6 +1,6 @@
 use super::super::AvailableSpace;
-use super::super::solver::{SolverMeasureObservation, SolverNodeId};
-use crate::{Pixels, Size, Window, size, util::ceil_to_device_pixel};
+use super::super::solver::SolverNodeId;
+use crate::{Pixels, Size, Window, size};
 use collections::FxHashMap;
 use std::{
     any::{Any, TypeId},
@@ -150,79 +150,49 @@ impl LayoutArtifact {
     }
 }
 
-/// GPUI-owned artifacts selected for the current layout solve.
+/// GPUI-owned artifacts selected by measured callbacks in the current solve.
 ///
 /// The solver owns whether a measured callback runs. This store owns only the
-/// artifact validity facts GPUI can prove in the current solve: exact
-/// query-keyed artifacts observed from callbacks or passive solver cache events.
+/// artifact validity facts GPUI can prove when the callback actually asks GPUI
+/// for an exact measured query.
 pub(super) struct ArtifactStore {
     current_query_artifacts: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
-    pending_proofs: Vec<ArtifactProof>,
     query_cache: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
 }
 
 /// Transaction checkpoint for GPUI-owned artifact validity.
 pub(super) struct ArtifactStoreCheckpoint {
     current_query_artifacts: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
-    pending_proofs: Vec<ArtifactProof>,
     query_cache: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
-}
-
-/// Solver-observed proof that an artifact node used one exact measurement result.
-///
-/// The artifact key alone is insufficient because wrapping, truncation, and
-/// other artifact-visible facts can also depend on the solver query. The
-/// measured size is part of the proof so a cached artifact with the same facts
-/// and query cannot silently stand in for a different solver result.
-#[derive(Clone)]
-pub(super) struct ArtifactProof {
-    pub(super) node_id: SolverNodeId,
-    pub(super) artifact_key: LayoutArtifactKey,
-    pub(super) known_dimensions: Size<Option<Pixels>>,
-    pub(super) available_space: Size<AvailableSpace>,
-    pub(super) measured_size: Size<Pixels>,
 }
 
 impl ArtifactStore {
     pub(super) fn new() -> Self {
         Self {
             current_query_artifacts: FxHashMap::default(),
-            pending_proofs: Vec::new(),
             query_cache: FxHashMap::default(),
         }
     }
 
     pub(super) fn begin_frame(&mut self) {
         self.current_query_artifacts.clear();
-        self.pending_proofs.clear();
     }
 
     pub(super) fn finish_frame(&mut self) {
         self.retain_current_query_cache();
         self.current_query_artifacts.clear();
-        self.pending_proofs.clear();
     }
 
     pub(super) fn checkpoint(&self) -> ArtifactStoreCheckpoint {
         ArtifactStoreCheckpoint {
             current_query_artifacts: self.current_query_artifacts.clone(),
-            pending_proofs: self.pending_proofs.clone(),
             query_cache: self.query_cache.clone(),
         }
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: ArtifactStoreCheckpoint) {
         self.current_query_artifacts = checkpoint.current_query_artifacts;
-        self.pending_proofs = checkpoint.pending_proofs;
         self.query_cache = checkpoint.query_cache;
-    }
-
-    pub(super) fn push_pending_proof(&mut self, proof: ArtifactProof) {
-        self.pending_proofs.push(proof);
-    }
-
-    pub(super) fn take_pending_proofs(&mut self) -> Vec<ArtifactProof> {
-        std::mem::take(&mut self.pending_proofs)
     }
 
     pub(super) fn artifact_for_query(
@@ -230,13 +200,6 @@ impl ArtifactStore {
         cache_key: &ArtifactCacheKey,
     ) -> Option<LayoutArtifact> {
         self.query_cache.get(cache_key).cloned()
-    }
-
-    pub(super) fn current_artifact_for_query(
-        &self,
-        cache_key: &ArtifactCacheKey,
-    ) -> Option<LayoutArtifact> {
-        self.current_query_artifacts.get(cache_key).cloned()
     }
 
     pub(super) fn record_for_query(
@@ -272,51 +235,7 @@ impl ArtifactStore {
     }
 }
 
-impl ArtifactProof {
-    pub(super) fn from_solver_measure_observation(
-        artifact_key: LayoutArtifactKey,
-        observation: SolverMeasureObservation,
-        scale_factor: f32,
-    ) -> Self {
-        let query = observation.query(scale_factor);
-        Self {
-            node_id: observation.node_id(),
-            artifact_key,
-            known_dimensions: query.known_dimensions,
-            available_space: query.available_space,
-            measured_size: observation.measured_size(scale_factor),
-        }
-    }
-
-    pub(super) fn cache_key(&self) -> ArtifactCacheKey {
-        ArtifactCacheKey::new(
-            self.node_id,
-            self.artifact_key.clone(),
-            self.known_dimensions,
-            self.available_space,
-        )
-    }
-
-    pub(super) fn assert_matches_artifact(&self, artifact: &LayoutArtifact, scale_factor: f32) {
-        self.artifact_key.assert_matches_artifact(
-            artifact,
-            "current artifact should match the exact solver query artifact key",
-        );
-        assert_eq!(
-            snap_artifact_size_to_solver_measurement(artifact.size(), scale_factor),
-            self.measured_size,
-            "current artifact should match the exact solver query measured size"
-        );
-    }
-}
-
-fn snap_artifact_size_to_solver_measurement(size: Size<Pixels>, scale_factor: f32) -> Size<Pixels> {
-    size.map(|dimension| {
-        Pixels(ceil_to_device_pixel(dimension.0.max(0.0), scale_factor) / scale_factor)
-    })
-}
-
-/// Exact validity key for an artifact observed through the solver.
+/// Exact validity key for an artifact produced by a measured callback.
 ///
 /// This key is built only from the measurement query the solver passes to GPUI.
 /// It does not predict or reconstruct the solver cache key; it lets GPUI avoid

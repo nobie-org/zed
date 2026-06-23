@@ -7,7 +7,7 @@
 use super::super::LayoutId;
 use super::super::telemetry::RetainedSubtreeWorkSample;
 use super::measurement::MeasuredCallbackTelemetry;
-use super::solver::{SolverCacheEvent, SolverNodeId};
+use super::solver::SolverNodeId;
 use super::work::RetainedWorkDelta;
 use crate::GlobalElementId;
 use collections::FxHashSet;
@@ -49,10 +49,6 @@ pub(super) struct SubtreeProbeComputeRecorder {
 struct SubtreeProbeComputeDelta {
     measured_callbacks: u64,
     no_work_exempt_measured_callbacks: u64,
-    solver_cache_hits: u64,
-    solver_cache_stores: u64,
-    solver_cache_clears: u64,
-    solver_cache_measure_observations: u64,
 }
 
 impl SubtreeProbe {
@@ -143,10 +139,6 @@ impl SubtreeProbe {
                 sample.measured_callbacks += delta.measured_callbacks;
                 sample.conservative_text_measured_callbacks +=
                     delta.no_work_exempt_measured_callbacks;
-                sample.solver_cache_hits += delta.solver_cache_hits;
-                sample.solver_cache_stores += delta.solver_cache_stores;
-                sample.solver_cache_clears += delta.solver_cache_clears;
-                sample.solver_cache_measure_observations += delta.solver_cache_measure_observations;
             }
         }
     }
@@ -171,7 +163,7 @@ impl SubtreeProbe {
             }
             self.emitted_samples += 1;
             eprintln!(
-                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} dirty_marks={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={} solver_cache_hits={} solver_cache_stores={} solver_cache_clears={} solver_cache_measure_observations={}",
+                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} dirty_marks={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={}",
                 sample.global_id,
                 sample.layout_id,
                 sample.node_count,
@@ -186,10 +178,6 @@ impl SubtreeProbe {
                 sample.mirror_measured_context_clears,
                 sample.measured_callbacks,
                 sample.conservative_text_measured_callbacks,
-                sample.solver_cache_hits,
-                sample.solver_cache_stores,
-                sample.solver_cache_clears,
-                sample.solver_cache_measure_observations,
             );
         }
     }
@@ -232,33 +220,6 @@ impl SubtreeProbeComputeRecorder {
                 delta.no_work_exempt_measured_callbacks += 1;
             }
         });
-    }
-
-    pub(super) fn record_cache_event(&mut self, event: SolverCacheEvent) {
-        let recorded = match event {
-            SolverCacheEvent::Hit(entry) => self.record_node(entry.node_id(), |delta| {
-                delta.solver_cache_hits += 1;
-            }),
-            SolverCacheEvent::Stored(entry) => self.record_node(entry.node_id(), |delta| {
-                delta.solver_cache_stores += 1;
-            }),
-            SolverCacheEvent::Cleared(clear) => self.record_node(clear.node_id(), |delta| {
-                delta.solver_cache_clears += 1;
-            }),
-            SolverCacheEvent::Measure(observation) => {
-                self.record_node(observation.node_id(), |delta| {
-                    delta.solver_cache_measure_observations += 1;
-                })
-            }
-        };
-
-        if recorded && trace_subtree_cache_events_enabled() {
-            trace_subtree_cache_event(event);
-        }
-    }
-
-    pub(super) fn has_active_subtrees(&self) -> bool {
-        !self.active_subtrees.is_empty()
     }
 
     fn record_node(
@@ -323,32 +284,4 @@ fn env_subtree_sample_limit() -> usize {
             .and_then(|limit| limit.parse().ok())
             .unwrap_or(120)
     })
-}
-
-fn trace_subtree_cache_events_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("GPUI_TRACE_RETAINED_LAYOUT_SUBTREE_CACHE_EVENTS").is_ok())
-}
-
-fn trace_subtree_cache_event(event: SolverCacheEvent) {
-    eprintln!("gpui retained_layout subtree_cache_event {event:?}");
-    match event {
-        SolverCacheEvent::Hit(entry) | SolverCacheEvent::Stored(entry) => {
-            let details = entry.trace_details();
-            eprintln!(
-                "gpui retained_layout subtree_cache_entry node_id={:?} entry_id={:?} run_mode={} sizing_mode={} axis={} known_dimensions={} parent_size={} available_space={} output_size={}",
-                entry.node_id(),
-                details.entry_id,
-                details.run_mode,
-                details.sizing_mode,
-                details.axis,
-                details.known_dimensions,
-                details.parent_size,
-                details.available_space,
-                details.output_size,
-            );
-        }
-        SolverCacheEvent::Cleared(_) | SolverCacheEvent::Measure(_) => {}
-    }
 }

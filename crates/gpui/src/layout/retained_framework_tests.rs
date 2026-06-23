@@ -1538,40 +1538,6 @@ fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
     );
 }
 
-fn assert_solver_cache_did_not_churn(
-    sample: LayoutWorkSample,
-    require_hits: bool,
-    expect_measure_observations: bool,
-) {
-    if require_hits {
-        assert!(
-            sample.solver_cache_hits > 0,
-            "stable generated framework frame should observe solver cache hits: {sample:?}"
-        );
-    }
-    assert_eq!(
-        [sample.solver_cache_stores, sample.solver_cache_clears,],
-        [0; 2],
-        "stable generated framework frame should not observe solver cache churn: {sample:?}"
-    );
-    if expect_measure_observations {
-        assert!(
-            sample.solver_cache_measure_observations > 0,
-            "stable generated framework text frame should observe cached measurement queries: {sample:?}"
-        );
-    }
-}
-
-fn assert_subtree_solver_preservation_observed(
-    sample: &crate::RetainedSubtreeWorkSample,
-    target: &str,
-) {
-    assert!(
-        sample.solver_cache_hits + sample.solver_cache_measure_observations > 0,
-        "stable subtree {target} should observe preserved solver state: {sample:?}"
-    );
-}
-
 fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample], target: &str) {
     let sample = samples
         .iter()
@@ -1602,10 +1568,9 @@ fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample
         sample.retained_reuses > 0,
         "stable subtree {target} should reuse retained nodes: {sample:?}"
     );
-    assert_subtree_solver_preservation_observed(sample, target);
 }
 
-fn assert_stable_subtree_preserved_without_solver_churn(
+fn assert_stable_subtree_preserved_without_gpui_work(
     samples: &[crate::RetainedSubtreeWorkSample],
     target: &str,
 ) {
@@ -1624,7 +1589,7 @@ fn assert_stable_subtree_preserved_without_solver_churn(
     assert_eq!(
         sample.no_work_total(),
         0,
-        "stable subtree {target} should not have retained or solver churn: {sample:?}"
+        "stable subtree {target} should not have retained layout work: {sample:?}"
     );
     assert_eq!(
         sample.measured_callbacks, 0,
@@ -1634,7 +1599,6 @@ fn assert_stable_subtree_preserved_without_solver_churn(
         sample.conservative_text_measured_callbacks, 0,
         "stable subtree {target} should not hide measured callbacks behind exemptions: {sample:?}"
     );
-    assert_subtree_solver_preservation_observed(sample, target);
 }
 
 fn assert_stable_subtree_retained_without_gpui_work(
@@ -1739,8 +1703,7 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
         );
         assert_runtime_fresh_compare_proved(stable_sample);
         assert_no_retained_writes_or_measurement(stable_sample);
-        assert_solver_cache_did_not_churn(stable_sample, false, false);
-        assert_stable_subtree_preserved_without_solver_churn(
+        assert_stable_subtree_preserved_without_gpui_work(
             &stable_subtree_samples,
             "generated-framework-retained-root",
         );
@@ -1793,7 +1756,6 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
         );
         assert_runtime_fresh_compare_proved(stable_sample);
         assert_no_retained_writes_or_measurement(stable_sample);
-        assert_solver_cache_did_not_churn(stable_sample, true, true);
     })
     .settings(hegel_settings(50))
     .run();
@@ -1850,8 +1812,7 @@ fn generated_framework_styled_tree_matches_fresh_and_stable_repeat_preserves_sol
         );
         assert_runtime_fresh_compare_proved(stable_sample);
         assert_no_retained_writes_or_measurement(stable_sample);
-        assert_solver_cache_did_not_churn(stable_sample, true, true);
-        assert_stable_subtree_preserved_without_solver_churn(
+        assert_stable_subtree_preserved_without_gpui_work(
             &stable_subtree_samples,
             "generated-framework-styled-retained-root",
         );
@@ -1927,7 +1888,7 @@ fn generated_framework_styled_sibling_churn_matches_fresh_and_preserves_stable_s
         );
         assert_runtime_fresh_compare_proved(second_retained_sample);
         assert_retained_frame_sample(second_retained_sample);
-        assert_stable_subtree_preserved_without_solver_churn(
+        assert_stable_subtree_preserved_without_gpui_work(
             &stable_subtree_samples,
             "generated-styled-stable-panel",
         );
@@ -2000,7 +1961,7 @@ fn generated_styled_sibling_frame_sequence_matches_fresh_and_preserves_stable_su
             );
             assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
-            assert_stable_subtree_preserved_without_solver_churn(
+            assert_stable_subtree_preserved_without_gpui_work(
                 &subtree_samples,
                 "generated-styled-stable-panel",
             );
@@ -2383,7 +2344,7 @@ fn generated_sibling_churn_matches_fresh_and_preserves_stable_subtree(cx: &mut T
             );
             assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
-            assert_stable_subtree_preserved_without_solver_churn(
+            assert_stable_subtree_preserved_without_gpui_work(
                 &subtree_samples,
                 "generated-sibling-churn-stable-panel",
             );
@@ -2447,7 +2408,7 @@ fn generated_keyed_sibling_churn_preserves_arbitrary_styled_subtree(cx: &mut Tes
             );
             assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
-            assert_stable_subtree_preserved_without_solver_churn(
+            assert_stable_subtree_preserved_without_gpui_work(
                 &subtree_samples,
                 "generated-styled-sibling-churn-stable-panel",
             );
@@ -2522,11 +2483,11 @@ fn generated_internal_edit_matches_fresh_and_preserves_unchanged_sibling_subtree
             );
             assert_runtime_fresh_compare_proved(sample);
             assert_retained_frame_sample(sample);
-            assert_stable_subtree_preserved_without_solver_churn(
+            assert_stable_subtree_preserved_without_gpui_work(
                 &subtree_samples,
                 "generated-internal-edit-stable-before",
             );
-            assert_stable_subtree_preserved_without_solver_churn(
+            assert_stable_subtree_preserved_without_gpui_work(
                 &subtree_samples,
                 "generated-internal-edit-stable-after",
             );

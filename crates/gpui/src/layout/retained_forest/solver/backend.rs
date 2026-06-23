@@ -2,15 +2,12 @@
 //!
 //! This module is the only retained-layout code that may name Taffy. It
 //! translates GPUI layout facts into Taffy styles, mirrors retained-tree
-//! mutations into a `TaffyTree`, runs the legal root solve, and reports passive
-//! solver cache observations back through opaque facade types.
+//! mutations into a `TaffyTree`, and runs the legal root solve.
 
 use super::super::super::{AvailableSpace, EXPECT_MESSAGE};
 use super::super::measurement::NodeContext;
 use super::{
-    FreshSolverNodeId, SolverBackend, SolverCacheClear, SolverCacheEntry, SolverCacheEntryId,
-    SolverCacheEntryTraceDetails, SolverCacheEvent, SolverLayout, SolverMeasureObservation,
-    SolverMeasureQuery, SolverNodeId, SolverStyle,
+    FreshSolverNodeId, SolverBackend, SolverLayout, SolverMeasureQuery, SolverNodeId, SolverStyle,
 };
 use crate::{
     AbsoluteLength, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size, Style, point,
@@ -20,7 +17,7 @@ use crate::{
 use std::fmt::{self, Debug};
 use std::ops::Range;
 use taffy::{
-    LayoutCacheEntry, LayoutCacheEntryId, LayoutCacheEvent, LayoutMeasureObservation, TaffyTree,
+    TaffyTree,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
     prelude::{TaffyGridLine, TaffyGridSpan, max_content, min_content},
     style::AvailableSpace as TaffyAvailableSpace,
@@ -77,94 +74,6 @@ impl From<TaffyLayout> for SolverLayout {
             location: point(layout.location.x, layout.location.y),
             size: size(layout.size.width, layout.size.height),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) struct BackendCacheEntryId(LayoutCacheEntryId);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct BackendCacheClear(NodeId);
-
-impl BackendCacheClear {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        SolverNodeId(BackendNodeId(self.0))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct BackendCacheEntry(LayoutCacheEntry);
-
-impl BackendCacheEntry {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        SolverNodeId(BackendNodeId(self.0.node_id()))
-    }
-
-    pub(super) fn entry_id(&self) -> SolverCacheEntryId {
-        SolverCacheEntryId(BackendCacheEntryId(self.0.entry_id()))
-    }
-
-    pub(super) fn trace_details(&self) -> SolverCacheEntryTraceDetails {
-        let input = self.0.requested_input();
-        let output = self.0.returned_output();
-        SolverCacheEntryTraceDetails {
-            entry_id: self.entry_id(),
-            run_mode: format!("{:?}", input.run_mode),
-            sizing_mode: format!("{:?}", input.sizing_mode),
-            axis: format!("{:?}", input.axis),
-            known_dimensions: format!("{:?}", input.known_dimensions),
-            parent_size: format!("{:?}", input.parent_size),
-            available_space: format!("{:?}", input.available_space),
-            output_size: format!("{:?}", output.size),
-            has_zero_output: output.size.width <= 0.0 || output.size.height <= 0.0,
-            has_zero_known_dimension: input.known_dimensions.width == Some(0.0)
-                || input.known_dimensions.height == Some(0.0),
-            has_zero_parent_dimension: input.parent_size.width == Some(0.0)
-                || input.parent_size.height == Some(0.0),
-            has_zero_available_space: matches!(
-                input.available_space.width,
-                TaffyAvailableSpace::Definite(width) if width <= 0.0
-            ) || matches!(
-                input.available_space.height,
-                TaffyAvailableSpace::Definite(height) if height <= 0.0
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct BackendMeasureObservation(LayoutMeasureObservation);
-
-impl BackendMeasureObservation {
-    pub(super) fn node_id(&self) -> SolverNodeId {
-        SolverNodeId(BackendNodeId(self.0.node_id()))
-    }
-
-    pub(super) fn known_dimensions(&self, scale_factor: f32) -> Size<Option<Pixels>> {
-        size(
-            self.0
-                .known_dimensions()
-                .width
-                .map(|value| Pixels(value / scale_factor)),
-            self.0
-                .known_dimensions()
-                .height
-                .map(|value| Pixels(value / scale_factor)),
-        )
-    }
-
-    pub(super) fn available_space(&self, scale_factor: f32) -> Size<AvailableSpace> {
-        size(
-            available_space_from_taffy(self.0.available_space().width, scale_factor),
-            available_space_from_taffy(self.0.available_space().height, scale_factor),
-        )
-    }
-
-    pub(super) fn measured_size(&self, scale_factor: f32) -> Size<Pixels> {
-        size(
-            Pixels(self.0.measured_size().width / scale_factor),
-            Pixels(self.0.measured_size().height / scale_factor),
-        )
     }
 }
 
@@ -315,47 +224,6 @@ impl SolverBackend for SolverBackendImpl {
             )
             .expect(EXPECT_MESSAGE);
     }
-
-    fn compute_layout_with_measure_and_cache_events(
-        &mut self,
-        root: SolverNodeId,
-        available_space: Size<AvailableSpace>,
-        scale_factor: f32,
-        mut measure: impl FnMut(SolverNodeId, bool, SolverMeasureQuery) -> Size<f32>,
-        mut handle_cache_event: impl FnMut(SolverCacheEvent),
-    ) {
-        let taffy_available_space = scale_available_space_for_taffy(available_space, scale_factor);
-        self.taffy
-            .compute_layout_with_measure_and_cache_events(
-                root.0.0,
-                taffy_available_space,
-                |known_dimensions, available_space, node_id, node_context, _style| {
-                    let known_dimensions = size(
-                        known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    );
-                    let available_space = size(
-                        available_space_from_taffy(available_space.width, scale_factor),
-                        available_space_from_taffy(available_space.height, scale_factor),
-                    );
-                    measure(
-                        SolverNodeId(BackendNodeId(node_id)),
-                        node_context.is_some(),
-                        SolverMeasureQuery {
-                            known_dimensions,
-                            available_space,
-                        },
-                    )
-                    .into()
-                },
-                |event| {
-                    if let Some(event) = solver_cache_event_from_taffy(event) {
-                        handle_cache_event(event);
-                    }
-                },
-            )
-            .expect(EXPECT_MESSAGE);
-    }
 }
 
 pub(super) struct FreshSolverBackendImpl<C> {
@@ -447,24 +315,6 @@ impl<C> FreshSolverBackendImpl<C> {
             .map(|node_id| FreshSolverNodeId(FreshBackendNodeId(node_id)))
             .collect()
     }
-}
-
-fn solver_cache_event_from_taffy(event: LayoutCacheEvent) -> Option<SolverCacheEvent> {
-    Some(match event {
-        LayoutCacheEvent::Hit(entry) => {
-            SolverCacheEvent::Hit(SolverCacheEntry(BackendCacheEntry(entry)))
-        }
-        LayoutCacheEvent::Stored(entry) => {
-            SolverCacheEvent::Stored(SolverCacheEntry(BackendCacheEntry(entry)))
-        }
-        LayoutCacheEvent::Cleared(clear) => {
-            SolverCacheEvent::Cleared(SolverCacheClear(BackendCacheClear(clear.node_id())))
-        }
-        LayoutCacheEvent::Measure(observation) => SolverCacheEvent::Measure(
-            SolverMeasureObservation(BackendMeasureObservation(observation)),
-        ),
-        _ => return None,
-    })
 }
 
 fn scale_available_space_for_taffy(

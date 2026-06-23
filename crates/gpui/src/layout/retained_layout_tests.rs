@@ -3620,6 +3620,105 @@ fn hovered_swatch_style_change_reuses_appearance_subtree_and_stable_siblings() {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_dynamic_sibling_keeps_stable_swatch_panel_local() {
+    fn request_panel_with_dynamic_sibling(
+        engine: &mut LayoutEngine,
+        swatch_widths: &[u16],
+        dynamic_width: u16,
+    ) -> (LayoutId, LayoutId, LayoutId, Vec<LayoutId>, LayoutId) {
+        let swatches = swatch_widths
+            .iter()
+            .enumerate()
+            .map(|(index, width)| request_keyed_leaf(engine, 32_100 + index as u64, *width as f32))
+            .collect::<Vec<_>>();
+
+        let mut swatch_row_style = Style::default();
+        swatch_row_style.display = Display::Flex;
+        swatch_row_style.flex_direction = FlexDirection::Row;
+        swatch_row_style.gap = size(definite_px(4.0), definite_px(4.0));
+        let swatch_row = request_keyed_layout(engine, 32_010, swatch_row_style, &swatches);
+        let panel = request_keyed_layout(engine, 32_001, Style::default(), &[swatch_row]);
+        let dynamic = request_keyed_leaf(engine, 32_900, dynamic_width as f32);
+        let root = request_flex_container(engine, &[panel, dynamic]);
+
+        (root, panel, swatch_row, swatches, dynamic)
+    }
+
+    hegel::Hegel::new(|tc| {
+        let swatch_count = draw_usize(&tc, 1, 8);
+        let swatch_widths = (0..swatch_count)
+            .map(|_| draw_u16(&tc, 1, 72))
+            .collect::<Vec<_>>();
+        let first_dynamic_width = draw_u16(&tc, 1, 160);
+        let second_dynamic_width = if first_dynamic_width == 160 {
+            159
+        } else {
+            first_dynamic_width + 1
+        };
+        let root_width = draw_u16(&tc, 240, 900) as f32;
+
+        let mut retained = LayoutEngine::new();
+        let (first_root, first_panel, first_swatch_row, first_swatches, _) =
+            request_panel_with_dynamic_sibling(&mut retained, &swatch_widths, first_dynamic_width);
+        compute_layout_without_measure(&mut retained, first_root, root_width, 160.0);
+        let first_panel_node = retained.retained_node_token_for_tests(first_panel);
+        let first_swatch_row_node = retained.retained_node_token_for_tests(first_swatch_row);
+        let first_swatch_nodes = first_swatches
+            .iter()
+            .map(|swatch| retained.retained_node_token_for_tests(*swatch))
+            .collect::<Vec<_>>();
+        retained.finish_frame();
+
+        retained.reset_retained_mutation_sample_for_tests();
+        let (second_root, second_panel, second_swatch_row, second_swatches, _) =
+            request_panel_with_dynamic_sibling(&mut retained, &swatch_widths, second_dynamic_width);
+        let retained_root =
+            compute_layout_without_measure(&mut retained, second_root, root_width, 160.0);
+        assert_facts_committed_exactly(&retained, second_root);
+
+        assert_eq!(
+            retained.retained_node_token_for_tests(second_panel),
+            first_panel_node
+        );
+        assert_eq!(
+            retained.retained_node_token_for_tests(second_swatch_row),
+            first_swatch_row_node
+        );
+        assert_eq!(
+            second_swatches
+                .iter()
+                .map(|swatch| retained.retained_node_token_for_tests(*swatch))
+                .collect::<Vec<_>>(),
+            first_swatch_nodes
+        );
+        assert_eq!(
+            retained.retained_mutation_sample_for_tests(),
+            RetainedForestMutationSample {
+                reuses: swatch_count as u64 + 4,
+                style_updates: 1,
+                ..RetainedForestMutationSample::default()
+            }
+        );
+
+        let mut fresh = LayoutEngine::new();
+        let (fresh_root, _, _, _, _) =
+            request_panel_with_dynamic_sibling(&mut fresh, &swatch_widths, second_dynamic_width);
+        let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, root_width, 160.0);
+        assert_eq!(
+            retained_layout_projection(&retained, retained_root),
+            retained_layout_projection(&fresh, fresh_root)
+        );
+        assert_eq!(
+            retained_layout_bounds_tree(&mut retained, retained_root, 1.0),
+            retained_layout_bounds_tree(&mut fresh, fresh_root, 1.0)
+        );
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
 #[test]
 fn rollback_discards_failed_transaction_root_slots() {
     let mut engine = LayoutEngine::new();

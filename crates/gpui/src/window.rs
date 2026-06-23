@@ -8408,8 +8408,8 @@ impl Window {
     /// This is a test-only oracle for retained-layout property tests. It keeps
     /// the window in retained mode, then records non-vacuous retained-vs-fresh
     /// comparison telemetry for every comparable root solve.
-    #[cfg(test)]
-    pub(crate) fn compare_retained_layout_with_fresh_for_tests(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn compare_retained_layout_with_fresh_for_tests(&mut self) {
         self.layout_engine
             .as_mut()
             .expect("window layout engine should exist before enabling fresh comparison")

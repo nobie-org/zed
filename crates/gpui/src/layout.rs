@@ -227,7 +227,7 @@ impl LayoutEngine {
             .set_retained_subtree_probe_targets_for_tests(targets);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn compare_with_fresh_for_tests(&mut self) {
         self.forest.compare_with_fresh_for_tests();
     }

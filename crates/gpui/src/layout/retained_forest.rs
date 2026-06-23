@@ -154,7 +154,7 @@ pub(super) struct RetainedLayoutForest {
     committed: CommittedLayoutState,
     root_slots: RootSlots,
     subtree_probe: SubtreeProbe,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     compare_with_fresh_for_tests: bool,
     work: RetainedWorkState,
 }
@@ -205,7 +205,7 @@ impl RetainedLayoutForest {
             committed: CommittedLayoutState::new(),
             root_slots: RootSlots::new(),
             subtree_probe: SubtreeProbe::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             compare_with_fresh_for_tests: false,
             work: RetainedWorkState::new(),
         }
@@ -226,11 +226,11 @@ impl RetainedLayoutForest {
     /// path, but there are no previous retained roots or mirror nodes to reuse.
     pub(super) fn reset_retained_state_for_fresh_frame(&mut self) {
         let subtree_probe = self.subtree_probe.clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let compare_with_fresh_for_tests = self.compare_with_fresh_for_tests;
         *self = Self::new();
         self.subtree_probe = subtree_probe;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.compare_with_fresh_for_tests = compare_with_fresh_for_tests;
         }
@@ -367,7 +367,7 @@ impl RetainedLayoutForest {
         self.subtree_probe.set_targets_for_tests(targets);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn compare_with_fresh_for_tests(&mut self) {
         self.compare_with_fresh_for_tests = true;
     }
@@ -486,11 +486,11 @@ impl RetainedLayoutForest {
 
         let (fresh_layout_comparison, fresh_compare_duration) =
             if retained_layout_fresh_compare_enabled() || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 {
                     self.compare_with_fresh_for_tests
                 }
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "test-support")))]
                 {
                     false
                 }

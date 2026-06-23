@@ -11,13 +11,15 @@ use super::{
     node::{RetainedLayoutNode, RetainedLayoutNodeKind},
     root_slots::RootSlots,
     roots::RootRegistry,
-    solver::{LayoutSolver, SolverNodeId, SolverStyle},
+    solver::{LayoutSolver, SolverCacheEvent, SolverNodeId, SolverStyle},
     work::{RetainedLayoutMissWork, RetainedLayoutWork, RetainedWorkState},
 };
-use crate::{Bounds, ElementId, GlobalElementId, Pixels, Size, TestAppContext, px, size};
+use crate::{
+    AvailableSpace, Bounds, ElementId, GlobalElementId, Pixels, Size, TestAppContext, px, size,
+};
 use hegel::generators;
 use stacksafe::StackSafe;
-use std::{collections::HashMap, sync::Arc};
+use std::{cell::Cell, collections::HashMap, sync::Arc};
 
 fn hegel_settings(test_cases: u64) -> hegel::Settings {
     hegel::Settings::new().test_cases(test_cases)
@@ -101,6 +103,70 @@ fn root_site_one() -> RetainedLayoutRootSite {
 
 fn root_site_two() -> RetainedLayoutRootSite {
     RetainedLayoutRootSite::caller(core::panic::Location::caller())
+}
+
+#[gpui::test]
+fn solver_cache_events_report_stable_repeat_reuse(_cx: &mut TestAppContext) {
+    let mut solver = LayoutSolver::new();
+    let measured = solver.new_measured(SolverStyle::default());
+    let root = solver.new_with_children(SolverStyle::default(), &[measured]);
+    let available_space = size(AvailableSpace::MaxContent, AvailableSpace::MaxContent);
+    let measure_invocations = Cell::new(0);
+
+    let mut first_events = Vec::new();
+    solver.compute_layout_with_measure_and_cache_events(
+        root,
+        available_space,
+        1.0,
+        |_node_id, has_measure_context, _query| {
+            assert!(has_measure_context);
+            measure_invocations.set(measure_invocations.get() + 1);
+            size(10.0_f32, 20.0_f32)
+        },
+        |event| first_events.push(event),
+    );
+    assert!(measure_invocations.get() > 0);
+    assert!(
+        first_events
+            .iter()
+            .any(|event| matches!(event, SolverCacheEvent::Stored(_))),
+        "first solve should populate the solver cache: {first_events:?}"
+    );
+
+    let invocations_after_first = measure_invocations.get();
+    let mut second_events = Vec::new();
+    solver.compute_layout_with_measure_and_cache_events(
+        root,
+        available_space,
+        1.0,
+        |_node_id, has_measure_context, _query| {
+            assert!(has_measure_context);
+            measure_invocations.set(measure_invocations.get() + 1);
+            size(10.0_f32, 20.0_f32)
+        },
+        |event| second_events.push(event),
+    );
+
+    assert_eq!(measure_invocations.get(), invocations_after_first);
+    assert!(
+        second_events
+            .iter()
+            .any(|event| matches!(event, SolverCacheEvent::Hit(_))),
+        "stable repeat should be observed as a solver cache hit: {second_events:?}"
+    );
+    assert!(
+        second_events
+            .iter()
+            .any(|event| matches!(event, SolverCacheEvent::Measure(_))),
+        "cache-hit solve should report the exact reused measurement query: {second_events:?}"
+    );
+    assert!(
+        !second_events.iter().any(|event| matches!(
+            event,
+            SolverCacheEvent::Stored(_) | SolverCacheEvent::Miss(_) | SolverCacheEvent::Cleared(_)
+        )),
+        "stable repeat should not store, miss, or clear solver cache entries: {second_events:?}"
+    );
 }
 
 #[gpui::test]

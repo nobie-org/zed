@@ -2473,11 +2473,34 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
         engine.reset_retained_mutation_sample_for_tests();
         let roots = request_generated_frame(&mut engine, &frame);
         compute_generated_roots(cx, &mut engine, &roots, available_width, available_height);
-        engine.finish_frame();
+        let stable_sample = engine.finish_frame();
 
         assert_eq!(
             engine.retained_mutation_sample_for_tests(),
             expected_mutations(&frame.roots, &frame.roots)
+        );
+        assert_eq!(
+            stable_sample.measured_layout_calls, 0,
+            "stable generated facts should not force measured callbacks on the repeat frame"
+        );
+        assert_eq!(
+            [
+                stable_sample.retained_layout_creates,
+                stable_sample.retained_layout_style_updates,
+                stable_sample.retained_layout_child_list_updates,
+                stable_sample.retained_layout_dirty_marks,
+                stable_sample.retained_layout_measured_context_clears,
+                stable_sample.retained_layout_removes,
+                stable_sample.retained_layout_miss_no_previous,
+                stable_sample.retained_layout_miss_style,
+                stable_sample.retained_layout_miss_kind,
+                stable_sample.retained_layout_miss_measured_kind,
+                stable_sample.retained_layout_miss_child_count,
+                stable_sample.retained_layout_miss_child_subtree,
+                stable_sample.retained_layout_miss_no_exact_child,
+            ],
+            [0; 13],
+            "stable generated facts should not mutate retained layout on the repeat frame"
         );
     })
     .settings(hegel_settings(100))

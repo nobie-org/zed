@@ -844,6 +844,10 @@ impl Render for GeneratedDynamicSiblingTextView {
                 div()
                     .id("generated-stable-panel")
                     .debug_selector(|| "stable-panel".into())
+                    // Solver no-work assertions require stable facts and stable incoming constraints.
+                    .flex_none()
+                    .w(px(220.0))
+                    .h(px(180.0))
                     .child(self.stable_tree.build_at("stable/root", false)),
             )
     }
@@ -2272,6 +2276,57 @@ fn generated_dynamic_text_frame_sequence_matches_fresh_and_keeps_stable_subtree_
     })
     .settings(hegel_settings(40))
     .run();
+}
+
+#[gpui::test]
+fn shrunk_dynamic_text_ticks_keep_fixed_stable_text_subtree_local(cx: &mut TestAppContext) {
+    let stable_tree = GeneratedTextNode::TextBox {
+        width: 24,
+        padding: 0,
+        text_size: 10,
+        text: "a".to_string(),
+    };
+    let mut state = GeneratedDynamicSiblingFrameState {
+        window_width: 360,
+        window_height: 220,
+        tick: 68,
+        dynamic_width: 64,
+    };
+
+    let retained = cx.open_window(state.window_size(), |window, _| {
+        window.compare_retained_layout_with_fresh_for_tests();
+        window.set_retained_subtree_probe_targets_for_tests(vec!["generated-stable-panel".into()]);
+        GeneratedDynamicSiblingTextView {
+            stable_tree: stable_tree.clone(),
+            tick: state.tick,
+            dynamic_width: state.dynamic_width,
+        }
+    });
+    cx.run_until_parked();
+    let retained_window = *retained.deref();
+    let (initial_retained_bounds, _, _) =
+        draw_dynamic_sibling_text_tree(cx, retained_window, &stable_tree);
+    let initial_fresh_bounds = draw_fresh_dynamic_sibling_text_tree(cx, &stable_tree, state);
+    assert_eq!(initial_retained_bounds, initial_fresh_bounds);
+
+    for delta in [16, 16] {
+        state = state.apply(GeneratedDynamicSiblingFrameChange::Tick { delta });
+        retained
+            .update(cx, |view, _, cx| {
+                view.tick = state.tick;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let (retained_bounds, sample, subtree_samples) =
+            draw_dynamic_sibling_text_tree(cx, retained_window, &stable_tree);
+        let fresh_bounds = draw_fresh_dynamic_sibling_text_tree(cx, &stable_tree, state);
+        assert_eq!(retained_bounds, fresh_bounds);
+        assert_runtime_fresh_compare_proved(sample);
+        assert_retained_frame_sample(sample);
+        assert_stable_subtree_did_no_work(&subtree_samples, "generated-stable-panel");
+    }
 }
 
 #[gpui::test]

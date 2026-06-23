@@ -235,7 +235,7 @@ impl SubtreeProbeComputeRecorder {
     }
 
     pub(super) fn record_cache_event(&mut self, event: SolverCacheEvent) {
-        match event {
+        let recorded = match event {
             SolverCacheEvent::Hit(entry) => self.record_node(entry.node_id(), |delta| {
                 delta.solver_cache_hits += 1;
             }),
@@ -248,8 +248,12 @@ impl SubtreeProbeComputeRecorder {
             SolverCacheEvent::Measure(observation) => {
                 self.record_node(observation.node_id(), |delta| {
                     delta.solver_cache_measure_observations += 1;
-                });
+                })
             }
+        };
+
+        if recorded && trace_subtree_cache_events_enabled() {
+            trace_subtree_cache_event(event);
         }
     }
 
@@ -261,14 +265,17 @@ impl SubtreeProbeComputeRecorder {
         &mut self,
         node_id: SolverNodeId,
         mut record: impl FnMut(&mut SubtreeProbeComputeDelta),
-    ) {
+    ) -> bool {
+        let mut recorded = false;
         for active in &self.active_subtrees {
             if active.node_ids.contains(&node_id)
                 && let Some(delta) = self.sample_deltas.get_mut(active.sample_index)
             {
                 record(delta);
+                recorded = true;
             }
         }
+        recorded
     }
 
     fn into_deltas(self) -> impl Iterator<Item = (usize, SubtreeProbeComputeDelta)> {
@@ -316,4 +323,32 @@ fn env_subtree_sample_limit() -> usize {
             .and_then(|limit| limit.parse().ok())
             .unwrap_or(120)
     })
+}
+
+fn trace_subtree_cache_events_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("GPUI_TRACE_RETAINED_LAYOUT_SUBTREE_CACHE_EVENTS").is_ok())
+}
+
+fn trace_subtree_cache_event(event: SolverCacheEvent) {
+    eprintln!("gpui retained_layout subtree_cache_event {event:?}");
+    match event {
+        SolverCacheEvent::Hit(entry) | SolverCacheEvent::Stored(entry) => {
+            let details = entry.trace_details();
+            eprintln!(
+                "gpui retained_layout subtree_cache_entry node_id={:?} entry_id={:?} run_mode={} sizing_mode={} axis={} known_dimensions={} parent_size={} available_space={} output_size={}",
+                entry.node_id(),
+                details.entry_id,
+                details.run_mode,
+                details.sizing_mode,
+                details.axis,
+                details.known_dimensions,
+                details.parent_size,
+                details.available_space,
+                details.output_size,
+            );
+        }
+        SolverCacheEvent::Cleared(_) | SolverCacheEvent::Measure(_) => {}
+    }
 }

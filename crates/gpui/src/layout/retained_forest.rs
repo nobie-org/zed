@@ -434,7 +434,7 @@ impl RetainedLayoutForest {
         let node_id = self.commit_root_layout(root_id, id);
         let retained_layout_commit_duration = commit_start.elapsed();
         let root_solve_input =
-            self.prepare_root_solve(root_id, id, node_id, available_space, scale_factor);
+            self.prepare_root_solve(root_id, node_id, available_space, scale_factor);
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             eprintln!(
@@ -642,18 +642,11 @@ impl RetainedLayoutForest {
     fn prepare_root_solve(
         &mut self,
         root_id: RetainedLayoutRootId,
-        layout_id: LayoutId,
         node_id: SolverNodeId,
         available_space: Size<AvailableSpace>,
         scale_factor: f32,
     ) -> RootSolveInput {
         let root_solve_input = RootSolveInput::new(available_space, scale_factor);
-        if self
-            .root_slots
-            .solve_input_changed(root_id, root_solve_input)
-        {
-            self.trace_retained_dirty_mark(layout_id, node_id, "root_solve_input_changed");
-        }
         self.geometry
             .begin_solve(root_id, node_id, available_space, scale_factor);
         root_solve_input
@@ -723,19 +716,6 @@ impl RetainedLayoutForest {
             Self::layout_facts_summary(self.facts(id)),
             Self::debug_fingerprint(previous_style),
             Self::debug_fingerprint(current_style)
-        );
-    }
-
-    fn trace_retained_dirty_mark(&self, id: LayoutId, node_id: SolverNodeId, reason: &str) {
-        if !trace::should_trace_mutation() {
-            return;
-        }
-        eprintln!(
-            "gpui retained_layout mutation kind=dirty_mark layout_id={} node_id={:?} reason={} facts={}",
-            id.0,
-            node_id,
-            reason,
-            Self::layout_facts_summary(self.facts(id))
         );
     }
 
@@ -985,7 +965,7 @@ impl RetainedLayoutForest {
     ) -> RetainedNodeToken {
         let root_node = self.commit_root_layout(root_id, id);
         let root_solve_input =
-            self.prepare_root_solve(root_id, id, root_node, available_space, scale_factor);
+            self.prepare_root_solve(root_id, root_node, available_space, scale_factor);
         self.solver.compute_layout_with_measure(
             root_node,
             available_space,
@@ -1604,14 +1584,12 @@ impl RetainedLayoutForest {
         if style_changed {
             self.trace_retained_style_update(id, node_id, &previous_style, &style);
             self.solver.set_style(node_id, style.clone());
-            self.mark_solver_path_dirty(node_id);
             self.work.record_style_update();
         }
 
         let children_changed = previous_child_node_ids != child_node_ids;
         if children_changed {
             self.solver.set_children(node_id, &child_node_ids);
-            self.mark_solver_path_dirty(node_id);
             self.work.record_child_list_update();
         }
 
@@ -1895,10 +1873,11 @@ impl RetainedLayoutForest {
 
     /// Commit a measured facts and register its current-frame producer.
     ///
-    /// Pure-size and text measured nodes keep their mirror identity across
-    /// explicit key changes; the key change dirties the node and replaces the
-    /// comparable retained facts. Opaque producers are still rebuilt because
-    /// their closure body is not layout-visible data.
+    /// Measured facts are part of the retained node's layout meaning. If those
+    /// facts change, the measured node is replaced so the solver mirror changes
+    /// through retained-tree mutation rather than through a raw dirty operation.
+    /// Opaque producers are also rebuilt because their closure body is not
+    /// layout-visible data.
     fn commit_measured_facts(
         &mut self,
         id: LayoutId,
@@ -1917,7 +1896,6 @@ impl RetainedLayoutForest {
             return self.build_fresh_measured_node(id, style, measured_facts);
         };
 
-        let previous_measured_facts = previous.measured_facts().cloned();
         let compatible = previous
             .measured_facts()
             .map(|previous_measured_facts| {
@@ -1954,16 +1932,10 @@ impl RetainedLayoutForest {
         self.committed.insert(id, node_id);
 
         let style_changed = previous_style != style;
-        let measured_facts_changed = previous_measured_facts.as_ref() != Some(&measured_facts);
         if style_changed {
             self.trace_retained_style_update(id, node_id, &previous_style, &style);
             self.solver.set_style(node_id, style.clone());
-            self.mark_solver_path_dirty(node_id);
             self.work.record_style_update();
-        }
-        if measured_facts_changed && !style_changed {
-            self.trace_retained_dirty_mark(id, node_id, "measured_facts_changed");
-            self.mark_solver_node_dirty(node_id);
         }
 
         self.measurements
@@ -2106,30 +2078,6 @@ impl RetainedLayoutForest {
                 self.measurements
                     .debug_assert_current_measurement_matches(node_id, measured);
             }
-        }
-    }
-
-    /// Mark one mirror node dirty at most once in the current frame.
-    fn mark_solver_node_dirty(&mut self, node_id: SolverNodeId) {
-        if self.committed.mark_solver_node_dirty(node_id) {
-            self.mark_solver_path_dirty(node_id);
-            self.work.record_dirty_mark();
-        }
-    }
-
-    /// Make a mirror mutation visible to the scheduled retained-root solve.
-    ///
-    /// The solver backend may represent "dirty" as an empty local cache. A
-    /// descendant can already have an empty cache while an ancestor/root is
-    /// clean, so dirtying only the changed node can fail to reach the legal root.
-    /// The forest owns retained parentage; after changing a node's mirrored
-    /// facts, it explicitly dirties that retained path and lets the solver decide
-    /// how much layout work to reuse below it.
-    fn mark_solver_path_dirty(&mut self, node_id: SolverNodeId) {
-        let mut current = Some(node_id);
-        while let Some(node_id) = current {
-            self.solver.mark_dirty(node_id);
-            current = self.solver.parent(node_id);
         }
     }
 

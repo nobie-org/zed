@@ -34,8 +34,6 @@ pub struct RetainedSubtreeWorkSample {
     pub mirror_set_style: u64,
     /// Mirror `set_children` operations inside this subtree.
     pub mirror_set_children: u64,
-    /// Explicit mirror dirty marks inside this subtree.
-    pub mirror_dirty_marks: u64,
     /// Measured-context clears caused by subtree removal.
     pub mirror_measured_context_clears: u64,
     /// Measured callbacks attributed to nodes inside this subtree.
@@ -58,7 +56,6 @@ impl RetainedSubtreeWorkSample {
             + self.mirror_node_removes
             + self.mirror_set_style
             + self.mirror_set_children
-            + self.mirror_dirty_marks
             + self.mirror_measured_context_clears
             + hard_measured_callbacks
     }
@@ -128,8 +125,6 @@ pub struct LayoutWorkSample {
     pub retained_layout_style_updates: u64,
     /// Retained layout child-list updates emitted while committing current facts.
     pub retained_layout_child_list_updates: u64,
-    /// Explicit retained mirror dirty marks emitted while committing current facts.
-    pub retained_layout_dirty_marks: u64,
     /// Retained measured-context clears emitted while removing retained nodes.
     pub retained_layout_measured_context_clears: u64,
     /// Retained layout nodes removed while sweeping old retained subtrees.
@@ -176,7 +171,6 @@ impl LayoutWorkSample {
         self.retained_layout_reuses = work.reuses;
         self.retained_layout_style_updates = work.style_updates;
         self.retained_layout_child_list_updates = work.child_list_updates;
-        self.retained_layout_dirty_marks = work.dirty_marks;
         self.retained_layout_measured_context_clears = work.measured_context_clears;
         self.retained_layout_removes = work.removes;
         self.retained_layout_miss_no_previous = misses.no_previous;

@@ -309,16 +309,7 @@ impl MeasuredLayoutFacts {
     }
 
     pub(super) fn can_reuse_solver_node_with(&self, current: &Self) -> bool {
-        matches!(
-            (&self.0, &current.0),
-            (
-                MeasuredLayoutFactsRepr::PureSize(_),
-                MeasuredLayoutFactsRepr::PureSize(_)
-            ) | (
-                MeasuredLayoutFactsRepr::Artifact(_),
-                MeasuredLayoutFactsRepr::Artifact(_)
-            )
-        )
+        self == current && self.supports_fresh_compare()
     }
 
     pub(super) fn supports_fresh_compare(&self) -> bool {

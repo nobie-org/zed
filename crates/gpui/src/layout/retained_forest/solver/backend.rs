@@ -135,10 +135,6 @@ impl SolverBackend for SolverBackendImpl {
         self.taffy.remove(node_id.0.0).expect(EXPECT_MESSAGE);
     }
 
-    fn mark_dirty(&mut self, node_id: SolverNodeId) {
-        self.taffy.mark_dirty(node_id.0.0).expect(EXPECT_MESSAGE);
-    }
-
     fn parent(&self, node_id: SolverNodeId) -> Option<SolverNodeId> {
         self.taffy
             .parent(node_id.0.0)

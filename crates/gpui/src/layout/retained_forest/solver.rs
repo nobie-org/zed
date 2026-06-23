@@ -93,7 +93,6 @@ trait SolverBackend: Clone {
     fn set_children(&mut self, node_id: SolverNodeId, children: &[SolverNodeId]);
     fn clear_measure_context(&mut self, node_id: SolverNodeId);
     fn remove(&mut self, node_id: SolverNodeId);
-    fn mark_dirty(&mut self, node_id: SolverNodeId);
     fn parent(&self, node_id: SolverNodeId) -> Option<SolverNodeId>;
     fn children(&self, node_id: SolverNodeId) -> Vec<SolverNodeId>;
     fn capture_layout_tree(&self, root: SolverNodeId) -> Vec<(SolverNodeId, SolverLayout)>;
@@ -145,10 +144,6 @@ impl LayoutSolver {
 
     pub(super) fn remove(&mut self, node_id: SolverNodeId) {
         self.backend.remove(node_id);
-    }
-
-    pub(super) fn mark_dirty(&mut self, node_id: SolverNodeId) {
-        self.backend.mark_dirty(node_id);
     }
 
     pub(super) fn parent(&self, node_id: SolverNodeId) -> Option<SolverNodeId> {

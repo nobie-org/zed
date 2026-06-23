@@ -345,7 +345,6 @@ fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
             + samples[0].mirror_node_removes
             + samples[0].mirror_set_style
             + samples[0].mirror_set_children
-            + samples[0].mirror_dirty_marks
             + samples[0].mirror_measured_context_clears
             + 1
     );

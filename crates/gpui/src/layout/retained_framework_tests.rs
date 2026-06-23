@@ -1522,7 +1522,6 @@ fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
             sample.retained_layout_creates,
             sample.retained_layout_style_updates,
             sample.retained_layout_child_list_updates,
-            sample.retained_layout_dirty_marks,
             sample.retained_layout_measured_context_clears,
             sample.retained_layout_removes,
             sample.retained_layout_miss_no_previous,
@@ -1533,7 +1532,7 @@ fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
             sample.retained_layout_miss_child_subtree,
             sample.retained_layout_miss_no_exact_child,
         ],
-        [0; 13],
+        [0; 12],
         "stable generated framework frame should not mutate retained layout"
     );
 }
@@ -1624,12 +1623,11 @@ fn assert_stable_subtree_retained_without_gpui_work(
             sample.mirror_node_removes,
             sample.mirror_set_style,
             sample.mirror_set_children,
-            sample.mirror_dirty_marks,
             sample.mirror_measured_context_clears,
             sample.measured_callbacks,
             sample.conservative_text_measured_callbacks,
         ],
-        [0; 9],
+        [0; 8],
         "stable subtree {target} should have no GPUI retained, mirror, or measured work: {sample:?}"
     );
 }

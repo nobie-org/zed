@@ -1605,41 +1605,10 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
             }
             (GeneratedTree::PureSize { .. }, GeneratedTree::PureSize { .. })
             | (GeneratedTree::Text { .. }, GeneratedTree::Text { .. }) => {
-                self.reuses += 1;
-                let measured_facts_changed = match (previous, current) {
-                    (
-                        GeneratedTree::PureSize {
-                            width: previous_width,
-                            height: previous_height,
-                        },
-                        GeneratedTree::PureSize {
-                            width: current_width,
-                            height: current_height,
-                        },
-                    ) => previous_width != current_width || previous_height != current_height,
-                    (
-                        GeneratedTree::Text {
-                            key_index: previous_key,
-                            width: previous_width,
-                            height: previous_height,
-                        },
-                        GeneratedTree::Text {
-                            key_index: current_key,
-                            width: current_width,
-                            height: current_height,
-                        },
-                    ) => {
-                        previous_key != current_key
-                            || previous_width != current_width
-                            || previous_height != current_height
-                    }
-                    _ => false,
-                };
-                if measured_facts_changed {
-                    self.dirty_marks += 1;
-                }
+                self.add_remove_tree(previous);
+                self.add_fresh_tree(current);
                 ExpectedCommitResult {
-                    retained_same_node: true,
+                    retained_same_node: false,
                 }
             }
             _ => {
@@ -2563,7 +2532,6 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
                 stable_sample.retained_layout_creates,
                 stable_sample.retained_layout_style_updates,
                 stable_sample.retained_layout_child_list_updates,
-                stable_sample.retained_layout_dirty_marks,
                 stable_sample.retained_layout_measured_context_clears,
                 stable_sample.retained_layout_removes,
                 stable_sample.retained_layout_miss_no_previous,
@@ -2574,7 +2542,7 @@ fn generated_reusable_exact_repeat_emits_no_retained_mutations(cx: &mut TestAppC
                 stable_sample.retained_layout_miss_child_subtree,
                 stable_sample.retained_layout_miss_no_exact_child,
             ],
-            [0; 13],
+            [0; 12],
             "stable generated facts should not mutate retained layout on the repeat frame"
         );
     })
@@ -5076,8 +5044,11 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 4,
-            dirty_marks: 1,
+            creates: 1,
+            reuses: 3,
+            child_list_updates: 1,
+            context_clears: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );
@@ -5275,8 +5246,9 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {
-            reuses: 1,
-            dirty_marks: 1,
+            creates: 1,
+            context_clears: 1,
+            removes: 1,
             ..RetainedForestMutationSample::default()
         }
     );

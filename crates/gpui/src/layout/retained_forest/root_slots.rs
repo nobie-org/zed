@@ -87,16 +87,6 @@ impl RootSlots {
         );
     }
 
-    pub(super) fn solve_input_changed(
-        &self,
-        root_id: RetainedLayoutRootId,
-        input: RootSolveInput,
-    ) -> bool {
-        self.last_solve_inputs
-            .get(&root_id)
-            .is_some_and(|previous| *previous != input)
-    }
-
     pub(super) fn record_solve_input(
         &mut self,
         root_id: RetainedLayoutRootId,

@@ -11,7 +11,6 @@ pub(in crate::layout) struct RetainedLayoutWork {
     pub(in crate::layout) reuses: u64,
     pub(in crate::layout) style_updates: u64,
     pub(in crate::layout) child_list_updates: u64,
-    pub(in crate::layout) dirty_marks: u64,
     pub(in crate::layout) measured_context_clears: u64,
     pub(in crate::layout) removes: u64,
 }
@@ -35,7 +34,6 @@ pub(in crate::layout) struct RetainedForestMutationSample {
     pub(in crate::layout) reuses: u64,
     pub(in crate::layout) style_updates: u64,
     pub(in crate::layout) child_list_updates: u64,
-    pub(in crate::layout) dirty_marks: u64,
     pub(in crate::layout) context_clears: u64,
     pub(in crate::layout) removes: u64,
 }
@@ -137,7 +135,6 @@ impl RetainedWorkState {
                 reuses: self.work.reuses - snapshot.work.reuses,
                 style_updates: self.work.style_updates - snapshot.work.style_updates,
                 child_list_updates: self.work.child_list_updates - snapshot.work.child_list_updates,
-                dirty_marks: self.work.dirty_marks - snapshot.work.dirty_marks,
                 measured_context_clears: self.work.measured_context_clears
                     - snapshot.work.measured_context_clears,
                 removes: self.work.removes - snapshot.work.removes,
@@ -201,14 +198,6 @@ impl RetainedWorkState {
         #[cfg(test)]
         {
             self.mutation_sample_for_tests.child_list_updates += 1;
-        }
-    }
-
-    pub(super) fn record_dirty_mark(&mut self) {
-        self.work.dirty_marks += 1;
-        #[cfg(test)]
-        {
-            self.mutation_sample_for_tests.dirty_marks += 1;
         }
     }
 

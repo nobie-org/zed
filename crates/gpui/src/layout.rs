@@ -151,7 +151,7 @@ impl LayoutEngine {
     }
 
     #[cfg(test)]
-    fn new_force_fresh_for_tests() -> Self {
+    pub(crate) fn new_force_fresh_for_tests() -> Self {
         Self::new_with_mode(LayoutEngineMode::Immediate)
     }
 
@@ -686,6 +686,8 @@ impl std::hash::Hash for LayoutId {
     }
 }
 
+#[cfg(test)]
+mod retained_framework_tests;
 #[cfg(test)]
 mod retained_layout_tests;
 

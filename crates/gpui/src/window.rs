@@ -8458,6 +8458,16 @@ impl Window {
         self.last_layout_work_sample
     }
 
+    /// Force this test window to rebuild layout state after every frame.
+    ///
+    /// Retained-layout tests use this as the pure framework-path oracle: the
+    /// same `Element` tree still flows through request_layout, prepaint, and
+    /// paint, but no retained solver state survives from one frame to the next.
+    #[cfg(test)]
+    pub(crate) fn force_fresh_layout_for_tests(&mut self) {
+        self.layout_engine = Some(LayoutEngine::new_force_fresh_for_tests());
+    }
+
     /// Returns the render-group work observation for the most recently completed draw.
     pub fn last_render_group_draw_observation(&self) -> Option<&RenderGroupDrawObservation> {
         self.last_render_group_draw_observation.as_ref()

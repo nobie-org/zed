@@ -43,7 +43,7 @@ pub(crate) struct LayoutEngine {
 ///
 /// This is a diagnostic switch, not a second layout authority. Both modes use
 /// the same GPUI frame lifecycle and private root solve path. `Immediate`
-/// discards retained state at frame start so the app can be run against a
+/// discards retained state at frame finish so the app can be run against a
 /// fresh-tree baseline while still exercising the retained-layout facade.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayoutEngineMode {
@@ -163,6 +163,10 @@ impl LayoutEngine {
         let mut layout_work = self.layout_work;
         layout_work.retained_layout_finish_frame_duration += retained_layout_finish_frame_duration;
         layout_work.record_retained_layout_work(retained_layout_work, retained_layout_misses);
+        if self.mode == LayoutEngineMode::Immediate {
+            self.forest.reset_retained_state_for_fresh_frame();
+            layout_work.force_fresh_frame_resets = 1;
+        }
         self.layout_work = LayoutWorkSample::default();
         layout_work
     }
@@ -170,10 +174,6 @@ impl LayoutEngine {
     /// Reset frame-local request/measurement state before a new render pass.
     pub fn begin_frame(&mut self) {
         self.layout_work = LayoutWorkSample::default();
-        if self.mode == LayoutEngineMode::Immediate {
-            self.forest.reset_retained_state_for_fresh_frame();
-            self.layout_work.force_fresh_frame_resets = 1;
-        }
         self.forest.begin_frame();
     }
 

@@ -699,6 +699,27 @@ fn draw_fresh_generated_styled_sibling_tree(
     bounds
 }
 
+fn draw_fresh_generated_resizing_parent_tree(
+    cx: &mut TestAppContext,
+    stable_tree: &GeneratedStyledNode,
+    tick: u8,
+    dynamic_width: u8,
+    window_size: crate::Size<Pixels>,
+) -> Vec<(String, Bounds<Pixels>)> {
+    let fresh = cx.open_window(window_size, |window, _| {
+        window.force_fresh_layout_for_tests();
+        GeneratedStyledSiblingView {
+            stable_tree: stable_tree.clone(),
+            tick,
+            dynamic_width,
+        }
+    });
+    cx.run_until_parked();
+    let (bounds, sample, _) = draw_generated_styled_sibling_tree(cx, *fresh.deref(), stable_tree);
+    assert_fresh_oracle_sample(sample);
+    bounds
+}
+
 struct GeneratedFrameworkView {
     tree: GeneratedDivNode,
 }
@@ -1366,6 +1387,39 @@ fn assert_stable_subtree_preserved_without_solver_churn(
     assert_subtree_solver_preservation_observed(sample, target);
 }
 
+fn assert_stable_subtree_retained_without_gpui_work(
+    samples: &[crate::RetainedSubtreeWorkSample],
+    target: &str,
+) {
+    let sample = samples
+        .iter()
+        .find(|sample| sample.global_id.ends_with(target))
+        .unwrap_or_else(|| panic!("missing retained subtree work sample for {target}"));
+    assert!(
+        sample.node_count > 0,
+        "stable subtree {target} should contain retained nodes: {sample:?}"
+    );
+    assert_eq!(
+        sample.retained_reuses, sample.node_count as u64,
+        "stable subtree {target} should reuse every node: {sample:?}"
+    );
+    assert_eq!(
+        [
+            sample.retained_misses,
+            sample.mirror_node_creates,
+            sample.mirror_node_removes,
+            sample.mirror_set_style,
+            sample.mirror_set_children,
+            sample.mirror_dirty_marks,
+            sample.mirror_measured_context_clears,
+            sample.measured_callbacks,
+            sample.conservative_text_measured_callbacks,
+        ],
+        [0; 9],
+        "stable subtree {target} should have no GPUI retained, mirror, or measured work: {sample:?}"
+    );
+}
+
 #[gpui::test]
 fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
     cx: &mut TestAppContext,
@@ -1567,6 +1621,136 @@ fn generated_framework_styled_sibling_churn_matches_fresh_and_preserves_stable_s
     })
     .settings(hegel_settings(60))
     .run();
+}
+
+#[gpui::test]
+fn generated_parent_resize_preserves_fixed_stable_subtree_retention(cx: &mut TestAppContext) {
+    hegel::Hegel::new(|tc| {
+        let stable_tree = GeneratedStyledNode::draw(&tc, 3, false);
+        let first_tick = draw_u8(&tc, 0, 120);
+        let second_tick = first_tick.wrapping_add(draw_u8(&tc, 1, 16));
+        let dynamic_width = draw_u8(&tc, 48, 180);
+        let first_width = draw_u16(&tc, 540, 720);
+        let second_width = draw_u16(&tc, 721, 960);
+        let height = draw_u16(&tc, 380, 520);
+        let first_window_size = size(px(first_width as f32), px(height as f32));
+        let second_window_size = size(px(second_width as f32), px(height as f32));
+
+        let (
+            _first_retained_bounds,
+            second_retained_bounds,
+            second_retained_sample,
+            stable_subtree_samples,
+        ) = {
+            let retained = cx.open_window(first_window_size, |window, _| {
+                window.set_retained_subtree_probe_targets_for_tests(vec![
+                    "generated-styled-stable-panel".to_string(),
+                ]);
+                GeneratedStyledSiblingView {
+                    stable_tree: stable_tree.clone(),
+                    tick: first_tick,
+                    dynamic_width,
+                }
+            });
+            cx.run_until_parked();
+            let window = *retained.deref();
+            let (first_bounds, _, _) = draw_generated_styled_sibling_tree(cx, window, &stable_tree);
+            retained
+                .update(cx, |view, _, cx| {
+                    view.tick = second_tick;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.simulate_window_resize(window, second_window_size);
+            cx.run_until_parked();
+            let (second_bounds, sample, subtree_samples) =
+                draw_generated_styled_sibling_tree(cx, window, &stable_tree);
+            (first_bounds, second_bounds, sample, subtree_samples)
+        };
+
+        let second_fresh_bounds = draw_fresh_generated_resizing_parent_tree(
+            cx,
+            &stable_tree,
+            second_tick,
+            dynamic_width,
+            second_window_size,
+        );
+
+        assert_eq!(
+            second_retained_bounds, second_fresh_bounds,
+            "retained fixed stable subtree under parent resize should match fresh layout"
+        );
+        assert_eq!(
+            second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
+            "runtime retained-vs-fresh comparison should not report parent-resize mismatches"
+        );
+        assert_retained_frame_sample(second_retained_sample);
+        assert_stable_subtree_retained_without_gpui_work(
+            &stable_subtree_samples,
+            "generated-styled-stable-panel",
+        );
+    })
+    .settings(hegel_settings(60))
+    .run();
+}
+
+#[gpui::test]
+fn minimized_parent_resize_preserves_fixed_stable_text_subtree_retention(cx: &mut TestAppContext) {
+    let stable_tree = GeneratedStyledNode::Text {
+        facts: GeneratedStyledNodeFacts::Fixed {
+            width: 20,
+            height: 16,
+        },
+        padding: 0,
+        text_size: 10,
+        text: "a".to_string(),
+    };
+    let first_window_size = size(px(540.0), px(380.0));
+    let second_window_size = size(px(721.0), px(380.0));
+
+    let (second_retained_bounds, second_retained_sample, stable_subtree_samples) = {
+        let retained = cx.open_window(first_window_size, |window, _| {
+            window.set_retained_subtree_probe_targets_for_tests(vec![
+                "generated-styled-stable-panel".to_string(),
+            ]);
+            GeneratedStyledSiblingView {
+                stable_tree: stable_tree.clone(),
+                tick: 0,
+                dynamic_width: 48,
+            }
+        });
+        cx.run_until_parked();
+        let window = *retained.deref();
+        let _ = draw_generated_styled_sibling_tree(cx, window, &stable_tree);
+        retained
+            .update(cx, |view, _, cx| {
+                view.tick = 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.simulate_window_resize(window, second_window_size);
+        cx.run_until_parked();
+        let (second_bounds, sample, subtree_samples) =
+            draw_generated_styled_sibling_tree(cx, window, &stable_tree);
+        (second_bounds, sample, subtree_samples)
+    };
+
+    let second_fresh_bounds =
+        draw_fresh_generated_resizing_parent_tree(cx, &stable_tree, 1, 48, second_window_size);
+
+    assert_eq!(
+        second_retained_bounds, second_fresh_bounds,
+        "retained minimized parent-resize frame should match fresh layout"
+    );
+    assert_eq!(
+        second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
+        "runtime retained-vs-fresh comparison should not report minimized parent-resize mismatches"
+    );
+    assert_retained_frame_sample(second_retained_sample);
+    assert_stable_subtree_retained_without_gpui_work(
+        &stable_subtree_samples,
+        "generated-styled-stable-panel",
+    );
 }
 
 #[gpui::test]

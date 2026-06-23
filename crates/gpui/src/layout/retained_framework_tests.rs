@@ -360,6 +360,23 @@ fn draw_dynamic_sibling_text_tree(
     )
 }
 
+fn draw_fresh_dynamic_sibling_text_tree(
+    cx: &mut TestAppContext,
+    stable_tree: &GeneratedTextNode,
+    state: GeneratedDynamicSiblingFrameState,
+) -> Vec<(String, Bounds<Pixels>)> {
+    let fresh = cx.open_window(state.window_size(), |window, _| {
+        window.force_fresh_layout_for_tests();
+        GeneratedDynamicSiblingTextView {
+            stable_tree: stable_tree.clone(),
+            tick: state.tick,
+            dynamic_width: state.dynamic_width,
+        }
+    });
+    cx.run_until_parked();
+    draw_dynamic_sibling_text_tree(cx, *fresh.deref(), stable_tree).0
+}
+
 struct GeneratedFrameworkView {
     tree: GeneratedDivNode,
 }
@@ -391,6 +408,7 @@ impl Render for GeneratedFrameworkTextView {
 struct GeneratedDynamicSiblingTextView {
     stable_tree: GeneratedTextNode,
     tick: u8,
+    dynamic_width: u8,
 }
 
 impl Render for GeneratedDynamicSiblingTextView {
@@ -405,12 +423,12 @@ impl Render for GeneratedDynamicSiblingTextView {
             .flex()
             .flex_row()
             .gap(px(8.0))
-            .w(px(360.0))
+            .w_full()
             .child(
                 div()
                     .id("dynamic-label")
                     .debug_selector(|| "dynamic".into())
-                    .w(px(88.0))
+                    .w(px(self.dynamic_width as f32))
                     .text_size(px(14.0))
                     .child(format!("frame {}", self.tick)),
             )
@@ -421,6 +439,79 @@ impl Render for GeneratedDynamicSiblingTextView {
                     .child(self.stable_tree.build_at("stable/root", false)),
             )
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GeneratedDynamicSiblingFrameState {
+    window_width: u16,
+    window_height: u16,
+    tick: u8,
+    dynamic_width: u8,
+}
+
+impl GeneratedDynamicSiblingFrameState {
+    fn draw(tc: &hegel::TestCase) -> Self {
+        Self {
+            window_width: draw_u16(tc, 360, 520),
+            window_height: draw_u16(tc, 220, 360),
+            tick: draw_u8(tc, 0, 120),
+            dynamic_width: draw_u8(tc, 64, 128),
+        }
+    }
+
+    fn window_size(self) -> crate::Size<Pixels> {
+        size(px(self.window_width as f32), px(self.window_height as f32))
+    }
+
+    fn apply(self, change: GeneratedDynamicSiblingFrameChange) -> Self {
+        match change {
+            GeneratedDynamicSiblingFrameChange::Tick { delta } => Self {
+                tick: self.tick.wrapping_add(delta),
+                ..self
+            },
+            GeneratedDynamicSiblingFrameChange::DynamicWidth { width } => Self {
+                dynamic_width: width,
+                ..self
+            },
+            GeneratedDynamicSiblingFrameChange::Resize { width, height } => Self {
+                window_width: width,
+                window_height: height,
+                ..self
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedDynamicSiblingFrameChange {
+    Tick { delta: u8 },
+    DynamicWidth { width: u8 },
+    Resize { width: u16, height: u16 },
+}
+
+impl GeneratedDynamicSiblingFrameChange {
+    fn draw(tc: &hegel::TestCase) -> Self {
+        match draw_u8(tc, 0, 2) {
+            0 => Self::Tick {
+                delta: draw_u8(tc, 1, 16),
+            },
+            1 => Self::DynamicWidth {
+                width: draw_u8(tc, 64, 128),
+            },
+            _ => Self::Resize {
+                width: draw_u16(tc, 360, 520),
+                height: draw_u16(tc, 220, 360),
+            },
+        }
+    }
+
+    fn keeps_stable_subtree_constraints(self) -> bool {
+        matches!(self, Self::Tick { .. } | Self::DynamicWidth { .. })
+    }
+}
+
+fn draw_u16(tc: &hegel::TestCase, min: u16, max: u16) -> u16 {
+    tc.draw(generators::integers::<u16>().min_value(min).max_value(max))
 }
 
 fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
@@ -589,6 +680,7 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
                 GeneratedDynamicSiblingTextView {
                     stable_tree: stable_tree.clone(),
                     tick: first_tick,
+                    dynamic_width: 88,
                 }
             });
             cx.run_until_parked();
@@ -612,6 +704,7 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
                 GeneratedDynamicSiblingTextView {
                     stable_tree: stable_tree.clone(),
                     tick: second_tick,
+                    dynamic_width: 88,
                 }
             });
             cx.run_until_parked();
@@ -633,5 +726,76 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
         );
     })
     .settings(hegel_settings(60))
+    .run();
+}
+
+#[gpui::test]
+fn generated_dynamic_text_frame_sequence_matches_fresh_and_keeps_stable_subtree_local(
+    cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let stable_tree = GeneratedTextNode::draw(&tc, 3);
+        let mut state = GeneratedDynamicSiblingFrameState::draw(&tc);
+        let frame_count = draw_u8(&tc, 2, 6);
+        let changes = (0..frame_count)
+            .map(|_| GeneratedDynamicSiblingFrameChange::draw(&tc))
+            .collect::<Vec<_>>();
+
+        let retained = cx.open_window(state.window_size(), |window, _| {
+            window.set_retained_subtree_probe_targets_for_tests(vec![
+                "generated-stable-panel".to_string(),
+            ]);
+            GeneratedDynamicSiblingTextView {
+                stable_tree: stable_tree.clone(),
+                tick: state.tick,
+                dynamic_width: state.dynamic_width,
+            }
+        });
+        cx.run_until_parked();
+        let retained_window = *retained.deref();
+        let (initial_retained_bounds, _, _) =
+            draw_dynamic_sibling_text_tree(cx, retained_window, &stable_tree);
+        let initial_fresh_bounds = draw_fresh_dynamic_sibling_text_tree(cx, &stable_tree, state);
+        assert_eq!(
+            initial_retained_bounds, initial_fresh_bounds,
+            "initial retained generated dynamic frame should match fresh layout"
+        );
+
+        for change in changes {
+            state = state.apply(change);
+            match change {
+                GeneratedDynamicSiblingFrameChange::Tick { .. }
+                | GeneratedDynamicSiblingFrameChange::DynamicWidth { .. } => {
+                    retained
+                        .update(cx, |view, _, cx| {
+                            view.tick = state.tick;
+                            view.dynamic_width = state.dynamic_width;
+                            cx.notify();
+                        })
+                        .unwrap();
+                }
+                GeneratedDynamicSiblingFrameChange::Resize { .. } => {
+                    cx.simulate_window_resize(retained_window, state.window_size());
+                }
+            }
+            cx.run_until_parked();
+
+            let (retained_bounds, sample, subtree_samples) =
+                draw_dynamic_sibling_text_tree(cx, retained_window, &stable_tree);
+            let fresh_bounds = draw_fresh_dynamic_sibling_text_tree(cx, &stable_tree, state);
+            assert_eq!(
+                retained_bounds, fresh_bounds,
+                "retained generated dynamic frame should match fresh layout after {change:?}"
+            );
+            assert_eq!(
+                sample.retained_layout_fresh_compare_mismatches, 0,
+                "runtime retained-vs-fresh comparison should not report mismatches after {change:?}"
+            );
+            if change.keeps_stable_subtree_constraints() {
+                assert_stable_subtree_did_no_work(&subtree_samples, "generated-stable-panel");
+            }
+        }
+    })
+    .settings(hegel_settings(40))
     .run();
 }

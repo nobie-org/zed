@@ -660,6 +660,51 @@ fn draw_generated_styled_sibling_tree(
     )
 }
 
+fn draw_generated_styled_tree(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    tree: &GeneratedStyledNode,
+) -> (
+    Vec<(String, Bounds<Pixels>)>,
+    LayoutWorkSample,
+    Vec<crate::RetainedSubtreeWorkSample>,
+) {
+    let mut selectors = vec!["styled-root-tree".to_string()];
+    selectors.extend(tree.selectors_at("styled/root"));
+
+    let bounds = selectors
+        .into_iter()
+        .map(|selector| {
+            let bounds = cx
+                .update_window(window, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(&selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("missing debug bounds for generated styled tree selector {selector}")
+                });
+            (selector, bounds)
+        })
+        .collect::<Vec<_>>();
+
+    let (sample, subtree_samples) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.last_layout_work_sample(),
+                window
+                    .last_retained_subtree_work_samples_for_tests()
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+
+    (
+        bounds,
+        sample.expect("generated styled tree draw should publish layout work"),
+        subtree_samples,
+    )
+}
+
 fn draw_fresh_dynamic_sibling_text_tree(
     cx: &mut TestAppContext,
     stable_tree: &GeneratedTextNode,
@@ -745,6 +790,26 @@ impl Render for GeneratedFrameworkTextView {
         _cx: &mut crate::Context<Self>,
     ) -> impl IntoElement {
         self.tree.build()
+    }
+}
+
+struct GeneratedFrameworkStyledView {
+    tree: GeneratedStyledNode,
+}
+
+impl Render for GeneratedFrameworkStyledView {
+    fn render(
+        &mut self,
+        _window: &mut BuildCx<'_>,
+        _cx: &mut crate::Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("generated-framework-styled-retained-root")
+            .debug_selector(|| "styled-root-tree".into())
+            .relative()
+            .w_full()
+            .h_full()
+            .child(self.tree.build_at("styled/root"))
     }
 }
 
@@ -1708,6 +1773,69 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
         assert_solver_cache_did_not_churn(stable_sample, true, true);
     })
     .settings(hegel_settings(50))
+    .run();
+}
+
+#[gpui::test]
+fn generated_framework_styled_tree_matches_fresh_and_stable_repeat_preserves_solver_work(
+    cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let tree = GeneratedStyledNode::draw(&tc, 3, false);
+        let window_size = size(
+            px(draw_u16(&tc, 360, 760) as f32),
+            px(draw_u16(&tc, 280, 620) as f32),
+        );
+
+        let (first_retained_bounds, second_retained_bounds, stable_sample, stable_subtree_samples) = {
+            let retained = cx.open_window(window_size, |window, _| {
+                window.set_retained_subtree_probe_targets_for_tests(vec![
+                    "generated-framework-styled-retained-root".to_string(),
+                ]);
+                GeneratedFrameworkStyledView { tree: tree.clone() }
+            });
+            cx.run_until_parked();
+            let window = *retained.deref();
+            let (first_bounds, _, _) = draw_generated_styled_tree(cx, window, &tree);
+            cx.update_window(window, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            let (second_bounds, sample, subtree_samples) =
+                draw_generated_styled_tree(cx, window, &tree);
+            (first_bounds, second_bounds, sample, subtree_samples)
+        };
+
+        let fresh_bounds = {
+            let fresh = cx.open_window(window_size, |window, _| {
+                window.force_fresh_layout_for_tests();
+                GeneratedFrameworkStyledView { tree: tree.clone() }
+            });
+            cx.run_until_parked();
+            let (bounds, sample, _) = draw_generated_styled_tree(cx, *fresh.deref(), &tree);
+            assert_fresh_oracle_sample(sample);
+            bounds
+        };
+
+        assert_eq!(
+            first_retained_bounds, fresh_bounds,
+            "retained generated styled tree should match fresh layout"
+        );
+        assert_eq!(
+            first_retained_bounds, second_retained_bounds,
+            "stable retained generated styled tree redraw should publish identical bounds"
+        );
+        assert_eq!(
+            stable_sample.retained_layout_fresh_compare_mismatches, 0,
+            "runtime retained-vs-fresh comparison should not report styled stable-repeat mismatches"
+        );
+        assert_no_retained_writes_or_measurement(stable_sample);
+        assert_solver_cache_did_not_churn(stable_sample, true, true);
+        assert_stable_subtree_preserved_without_solver_churn(
+            &stable_subtree_samples,
+            "generated-framework-styled-retained-root",
+        );
+    })
+    .settings(hegel_settings(60))
     .run();
 }
 

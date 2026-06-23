@@ -688,6 +688,40 @@ struct GeneratedCanvasChromeFrameSpec {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+enum GeneratedSemanticChildKind {
+    AnonymousLeaf,
+    UniqueLeaf,
+    DuplicateLeaf,
+    AnonymousPanel,
+    UniquePanel,
+    DuplicatePanel,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+struct GeneratedSemanticChildTemplate {
+    kind: GeneratedSemanticChildKind,
+    identity: u8,
+    width: u16,
+    child_width: u16,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+struct GeneratedSemanticChildUse {
+    template_index: usize,
+    width_delta: u16,
+    child_width_delta: u16,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+struct GeneratedSemanticFrame {
+    children: Vec<GeneratedSemanticChildUse>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, PartialEq)]
 struct CanvasChromeFrameOutputForTests {
     shape: RetainedLayoutShapeForTests,
@@ -889,6 +923,54 @@ fn draw_canvas_chrome_frame_specs(
             sidebar_content_height: draw_u16(tc, 0, 360),
             content_gap: draw_u8(tc, 0, 32),
             scale_factor: if draw_u8(tc, 0, 1) == 0 { 1.0 } else { 2.0 },
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_generated_semantic_child_kind(tc: &hegel::TestCase) -> GeneratedSemanticChildKind {
+    match draw_u8(tc, 0, 5) {
+        0 => GeneratedSemanticChildKind::AnonymousLeaf,
+        1 => GeneratedSemanticChildKind::UniqueLeaf,
+        2 => GeneratedSemanticChildKind::DuplicateLeaf,
+        3 => GeneratedSemanticChildKind::AnonymousPanel,
+        4 => GeneratedSemanticChildKind::UniquePanel,
+        _ => GeneratedSemanticChildKind::DuplicatePanel,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_generated_semantic_child_templates(
+    tc: &hegel::TestCase,
+) -> Vec<GeneratedSemanticChildTemplate> {
+    let template_count = draw_usize(tc, 2, 8);
+    (0..template_count)
+        .map(|index| GeneratedSemanticChildTemplate {
+            kind: draw_generated_semantic_child_kind(tc),
+            identity: index as u8,
+            width: draw_u16(tc, 1, 140),
+            child_width: draw_u16(tc, 1, 140),
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_generated_semantic_frames(
+    tc: &hegel::TestCase,
+    template_count: usize,
+) -> Vec<GeneratedSemanticFrame> {
+    let frame_count = draw_usize(tc, 3, 8);
+    (0..frame_count)
+        .map(|_| {
+            let child_count = draw_usize(tc, 0, template_count + 3);
+            let children = (0..child_count)
+                .map(|_| GeneratedSemanticChildUse {
+                    template_index: draw_usize(tc, 0, template_count - 1),
+                    width_delta: draw_u16(tc, 0, 32),
+                    child_width_delta: draw_u16(tc, 0, 32),
+                })
+                .collect();
+            GeneratedSemanticFrame { children }
         })
         .collect()
 }
@@ -1207,6 +1289,73 @@ fn request_generated_frame(engine: &mut LayoutEngine, frame: &GeneratedFrame) ->
         .iter()
         .map(|root| request_generated_tree(engine, root))
         .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn semantic_width(base: u16, delta: u16) -> f32 {
+    (base + delta) as f32
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn request_generated_semantic_child(
+    engine: &mut LayoutEngine,
+    template: GeneratedSemanticChildTemplate,
+    child_use: GeneratedSemanticChildUse,
+) -> LayoutId {
+    let width = semantic_width(template.width, child_use.width_delta);
+    let child_width = semantic_width(template.child_width, child_use.child_width_delta);
+    match template.kind {
+        GeneratedSemanticChildKind::AnonymousLeaf => request_leaf(engine, width),
+        GeneratedSemanticChildKind::UniqueLeaf => {
+            request_keyed_leaf(engine, 50_000 + template.identity as u64, width)
+        }
+        GeneratedSemanticChildKind::DuplicateLeaf => {
+            request_keyed_leaf(engine, 50_900 + u64::from(template.identity % 2), width)
+        }
+        GeneratedSemanticChildKind::AnonymousPanel => {
+            let child = request_leaf(engine, child_width);
+            request_container(engine, &[child])
+        }
+        GeneratedSemanticChildKind::UniquePanel => {
+            let child = request_leaf(engine, child_width);
+            request_keyed_layout(
+                engine,
+                51_000 + template.identity as u64,
+                style_with_width(width),
+                &[child],
+            )
+        }
+        GeneratedSemanticChildKind::DuplicatePanel => {
+            let child = request_leaf(engine, child_width);
+            request_keyed_layout(
+                engine,
+                51_900 + u64::from(template.identity % 2),
+                style_with_width(width),
+                &[child],
+            )
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn request_generated_semantic_frame(
+    engine: &mut LayoutEngine,
+    templates: &[GeneratedSemanticChildTemplate],
+    frame: &GeneratedSemanticFrame,
+) -> (LayoutId, Vec<LayoutId>) {
+    let children = frame
+        .children
+        .iter()
+        .map(|child_use| {
+            request_generated_semantic_child(
+                engine,
+                templates[child_use.template_index],
+                *child_use,
+            )
+        })
+        .collect::<Vec<_>>();
+    let root = request_flex_container(engine, &children);
+    (root, children)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3533,6 +3682,68 @@ fn generated_duplicate_global_id_reorder_delete_retains_by_exact_facts() {
         );
     })
     .settings(hegel_settings(64))
+    .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_semantic_sibling_sequences_match_fresh_across_constraint_aba() {
+    hegel::Hegel::new(|tc| {
+        let templates = draw_generated_semantic_child_templates(&tc);
+        let frames = draw_generated_semantic_frames(&tc, templates.len());
+        let first_width = draw_u16(&tc, 160, 900) as f32;
+        let first_height = draw_u16(&tc, 48, 240) as f32;
+        let second_width = draw_u16(&tc, 160, 900) as f32;
+        let second_height = draw_u16(&tc, 48, 240) as f32;
+        let constraints = [
+            (first_width, first_height),
+            (second_width, second_height),
+            (first_width, first_height),
+        ];
+        let mut retained = LayoutEngine::new();
+
+        for (frame_index, frame) in frames.iter().enumerate() {
+            let (width, height) = constraints[frame_index % constraints.len()];
+            let (retained_layout_id, retained_children) =
+                request_generated_semantic_frame(&mut retained, &templates, frame);
+            let retained_root =
+                compute_layout_without_measure(&mut retained, retained_layout_id, width, height);
+            assert_facts_committed_exactly(&retained, retained_layout_id);
+
+            let retained_child_nodes = retained_children
+                .iter()
+                .map(|child| retained.retained_node_token_for_tests(*child))
+                .collect::<Vec<_>>();
+            let unique_retained_child_nodes = retained_child_nodes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                unique_retained_child_nodes.len(),
+                retained_child_nodes.len(),
+                "current-frame layout facts must never alias one retained node"
+            );
+
+            let mut fresh = LayoutEngine::new();
+            let (fresh_layout_id, _) =
+                request_generated_semantic_frame(&mut fresh, &templates, frame);
+            let fresh_root =
+                compute_layout_without_measure(&mut fresh, fresh_layout_id, width, height);
+            assert_facts_committed_exactly(&fresh, fresh_layout_id);
+
+            assert_eq!(
+                retained_layout_projection(&retained, retained_root),
+                retained_layout_projection(&fresh, fresh_root)
+            );
+            assert_eq!(
+                retained_layout_bounds_tree(&mut retained, retained_root, 1.0),
+                retained_layout_bounds_tree(&mut fresh, fresh_root, 1.0)
+            );
+
+            retained.finish_frame();
+        }
+    })
+    .settings(hegel_settings(96))
     .run();
 }
 

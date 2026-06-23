@@ -466,13 +466,16 @@ impl RetainedLayoutForest {
             Vec::new()
         });
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
+        let observe_solver_cache_events = measurement_solve_observer.has_artifact_obligations()
+            || subtree_compute_recorder.has_active_subtrees()
+            || trace::detail_enabled();
         let solver_observation_setup_duration = solver_observation_setup_start.elapsed();
         let solver_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
             node_id,
             available_space,
             scale_factor,
-            measurement_solve_observer.has_artifact_obligations(),
+            observe_solver_cache_events,
             window,
             cx,
             &mut subtree_compute_recorder,

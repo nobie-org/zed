@@ -124,6 +124,7 @@ impl SubtreeProbe {
             mirror_node_removes: work_delta.work.removes,
             mirror_set_style: work_delta.work.style_updates,
             mirror_set_children: work_delta.work.child_list_updates,
+            mirror_dirty_marks: work_delta.work.dirty_marks,
             mirror_measured_context_clears: work_delta.work.measured_context_clears,
             ..RetainedSubtreeWorkSample::default()
         });
@@ -172,7 +173,7 @@ impl SubtreeProbe {
             }
             self.emitted_samples += 1;
             eprintln!(
-                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={} solver_cache_hits={} solver_cache_stores={} solver_cache_misses={} solver_cache_clears={} solver_cache_measure_observations={}",
+                "gpui retained_layout subtree_sample global_id=\"{}\" layout_id={} nodes={} no_work_total={} retained_reuses={} retained_misses={} creates={} removes={} set_style={} set_children={} dirty_marks={} context_clears={} measured_callbacks={} conservative_text_measured_callbacks={} solver_cache_hits={} solver_cache_stores={} solver_cache_misses={} solver_cache_clears={} solver_cache_measure_observations={}",
                 sample.global_id,
                 sample.layout_id,
                 sample.node_count,
@@ -183,6 +184,7 @@ impl SubtreeProbe {
                 sample.mirror_node_removes,
                 sample.mirror_set_style,
                 sample.mirror_set_children,
+                sample.mirror_dirty_marks,
                 sample.mirror_measured_context_clears,
                 sample.measured_callbacks,
                 sample.conservative_text_measured_callbacks,
@@ -255,6 +257,10 @@ impl SubtreeProbeComputeRecorder {
                 });
             }
         }
+    }
+
+    pub(super) fn has_active_subtrees(&self) -> bool {
+        !self.active_subtrees.is_empty()
     }
 
     fn record_node(

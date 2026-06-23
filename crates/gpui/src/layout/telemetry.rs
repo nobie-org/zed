@@ -34,6 +34,8 @@ pub struct RetainedSubtreeWorkSample {
     pub mirror_set_style: u64,
     /// Mirror `set_children` operations inside this subtree.
     pub mirror_set_children: u64,
+    /// Explicit mirror dirty marks inside this subtree.
+    pub mirror_dirty_marks: u64,
     /// Measured-context clears caused by subtree removal.
     pub mirror_measured_context_clears: u64,
     /// Measured callbacks attributed to nodes inside this subtree.
@@ -66,6 +68,7 @@ impl RetainedSubtreeWorkSample {
             + self.mirror_node_removes
             + self.mirror_set_style
             + self.mirror_set_children
+            + self.mirror_dirty_marks
             + self.mirror_measured_context_clears
             + self.solver_cache_stores
             + self.solver_cache_misses

@@ -235,6 +235,8 @@ fn stable_subtree_probe_reports_zero_write_work_after_admission() {
         layout_id: 0,
         node_count: 1,
         retained_reuses: 1,
+        solver_cache_hits: 1,
+        solver_cache_measure_observations: 1,
         ..RetainedSubtreeWorkSample::default()
     };
     assert_eq!(samples, std::slice::from_ref(&expected_sample));
@@ -350,6 +352,7 @@ fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
             + samples[0].mirror_node_removes
             + samples[0].mirror_set_style
             + samples[0].mirror_set_children
+            + samples[0].mirror_dirty_marks
             + samples[0].mirror_measured_context_clears
             + samples[0].solver_cache_stores
             + samples[0].solver_cache_misses

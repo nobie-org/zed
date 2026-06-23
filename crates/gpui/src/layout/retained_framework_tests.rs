@@ -374,7 +374,9 @@ fn draw_fresh_dynamic_sibling_text_tree(
         }
     });
     cx.run_until_parked();
-    draw_dynamic_sibling_text_tree(cx, *fresh.deref(), stable_tree).0
+    let (bounds, sample, _) = draw_dynamic_sibling_text_tree(cx, *fresh.deref(), stable_tree);
+    assert_fresh_oracle_sample(sample);
+    bounds
 }
 
 struct GeneratedFrameworkView {
@@ -622,7 +624,165 @@ fn draw_fresh_sibling_churn_text_tree(
         }
     });
     cx.run_until_parked();
-    draw_sibling_churn_text_tree(cx, *fresh.deref(), stable_tree, frame).0
+    let (bounds, sample, _) = draw_sibling_churn_text_tree(cx, *fresh.deref(), stable_tree, frame);
+    assert_fresh_oracle_sample(sample);
+    bounds
+}
+
+#[derive(Clone, Debug)]
+struct GeneratedInternalEditFrame {
+    tick: u8,
+    mutable_width: u8,
+    mutable_height: u8,
+    mutable_text_size: u8,
+}
+
+impl GeneratedInternalEditFrame {
+    fn draw(tc: &hegel::TestCase, tick: u8) -> Self {
+        Self {
+            tick,
+            mutable_width: draw_u8(tc, 80, 220),
+            mutable_height: draw_u8(tc, 20, 80),
+            mutable_text_size: draw_u8(tc, 10, 22),
+        }
+    }
+
+    fn window_size(&self) -> crate::Size<Pixels> {
+        size(px(440.0), px(1080.0))
+    }
+
+    fn selectors(
+        &self,
+        before_tree: &GeneratedTextNode,
+        after_tree: &GeneratedTextNode,
+    ) -> Vec<String> {
+        let mut selectors = vec![
+            "root".to_string(),
+            "stable-before-panel".to_string(),
+            "mutable".to_string(),
+            "stable-after-panel".to_string(),
+        ];
+        selectors.extend(before_tree.selectors_at("before/root"));
+        selectors.extend(after_tree.selectors_at("after/root"));
+        selectors
+    }
+}
+
+struct GeneratedInternalEditTextView {
+    before_tree: GeneratedTextNode,
+    after_tree: GeneratedTextNode,
+    frame: GeneratedInternalEditFrame,
+}
+
+impl Render for GeneratedInternalEditTextView {
+    fn render(
+        &mut self,
+        _window: &mut BuildCx<'_>,
+        _cx: &mut crate::Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("generated-internal-edit-root")
+            .debug_selector(|| "root".into())
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .w(px(400.0))
+            .h(px(1040.0))
+            .child(
+                div()
+                    .id("generated-internal-edit-stable-before")
+                    .debug_selector(|| "stable-before-panel".into())
+                    .flex_none()
+                    .w(px(320.0))
+                    .h(px(360.0))
+                    .child(self.before_tree.build_at("before/root", false)),
+            )
+            .child(
+                div()
+                    .id("generated-internal-edit-mutable")
+                    .debug_selector(|| "mutable".into())
+                    .flex_none()
+                    .w(px(self.frame.mutable_width as f32))
+                    .h(px(self.frame.mutable_height as f32))
+                    .text_size(px(self.frame.mutable_text_size as f32))
+                    .child(format!("mutable frame {}", self.frame.tick)),
+            )
+            .child(
+                div()
+                    .id("generated-internal-edit-stable-after")
+                    .debug_selector(|| "stable-after-panel".into())
+                    .flex_none()
+                    .w(px(320.0))
+                    .h(px(360.0))
+                    .child(self.after_tree.build_at("after/root", false)),
+            )
+    }
+}
+
+fn draw_internal_edit_text_tree(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    before_tree: &GeneratedTextNode,
+    after_tree: &GeneratedTextNode,
+    frame: &GeneratedInternalEditFrame,
+) -> (
+    Vec<(String, Bounds<Pixels>)>,
+    LayoutWorkSample,
+    Vec<crate::RetainedSubtreeWorkSample>,
+) {
+    let bounds = frame
+        .selectors(before_tree, after_tree)
+        .into_iter()
+        .map(|selector| {
+            let bounds = cx
+                .update_window(window, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(&selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("missing debug bounds for internal-edit selector {selector}")
+                });
+            (selector, bounds)
+        })
+        .collect::<Vec<_>>();
+
+    let (sample, subtree_samples) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.last_layout_work_sample(),
+                window
+                    .last_retained_subtree_work_samples_for_tests()
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+
+    (
+        bounds,
+        sample.expect("internal-edit draw should publish layout work"),
+        subtree_samples,
+    )
+}
+
+fn draw_fresh_internal_edit_text_tree(
+    cx: &mut TestAppContext,
+    before_tree: &GeneratedTextNode,
+    after_tree: &GeneratedTextNode,
+    frame: &GeneratedInternalEditFrame,
+) -> Vec<(String, Bounds<Pixels>)> {
+    let fresh = cx.open_window(frame.window_size(), |window, _| {
+        window.force_fresh_layout_for_tests();
+        GeneratedInternalEditTextView {
+            before_tree: before_tree.clone(),
+            after_tree: after_tree.clone(),
+            frame: frame.clone(),
+        }
+    });
+    cx.run_until_parked();
+    let (bounds, sample, _) =
+        draw_internal_edit_text_tree(cx, *fresh.deref(), before_tree, after_tree, frame);
+    assert_fresh_oracle_sample(sample);
+    bounds
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,7 +858,22 @@ fn draw_u16(tc: &hegel::TestCase, min: u16, max: u16) -> u16 {
     tc.draw(generators::integers::<u16>().min_value(min).max_value(max))
 }
 
+fn assert_fresh_oracle_sample(sample: LayoutWorkSample) {
+    assert_eq!(
+        sample.force_fresh_frame_resets, 1,
+        "fresh oracle window should discard retained layout state: {sample:?}"
+    );
+}
+
+fn assert_retained_frame_sample(sample: LayoutWorkSample) {
+    assert_eq!(
+        sample.force_fresh_frame_resets, 0,
+        "retained test window should not run in forced-fresh mode: {sample:?}"
+    );
+}
+
 fn assert_no_retained_writes_or_measurement(sample: LayoutWorkSample) {
+    assert_retained_frame_sample(sample);
     assert_eq!(
         sample.measured_layout_calls, 0,
         "stable generated framework frame should not run measured callbacks"
@@ -752,11 +927,29 @@ fn assert_solver_cache_did_not_churn(
     }
 }
 
+fn assert_subtree_solver_preservation_observed(
+    sample: &crate::RetainedSubtreeWorkSample,
+    target: &str,
+) {
+    assert!(
+        sample.solver_cache_hits + sample.solver_cache_measure_observations > 0,
+        "stable subtree {target} should observe preserved solver state: {sample:?}"
+    );
+}
+
 fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample], target: &str) {
     let sample = samples
         .iter()
         .find(|sample| sample.global_id.ends_with(target))
         .unwrap_or_else(|| panic!("missing retained subtree work sample for {target}"));
+    assert!(
+        sample.node_count > 0,
+        "stable subtree {target} should contain retained nodes: {sample:?}"
+    );
+    assert_eq!(
+        sample.retained_reuses, sample.node_count as u64,
+        "stable subtree {target} should reuse every node: {sample:?}"
+    );
     assert_eq!(
         sample.no_work_total(),
         0,
@@ -766,10 +959,7 @@ fn assert_stable_subtree_did_no_work(samples: &[crate::RetainedSubtreeWorkSample
         sample.retained_reuses > 0,
         "stable subtree {target} should reuse retained nodes: {sample:?}"
     );
-    assert!(
-        sample.solver_cache_hits > 0 || sample.solver_cache_measure_observations > 0,
-        "stable subtree {target} should observe solver cache reuse or cached measurement proofs: {sample:?}"
-    );
+    assert_subtree_solver_preservation_observed(sample, target);
 }
 
 fn assert_stable_subtree_preserved_without_solver_churn(
@@ -780,15 +970,20 @@ fn assert_stable_subtree_preserved_without_solver_churn(
         .iter()
         .find(|sample| sample.global_id.ends_with(target))
         .unwrap_or_else(|| panic!("missing retained subtree work sample for {target}"));
+    assert!(
+        sample.node_count > 0,
+        "stable subtree {target} should contain retained nodes: {sample:?}"
+    );
+    assert_eq!(
+        sample.retained_reuses, sample.node_count as u64,
+        "stable subtree {target} should reuse every node: {sample:?}"
+    );
     assert_eq!(
         sample.no_work_total(),
         0,
         "stable subtree {target} should not have retained or solver churn: {sample:?}"
     );
-    assert!(
-        sample.retained_reuses > 0,
-        "stable subtree {target} should retain nodes through sibling churn: {sample:?}"
-    );
+    assert_subtree_solver_preservation_observed(sample, target);
 }
 
 #[gpui::test]
@@ -832,7 +1027,9 @@ fn generated_framework_div_tree_matches_fresh_and_stable_repeat_preserves_work(
                 },
             );
             cx.run_until_parked();
-            draw_generated_div_tree(cx, *fresh.deref(), &tree).0
+            let (bounds, sample) = draw_generated_div_tree(cx, *fresh.deref(), &tree);
+            assert_fresh_oracle_sample(sample);
+            bounds
         };
 
         assert_eq!(
@@ -878,7 +1075,9 @@ fn generated_framework_text_tree_matches_fresh_and_stable_repeat_preserves_work(
                 GeneratedFrameworkTextView { tree: tree.clone() }
             });
             cx.run_until_parked();
-            draw_generated_text_tree(cx, *fresh.deref(), &tree).0
+            let (bounds, sample) = draw_generated_text_tree(cx, *fresh.deref(), &tree);
+            assert_fresh_oracle_sample(sample);
+            bounds
         };
 
         assert_eq!(
@@ -945,7 +1144,10 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
                 }
             });
             cx.run_until_parked();
-            draw_dynamic_sibling_text_tree(cx, *fresh.deref(), &stable_tree).0
+            let (bounds, sample, _) =
+                draw_dynamic_sibling_text_tree(cx, *fresh.deref(), &stable_tree);
+            assert_fresh_oracle_sample(sample);
+            bounds
         };
 
         assert_eq!(
@@ -961,6 +1163,7 @@ fn dynamic_text_sibling_does_not_poison_stable_generated_text_subtree(cx: &mut T
             second_retained_sample.retained_layout_fresh_compare_mismatches, 0,
             "runtime retained-vs-fresh comparison should not report mismatches"
         );
+        assert_retained_frame_sample(second_retained_sample);
     })
     .settings(hegel_settings(60))
     .run();
@@ -1028,6 +1231,7 @@ fn generated_dynamic_text_frame_sequence_matches_fresh_and_keeps_stable_subtree_
                 sample.retained_layout_fresh_compare_mismatches, 0,
                 "runtime retained-vs-fresh comparison should not report mismatches after {change:?}"
             );
+            assert_retained_frame_sample(sample);
             if change.keeps_stable_subtree_constraints() {
                 assert_stable_subtree_did_no_work(&subtree_samples, "generated-stable-panel");
             }
@@ -1092,9 +1296,91 @@ fn generated_sibling_churn_matches_fresh_and_preserves_stable_subtree(cx: &mut T
                 sample.retained_layout_fresh_compare_mismatches, 0,
                 "runtime retained-vs-fresh comparison should not report mismatches for {frame:?}"
             );
+            assert_retained_frame_sample(sample);
             assert_stable_subtree_preserved_without_solver_churn(
                 &subtree_samples,
                 "generated-sibling-churn-stable-panel",
+            );
+        }
+    })
+    .settings(hegel_settings(40))
+    .run();
+}
+
+#[gpui::test]
+fn generated_internal_edit_matches_fresh_and_preserves_unchanged_sibling_subtrees(
+    cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let before_tree = GeneratedTextNode::draw(&tc, 3);
+        let after_tree = GeneratedTextNode::draw(&tc, 3);
+        let frame_count = draw_u8(&tc, 2, 6);
+        let frames = (0..frame_count)
+            .map(|tick| GeneratedInternalEditFrame::draw(&tc, tick))
+            .collect::<Vec<_>>();
+        let first_frame = frames
+            .first()
+            .expect("generated internal edit should contain at least one frame")
+            .clone();
+
+        let retained = cx.open_window(first_frame.window_size(), |window, _| {
+            window.set_retained_subtree_probe_targets_for_tests(vec![
+                "generated-internal-edit-stable-before".to_string(),
+                "generated-internal-edit-stable-after".to_string(),
+            ]);
+            GeneratedInternalEditTextView {
+                before_tree: before_tree.clone(),
+                after_tree: after_tree.clone(),
+                frame: first_frame.clone(),
+            }
+        });
+        cx.run_until_parked();
+        let retained_window = *retained.deref();
+
+        let (initial_retained_bounds, _, _) = draw_internal_edit_text_tree(
+            cx,
+            retained_window,
+            &before_tree,
+            &after_tree,
+            &first_frame,
+        );
+        let initial_fresh_bounds =
+            draw_fresh_internal_edit_text_tree(cx, &before_tree, &after_tree, &first_frame);
+        assert_eq!(
+            initial_retained_bounds, initial_fresh_bounds,
+            "initial retained internal-edit frame should match fresh layout"
+        );
+
+        for frame in frames.iter().skip(1) {
+            retained
+                .update(cx, |view, _, cx| {
+                    view.frame = frame.clone();
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+
+            let (retained_bounds, sample, subtree_samples) =
+                draw_internal_edit_text_tree(cx, retained_window, &before_tree, &after_tree, frame);
+            let fresh_bounds =
+                draw_fresh_internal_edit_text_tree(cx, &before_tree, &after_tree, frame);
+
+            assert_eq!(
+                retained_bounds, fresh_bounds,
+                "retained internal-edit frame should match fresh layout for {frame:?}"
+            );
+            assert_eq!(
+                sample.retained_layout_fresh_compare_mismatches, 0,
+                "runtime retained-vs-fresh comparison should not report mismatches for {frame:?}"
+            );
+            assert_retained_frame_sample(sample);
+            assert_stable_subtree_preserved_without_solver_churn(
+                &subtree_samples,
+                "generated-internal-edit-stable-before",
+            );
+            assert_stable_subtree_preserved_without_solver_churn(
+                &subtree_samples,
+                "generated-internal-edit-stable-after",
             );
         }
     })

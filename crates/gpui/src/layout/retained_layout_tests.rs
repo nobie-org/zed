@@ -3441,6 +3441,101 @@ fn generated_duplicate_global_id_uses_exact_current_facts_not_scan_order_identit
     .run();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generated_duplicate_global_id_reorder_delete_retains_by_exact_facts() {
+    hegel::Hegel::new(|tc| {
+        let duplicate_count = draw_usize(&tc, 2, 7);
+        let base_width = draw_u16(&tc, 1, 40);
+        let width_step = draw_u16(&tc, 1, 20);
+        let previous_widths = (0..duplicate_count)
+            .map(|index| base_width + index as u16 * width_step)
+            .collect::<Vec<_>>();
+        let start = draw_usize(&tc, 1, duplicate_count - 1);
+        let current_len = draw_usize(&tc, 1, duplicate_count - 1);
+        let reverse = draw_u8(&tc, 0, 1) == 1;
+        let root_width = draw_u16(&tc, 240, 900) as f32;
+
+        let mut current_previous_indices = (0..duplicate_count)
+            .cycle()
+            .skip(start)
+            .take(current_len)
+            .collect::<Vec<_>>();
+        if reverse {
+            current_previous_indices.reverse();
+        }
+
+        let mut retained = LayoutEngine::new();
+        let previous_duplicates = previous_widths
+            .iter()
+            .map(|width| request_keyed_leaf(&mut retained, 41_900, *width as f32))
+            .collect::<Vec<_>>();
+        let first_root = request_flex_container(&mut retained, &previous_duplicates);
+        let first_root_node =
+            compute_layout_without_measure(&mut retained, first_root, root_width, 80.0);
+        let previous_duplicate_nodes = previous_duplicates
+            .iter()
+            .map(|duplicate| retained.retained_node_token_for_tests(*duplicate))
+            .collect::<Vec<_>>();
+        retained.finish_frame();
+
+        retained.reset_retained_mutation_sample_for_tests();
+        let current_duplicates = current_previous_indices
+            .iter()
+            .map(|index| request_keyed_leaf(&mut retained, 41_900, previous_widths[*index] as f32))
+            .collect::<Vec<_>>();
+        let second_root = request_flex_container(&mut retained, &current_duplicates);
+        let second_root_node =
+            compute_layout_without_measure(&mut retained, second_root, root_width, 80.0);
+        assert_facts_committed_exactly(&retained, second_root);
+
+        assert_eq!(second_root_node, first_root_node);
+        let current_duplicate_nodes = current_duplicates
+            .iter()
+            .map(|duplicate| retained.retained_node_token_for_tests(*duplicate))
+            .collect::<Vec<_>>();
+        let expected_duplicate_nodes = current_previous_indices
+            .iter()
+            .map(|index| previous_duplicate_nodes[*index])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            current_duplicate_nodes, expected_duplicate_nodes,
+            "same global id cannot choose identity; moved duplicate siblings must retain only by exact current facts"
+        );
+        assert_eq!(
+            retained.retained_child_tokens_for_tests(second_root_node),
+            current_duplicate_nodes
+        );
+        assert_eq!(
+            retained.retained_mutation_sample_for_tests(),
+            RetainedForestMutationSample {
+                reuses: current_len as u64 + 1,
+                child_list_updates: 1,
+                removes: duplicate_count as u64 - current_len as u64,
+                ..RetainedForestMutationSample::default()
+            }
+        );
+
+        let mut fresh = LayoutEngine::new();
+        let fresh_duplicates = current_previous_indices
+            .iter()
+            .map(|index| request_keyed_leaf(&mut fresh, 41_900, previous_widths[*index] as f32))
+            .collect::<Vec<_>>();
+        let fresh_root = request_flex_container(&mut fresh, &fresh_duplicates);
+        let fresh_root = compute_layout_without_measure(&mut fresh, fresh_root, root_width, 80.0);
+        assert_eq!(
+            retained_layout_projection(&retained, second_root_node),
+            retained_layout_projection(&fresh, fresh_root)
+        );
+        assert_eq!(
+            retained_layout_bounds_tree(&mut retained, second_root_node, 1.0),
+            retained_layout_bounds_tree(&mut fresh, fresh_root, 1.0)
+        );
+    })
+    .settings(hegel_settings(64))
+    .run();
+}
+
 #[test]
 fn changed_measured_child_is_not_an_exact_reordered_match() {
     let mut engine = LayoutEngine::new();

@@ -1623,36 +1623,17 @@ impl RetainedLayoutForest {
         let mut assigned = std::iter::repeat_with(|| None)
             .take(children.len())
             .collect::<Vec<_>>();
+        for (index, child) in children.iter().enumerate() {
+            assigned[index] =
+                self.take_same_position_shallow_child(*child, index, previous_children);
+        }
+
+        if assigned.iter().all(Option::is_some) {
+            return assigned;
+        }
+
         let unique_current_global_ids = self.unique_current_child_global_ids(children);
         let unique_previous_global_ids = Self::unique_previous_child_global_ids(previous_children);
-
-        let same_position_exact_matches = children
-            .iter()
-            .enumerate()
-            .map(|(index, child)| {
-                let Some(candidate) = previous_children
-                    .get(index)
-                    .and_then(|previous_child| previous_child.as_ref())
-                else {
-                    return false;
-                };
-                self.retained_node_is_exact_current_facts(*child, candidate)
-                    && self.same_position_exact_match_is_unambiguous(
-                        *child,
-                        children,
-                        previous_children,
-                    )
-            })
-            .collect::<Vec<_>>();
-
-        for (index, should_preserve) in same_position_exact_matches.into_iter().enumerate() {
-            if should_preserve {
-                let previous_child = previous_children
-                    .get_mut(index)
-                    .expect("previous child index should exist after exact-position lookup");
-                assigned[index] = previous_child.take();
-            }
-        }
 
         for (index, child) in children.iter().enumerate() {
             if assigned[index].is_none() {
@@ -1681,16 +1662,6 @@ impl RetainedLayoutForest {
         }
 
         assigned
-    }
-
-    fn same_position_exact_match_is_unambiguous(
-        &self,
-        child: LayoutId,
-        current_children: &[LayoutId],
-        previous_children: &[Option<RetainedLayoutNode>],
-    ) -> bool {
-        self.current_exact_child_count(child, current_children)
-            == self.previous_exact_child_count(child, previous_children)
     }
 
     /// Find unique current child identities. Duplicates are not semantic proof.
@@ -1806,22 +1777,60 @@ impl RetainedLayoutForest {
         None
     }
 
+    /// Remove an unchanged same-position previous child without recursive
+    /// subtree proof.
+    ///
+    /// This is a hot-path shortcut for stable tree shape. It only proves that
+    /// the same structural slot still has the same shallow facts; descendants
+    /// are still fully recommitted by `commit_facts`.
+    fn take_same_position_shallow_child(
+        &self,
+        child: LayoutId,
+        current_index: usize,
+        previous_children: &mut [Option<RetainedLayoutNode>],
+    ) -> Option<RetainedLayoutNode> {
+        let previous_child = previous_children.get_mut(current_index)?;
+        let candidate = previous_child.as_ref()?;
+        if self.retained_node_has_same_position_facts(child, candidate) {
+            return previous_child.take();
+        }
+        None
+    }
+
+    fn retained_node_has_same_position_facts(
+        &self,
+        id: LayoutId,
+        previous: &RetainedLayoutNode,
+    ) -> bool {
+        let facts = self.facts(id);
+        if previous.identity.as_ref() != facts.global_id.as_ref() {
+            return false;
+        }
+        if previous.style != facts.style {
+            return false;
+        }
+
+        match (&facts.kind, &previous.kind) {
+            (
+                CurrentLayoutNodeKind::Unmeasured { children },
+                RetainedLayoutNodeKind::Unmeasured {
+                    children: previous_children,
+                },
+            ) => children.len() == previous_children.len(),
+            (
+                CurrentLayoutNodeKind::Measured(measured),
+                RetainedLayoutNodeKind::Measured {
+                    measured_facts: previous_measured_facts,
+                },
+            ) => previous_measured_facts == measured,
+            _ => false,
+        }
+    }
+
     fn current_exact_child_count(&self, child: LayoutId, current_children: &[LayoutId]) -> usize {
         current_children
             .iter()
             .filter(|candidate| self.current_fact_subtrees_are_exact(child, **candidate))
-            .count()
-    }
-
-    fn previous_exact_child_count(
-        &self,
-        child: LayoutId,
-        previous_children: &[Option<RetainedLayoutNode>],
-    ) -> usize {
-        previous_children
-            .iter()
-            .filter_map(Option::as_ref)
-            .filter(|candidate| self.retained_node_is_exact_current_facts(child, candidate))
             .count()
     }
 

@@ -1062,6 +1062,46 @@ impl GeneratedTree {
         }
     }
 
+    fn same_position_facts_match(&self, current: &Self) -> bool {
+        match (self, current) {
+            (
+                Self::Unmeasured {
+                    style: previous_style,
+                    children: previous_children,
+                },
+                Self::Unmeasured {
+                    style: current_style,
+                    children: current_children,
+                },
+            ) => {
+                previous_style == current_style && previous_children.len() == current_children.len()
+            }
+            (
+                Self::PureSize {
+                    width: left_width,
+                    height: left_height,
+                },
+                Self::PureSize {
+                    width: right_width,
+                    height: right_height,
+                },
+            ) => left_width == right_width && left_height == right_height,
+            (
+                Self::Text {
+                    key_index: left_key,
+                    width: left_width,
+                    height: left_height,
+                },
+                Self::Text {
+                    key_index: right_key,
+                    width: right_width,
+                    height: right_height,
+                },
+            ) => left_key == right_key && left_width == right_width && left_height == right_height,
+            _ => false,
+        }
+    }
+
     fn can_host_recommitted_facts(&self, current: &Self) -> bool {
         matches!(
             (self, current),
@@ -1336,13 +1376,7 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
 
                 for (current_index, current_child) in current_children.iter().enumerate() {
                     if let Some(previous_child) = previous_children.get(current_index) {
-                        if previous_child.retained_node_matches_current_facts(current_child)
-                            && GeneratedTree::exact_child_count(current_child, current_children)
-                                == GeneratedTree::exact_child_count(
-                                    current_child,
-                                    previous_children,
-                                )
-                        {
+                        if previous_child.same_position_facts_match(current_child) {
                             previous_used[current_index] = true;
                             assigned_previous_indices[current_index] = Some(current_index);
                         }

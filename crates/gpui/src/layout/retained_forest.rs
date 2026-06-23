@@ -88,6 +88,7 @@ pub(super) struct FreshLayoutComparisonSummary {
     pub(super) checked_nodes: u64,
     pub(super) mismatches: u64,
     pub(super) equal_zero_nodes: u64,
+    pub(super) skipped_uncomparable_roots: u64,
     pub(super) target_nodes: u64,
     pub(super) target_mismatches: u64,
 }
@@ -179,9 +180,18 @@ fn snap_measured_size_to_device_pixels(size: Size<Pixels>, scale_factor: f32) ->
     size.map(|d| ceil_to_device_pixel(d.0.max(0.0), scale_factor))
 }
 
-fn retained_layout_fresh_compare_enabled() -> bool {
+fn retained_layout_fresh_compare_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GPUI_TRACE_RETAINED_LAYOUT_FRESH_COMPARE").is_some())
+}
+
+fn retained_layout_fresh_compare_assert_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GPUI_ASSERT_RETAINED_LAYOUT_FRESH_COMPARE").is_some())
+}
+
+fn retained_layout_fresh_compare_enabled() -> bool {
+    retained_layout_fresh_compare_trace_enabled() || retained_layout_fresh_compare_assert_enabled()
 }
 
 impl RetainedLayoutForest {
@@ -210,7 +220,7 @@ impl RetainedLayoutForest {
 
     /// Drop retained layout authority while preserving diagnostic configuration.
     ///
-    /// Immediate-mode proof runs use this before a frame starts. The next frame
+    /// Immediate-mode proof runs use this after a frame finishes. The next frame
     /// still goes through the same retained-layout facade and private solver
     /// path, but there are no previous retained roots or mirror nodes to reuse.
     pub(super) fn reset_retained_state_for_fresh_frame(&mut self) {
@@ -1063,11 +1073,21 @@ impl RetainedLayoutForest {
         target_layout_ids: Option<&[usize]>,
     ) -> FreshLayoutComparisonSummary {
         if !self.facts_subtree_supports_fresh_compare(root_layout_id) {
+            let summary = FreshLayoutComparisonSummary {
+                skipped_uncomparable_roots: 1,
+                ..FreshLayoutComparisonSummary::default()
+            };
             eprintln!(
                 "gpui retained_layout fresh_compare_skipped root_layout_id={} retained_root_node_id={:?} available_space={:?} reason=uncomparable_measured_node",
                 root_layout_id.0, retained_root_node_id, available_space
             );
-            return FreshLayoutComparisonSummary::default();
+            if retained_layout_fresh_compare_assert_enabled() {
+                panic!(
+                    "gpui retained-layout fresh-compare assertion cannot prove root layout_id={} because its current facts contain an uncomparable measured node",
+                    root_layout_id.0
+                );
+            }
+            return summary;
         }
 
         let mut fresh_solver = FreshLayoutSolver::<FreshLayoutCompareNodeContext>::new();
@@ -1132,7 +1152,7 @@ impl RetainedLayoutForest {
             );
         }
 
-        if let Some(mismatch) = comparison.mismatch {
+        if let Some(mismatch) = comparison.mismatch.as_ref() {
             eprintln!(
                 "gpui retained_layout fresh_compare_mismatch root_layout_id={} retained_root_node_id={:?} fresh_root_node_id={:?} available_space={:?} {}",
                 root_layout_id.0,
@@ -1141,7 +1161,7 @@ impl RetainedLayoutForest {
                 available_space,
                 mismatch
             );
-        } else if let Some(equal_zero) = comparison.equal_zero {
+        } else if let Some(equal_zero) = comparison.equal_zero.as_ref() {
             eprintln!(
                 "gpui retained_layout fresh_compare_equal_zero root_layout_id={} retained_root_node_id={:?} fresh_root_node_id={:?} available_space={:?} {}",
                 root_layout_id.0,
@@ -1149,6 +1169,18 @@ impl RetainedLayoutForest {
                 fresh_root_node_id,
                 available_space,
                 equal_zero
+            );
+        }
+
+        if retained_layout_fresh_compare_assert_enabled() && comparison.summary.mismatches != 0 {
+            panic!(
+                "gpui retained-layout fresh-compare assertion failed for root layout_id={} mismatches={} first_mismatch={}",
+                root_layout_id.0,
+                comparison.summary.mismatches,
+                comparison
+                    .mismatch
+                    .as_deref()
+                    .unwrap_or("missing mismatch detail")
             );
         }
 

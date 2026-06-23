@@ -163,6 +163,8 @@ pub struct LayoutWorkSample {
     pub retained_layout_fresh_compare_mismatches: u64,
     /// Retained-vs-fresh layout comparison nodes that matched with a zero width or height.
     pub retained_layout_fresh_compare_equal_zero_nodes: u64,
+    /// Retained-vs-fresh layout comparison roots skipped because the facts cannot be replayed fresh.
+    pub retained_layout_fresh_compare_skipped_roots: u64,
     /// Targeted retained-vs-fresh layout comparison nodes checked for the draw.
     pub retained_layout_fresh_compare_target_nodes: u64,
     /// Targeted retained-vs-fresh layout comparison nodes whose layout differed.
@@ -198,6 +200,7 @@ impl LayoutWorkSample {
         self.retained_layout_fresh_compare_nodes += summary.checked_nodes;
         self.retained_layout_fresh_compare_mismatches += summary.mismatches;
         self.retained_layout_fresh_compare_equal_zero_nodes += summary.equal_zero_nodes;
+        self.retained_layout_fresh_compare_skipped_roots += summary.skipped_uncomparable_roots;
         self.retained_layout_fresh_compare_target_nodes += summary.target_nodes;
         self.retained_layout_fresh_compare_target_mismatches += summary.target_mismatches;
     }

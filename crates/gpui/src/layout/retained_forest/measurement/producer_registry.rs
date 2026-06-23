@@ -44,8 +44,4 @@ impl ProducerRegistry {
     pub(super) fn context_mut(&mut self, measure_id: usize) -> Option<&mut LayoutMeasureContext> {
         self.contexts.get_mut(measure_id).and_then(Option::as_mut)
     }
-
-    pub(super) fn context(&self, measure_id: usize) -> Option<&LayoutMeasureContext> {
-        self.contexts.get(measure_id).and_then(Option::as_ref)
-    }
 }

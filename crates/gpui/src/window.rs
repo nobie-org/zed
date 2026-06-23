@@ -849,11 +849,10 @@ impl<'a> LayoutRequestCx<'a> {
             .request_content_size_measured_layout(style, content_size)
     }
 
-    pub(crate) fn request_text_measured_layout<F, H>(
+    pub(crate) fn request_text_measured_layout<F>(
         &mut self,
         style: Style,
         measure_key: TextMeasureKey,
-        hydrate: H,
         measure: F,
     ) -> LayoutId
     where
@@ -863,36 +862,9 @@ impl<'a> LayoutRequestCx<'a> {
                 &mut MeasureCx<'_>,
             ) -> TextLayoutArtifact
             + 'static,
-        H: Fn(&TextLayoutArtifact) + 'static,
     {
         self.window
-            .request_text_measured_layout(style, measure_key, hydrate, measure)
-    }
-
-    pub(crate) fn request_fixed_size_text_measured_layout<F, H>(
-        &mut self,
-        style: Style,
-        content_size: Size<Pixels>,
-        measure_key: TextMeasureKey,
-        hydrate: H,
-        measure: F,
-    ) -> LayoutId
-    where
-        F: FnMut(
-                Size<Option<Pixels>>,
-                Size<AvailableSpace>,
-                &mut MeasureCx<'_>,
-            ) -> TextLayoutArtifact
-            + 'static,
-        H: Fn(&TextLayoutArtifact) + 'static,
-    {
-        self.window.request_fixed_size_text_measured_layout(
-            style,
-            content_size,
-            measure_key,
-            hydrate,
-            measure,
-        )
+            .request_text_measured_layout(style, measure_key, measure)
     }
 
     pub fn rem_size(&self) -> Pixels {
@@ -995,6 +967,13 @@ pub struct MeasureCx<'a> {
 impl<'a> MeasureCx<'a> {
     pub(crate) fn new(window: &'a Window, cx: &'a App) -> Self {
         Self { window, cx }
+    }
+
+    pub(crate) fn new_for_prepaint(window: &'a PrepaintCx<'_>, cx: &'a App) -> Self {
+        Self {
+            window: window.window,
+            cx,
+        }
     }
 
     pub fn rem_size(&self) -> Pixels {
@@ -8329,11 +8308,10 @@ impl Window {
             )
     }
 
-    fn request_text_measured_layout<F, H>(
+    fn request_text_measured_layout<F>(
         &mut self,
         style: Style,
         measure_key: TextMeasureKey,
-        hydrate: H,
         measure: F,
     ) -> LayoutId
     where
@@ -8343,7 +8321,6 @@ impl Window {
                 &mut MeasureCx<'_>,
             ) -> TextLayoutArtifact
             + 'static,
-        H: Fn(&TextLayoutArtifact) + 'static,
     {
         self.invalidator.debug_assert_prepaint();
 
@@ -8352,49 +8329,7 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_text_measured_layout(
-                style,
-                rem_size,
-                scale_factor,
-                measure_key,
-                hydrate,
-                measure,
-            )
-    }
-
-    fn request_fixed_size_text_measured_layout<F, H>(
-        &mut self,
-        style: Style,
-        content_size: Size<Pixels>,
-        measure_key: TextMeasureKey,
-        hydrate: H,
-        measure: F,
-    ) -> LayoutId
-    where
-        F: FnMut(
-                Size<Option<Pixels>>,
-                Size<AvailableSpace>,
-                &mut MeasureCx<'_>,
-            ) -> TextLayoutArtifact
-            + 'static,
-        H: Fn(&TextLayoutArtifact) + 'static,
-    {
-        self.invalidator.debug_assert_prepaint();
-
-        let rem_size = self.rem_size();
-        let scale_factor = self.scale_factor();
-        self.layout_engine
-            .as_mut()
-            .unwrap()
-            .request_fixed_size_text_measured_layout(
-                style,
-                rem_size,
-                scale_factor,
-                content_size,
-                measure_key,
-                hydrate,
-                measure,
-            )
+            .request_text_measured_layout(style, rem_size, scale_factor, measure_key, measure)
     }
 
     #[cfg(any(test, feature = "test-support"))]

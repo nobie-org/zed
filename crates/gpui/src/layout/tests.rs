@@ -93,7 +93,7 @@ fn layout_work_sample_counts_compute_and_measure() {
             solver_observation_setup_duration: sample.solver_observation_setup_duration,
             solver_layout_duration: sample.solver_layout_duration,
             geometry_capture_duration: sample.geometry_capture_duration,
-            artifact_hydration_duration: sample.artifact_hydration_duration,
+            artifact_completion_duration: sample.artifact_completion_duration,
             fresh_compare_duration: sample.fresh_compare_duration,
             retained_layout_finish_frame_duration: sample.retained_layout_finish_frame_duration,
             compute_layout_duration: sample.compute_layout_duration,
@@ -108,7 +108,7 @@ fn layout_work_sample_counts_compute_and_measure() {
     assert!(sample.compute_layout_duration >= sample.retained_layout_commit_duration);
     assert!(sample.compute_layout_duration >= sample.solver_layout_duration);
     assert!(sample.compute_layout_duration >= sample.geometry_capture_duration);
-    assert!(sample.compute_layout_duration >= sample.artifact_hydration_duration);
+    assert!(sample.compute_layout_duration >= sample.artifact_completion_duration);
     assert!(sample.compute_layout_duration >= sample.solver_observation_setup_duration);
     assert!(sample.solver_layout_duration >= sample.measured_layout_duration);
     assert!(sample.measured_layout_duration > Duration::default());
@@ -317,7 +317,6 @@ fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
         Pixels(16.0),
         1.0,
         key,
-        |_| {},
         move |_, _, _| artifact.clone(),
     );
     let root = engine.request_layout_with_global_id(

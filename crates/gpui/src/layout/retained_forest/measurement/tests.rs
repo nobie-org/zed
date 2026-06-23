@@ -6,9 +6,6 @@ use crate::px;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct TestArtifactKey(&'static str);
 
-#[derive(Clone)]
-struct TestArtifact;
-
 fn test_artifact_key(key: TestArtifactKey) -> LayoutArtifactKey {
     LayoutArtifactKey::new(
         key,
@@ -30,7 +27,7 @@ fn test_artifact(key: TestArtifactKey, measured_width: f32) -> LayoutArtifact {
 }
 
 fn test_artifact_with_size(key: TestArtifactKey, measured_size: Size<Pixels>) -> LayoutArtifact {
-    LayoutArtifact::new(test_artifact_key(key), measured_size, TestArtifact)
+    LayoutArtifact::new(test_artifact_key(key), measured_size)
 }
 
 fn artifact_summary(artifact: Option<LayoutArtifact>) -> Option<(LayoutArtifactKey, Size<Pixels>)> {
@@ -156,7 +153,7 @@ fn artifact_store_retains_only_current_exact_query_cache() {
     );
 
     store.begin_frame();
-    store.record_for_query(node_id, narrow.cache_key(), &narrow_artifact);
+    store.record_for_query(narrow.cache_key(), &narrow_artifact);
     assert_eq!(
         (
             artifact_summary(store.current_artifact_for_query(&narrow.cache_key())),

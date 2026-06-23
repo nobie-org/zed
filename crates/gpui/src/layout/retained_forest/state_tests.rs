@@ -1,7 +1,7 @@
 use super::super::{LayoutId, RetainedLayoutRootId, RetainedLayoutRootSite};
 use super::{
     committed::CommittedLayoutState,
-    facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind, LayoutArtifactPolicy},
+    facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind},
     frame::CurrentLayoutFactsLog,
     geometry::FrameLayoutOutput,
     measurement::{
@@ -45,7 +45,6 @@ fn unmeasured_facts(children: Vec<LayoutId>) -> CurrentLayoutNodeFacts {
     CurrentLayoutNodeFacts {
         global_id: None,
         style: SolverStyle::default(),
-        artifact_policy: LayoutArtifactPolicy::CanProduceArtifacts,
         kind: CurrentLayoutNodeKind::Unmeasured { children },
     }
 }
@@ -54,7 +53,6 @@ fn measured_facts(measured_facts: MeasuredLayoutFacts) -> CurrentLayoutNodeFacts
     CurrentLayoutNodeFacts {
         global_id: None,
         style: SolverStyle::default(),
-        artifact_policy: LayoutArtifactPolicy::CanProduceArtifacts,
         kind: CurrentLayoutNodeKind::Measured(measured_facts),
     }
 }

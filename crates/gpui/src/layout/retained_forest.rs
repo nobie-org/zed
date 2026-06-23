@@ -28,7 +28,7 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use committed::{CommittedLayoutCheckpoint, CommittedLayoutState};
-use facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind, LayoutArtifactPolicy};
+use facts::{CurrentLayoutNodeFacts, CurrentLayoutNodeKind};
 use frame::{CurrentLayoutFactsLog, CurrentLayoutFactsLogCheckpoint};
 use geometry::{FrameLayoutOutput, FrameLayoutOutputCheckpoint};
 pub(crate) use measurement::PureSizeMeasure;
@@ -64,7 +64,7 @@ pub(super) struct ComputeLayoutWork {
     pub(super) solver_observation_setup_duration: Duration,
     pub(super) solver_layout_duration: Duration,
     pub(super) geometry_capture_duration: Duration,
-    pub(super) artifact_hydration_duration: Duration,
+    pub(super) artifact_completion_duration: Duration,
     pub(super) fresh_compare_duration: Duration,
     pub(super) compute_layout_duration: Duration,
     pub(super) measured_layout_duration: Duration,
@@ -330,7 +330,6 @@ impl RetainedLayoutForest {
     ) -> LayoutId {
         self.push_facts(CurrentLayoutNodeFacts {
             global_id: global_id.cloned(),
-            artifact_policy: LayoutArtifactPolicy::from_style(&style),
             style: SolverStyle::from_gpui_style(&style, rem_size, scale_factor),
             kind: CurrentLayoutNodeKind::Unmeasured {
                 children: children.to_vec(),
@@ -355,7 +354,6 @@ impl RetainedLayoutForest {
 
         let id = self.push_facts(CurrentLayoutNodeFacts {
             global_id: None,
-            artifact_policy: LayoutArtifactPolicy::from_style(&style),
             style: SolverStyle::from_gpui_style(&style, rem_size, scale_factor),
             kind: CurrentLayoutNodeKind::Measured(measured_facts),
         });
@@ -449,41 +447,14 @@ impl RetainedLayoutForest {
             );
         }
         let solver_observation_setup_start = std::time::Instant::now();
-        let measurement_solve_observer = {
-            let Self {
-                solver,
-                measurements,
-                committed,
-                frame,
-                ..
-            } = self;
-            measurements.solve_observer(
-                node_id,
-                |node_id| solver.children(node_id),
-                |node_id| {
-                    committed
-                        .layout_id_for_node(node_id)
-                        .map(|layout_id| {
-                            frame
-                                .facts(layout_id)
-                                .artifact_policy
-                                .can_produce_artifacts()
-                        })
-                        .unwrap_or_else(|| {
-                            panic!("solver node in legal root should have a committed layout id")
-                        })
-                },
-            )
-        };
         let mut cache_event_tracer = CacheEventTracer::new(if trace::detail_enabled() {
             self.committed.node_layout_ids_for_trace()
         } else {
             Vec::new()
         });
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
-        let observe_solver_cache_events = measurement_solve_observer.has_artifact_obligations()
-            || subtree_compute_recorder.has_active_subtrees()
-            || trace::detail_enabled();
+        let observe_solver_cache_events =
+            subtree_compute_recorder.has_active_subtrees() || trace::detail_enabled();
         let solver_observation_setup_duration = solver_observation_setup_start.elapsed();
         let solver_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
@@ -520,13 +491,9 @@ impl RetainedLayoutForest {
         }
         let geometry_capture_duration = geometry_start.elapsed();
         let artifact_start = std::time::Instant::now();
-        self.measurements.finish_completed_solve(
-            &measurement_solve_observer,
-            scale_factor,
-            window,
-            cx,
-        );
-        let artifact_hydration_duration = artifact_start.elapsed();
+        self.measurements
+            .finish_completed_solve(scale_factor, window, cx);
+        let artifact_completion_duration = artifact_start.elapsed();
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -571,7 +538,7 @@ impl RetainedLayoutForest {
             solver_observation_setup_duration,
             solver_layout_duration,
             geometry_capture_duration,
-            artifact_hydration_duration,
+            artifact_completion_duration,
             fresh_compare_duration,
             compute_layout_duration,
             measured_layout_duration,
@@ -1919,10 +1886,6 @@ impl RetainedLayoutForest {
         if left_facts.style != right_facts.style {
             return false;
         }
-        if left_facts.artifact_policy != right_facts.artifact_policy {
-            return false;
-        }
-
         match (&left_facts.kind, &right_facts.kind) {
             (
                 CurrentLayoutNodeKind::Unmeasured {

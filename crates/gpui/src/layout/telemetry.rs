@@ -135,8 +135,8 @@ pub struct LayoutWorkSample {
     pub solver_layout_duration: Duration,
     /// Wall time spent copying solver scratch layouts into GPUI frame geometry.
     pub geometry_capture_duration: Duration,
-    /// Wall time spent hydrating GPUI-owned post-solve layout artifacts.
-    pub artifact_hydration_duration: Duration,
+    /// Wall time spent completing GPUI-owned post-solve artifact proofs.
+    pub artifact_completion_duration: Duration,
     /// Wall time spent in optional retained-vs-fresh diagnostic comparison.
     pub fresh_compare_duration: Duration,
     /// Wall time spent finishing retained layout state for the frame.
@@ -147,7 +147,7 @@ pub struct LayoutWorkSample {
     /// Total wall time spent computing retained root layouts.
     ///
     /// This spans retained commit, solver execution, frame-geometry capture,
-    /// artifact hydration, and optional fresh comparison. Use the phase fields
+    /// artifact completion, and optional fresh comparison. Use the phase fields
     /// above for ownership attribution.
     pub compute_layout_duration: Duration,
     /// Wall time spent inside measured layout work counted by

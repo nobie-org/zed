@@ -124,36 +124,21 @@ impl Hash for LayoutArtifactKey {
     }
 }
 
-/// GPUI-owned artifact valid for one artifact key and measured size.
+/// GPUI-owned measurement artifact valid for one artifact key and measured size.
 ///
-/// Layout never interprets the payload. Consumers downcast only at the facade
-/// edge that created the request, after retained measurement has proven the
-/// artifact key and solver query.
+/// Retained measurement only needs enough data to answer the same exact solver
+/// query without invoking the producer again. Paint/hit-test payloads belong to
+/// their owning elements, not to the layout measurement cache.
 #[derive(Clone)]
 pub(in crate::layout) struct LayoutArtifact {
     key: LayoutArtifactKey,
     size: Size<Pixels>,
-    payload: Rc<dyn Any>,
 }
 
 impl LayoutArtifact {
-    /// Wrap an artifact payload after the producer has computed its measured
-    /// size and explicit key.
-    pub(in crate::layout) fn new<T: 'static>(
-        key: LayoutArtifactKey,
-        size: Size<Pixels>,
-        payload: T,
-    ) -> Self {
-        Self {
-            key,
-            size,
-            payload: Rc::new(payload),
-        }
-    }
-
-    /// Downcast the payload at the typed consumer boundary.
-    pub(in crate::layout) fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.payload.downcast_ref::<T>()
+    /// Record a measured size for explicit artifact facts.
+    pub(in crate::layout) fn new(key: LayoutArtifactKey, size: Size<Pixels>) -> Self {
+        Self { key, size }
     }
 
     pub(super) fn key(&self) -> &LayoutArtifactKey {
@@ -171,7 +156,6 @@ impl LayoutArtifact {
 /// artifact validity facts GPUI can prove in the current solve: exact
 /// query-keyed artifacts observed from callbacks or passive solver cache events.
 pub(super) struct ArtifactStore {
-    current_artifacts: FxHashMap<SolverNodeId, LayoutArtifact>,
     current_query_artifacts: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
     pending_proofs: Vec<ArtifactProof>,
     query_cache: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
@@ -179,7 +163,6 @@ pub(super) struct ArtifactStore {
 
 /// Transaction checkpoint for GPUI-owned artifact validity.
 pub(super) struct ArtifactStoreCheckpoint {
-    current_artifacts: FxHashMap<SolverNodeId, LayoutArtifact>,
     current_query_artifacts: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
     pending_proofs: Vec<ArtifactProof>,
     query_cache: FxHashMap<ArtifactCacheKey, LayoutArtifact>,
@@ -203,7 +186,6 @@ pub(super) struct ArtifactProof {
 impl ArtifactStore {
     pub(super) fn new() -> Self {
         Self {
-            current_artifacts: FxHashMap::default(),
             current_query_artifacts: FxHashMap::default(),
             pending_proofs: Vec::new(),
             query_cache: FxHashMap::default(),
@@ -211,21 +193,18 @@ impl ArtifactStore {
     }
 
     pub(super) fn begin_frame(&mut self) {
-        self.current_artifacts.clear();
         self.current_query_artifacts.clear();
         self.pending_proofs.clear();
     }
 
     pub(super) fn finish_frame(&mut self) {
         self.retain_current_query_cache();
-        self.current_artifacts.clear();
         self.current_query_artifacts.clear();
         self.pending_proofs.clear();
     }
 
     pub(super) fn checkpoint(&self) -> ArtifactStoreCheckpoint {
         ArtifactStoreCheckpoint {
-            current_artifacts: self.current_artifacts.clone(),
             current_query_artifacts: self.current_query_artifacts.clone(),
             pending_proofs: self.pending_proofs.clone(),
             query_cache: self.query_cache.clone(),
@@ -233,7 +212,6 @@ impl ArtifactStore {
     }
 
     pub(super) fn rollback_to_checkpoint(&mut self, checkpoint: ArtifactStoreCheckpoint) {
-        self.current_artifacts = checkpoint.current_artifacts;
         self.current_query_artifacts = checkpoint.current_query_artifacts;
         self.pending_proofs = checkpoint.pending_proofs;
         self.query_cache = checkpoint.query_cache;
@@ -245,14 +223,6 @@ impl ArtifactStore {
 
     pub(super) fn take_pending_proofs(&mut self) -> Vec<ArtifactProof> {
         std::mem::take(&mut self.pending_proofs)
-    }
-
-    pub(super) fn current_artifact(&self, node_id: SolverNodeId) -> Option<LayoutArtifact> {
-        self.current_artifacts.get(&node_id).cloned()
-    }
-
-    pub(super) fn has_current_artifact(&self, node_id: SolverNodeId) -> bool {
-        self.current_artifacts.contains_key(&node_id)
     }
 
     pub(super) fn artifact_for_query(
@@ -271,7 +241,6 @@ impl ArtifactStore {
 
     pub(super) fn record_for_query(
         &mut self,
-        node_id: SolverNodeId,
         cache_key: ArtifactCacheKey,
         artifact: &LayoutArtifact,
     ) {
@@ -289,8 +258,6 @@ impl ArtifactStore {
                 artifact.size(),
                 "same artifact query should not select artifacts with different sizes"
             );
-        } else {
-            self.current_artifacts.insert(node_id, artifact.clone());
         }
     }
 

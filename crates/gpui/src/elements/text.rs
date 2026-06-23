@@ -49,10 +49,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
-        _cx: &mut App,
+        window: &mut PrepaintCx<'_>,
+        cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self)
+        text_layout.prepaint(bounds, self, window, cx)
     }
 
     fn paint(
@@ -123,10 +123,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
-        _cx: &mut App,
+        window: &mut PrepaintCx<'_>,
+        cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref())
+        text_layout.prepaint(bounds, self.as_ref(), window, cx)
     }
 
     fn paint(
@@ -349,10 +349,10 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
-        _cx: &mut App,
+        window: &mut PrepaintCx<'_>,
+        cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text)
+        self.layout.prepaint(bounds, &self.text, window, cx)
     }
 
     fn paint(
@@ -377,104 +377,21 @@ impl IntoElement for StyledText {
     }
 }
 
-/// Construct text whose layout contribution is an explicit fixed size.
-///
-/// This is for diagnostic/HUD/readout-style text that paints inside a known box
-/// and must not make changing glyph payloads look like intrinsic layout facts.
-/// Ordinary string children remain intrinsic measured text.
-pub fn fixed_text(text: impl Into<SharedString>, content_size: Size<Pixels>) -> FixedSizeText {
-    FixedSizeText::new(text, content_size)
-}
-
-/// Text painted inside a fixed layout box.
-///
-/// The retained layout tree sees this as a generic measured node with a pure
-/// size answer. Text shaping remains a GPUI artifact validated from the exact
-/// solver query, so changing the text can update pixels without dirtying layout
-/// when the fixed size is unchanged.
-pub struct FixedSizeText {
-    text: SharedString,
-    content_size: Size<Pixels>,
-    layout: TextLayout,
-}
-
-impl FixedSizeText {
-    /// Create fixed-layout text with an explicit content size.
-    pub fn new(text: impl Into<SharedString>, content_size: Size<Pixels>) -> Self {
-        Self {
-            text: text.into(),
-            content_size,
-            layout: TextLayout::default(),
-        }
-    }
-}
-
-impl Element for FixedSizeText {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut LayoutRequestCx<'_>,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout_id =
-            self.layout
-                .layout_fixed_size(self.text.clone(), self.content_size, window, cx);
-        (layout_id, ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        _window: &mut PrepaintCx<'_>,
-        _cx: &mut App,
-    ) {
-        self.layout.prepaint(bounds, &self.text)
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        window: &mut PaintCx<'_>,
-        cx: &mut App,
-    ) {
-        self.layout.paint(&self.text, window, cx)
-    }
-}
-
-impl IntoElement for FixedSizeText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 /// The frame-local layout state for a text element.
 ///
 /// Paint, prepaint, and hit testing need shaped lines in this handle. Retained
-/// layout hydrates `TextLayout` only from a current compute callback or an
-/// exact query-keyed artifact selected by passive Taffy cache observation.
+/// layout uses Taffy's measurement callback only as a pure size query; prepaint
+/// installs the paint artifact from the final solved bounds and explicit text
+/// facts. Text correctness therefore does not depend on whether the solver calls
+/// or skips a measurement callback.
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct TextLayout(Rc<RefCell<TextLayoutState>>);
+
+#[derive(Default)]
+struct TextLayoutState {
+    measure_key: Option<TextMeasureKey>,
+    inner: Option<TextLayoutInner>,
+}
 
 #[derive(Clone)]
 struct TextLayoutInner {
@@ -537,8 +454,9 @@ impl TextMeasureKey {
 
     /// Produce a shaped text artifact for one Taffy measurement query.
     ///
-    /// This returns data only. Hydrating `TextLayout` is a separate step owned
-    /// by the layout engine's same-compute measurement callback.
+    /// This returns data only. Paintable `TextLayout` state is installed during
+    /// prepaint from final solved bounds, so the solver callback remains a pure
+    /// size producer.
     pub(crate) fn measure(
         &self,
         known_dimensions: Size<Option<Pixels>>,
@@ -623,6 +541,22 @@ impl TextMeasureKey {
             },
         }
     }
+
+    fn measure_for_paint_bounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        measure_cx: &mut MeasureCx<'_>,
+    ) -> TextLayoutArtifact {
+        self.measure(
+            bounds.size.map(Some),
+            bounds.size.map(crate::AvailableSpace::Definite),
+            measure_cx,
+        )
+    }
+
+    fn assert_matches_artifact(&self, artifact: &TextLayoutArtifact, message: &'static str) {
+        assert_eq!(artifact.key(), self, "{message}");
+    }
 }
 
 /// Shaped text data valid for one `TextMeasureKey` and measurement query.
@@ -664,7 +598,7 @@ impl TextLayoutArtifact {
 }
 
 impl TextLayout {
-    /// Request measured layout for this text and register artifact hydration.
+    /// Request measured layout for this text.
     fn layout(
         &self,
         text: SharedString,
@@ -695,52 +629,11 @@ impl TextLayout {
             window.text_system().shaping_epoch(),
         );
         let measure_key_for_measure = measure_key.clone();
-        let layout = self.clone();
+        self.set_measure_key(measure_key.clone());
 
         window.request_text_measured_layout(
             Default::default(),
             measure_key,
-            move |artifact| layout.hydrate(artifact),
-            move |known_dimensions, available_space, measure_cx| {
-                measure_key_for_measure.measure(known_dimensions, available_space, measure_cx)
-            },
-        )
-    }
-
-    /// Request fixed-size layout for text while keeping text shaping as an artifact.
-    fn layout_fixed_size(
-        &self,
-        text: SharedString,
-        content_size: Size<Pixels>,
-        window: &mut LayoutRequestCx<'_>,
-        _cx: &mut App,
-    ) -> LayoutId {
-        let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
-
-        let runs = vec![text_style.to_run(text.len())];
-        let measure_key = TextMeasureKey::new(
-            text,
-            runs,
-            &text_style,
-            font_size,
-            line_height,
-            window.scale_factor(),
-            window.text_system().shaping_epoch(),
-        );
-        let measure_key_for_measure = measure_key.clone();
-        let layout = self.clone();
-
-        window.request_fixed_size_text_measured_layout(
-            Default::default(),
-            content_size,
-            measure_key,
-            move |artifact| layout.hydrate(artifact),
             move |known_dimensions, available_space, measure_cx| {
                 measure_key_for_measure.measure(known_dimensions, available_space, measure_cx)
             },
@@ -748,25 +641,60 @@ impl TextLayout {
     }
 
     /// Install a newly measured artifact into this frame's layout state.
-    fn hydrate(&self, artifact: &TextLayoutArtifact) {
+    fn install_artifact(&self, artifact: &TextLayoutArtifact) {
         let mut state = self.0.borrow_mut();
         let mut inner = artifact.inner.clone();
         inner.bounds = None;
-        state.replace(inner);
+        state.inner = Some(inner);
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+    fn set_measure_key(&self, key: TextMeasureKey) {
+        let mut state = self.0.borrow_mut();
+        state.measure_key = Some(key);
+        state.inner = None;
+    }
+
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &mut PrepaintCx<'_>, cx: &App) {
+        self.install_artifact_for_paint_bounds(bounds, text, window, cx);
         let mut element_state = self.0.borrow_mut();
         let element_state = element_state
+            .inner
             .as_mut()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
         element_state.bounds = Some(bounds);
     }
 
+    fn install_artifact_for_paint_bounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        text: &str,
+        window: &mut PrepaintCx<'_>,
+        cx: &App,
+    ) {
+        let key = {
+            let state = self.0.borrow();
+            state
+                .measure_key
+                .clone()
+                .with_context(|| format!("text facts have not been recorded for {text}"))
+                .unwrap()
+        };
+        let artifact = {
+            let mut measure_cx = MeasureCx::new_for_prepaint(window, cx);
+            key.measure_for_paint_bounds(bounds, &mut measure_cx)
+        };
+        key.assert_matches_artifact(
+            &artifact,
+            "text paint artifact should match the current text facts",
+        );
+        self.install_artifact(&artifact);
+    }
+
     fn paint(&self, text: &str, window: &mut PaintCx<'_>, cx: &mut App) {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .inner
             .as_ref()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
@@ -805,6 +733,7 @@ impl TextLayout {
     pub fn index_for_position(&self, mut position: Point<Pixels>) -> Result<usize, usize> {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .inner
             .as_ref()
             .expect("measurement has not been performed");
         let bounds = element_state
@@ -839,6 +768,7 @@ impl TextLayout {
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .inner
             .as_ref()
             .expect("measurement has not been performed");
         let bounds = element_state
@@ -870,6 +800,7 @@ impl TextLayout {
     pub fn line_layout_for_index(&self, index: usize) -> Option<Arc<WrappedLineLayout>> {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .inner
             .as_ref()
             .expect("measurement has not been performed");
         let bounds = element_state
@@ -898,23 +829,24 @@ impl TextLayout {
 
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.0.borrow().as_ref().unwrap().bounds.unwrap()
+        self.0.borrow().inner.as_ref().unwrap().bounds.unwrap()
     }
 
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
-        self.0.borrow().as_ref().unwrap().line_height
+        self.0.borrow().inner.as_ref().unwrap().line_height
     }
 
     /// The UTF-8 length of the underlying text.
     pub fn len(&self) -> usize {
-        self.0.borrow().as_ref().unwrap().len
+        self.0.borrow().inner.as_ref().unwrap().len
     }
 
     /// The text for this layout.
     pub fn text(&self) -> String {
         self.0
             .borrow()
+            .inner
             .as_ref()
             .unwrap()
             .lines
@@ -927,7 +859,7 @@ impl TextLayout {
     pub fn wrapped_text(&self) -> String {
         let mut accumulator = String::new();
 
-        for wrapped in self.0.borrow().as_ref().unwrap().lines.iter() {
+        for wrapped in self.0.borrow().inner.as_ref().unwrap().lines.iter() {
             let mut seen = 0;
             for boundary in wrapped.layout.wrap_boundaries.iter() {
                 let index = wrapped.layout.unwrapped_layout.runs[boundary.run_ix].glyphs

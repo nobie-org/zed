@@ -325,21 +325,17 @@ impl LayoutEngine {
         )
     }
 
-    /// Record a text measured layout intent with explicit artifact hydration.
+    /// Record a text measured layout intent with explicit artifact facts.
     ///
-    /// GPUI needs the shaped text artifact for paint and hit testing. The
-    /// retained forest never replays an artifact from `TextMeasureKey` alone:
-    /// it hydrates from the current callback, an exact query-keyed cache
-    /// observation, or a current solver final-layout cache observation that
-    /// selects a validated artifact bundle for the solved subtree. Retained node
-    /// identity and old solve context are never artifact proof.
+    /// The solver callback answers size. Text prepaint owns shaped paint and
+    /// hit-test artifacts from final solved bounds, so layout measurement never
+    /// needs a side-effecting hydrator to make text paintable.
     pub(crate) fn request_text_measured_layout(
         &mut self,
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
         measure_key: TextMeasureKey,
-        hydrate: impl Fn(&TextLayoutArtifact) + 'static,
         mut measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
@@ -355,62 +351,10 @@ impl LayoutEngine {
             scale_factor,
             MeasuredLayoutRequest::artifact(
                 artifact_key,
-                move |artifact| {
-                    let artifact = artifact
-                        .downcast_ref::<TextLayoutArtifact>()
-                        .expect("text measured layout should hydrate a text artifact");
-                    hydrate(artifact)
-                },
                 move |known_dimensions, available_space, measure_cx| {
                     let artifact = measure(known_dimensions, available_space, measure_cx);
                     let artifact_key = text_layout_artifact_key(artifact.key().clone());
-                    LayoutArtifact::new(artifact_key, artifact.size(), artifact)
-                },
-            ),
-        )
-    }
-
-    /// Record text whose layout answer is explicit and whose glyphs are an artifact.
-    ///
-    /// This is for text drawn inside a layout-stable box. The fixed content size
-    /// is the measured layout fact; the `TextMeasureKey` is only artifact
-    /// validity. Changing the text can therefore hydrate a new artifact without
-    /// dirtying the solver as long as the fixed measured answer is unchanged.
-    pub(crate) fn request_fixed_size_text_measured_layout(
-        &mut self,
-        style: Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-        content_size: Size<Pixels>,
-        measure_key: TextMeasureKey,
-        hydrate: impl Fn(&TextLayoutArtifact) + 'static,
-        mut measure: impl FnMut(
-            Size<Option<Pixels>>,
-            Size<AvailableSpace>,
-            &mut MeasureCx<'_>,
-        ) -> TextLayoutArtifact
-        + 'static,
-    ) -> LayoutId {
-        self.layout_work.measured_layout_node_requests += 1;
-        let layout_measure = PureSizeMeasure::content_size(content_size, scale_factor);
-        let artifact_key = text_layout_artifact_key(measure_key);
-        self.forest.request_measured_layout(
-            style,
-            rem_size,
-            scale_factor,
-            MeasuredLayoutRequest::artifact_with_pure_size(
-                layout_measure,
-                artifact_key,
-                move |artifact| {
-                    let artifact = artifact
-                        .downcast_ref::<TextLayoutArtifact>()
-                        .expect("fixed-size text measured layout should hydrate a text artifact");
-                    hydrate(artifact)
-                },
-                move |known_dimensions, available_space, measure_cx| {
-                    let artifact = measure(known_dimensions, available_space, measure_cx);
-                    let artifact_key = text_layout_artifact_key(artifact.key().clone());
-                    LayoutArtifact::new(artifact_key, content_size, artifact)
+                    LayoutArtifact::new(artifact_key, artifact.size())
                 },
             ),
         )
@@ -489,7 +433,7 @@ impl LayoutEngine {
             compute_work.solver_observation_setup_duration;
         self.layout_work.solver_layout_duration += compute_work.solver_layout_duration;
         self.layout_work.geometry_capture_duration += compute_work.geometry_capture_duration;
-        self.layout_work.artifact_hydration_duration += compute_work.artifact_hydration_duration;
+        self.layout_work.artifact_completion_duration += compute_work.artifact_completion_duration;
         self.layout_work.fresh_compare_duration += compute_work.fresh_compare_duration;
         self.layout_work.compute_layout_duration += compute_work.compute_layout_duration;
         self.layout_work.measured_layout_calls += compute_work.measured_layout_calls;

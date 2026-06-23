@@ -1,17 +1,11 @@
 use super::*;
 use crate::{
-    AbsoluteLength, DefiniteLength, Display, Drawable, Edges, Element, ElementId, FlexDirection,
-    FlexWrap, GlobalElementId, GridPlacement, GridTemplate, InspectorElementId, IntoElement,
-    LayoutRequestCx, Length, Overflow, PaintCx, ParentElement as _, Position, PrepaintCx,
-    SharedString, Styled as _, TemplateColumnMinSize, TestAppContext, TextOverflow, TextStyle,
-    VisualTestContext, WhiteSpace, div, point, px, size,
+    AbsoluteLength, DefiniteLength, Display, Edges, ElementId, FlexDirection, FlexWrap,
+    GlobalElementId, GridPlacement, GridTemplate, IntoElement, Length, Overflow,
+    ParentElement as _, Position, SharedString, Styled as _, TemplateColumnMinSize, TestAppContext,
+    TextOverflow, TextStyle, VisualTestContext, WhiteSpace, div, point, px, size,
 };
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    sync::Arc,
-    time::Duration,
-};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 fn style_with_width(width: f32) -> Style {
     let mut style = Style::default();
@@ -539,16 +533,8 @@ fn request_text_measured(
     key: TextMeasureKey,
     size: Size<Pixels>,
     measure_invocations: Rc<Cell<usize>>,
-    hydrations: Rc<Cell<usize>>,
 ) -> LayoutId {
-    request_text_measured_with_hydration_log(
-        engine,
-        key,
-        size,
-        measure_invocations,
-        hydrations,
-        None,
-    )
+    request_text_measured_with_measure_log(engine, key, size, measure_invocations)
 }
 
 fn request_text_measured_with_style(
@@ -562,7 +548,6 @@ fn request_text_measured_with_style(
         px(16.0),
         1.0,
         key.clone(),
-        |_| {},
         move |known_dimensions, available_space, _| {
             TextLayoutArtifact::for_tests(
                 key.clone(),
@@ -590,12 +575,6 @@ fn text_artifact_size_for_query(
             AvailableSpace::MinContent | AvailableSpace::MaxContent => fallback_size.height,
         });
     size(width, height)
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct HydratedTextArtifact {
-    key: TextMeasureKey,
-    size: Size<Pixels>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -729,15 +708,6 @@ struct CanvasChromeFrameOutputForTests {
     bounds: RetainedLayoutBoundsTreeForTests,
     canvas_chain_sizes: (Size<f32>, Size<f32>, Size<f32>, Size<f32>),
     canvas_is_paintable: (bool, bool),
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GeneratedTextHydration {
-    label: u16,
-    key_index: u8,
-    width: u16,
-    height: u16,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1257,7 +1227,6 @@ fn request_generated_tree(engine: &mut LayoutEngine, tree: &GeneratedTree) -> La
                 px(16.0),
                 1.0,
                 key.clone(),
-                |_| {},
                 move |known_dimensions, available_space, _| {
                     TextLayoutArtifact::for_tests(
                         key.clone(),
@@ -1700,28 +1669,17 @@ impl ExpectedMutationCountsExt for RetainedForestMutationSample {
     }
 }
 
-fn request_text_measured_with_hydration_log(
+fn request_text_measured_with_measure_log(
     engine: &mut LayoutEngine,
     key: TextMeasureKey,
     size: Size<Pixels>,
     measure_invocations: Rc<Cell<usize>>,
-    hydrations: Rc<Cell<usize>>,
-    hydrated_artifacts: Option<Rc<RefCell<Vec<HydratedTextArtifact>>>>,
 ) -> LayoutId {
     engine.request_text_measured_layout(
         Style::default(),
         px(16.0),
         1.0,
         key.clone(),
-        move |artifact| {
-            hydrations.set(hydrations.get() + 1);
-            if let Some(hydrated_artifacts) = hydrated_artifacts.as_ref() {
-                hydrated_artifacts.borrow_mut().push(HydratedTextArtifact {
-                    key: artifact.key().clone(),
-                    size: artifact.size(),
-                });
-            }
-        },
         move |known_dimensions, available_space, _| {
             measure_invocations.set(measure_invocations.get() + 1);
             TextLayoutArtifact::for_tests(
@@ -1732,47 +1690,14 @@ fn request_text_measured_with_hydration_log(
     )
 }
 
-fn request_fixed_size_text_measured_with_hydration_log(
-    engine: &mut LayoutEngine,
-    key: TextMeasureKey,
-    layout_size: Size<Pixels>,
-    artifact_size: Size<Pixels>,
-    measure_invocations: Rc<Cell<usize>>,
-    hydrations: Rc<Cell<usize>>,
-    hydrated_artifacts: Rc<RefCell<Vec<HydratedTextArtifact>>>,
-) -> LayoutId {
-    engine.request_fixed_size_text_measured_layout(
-        Style::default(),
-        px(16.0),
-        1.0,
-        layout_size,
-        key.clone(),
-        move |artifact| {
-            hydrations.set(hydrations.get() + 1);
-            hydrated_artifacts.borrow_mut().push(HydratedTextArtifact {
-                key: artifact.key().clone(),
-                size: artifact.size(),
-            });
-        },
-        move |known_dimensions, available_space, _| {
-            measure_invocations.set(measure_invocations.get() + 1);
-            TextLayoutArtifact::for_tests(
-                key.clone(),
-                text_artifact_size_for_query(artifact_size, known_dimensions, available_space),
-            )
-        },
-    )
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn request_input_sensitive_text_measured(
     engine: &mut LayoutEngine,
-    label: u16,
+    _label: u16,
     key_index: u8,
     fallback_width: u16,
     height: u16,
     measure_invocations: Rc<Cell<usize>>,
-    hydrated_artifacts: Rc<RefCell<Vec<GeneratedTextHydration>>>,
 ) -> LayoutId {
     let key = generated_text_measure_key(key_index, fallback_width, height);
     let measure_key = key.clone();
@@ -1781,17 +1706,6 @@ fn request_input_sensitive_text_measured(
         px(16.0),
         1.0,
         key,
-        move |artifact| {
-            let size = artifact.size();
-            hydrated_artifacts
-                .borrow_mut()
-                .push(GeneratedTextHydration {
-                    label,
-                    key_index,
-                    width: size.width.0.round() as u16,
-                    height: size.height.0.round() as u16,
-                });
-        },
         move |known_dimensions, available_space, _| {
             measure_invocations.set(measure_invocations.get() + 1);
             let measured_width = known_dimensions
@@ -1814,12 +1728,11 @@ fn request_input_sensitive_text_measured(
 #[cfg(not(target_arch = "wasm32"))]
 fn request_growing_input_sensitive_text_measured(
     engine: &mut LayoutEngine,
-    label: u16,
+    _label: u16,
     key_index: u8,
     fallback_width: u16,
     height: u16,
     measure_invocations: Rc<Cell<usize>>,
-    hydrated_artifacts: Rc<RefCell<Vec<GeneratedTextHydration>>>,
 ) -> LayoutId {
     let key = generated_text_measure_key(key_index, fallback_width, height);
     let measure_key = key.clone();
@@ -1833,17 +1746,6 @@ fn request_growing_input_sensitive_text_measured(
         px(16.0),
         1.0,
         key,
-        move |artifact| {
-            let size = artifact.size();
-            hydrated_artifacts
-                .borrow_mut()
-                .push(GeneratedTextHydration {
-                    label,
-                    key_index,
-                    width: size.width.0.round() as u16,
-                    height: size.height.0.round() as u16,
-                });
-        },
         move |known_dimensions, available_space, _| {
             measure_invocations.set(measure_invocations.get() + 1);
             let measured_width = known_dimensions
@@ -2747,14 +2649,13 @@ fn same_frame_root_recompute_panics(cx: &mut TestAppContext) {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext) {
+fn generated_text_exact_repeat_reuses_measurement_query_cache(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     hegel::Hegel::new(|tc| {
         let key_index = draw_u8(&tc, 0, 3);
         let width = draw_u16(&tc, 1, 240);
         let height = draw_u16(&tc, 1, 120);
         let measure_invocations = Rc::new(Cell::new(0));
-        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut engine = LayoutEngine::new();
 
         let root = request_input_sensitive_text_measured(
@@ -2764,7 +2665,6 @@ fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext
             width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, width);
         engine.finish_frame();
@@ -2777,30 +2677,12 @@ fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext
             width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, width);
 
         assert_eq!(measure_invocations.get(), 1);
         assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
         assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
-        assert_eq!(
-            hydrated_artifacts.borrow().as_slice(),
-            [
-                GeneratedTextHydration {
-                    label: 0,
-                    key_index,
-                    width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index,
-                    width,
-                    height,
-                },
-            ]
-        );
     })
     .settings(hegel_settings(64))
     .run();
@@ -2808,14 +2690,15 @@ fn generated_text_exact_repeat_hydrates_from_query_cache(cx: &mut TestAppContext
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn generated_text_descendant_hydrates_when_parent_final_layout_cache_hits(cx: &mut TestAppContext) {
+fn generated_text_descendant_skips_callback_when_parent_final_layout_cache_hits(
+    cx: &mut TestAppContext,
+) {
     let cx = cx.add_empty_window();
     let key_index = 0;
     let fallback_width = 80;
     let height = 18;
     let root_width = 120;
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
     let mut engine = LayoutEngine::new();
 
     let text = request_input_sensitive_text_measured(
@@ -2825,14 +2708,11 @@ fn generated_text_descendant_hydrates_when_parent_final_layout_cache_hits(cx: &m
         fallback_width,
         height,
         measure_invocations.clone(),
-        hydrated_artifacts.clone(),
     );
     let root = request_container(&mut engine, &[text]);
     compute_generated_text_root(cx, &mut engine, root, root_width);
     engine.finish_frame();
-    let first_hydration = hydrated_artifacts.borrow()[0].clone();
     measure_invocations.set(0);
-    hydrated_artifacts.borrow_mut().clear();
 
     let text = request_input_sensitive_text_measured(
         &mut engine,
@@ -2841,7 +2721,6 @@ fn generated_text_descendant_hydrates_when_parent_final_layout_cache_hits(cx: &m
         fallback_width,
         height,
         measure_invocations.clone(),
-        hydrated_artifacts.clone(),
     );
     let root = request_container(&mut engine, &[text]);
     compute_generated_text_root(cx, &mut engine, root, root_width);
@@ -2849,16 +2728,7 @@ fn generated_text_descendant_hydrates_when_parent_final_layout_cache_hits(cx: &m
     assert_eq!(
         measure_invocations.get(),
         0,
-        "unchanged text descendant should hydrate from the parent's final-layout cache hit"
-    );
-    assert_eq!(
-        hydrated_artifacts.borrow().as_slice(),
-        [GeneratedTextHydration {
-            label: 1,
-            key_index,
-            width: first_hydration.width,
-            height: first_hydration.height,
-        }]
+        "unchanged text descendant should reuse the solver measurement cache"
     );
 }
 
@@ -2873,7 +2743,6 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
         let second_width = first_width + width_delta;
         let height = draw_u16(&tc, 1, 120);
         let measure_invocations = Rc::new(Cell::new(0));
-        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut engine = LayoutEngine::new();
 
         let root = request_input_sensitive_text_measured(
@@ -2883,7 +2752,6 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
             first_width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, first_width);
         engine.finish_frame();
@@ -2896,30 +2764,12 @@ fn generated_text_same_key_new_available_width_remeasures(cx: &mut TestAppContex
             second_width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, second_width);
 
         assert_eq!(measure_invocations.get(), 2);
         assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
         assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
-        assert_eq!(
-            hydrated_artifacts.borrow().as_slice(),
-            [
-                GeneratedTextHydration {
-                    label: 0,
-                    key_index,
-                    width: first_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index,
-                    width: second_width,
-                    height,
-                },
-            ]
-        );
     })
     .settings(hegel_settings(64))
     .run();
@@ -2937,7 +2787,6 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
         let root_width = second_parent_width + draw_u16(&tc, 1, 40);
         let height = draw_u16(&tc, 1, 120);
         let retained_measure_invocations = Rc::new(Cell::new(0));
-        let retained_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut engine = LayoutEngine::new();
 
         let text = request_input_sensitive_text_measured(
@@ -2947,7 +2796,6 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
             fallback_width,
             height,
             retained_measure_invocations.clone(),
-            retained_hydrated_artifacts.clone(),
         );
         let parent = engine.request_layout(
             style_with_width(first_parent_width as f32),
@@ -2959,7 +2807,6 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
         compute_generated_text_root(cx, &mut engine, root, root_width);
         engine.finish_frame();
         retained_measure_invocations.set(0);
-        retained_hydrated_artifacts.borrow_mut().clear();
 
         let text = request_input_sensitive_text_measured(
             &mut engine,
@@ -2968,7 +2815,6 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
             fallback_width,
             height,
             retained_measure_invocations.clone(),
-            retained_hydrated_artifacts.clone(),
         );
         let parent = engine.request_layout(
             style_with_width(second_parent_width as f32),
@@ -2980,7 +2826,6 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
         compute_generated_text_root(cx, &mut engine, root, root_width);
 
         let fresh_measure_invocations = Rc::new(Cell::new(0));
-        let fresh_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut fresh_engine = LayoutEngine::new();
         let fresh_text = request_input_sensitive_text_measured(
             &mut fresh_engine,
@@ -2989,7 +2834,6 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
             fallback_width,
             height,
             fresh_measure_invocations.clone(),
-            fresh_hydrated_artifacts.clone(),
         );
         let fresh_parent = fresh_engine.request_layout(
             style_with_width(second_parent_width as f32),
@@ -3006,9 +2850,9 @@ fn generated_text_same_key_new_parent_width_remeasures(cx: &mut TestAppContext) 
             "fresh layout should observe the current-frame text measurement query"
         );
         assert_eq!(
-            retained_hydrated_artifacts.borrow().as_slice(),
-            fresh_hydrated_artifacts.borrow().as_slice(),
-            "retained layout must hydrate text artifacts equivalent to a fresh current-frame layout"
+            retained_measure_invocations.get(),
+            fresh_measure_invocations.get(),
+            "retained layout should measure the same current-frame text query as fresh layout"
         );
         assert_eq!(
             engine.layout_work_sample().solver_compute_layout_calls,
@@ -3031,7 +2875,6 @@ fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) 
     let root_width = 4;
     let height = 1;
     let retained_measure_invocations = Rc::new(Cell::new(0));
-    let retained_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
     let mut engine = LayoutEngine::new();
 
     let text = request_input_sensitive_text_measured(
@@ -3041,7 +2884,6 @@ fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) 
         fallback_width,
         height,
         retained_measure_invocations.clone(),
-        retained_hydrated_artifacts.clone(),
     );
     let parent = engine.request_layout(
         style_with_width(first_parent_width as f32),
@@ -3053,7 +2895,6 @@ fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) 
     compute_generated_text_root(cx, &mut engine, root, root_width);
     engine.finish_frame();
     retained_measure_invocations.set(0);
-    retained_hydrated_artifacts.borrow_mut().clear();
 
     let text = request_input_sensitive_text_measured(
         &mut engine,
@@ -3062,7 +2903,6 @@ fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) 
         fallback_width,
         height,
         retained_measure_invocations.clone(),
-        retained_hydrated_artifacts.clone(),
     );
     let parent = engine.request_layout(
         style_with_width(second_parent_width as f32),
@@ -3073,27 +2913,18 @@ fn text_same_key_new_parent_width_minimized_remeasures(cx: &mut TestAppContext) 
     let root = request_container(&mut engine, &[parent]);
     compute_generated_text_root(cx, &mut engine, root, root_width);
 
-    assert_eq!(
-        retained_hydrated_artifacts.borrow().as_slice(),
-        [GeneratedTextHydration {
-            label: 1,
-            key_index,
-            width: 2,
-            height,
-        }]
-    );
+    assert_eq!(retained_measure_invocations.get(), 1);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[gpui::test]
-fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut TestAppContext) {
+fn text_same_key_changed_flex_sibling_width_matches_fresh_layout(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key_index = 0;
     let fallback_width = 120;
     let height = 1;
     let root_width = 100;
     let retained_measure_invocations = Rc::new(Cell::new(0));
-    let retained_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
     let mut engine = LayoutEngine::new();
 
     let text = request_growing_input_sensitive_text_measured(
@@ -3103,14 +2934,12 @@ fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut Tes
         fallback_width,
         height,
         retained_measure_invocations.clone(),
-        retained_hydrated_artifacts.clone(),
     );
     let sibling = request_leaf(&mut engine, 10.0);
     let root = request_flex_container(&mut engine, &[text, sibling]);
     compute_generated_text_root(cx, &mut engine, root, root_width);
     engine.finish_frame();
     retained_measure_invocations.set(0);
-    retained_hydrated_artifacts.borrow_mut().clear();
 
     let text = request_growing_input_sensitive_text_measured(
         &mut engine,
@@ -3119,14 +2948,14 @@ fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut Tes
         fallback_width,
         height,
         retained_measure_invocations.clone(),
-        retained_hydrated_artifacts.clone(),
     );
     let sibling = request_leaf(&mut engine, 30.0);
     let root = request_flex_container(&mut engine, &[text, sibling]);
     compute_generated_text_root(cx, &mut engine, root, root_width);
+    let retained_root = engine.retained_node_token_for_tests(root);
+    let retained_text = engine.retained_node_token_for_tests(text);
 
     let fresh_measure_invocations = Rc::new(Cell::new(0));
-    let fresh_hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
     let mut fresh_engine = LayoutEngine::new();
     let fresh_text = request_growing_input_sensitive_text_measured(
         &mut fresh_engine,
@@ -3135,11 +2964,12 @@ fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut Tes
         fallback_width,
         height,
         fresh_measure_invocations.clone(),
-        fresh_hydrated_artifacts.clone(),
     );
     let fresh_sibling = request_leaf(&mut fresh_engine, 30.0);
     let fresh_root = request_flex_container(&mut fresh_engine, &[fresh_text, fresh_sibling]);
     compute_generated_text_root(cx, &mut fresh_engine, fresh_root, root_width);
+    let fresh_root = fresh_engine.retained_node_token_for_tests(fresh_root);
+    let fresh_text = fresh_engine.retained_node_token_for_tests(fresh_text);
 
     assert_ne!(
         fresh_measure_invocations.get(),
@@ -3147,9 +2977,14 @@ fn text_same_key_changed_flex_sibling_width_matches_fresh_hydration(cx: &mut Tes
         "fresh layout should observe the current-frame text measurement query"
     );
     assert_eq!(
-        retained_hydrated_artifacts.borrow().as_slice(),
-        fresh_hydrated_artifacts.borrow().as_slice(),
-        "retained text hydration should match fresh solver measurement semantics"
+        retained_layout_projection(&engine, retained_root),
+        retained_layout_projection(&fresh_engine, fresh_root),
+        "retained text layout should match fresh solver semantics"
+    );
+    assert_eq!(
+        retained_node_size(&engine, retained_text),
+        retained_node_size(&fresh_engine, fresh_text),
+        "retained text node size should match fresh solver semantics"
     );
 }
 
@@ -3166,7 +3001,6 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
         let second_width = first_width + width_delta;
         let height = draw_u16(&tc, 1, 120);
         let measure_invocations = Rc::new(Cell::new(0));
-        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut engine = LayoutEngine::new();
 
         let root = request_input_sensitive_text_measured(
@@ -3176,7 +3010,6 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
             first_width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, first_width);
         engine.finish_frame();
@@ -3188,7 +3021,6 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
             first_width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, second_width);
         engine.finish_frame();
@@ -3200,34 +3032,10 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
             first_width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, first_width);
 
         assert_eq!(measure_invocations.get(), 3);
-        assert_eq!(
-            hydrated_artifacts.borrow().as_slice(),
-            [
-                GeneratedTextHydration {
-                    label: 0,
-                    key_index,
-                    width: first_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 0,
-                    key_index,
-                    width: second_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index,
-                    width: first_width,
-                    height,
-                },
-            ]
-        );
     })
     .settings(hegel_settings(64))
     .run();
@@ -3239,17 +3047,9 @@ fn generated_text_does_not_replay_stale_artifact_after_multiple_measure_queries(
 fn text_same_frame_root_recompute_panics(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
     let mut engine = LayoutEngine::new();
-    let root = request_input_sensitive_text_measured(
-        &mut engine,
-        0,
-        1,
-        120,
-        24,
-        measure_invocations,
-        hydrated_artifacts,
-    );
+    let root =
+        request_input_sensitive_text_measured(&mut engine, 0, 1, 120, 24, measure_invocations);
 
     cx.update(|window, app| {
         engine.compute_layout(
@@ -3284,7 +3084,6 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
         let transient_width = width + draw_u16(&tc, 1, 40);
         let height = draw_u16(&tc, 1, 120);
         let measure_invocations = Rc::new(Cell::new(0));
-        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut engine = LayoutEngine::new();
 
         let root = request_input_sensitive_text_measured(
@@ -3294,7 +3093,6 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
             width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, root, width);
         engine.finish_frame();
@@ -3307,7 +3105,6 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
             width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         let checkpoint = engine.checkpoint();
         let transient_root = request_input_sensitive_text_measured(
@@ -3317,7 +3114,6 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
             transient_width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, transient_root, transient_width);
         engine.rollback_to_checkpoint(checkpoint);
@@ -3332,42 +3128,12 @@ fn generated_text_rollback_discards_transient_measurement_state(cx: &mut TestApp
             width,
             height,
             measure_invocations.clone(),
-            hydrated_artifacts.clone(),
         );
         compute_generated_text_root(cx, &mut engine, repeat_root, width);
 
         assert_eq!(measure_invocations.get(), 2);
         assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
         assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
-        assert_eq!(
-            hydrated_artifacts.borrow().as_slice(),
-            [
-                GeneratedTextHydration {
-                    label: 0,
-                    key_index,
-                    width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 1,
-                    key_index: transient_key_index,
-                    width: transient_width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 2,
-                    key_index,
-                    width,
-                    height,
-                },
-                GeneratedTextHydration {
-                    label: 3,
-                    key_index,
-                    width,
-                    height,
-                },
-            ]
-        );
     })
     .settings(hegel_settings(64))
     .run();
@@ -4966,7 +4732,7 @@ fn unchanged_pure_size_measure_reuses_solver_cache(cx: &mut TestAppContext) {
                 .solver_observation_setup_duration,
             solver_layout_duration: engine.layout_work_sample().solver_layout_duration,
             geometry_capture_duration: engine.layout_work_sample().geometry_capture_duration,
-            artifact_hydration_duration: engine.layout_work_sample().artifact_hydration_duration,
+            artifact_completion_duration: engine.layout_work_sample().artifact_completion_duration,
             fresh_compare_duration: engine.layout_work_sample().fresh_compare_duration,
             retained_layout_finish_frame_duration: engine
                 .layout_work_sample()
@@ -4979,11 +4745,10 @@ fn unchanged_pure_size_measure_reuses_solver_cache(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn unchanged_text_measure_hydrates_from_query_cache(cx: &mut TestAppContext) {
+fn unchanged_text_measure_reuses_query_cache(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
     let mut engine = LayoutEngine::new();
 
     let root = request_text_measured(
@@ -4991,7 +4756,6 @@ fn unchanged_text_measure_hydrates_from_query_cache(cx: &mut TestAppContext) {
         key.clone(),
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     compute_stable_test_root(
         cx,
@@ -5006,7 +4770,6 @@ fn unchanged_text_measure_hydrates_from_query_cache(cx: &mut TestAppContext) {
         key,
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     compute_stable_test_root(
         cx,
@@ -5015,17 +4778,16 @@ fn unchanged_text_measure_hydrates_from_query_cache(cx: &mut TestAppContext) {
         size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
     );
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 2));
+    assert_eq!(measure_invocations.get(), 1);
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
 }
 
 #[gpui::test]
-fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppContext) {
+fn unchanged_nested_text_measure_reuses_query_cache(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
     let mut engine = LayoutEngine::new();
 
     let text = request_text_measured(
@@ -5033,7 +4795,6 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
         key.clone(),
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let root = request_container(&mut engine, &[text]);
     compute_stable_test_root(
@@ -5045,14 +4806,12 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
     engine.finish_frame();
 
     measure_invocations.set(0);
-    hydrations.set(0);
     engine.reset_retained_mutation_sample_for_tests();
     let text = request_text_measured(
         &mut engine,
         key,
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let root = request_container(&mut engine, &[text]);
     compute_stable_test_root(
@@ -5063,7 +4822,7 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
     );
 
     assert_facts_committed_exactly(&engine, root);
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(measure_invocations.get(), 0);
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
     assert_eq!(
@@ -5076,11 +4835,10 @@ fn unchanged_nested_text_measure_hydrates_from_query_cache(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut TestAppContext) {
+fn changed_unmeasured_sibling_reuses_stable_text_measurement(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
     let mut engine = LayoutEngine::new();
 
     let text = request_text_measured(
@@ -5088,7 +4846,6 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
         key.clone(),
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let changing_sibling = request_leaf(&mut engine, 10.0);
     let root = request_container(&mut engine, &[text, changing_sibling]);
@@ -5103,14 +4860,12 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
     engine.finish_frame();
 
     measure_invocations.set(0);
-    hydrations.set(0);
     engine.reset_retained_mutation_sample_for_tests();
     let text = request_text_measured(
         &mut engine,
         key,
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let changing_sibling = request_leaf(&mut engine, 20.0);
     let root = request_container(&mut engine, &[text, changing_sibling]);
@@ -5123,7 +4878,7 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
         );
     });
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(measure_invocations.get(), 0);
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
@@ -5136,13 +4891,10 @@ fn changed_unmeasured_sibling_hydrates_stable_text_without_callback(cx: &mut Tes
 }
 
 #[gpui::test]
-fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
-    cx: &mut TestAppContext,
-) {
+fn changed_unmeasured_sibling_reuses_nested_stable_text_measurement(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
     let mut engine = LayoutEngine::new();
 
     let text = request_text_measured(
@@ -5150,7 +4902,6 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
         key.clone(),
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let stable_container = request_container(&mut engine, &[text]);
     let changing_sibling = request_leaf(&mut engine, 10.0);
@@ -5167,14 +4918,12 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
     engine.finish_frame();
 
     measure_invocations.set(0);
-    hydrations.set(0);
     engine.reset_retained_mutation_sample_for_tests();
     let text = request_text_measured(
         &mut engine,
         key,
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let stable_container = request_container(&mut engine, &[text]);
     let changing_sibling = request_leaf(&mut engine, 20.0);
@@ -5192,7 +4941,7 @@ fn changed_unmeasured_sibling_hydrates_nested_stable_text_without_callback(
         engine.retained_node_token_for_tests(stable_container),
         first_container_node
     );
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(measure_invocations.get(), 0);
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
@@ -5211,9 +4960,7 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
     let first_dynamic_key = text_measure_key("frame 1");
     let second_dynamic_key = text_measure_key("frame 2");
     let stable_measures = Rc::new(Cell::new(0));
-    let stable_hydrations = Rc::new(Cell::new(0));
     let dynamic_measures = Rc::new(Cell::new(0));
-    let dynamic_hydrations = Rc::new(Cell::new(0));
     let mut engine = LayoutEngine::new();
 
     let stable_text = request_text_measured(
@@ -5221,7 +4968,6 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         stable_key.clone(),
         size(px(40.0), px(20.0)),
         stable_measures.clone(),
-        stable_hydrations.clone(),
     );
     let stable_subtree = request_container(&mut engine, &[stable_text]);
     let dynamic_text = request_text_measured(
@@ -5229,7 +4975,6 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         first_dynamic_key,
         size(px(50.0), px(20.0)),
         dynamic_measures.clone(),
-        dynamic_hydrations.clone(),
     );
     let root = request_container(&mut engine, &[stable_subtree, dynamic_text]);
     cx.update(|window, app| {
@@ -5243,16 +4988,13 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
     engine.finish_frame();
 
     stable_measures.set(0);
-    stable_hydrations.set(0);
     dynamic_measures.set(0);
-    dynamic_hydrations.set(0);
     engine.reset_retained_mutation_sample_for_tests();
     let stable_text = request_text_measured(
         &mut engine,
         stable_key,
         size(px(40.0), px(20.0)),
         stable_measures.clone(),
-        stable_hydrations.clone(),
     );
     let stable_subtree = request_container(&mut engine, &[stable_text]);
     let dynamic_text = request_text_measured(
@@ -5260,7 +5002,6 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         second_dynamic_key,
         size(px(50.0), px(20.0)),
         dynamic_measures.clone(),
-        dynamic_hydrations.clone(),
     );
     let root = request_container(&mut engine, &[stable_subtree, dynamic_text]);
     cx.update(|window, app| {
@@ -5272,15 +5013,7 @@ fn changed_text_outside_stable_subtree_does_not_remeasure_stable_text(cx: &mut T
         );
     });
 
-    assert_eq!(
-        (
-            stable_measures.get(),
-            stable_hydrations.get(),
-            dynamic_measures.get(),
-            dynamic_hydrations.get()
-        ),
-        (0, 1, 1, 1)
-    );
+    assert_eq!((stable_measures.get(), dynamic_measures.get(),), (0, 1));
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
@@ -5355,7 +5088,6 @@ fn fresh_compare_uses_text_measure_key_not_retained_layout_size(cx: &mut TestApp
         px(16.0),
         1.0,
         key,
-        |_| {},
         move |known_dimensions, available_space, measure_cx| {
             measure_key.measure(known_dimensions, available_space, measure_cx)
         },
@@ -5394,11 +5126,10 @@ fn fresh_compare_skips_opaque_measured_nodes(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
+fn rollback_resets_text_measurement_state_for_retry(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     let key = text_measure_key("hello");
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
     let mut engine = LayoutEngine::new();
 
     let root = request_text_measured(
@@ -5406,7 +5137,6 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
         key.clone(),
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     compute_stable_test_root(
         cx,
@@ -5421,7 +5151,6 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
         key,
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
     );
     let checkpoint = engine.checkpoint();
     compute_stable_test_root(
@@ -5438,7 +5167,7 @@ fn rollback_resets_text_hydration_state_for_retry(cx: &mut TestAppContext) {
         size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
     );
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (1, 3));
+    assert_eq!(measure_invocations.get(), 1);
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
     assert_eq!(engine.layout_work_sample().solver_compute_layout_calls, 1);
 }
@@ -5449,17 +5178,13 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
     let first_key = text_measure_key("hello");
     let second_key = text_measure_key("world");
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
-    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
     let mut engine = LayoutEngine::new();
 
-    let root = request_text_measured_with_hydration_log(
+    let root = request_text_measured(
         &mut engine,
-        first_key.clone(),
+        first_key,
         size(px(40.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
-        Some(hydrated_artifacts.clone()),
     );
     cx.update(|window, app| {
         engine.compute_layout(
@@ -5472,13 +5197,11 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
     engine.finish_frame();
 
     engine.reset_retained_mutation_sample_for_tests();
-    let root = request_text_measured_with_hydration_log(
+    let root = request_text_measured(
         &mut engine,
-        second_key.clone(),
+        second_key,
         size(px(60.0), px(20.0)),
         measure_invocations.clone(),
-        hydrations.clone(),
-        Some(hydrated_artifacts.clone()),
     );
     cx.update(|window, app| {
         engine.compute_layout(
@@ -5489,7 +5212,7 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
         );
     });
 
-    assert_eq!((measure_invocations.get(), hydrations.get()), (2, 2));
+    assert_eq!(measure_invocations.get(), 2);
     assert_eq!(engine.layout_work_sample().measured_layout_calls, 1);
     assert_eq!(
         engine.retained_mutation_sample_for_tests(),
@@ -5498,88 +5221,6 @@ fn changed_text_measure_key_remeasures(cx: &mut TestAppContext) {
             dirty_marks: 1,
             ..RetainedForestMutationSample::default()
         }
-    );
-    assert_eq!(
-        hydrated_artifacts.borrow().as_slice(),
-        [
-            HydratedTextArtifact {
-                key: first_key,
-                size: size(px(40.0), px(20.0)),
-            },
-            HydratedTextArtifact {
-                key: second_key,
-                size: size(px(60.0), px(20.0)),
-            },
-        ]
-    );
-}
-
-#[gpui::test]
-fn fixed_size_text_artifact_change_does_not_dirty_layout(cx: &mut TestAppContext) {
-    let cx = cx.add_empty_window();
-    let first_key = text_measure_key("draw     17");
-    let second_key = text_measure_key("draw     18");
-    let layout_size = size(px(120.0), px(20.0));
-    let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
-    let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
-    let mut engine = LayoutEngine::new();
-
-    let root = request_fixed_size_text_measured_with_hydration_log(
-        &mut engine,
-        first_key.clone(),
-        layout_size,
-        size(px(40.0), px(20.0)),
-        measure_invocations.clone(),
-        hydrations.clone(),
-        hydrated_artifacts.clone(),
-    );
-    compute_stable_test_root(
-        cx,
-        &mut engine,
-        root,
-        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-    );
-    engine.finish_frame();
-
-    engine.reset_retained_mutation_sample_for_tests();
-    let root = request_fixed_size_text_measured_with_hydration_log(
-        &mut engine,
-        second_key.clone(),
-        layout_size,
-        size(px(50.0), px(20.0)),
-        measure_invocations.clone(),
-        hydrations.clone(),
-        hydrated_artifacts.clone(),
-    );
-    compute_stable_test_root(
-        cx,
-        &mut engine,
-        root,
-        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
-    );
-
-    assert_eq!(engine.layout_work_sample().measured_layout_calls, 0);
-    assert_eq!(
-        engine.retained_mutation_sample_for_tests(),
-        RetainedForestMutationSample {
-            reuses: 1,
-            ..RetainedForestMutationSample::default()
-        }
-    );
-    assert_eq!((measure_invocations.get(), hydrations.get()), (2, 2));
-    assert_eq!(
-        hydrated_artifacts.borrow().as_slice(),
-        [
-            HydratedTextArtifact {
-                key: first_key,
-                size: size(px(40.0), px(20.0)),
-            },
-            HydratedTextArtifact {
-                key: second_key,
-                size: size(px(50.0), px(20.0)),
-            },
-        ]
     );
 }
 
@@ -5645,17 +5286,13 @@ fn changed_text_measure_key_layout_facts_remeasure(cx: &mut TestAppContext) {
 
     for (name, second_key) in cases {
         let measure_invocations = Rc::new(Cell::new(0));
-        let hydrations = Rc::new(Cell::new(0));
-        let hydrated_artifacts = Rc::new(RefCell::new(Vec::new()));
         let mut engine = LayoutEngine::new();
 
-        let root = request_text_measured_with_hydration_log(
+        let root = request_text_measured(
             &mut engine,
             first_key.clone(),
             size(px(40.0), px(20.0)),
             measure_invocations.clone(),
-            hydrations.clone(),
-            Some(hydrated_artifacts.clone()),
         );
         cx.update(|window, app| {
             engine.compute_layout(
@@ -5667,13 +5304,11 @@ fn changed_text_measure_key_layout_facts_remeasure(cx: &mut TestAppContext) {
         });
         engine.finish_frame();
 
-        let root = request_text_measured_with_hydration_log(
+        let root = request_text_measured(
             &mut engine,
             second_key,
             size(px(60.0), px(24.0)),
             measure_invocations.clone(),
-            hydrations.clone(),
-            Some(hydrated_artifacts),
         );
         cx.update(|window, app| {
             engine.compute_layout(
@@ -5687,7 +5322,6 @@ fn changed_text_measure_key_layout_facts_remeasure(cx: &mut TestAppContext) {
         actual.push((
             name,
             measure_invocations.get(),
-            hydrations.get(),
             engine.layout_work_sample().measured_layout_calls,
         ));
     }
@@ -5695,13 +5329,13 @@ fn changed_text_measure_key_layout_facts_remeasure(cx: &mut TestAppContext) {
     assert_eq!(
         actual,
         vec![
-            ("font-size", 2, 2, 1),
-            ("line-height", 2, 2, 1),
-            ("white-space", 2, 2, 1),
-            ("text-overflow", 2, 2, 1),
-            ("line-clamp", 2, 2, 1),
-            ("scale-factor", 2, 2, 1),
-            ("shaping-epoch", 2, 2, 1),
+            ("font-size", 2, 1),
+            ("line-height", 2, 1),
+            ("white-space", 2, 1),
+            ("text-overflow", 2, 1),
+            ("line-clamp", 2, 1),
+            ("scale-factor", 2, 1),
+            ("shaping-epoch", 2, 1),
         ]
     );
 }
@@ -6390,7 +6024,6 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
     fn request_frame(
         engine: &mut LayoutEngine,
         measure_invocations: Rc<Cell<usize>>,
-        hydrations: Rc<Cell<usize>>,
     ) -> (LayoutId, LayoutId, LayoutId, LayoutId, LayoutId) {
         request_canvas_like_chrome_frame_with_sidebar(engine, |engine| {
             let text = request_text_measured(
@@ -6398,7 +6031,6 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
                 text_measure_key("debug text"),
                 size(px(120.0), px(20.0)),
                 measure_invocations,
-                hydrations,
             );
 
             let mut style = Style::default();
@@ -6413,12 +6045,8 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
     let cx = cx.add_empty_window();
     let mut retained = LayoutEngine::new();
     let measure_invocations = Rc::new(Cell::new(0));
-    let hydrations = Rc::new(Cell::new(0));
-    let (root, _panel, _flex_child, _canvas_host, _canvas) = request_frame(
-        &mut retained,
-        measure_invocations.clone(),
-        hydrations.clone(),
-    );
+    let (root, _panel, _flex_child, _canvas_host, _canvas) =
+        request_frame(&mut retained, measure_invocations.clone());
     compute_stable_test_root(
         cx,
         &mut retained,
@@ -6431,13 +6059,9 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
     retained.finish_frame();
 
     measure_invocations.set(0);
-    hydrations.set(0);
     retained.reset_retained_mutation_sample_for_tests();
-    let (root, panel, flex_child, canvas_host, canvas) = request_frame(
-        &mut retained,
-        measure_invocations.clone(),
-        hydrations.clone(),
-    );
+    let (root, panel, flex_child, canvas_host, canvas) =
+        request_frame(&mut retained, measure_invocations.clone());
     compute_stable_test_root(
         cx,
         &mut retained,
@@ -6455,9 +6079,8 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
 
     let mut fresh = LayoutEngine::new();
     let fresh_measure_invocations = Rc::new(Cell::new(0));
-    let fresh_hydrations = Rc::new(Cell::new(0));
     let (root, panel, flex_child, canvas_host, canvas) =
-        request_frame(&mut fresh, fresh_measure_invocations, fresh_hydrations);
+        request_frame(&mut fresh, fresh_measure_invocations);
     compute_stable_test_root(
         cx,
         &mut fresh,
@@ -6493,7 +6116,7 @@ fn reused_canvas_panel_with_dirty_text_sibling_matches_fresh_layout(cx: &mut Tes
         )
     );
     assert!(retained_node_size(&retained, retained_canvas).height > 0.0);
-    assert_eq!((measure_invocations.get(), hydrations.get()), (0, 1));
+    assert_eq!(measure_invocations.get(), 0);
     assert_eq!(
         retained.retained_mutation_sample_for_tests(),
         RetainedForestMutationSample {

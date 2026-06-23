@@ -4299,6 +4299,19 @@ fn unchanged_pure_size_measure_reuses_solver_cache(cx: &mut TestAppContext) {
             compute_layout_calls: 1,
             solver_compute_layout_calls: 1,
             measured_layout_calls: 0,
+            retained_layout_commit_duration: engine
+                .layout_work_sample()
+                .retained_layout_commit_duration,
+            solver_observation_setup_duration: engine
+                .layout_work_sample()
+                .solver_observation_setup_duration,
+            solver_layout_duration: engine.layout_work_sample().solver_layout_duration,
+            geometry_capture_duration: engine.layout_work_sample().geometry_capture_duration,
+            artifact_hydration_duration: engine.layout_work_sample().artifact_hydration_duration,
+            fresh_compare_duration: engine.layout_work_sample().fresh_compare_duration,
+            retained_layout_finish_frame_duration: engine
+                .layout_work_sample()
+                .retained_layout_finish_frame_duration,
             compute_layout_duration: engine.layout_work_sample().compute_layout_duration,
             measured_layout_duration: Duration::default(),
             ..LayoutWorkSample::default()

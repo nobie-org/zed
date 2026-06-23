@@ -120,8 +120,11 @@ impl LayoutEngine {
 
     /// End the frame, promote successfully computed roots, and return work telemetry.
     pub fn finish_frame(&mut self) -> LayoutWorkSample {
+        let finish_frame_start = std::time::Instant::now();
         let (retained_layout_work, retained_layout_misses) = self.forest.finish_frame();
+        let retained_layout_finish_frame_duration = finish_frame_start.elapsed();
         let mut layout_work = self.layout_work;
+        layout_work.retained_layout_finish_frame_duration += retained_layout_finish_frame_duration;
         layout_work.record_retained_layout_work(retained_layout_work, retained_layout_misses);
         self.layout_work = LayoutWorkSample::default();
         layout_work
@@ -429,6 +432,14 @@ impl LayoutEngine {
             self.forest
                 .compute_layout(root_id, id, available_space, scale_factor, window, cx);
         self.layout_work.solver_compute_layout_calls += compute_work.solver_compute_layout_calls;
+        self.layout_work.retained_layout_commit_duration +=
+            compute_work.retained_layout_commit_duration;
+        self.layout_work.solver_observation_setup_duration +=
+            compute_work.solver_observation_setup_duration;
+        self.layout_work.solver_layout_duration += compute_work.solver_layout_duration;
+        self.layout_work.geometry_capture_duration += compute_work.geometry_capture_duration;
+        self.layout_work.artifact_hydration_duration += compute_work.artifact_hydration_duration;
+        self.layout_work.fresh_compare_duration += compute_work.fresh_compare_duration;
         self.layout_work.compute_layout_duration += compute_work.compute_layout_duration;
         self.layout_work.measured_layout_calls += compute_work.measured_layout_calls;
         self.layout_work.measured_layout_duration += compute_work.measured_layout_duration;

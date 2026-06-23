@@ -59,6 +59,12 @@ use work::{RetainedWorkCheckpoint, RetainedWorkState};
 pub(super) struct ComputeLayoutWork {
     pub(super) solver_compute_layout_calls: u64,
     pub(super) measured_layout_calls: u64,
+    pub(super) retained_layout_commit_duration: Duration,
+    pub(super) solver_observation_setup_duration: Duration,
+    pub(super) solver_layout_duration: Duration,
+    pub(super) geometry_capture_duration: Duration,
+    pub(super) artifact_hydration_duration: Duration,
+    pub(super) fresh_compare_duration: Duration,
     pub(super) compute_layout_duration: Duration,
     pub(super) measured_layout_duration: Duration,
     pub(super) fresh_layout_comparison: Option<FreshLayoutComparisonSummary>,
@@ -392,7 +398,10 @@ impl RetainedLayoutForest {
         window: &mut Window,
         cx: &mut App,
     ) -> ComputeLayoutWork {
+        let compute_start = std::time::Instant::now();
+        let commit_start = std::time::Instant::now();
         let node_id = self.commit_root_layout(root_id, id);
+        let retained_layout_commit_duration = commit_start.elapsed();
         self.geometry
             .begin_solve(root_id, node_id, available_space, scale_factor);
 
@@ -402,6 +411,7 @@ impl RetainedLayoutForest {
                 id.0, node_id, available_space
             );
         }
+        let solver_observation_setup_start = std::time::Instant::now();
         let measurement_solve_observer = {
             let Self {
                 solver,
@@ -433,8 +443,9 @@ impl RetainedLayoutForest {
         } else {
             Vec::new()
         });
-        let compute_start = std::time::Instant::now();
         let mut subtree_compute_recorder = self.subtree_probe.compute_recorder();
+        let solver_observation_setup_duration = solver_observation_setup_start.elapsed();
+        let solver_start = std::time::Instant::now();
         let (measured_layout_calls, measured_layout_duration) = self.compute_layout_with_measure(
             node_id,
             available_space,
@@ -445,9 +456,10 @@ impl RetainedLayoutForest {
             &mut subtree_compute_recorder,
             &mut cache_event_tracer,
         );
-        let compute_layout_duration = compute_start.elapsed();
+        let solver_layout_duration = solver_start.elapsed();
         self.subtree_probe.record_compute(subtree_compute_recorder);
 
+        let geometry_start = std::time::Instant::now();
         {
             let Self {
                 solver,
@@ -465,12 +477,15 @@ impl RetainedLayoutForest {
                 |node_id| committed.layout_id_for_node(node_id),
             );
         }
+        let geometry_capture_duration = geometry_start.elapsed();
+        let artifact_start = std::time::Instant::now();
         self.measurements.finish_completed_solve(
             &measurement_solve_observer,
             scale_factor,
             window,
             cx,
         );
+        let artifact_hydration_duration = artifact_start.elapsed();
 
         if trace::detail_enabled() && trace::layout_id_is_targeted(Some(id.0)) {
             let layout = self.geometry_layout(node_id);
@@ -480,14 +495,11 @@ impl RetainedLayoutForest {
             );
         }
 
-        let work = ComputeLayoutWork {
-            solver_compute_layout_calls: 1,
-            measured_layout_calls,
-            compute_layout_duration,
-            measured_layout_duration,
-            fresh_layout_comparison: if retained_layout_fresh_compare_enabled() {
+        let (fresh_layout_comparison, fresh_compare_duration) =
+            if retained_layout_fresh_compare_enabled() {
+                let fresh_compare_start = std::time::Instant::now();
                 let target_layout_ids = trace::target_layout_ids();
-                Some(self.trace_retained_fresh_layout_comparison(
+                let comparison = self.trace_retained_fresh_layout_comparison(
                     id,
                     node_id,
                     available_space,
@@ -495,10 +507,24 @@ impl RetainedLayoutForest {
                     window,
                     cx,
                     target_layout_ids,
-                ))
+                );
+                (Some(comparison), fresh_compare_start.elapsed())
             } else {
-                None
-            },
+                (None, Duration::default())
+            };
+        let compute_layout_duration = compute_start.elapsed();
+        let work = ComputeLayoutWork {
+            solver_compute_layout_calls: 1,
+            measured_layout_calls,
+            retained_layout_commit_duration,
+            solver_observation_setup_duration,
+            solver_layout_duration,
+            geometry_capture_duration,
+            artifact_hydration_duration,
+            fresh_compare_duration,
+            compute_layout_duration,
+            measured_layout_duration,
+            fresh_layout_comparison,
         };
         work
     }

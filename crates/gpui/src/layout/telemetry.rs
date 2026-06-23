@@ -83,7 +83,39 @@ pub struct LayoutWorkSample {
     /// still ask a measured query during its legal solve; this counter tracks the
     /// GPUI producer work that was not avoided.
     pub measured_layout_calls: u64,
-    /// Wall time spent computing root layouts.
+    /// Wall time spent in retained tree commit and private mirror mutation.
+    ///
+    /// This is GPUI-owned work: current layout facts are matched/recommitted
+    /// into the retained tree, and only actual fact changes become mirror
+    /// mutations. It does not include the solver call.
+    pub retained_layout_commit_duration: Duration,
+    /// Wall time spent setting up solver/artifact observations before solving.
+    ///
+    /// This is GPUI-owned diagnostic/artifact bookkeeping. It is intentionally
+    /// separate from solver time so observation overhead cannot be mistaken for
+    /// backend layout work.
+    pub solver_observation_setup_duration: Duration,
+    /// Wall time spent inside the private layout solver call.
+    ///
+    /// The current backend is Taffy, but this public telemetry intentionally
+    /// names the solver boundary rather than leaking backend internals.
+    pub solver_layout_duration: Duration,
+    /// Wall time spent copying solver scratch layouts into GPUI frame geometry.
+    pub geometry_capture_duration: Duration,
+    /// Wall time spent hydrating GPUI-owned post-solve layout artifacts.
+    pub artifact_hydration_duration: Duration,
+    /// Wall time spent in optional retained-vs-fresh diagnostic comparison.
+    pub fresh_compare_duration: Duration,
+    /// Wall time spent finishing retained layout state for the frame.
+    ///
+    /// This includes retained-root promotion/sweep cleanup performed after root
+    /// solves. It is not part of solver time.
+    pub retained_layout_finish_frame_duration: Duration,
+    /// Total wall time spent computing retained root layouts.
+    ///
+    /// This spans retained commit, solver execution, frame-geometry capture,
+    /// artifact hydration, and optional fresh comparison. Use the phase fields
+    /// above for ownership attribution.
     pub compute_layout_duration: Duration,
     /// Wall time spent inside measured layout work counted by
     /// [`LayoutWorkSample::measured_layout_calls`].

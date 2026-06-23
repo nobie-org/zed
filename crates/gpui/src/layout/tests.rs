@@ -81,6 +81,13 @@ fn layout_work_sample_counts_compute_and_measure() {
             compute_layout_calls: 1,
             solver_compute_layout_calls: 1,
             measured_layout_calls: 1,
+            retained_layout_commit_duration: sample.retained_layout_commit_duration,
+            solver_observation_setup_duration: sample.solver_observation_setup_duration,
+            solver_layout_duration: sample.solver_layout_duration,
+            geometry_capture_duration: sample.geometry_capture_duration,
+            artifact_hydration_duration: sample.artifact_hydration_duration,
+            fresh_compare_duration: sample.fresh_compare_duration,
+            retained_layout_finish_frame_duration: sample.retained_layout_finish_frame_duration,
             compute_layout_duration: sample.compute_layout_duration,
             measured_layout_duration: sample.measured_layout_duration,
             retained_layout_creates: 1,
@@ -90,6 +97,12 @@ fn layout_work_sample_counts_compute_and_measure() {
     );
     assert_eq!(measure_invocations.get(), 1);
     assert!(sample.compute_layout_duration >= sample.measured_layout_duration);
+    assert!(sample.compute_layout_duration >= sample.retained_layout_commit_duration);
+    assert!(sample.compute_layout_duration >= sample.solver_layout_duration);
+    assert!(sample.compute_layout_duration >= sample.geometry_capture_duration);
+    assert!(sample.compute_layout_duration >= sample.artifact_hydration_duration);
+    assert!(sample.compute_layout_duration >= sample.solver_observation_setup_duration);
+    assert!(sample.solver_layout_duration >= sample.measured_layout_duration);
     assert!(sample.measured_layout_duration > Duration::default());
 }
 

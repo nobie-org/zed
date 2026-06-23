@@ -952,6 +952,14 @@ impl GeneratedSiblingChurnFrame {
         selectors.extend(stable_tree.selectors_at("stable/root"));
         selectors
     }
+
+    fn styled_selectors(&self, stable_tree: &GeneratedStyledNode) -> Vec<String> {
+        let mut selectors = vec!["root".to_string(), "stable-panel".to_string()];
+        selectors.extend(self.before.iter().map(|sibling| sibling.selector("before")));
+        selectors.extend(self.after.iter().map(|sibling| sibling.selector("after")));
+        selectors.extend(stable_tree.selectors_at("stable/root"));
+        selectors
+    }
 }
 
 struct GeneratedSiblingChurnTextView {
@@ -995,6 +1003,53 @@ impl Render for GeneratedSiblingChurnTextView {
                     .w(px(300.0))
                     .h(px(360.0))
                     .child(self.stable_tree.build_at("stable/root", false)),
+            )
+            .children(after)
+    }
+}
+
+struct GeneratedSiblingChurnStyledView {
+    stable_tree: GeneratedStyledNode,
+    frame: GeneratedSiblingChurnFrame,
+}
+
+impl Render for GeneratedSiblingChurnStyledView {
+    fn render(
+        &mut self,
+        _window: &mut BuildCx<'_>,
+        _cx: &mut crate::Context<Self>,
+    ) -> impl IntoElement {
+        let before = self
+            .frame
+            .before
+            .iter()
+            .map(|sibling| sibling.build("before", self.frame.tick))
+            .collect::<Vec<_>>();
+        let after = self
+            .frame
+            .after
+            .iter()
+            .map(|sibling| sibling.build("after", self.frame.tick))
+            .collect::<Vec<_>>();
+
+        div()
+            .id("generated-styled-sibling-churn-root")
+            .debug_selector(|| "root".into())
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .w(px(360.0))
+            .h(px(920.0))
+            .children(before)
+            .child(
+                div()
+                    .id("generated-styled-sibling-churn-stable-panel")
+                    .debug_selector(|| "stable-panel".into())
+                    .relative()
+                    .flex_none()
+                    .w(px(300.0))
+                    .h(px(360.0))
+                    .child(self.stable_tree.build_at("stable/root")),
             )
             .children(after)
     }
@@ -1058,6 +1113,69 @@ fn draw_fresh_sibling_churn_text_tree(
     });
     cx.run_until_parked();
     let (bounds, sample, _) = draw_sibling_churn_text_tree(cx, *fresh.deref(), stable_tree, frame);
+    assert_fresh_oracle_sample(sample);
+    bounds
+}
+
+fn draw_sibling_churn_styled_tree(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    stable_tree: &GeneratedStyledNode,
+    frame: &GeneratedSiblingChurnFrame,
+) -> (
+    Vec<(String, Bounds<Pixels>)>,
+    LayoutWorkSample,
+    Vec<crate::RetainedSubtreeWorkSample>,
+) {
+    let bounds = frame
+        .styled_selectors(stable_tree)
+        .into_iter()
+        .map(|selector| {
+            let bounds = cx
+                .update_window(window, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(&selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("missing debug bounds for styled sibling churn selector {selector}")
+                });
+            (selector, bounds)
+        })
+        .collect::<Vec<_>>();
+
+    let (sample, subtree_samples) = cx
+        .update_window(window, |_, window, _| {
+            (
+                window.last_layout_work_sample(),
+                window
+                    .last_retained_subtree_work_samples_for_tests()
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+
+    (
+        bounds,
+        sample.expect("styled sibling churn draw should publish layout work"),
+        subtree_samples,
+    )
+}
+
+fn draw_fresh_sibling_churn_styled_tree(
+    cx: &mut TestAppContext,
+    stable_tree: &GeneratedStyledNode,
+    frame: &GeneratedSiblingChurnFrame,
+) -> Vec<(String, Bounds<Pixels>)> {
+    let fresh = cx.open_window(frame.window_size(), |window, _| {
+        window.force_fresh_layout_for_tests();
+        GeneratedSiblingChurnStyledView {
+            stable_tree: stable_tree.clone(),
+            frame: frame.clone(),
+        }
+    });
+    cx.run_until_parked();
+    let (bounds, sample, _) =
+        draw_sibling_churn_styled_tree(cx, *fresh.deref(), stable_tree, frame);
     assert_fresh_oracle_sample(sample);
     bounds
 }
@@ -2082,6 +2200,72 @@ fn generated_sibling_churn_matches_fresh_and_preserves_stable_subtree(cx: &mut T
             assert_stable_subtree_preserved_without_solver_churn(
                 &subtree_samples,
                 "generated-sibling-churn-stable-panel",
+            );
+        }
+    })
+    .settings(hegel_settings(40))
+    .run();
+}
+
+#[gpui::test]
+fn generated_keyed_sibling_churn_preserves_arbitrary_styled_subtree(cx: &mut TestAppContext) {
+    hegel::Hegel::new(|tc| {
+        let stable_tree = GeneratedStyledNode::draw(&tc, 3, false);
+        let frame_count = draw_u8(&tc, 2, 6);
+        let frames = (0..frame_count)
+            .map(|tick| GeneratedSiblingChurnFrame::draw(&tc, tick))
+            .collect::<Vec<_>>();
+        let first_frame = frames
+            .first()
+            .expect("generated styled sibling churn should contain at least one frame")
+            .clone();
+
+        let retained = cx.open_window(first_frame.window_size(), |window, _| {
+            window.set_retained_subtree_probe_targets_for_tests(vec![
+                "generated-styled-sibling-churn-stable-panel".to_string(),
+            ]);
+            GeneratedSiblingChurnStyledView {
+                stable_tree: stable_tree.clone(),
+                frame: first_frame.clone(),
+            }
+        });
+        cx.run_until_parked();
+        let retained_window = *retained.deref();
+
+        let (initial_retained_bounds, _, _) =
+            draw_sibling_churn_styled_tree(cx, retained_window, &stable_tree, &first_frame);
+        let initial_fresh_bounds =
+            draw_fresh_sibling_churn_styled_tree(cx, &stable_tree, &first_frame);
+        assert_eq!(
+            initial_retained_bounds, initial_fresh_bounds,
+            "initial retained styled sibling-churn frame should match fresh layout"
+        );
+
+        for frame in frames.iter().skip(1) {
+            retained
+                .update(cx, |view, _, cx| {
+                    view.frame = frame.clone();
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+
+            let (retained_bounds, sample, subtree_samples) =
+                draw_sibling_churn_styled_tree(cx, retained_window, &stable_tree, frame);
+            let fresh_bounds = draw_fresh_sibling_churn_styled_tree(cx, &stable_tree, frame);
+
+            assert_eq!(
+                retained_bounds, fresh_bounds,
+                "retained styled sibling-churn frame should match fresh layout for {frame:?}"
+            );
+            assert_eq!(
+                sample.retained_layout_fresh_compare_mismatches, 0,
+                "runtime retained-vs-fresh comparison should not report styled sibling-churn mismatches for {frame:?}"
+            );
+            assert_retained_frame_sample(sample);
+            assert_stable_subtree_preserved_without_solver_churn(
+                &subtree_samples,
+                "generated-styled-sibling-churn-stable-panel",
             );
         }
     })

@@ -1447,6 +1447,27 @@ fn compute_generated_roots(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn assert_generated_layout_outputs_match(
+    retained: &mut LayoutEngine,
+    retained_roots: &[RetainedNodeToken],
+    fresh: &mut LayoutEngine,
+    fresh_roots: &[RetainedNodeToken],
+) {
+    assert_eq!(
+        retained_layout_shapes(retained, retained_roots),
+        retained_layout_shapes(fresh, fresh_roots)
+    );
+    assert_eq!(
+        retained_layout_projections(retained, retained_roots),
+        retained_layout_projections(fresh, fresh_roots)
+    );
+    assert_eq!(
+        retained_layout_bounds_trees(retained, retained_roots, 1.0),
+        retained_layout_bounds_trees(fresh, fresh_roots, 1.0)
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn expected_mutations(
     previous: &[GeneratedTree],
     current: &[GeneratedTree],
@@ -1984,6 +2005,84 @@ fn generated_retained_commit_matches_fresh_outputs(cx: &mut TestAppContext) {
         }
     })
     .settings(hegel_settings(100))
+    .run();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[gpui::test]
+fn generated_retained_layout_matches_immediate_mode_oracle_across_frame_sequence(
+    cx: &mut TestAppContext,
+) {
+    hegel::Hegel::new(|tc| {
+        let mut cx = cx.add_empty_window();
+        let frames = draw_generated_frames(&tc, true, 2, 6);
+        let first_width = draw_u16(&tc, 1, 360);
+        let first_height = draw_u16(&tc, 1, 240);
+        let second_width = draw_u16(&tc, 1, 360);
+        let second_height = draw_u16(&tc, 1, 240);
+        let constraints = [
+            (first_width, first_height),
+            (second_width, second_height),
+            (first_width, first_height),
+        ];
+        let mut retained = LayoutEngine::new();
+        let mut immediate = LayoutEngine::new_force_fresh_for_tests();
+
+        for (frame_index, frame) in frames.iter().enumerate() {
+            let (available_width, available_height) = constraints[frame_index % constraints.len()];
+            let retained_ids = request_generated_frame(&mut retained, frame);
+            let retained_roots = compute_generated_roots(
+                cx,
+                &mut retained,
+                &retained_ids,
+                available_width,
+                available_height,
+            );
+            for root in &retained_ids {
+                assert_facts_committed_exactly(&retained, *root);
+            }
+
+            let immediate_ids = request_generated_frame(&mut immediate, frame);
+            let immediate_roots = compute_generated_roots(
+                cx,
+                &mut immediate,
+                &immediate_ids,
+                available_width,
+                available_height,
+            );
+            for root in &immediate_ids {
+                assert_facts_committed_exactly(&immediate, *root);
+            }
+
+            assert_generated_layout_outputs_match(
+                &mut retained,
+                &retained_roots,
+                &mut immediate,
+                &immediate_roots,
+            );
+
+            let expected_immediate_creates = frame
+                .roots
+                .iter()
+                .map(GeneratedTree::node_count)
+                .sum::<u64>();
+            retained.finish_frame();
+            let immediate_sample = immediate.finish_frame();
+            assert_eq!(
+                immediate_sample.force_fresh_frame_resets, 1,
+                "immediate oracle must throw away retained state at every frame boundary"
+            );
+            assert_eq!(
+                immediate_sample.retained_layout_reuses, 0,
+                "immediate oracle must not reuse retained nodes from a prior frame"
+            );
+            assert_eq!(
+                immediate_sample.retained_layout_creates, expected_immediate_creates,
+                "immediate oracle should build the whole current generated frame from scratch"
+            );
+        }
+    })
+    .settings(hegel_settings(80))
     .run();
 }
 

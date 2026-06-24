@@ -1,0 +1,5 @@
+error[E0599]: no method named `frame_prepaint_plan` found for mutable reference `&mut VisibleRootGroupCx<'_>` in the current scope
+ --> tests/retained_layout_lifecycle/visible_root_group_cx_cannot_schedule_frame_work.rs:4:14
+  |
+4 |     group_cx.frame_prepaint_plan(|_, _| ());
+  |              ^^^^^^^^^^^^^^^^^^^ method not found in `&mut VisibleRootGroupCx<'_>`

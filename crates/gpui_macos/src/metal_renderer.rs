@@ -9,7 +9,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, ScaledPixels, Size, Surface, point,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, ScaledPixels, Size, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
         PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
@@ -23,7 +23,12 @@ use gpui::{SceneCapture, SceneCaptureBackend};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
-use foreign_types::ForeignType;
+use core_foundation::base::TCFType;
+use core_video::{
+    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+};
+use foreign_types::{ForeignType, ForeignTypeRef};
 use gpui::nobie_platform_trace;
 use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
@@ -526,6 +531,18 @@ impl Renderer {
             Self::Wgpu { renderer, .. } => renderer.take_presented_capture(),
         }
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture_scene(&mut self, scene: &Scene) -> Result<SceneCapture> {
+        self.request_frame_capture();
+        match self.draw(scene) {
+            RenderGroupDrawOutcome::Completed { .. } => self.take_presented_capture(),
+            RenderGroupDrawOutcome::NotCompleted => {
+                anyhow::bail!("scene capture draw did not complete")
+            }
+            _ => anyhow::bail!("scene capture draw returned an unsupported outcome"),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -625,11 +642,13 @@ pub(crate) struct MetalRenderer {
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    ycbcr_surfaces_pipeline_state: metal::RenderPipelineState,
     bgra_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
+    core_video_texture_cache: CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -859,6 +878,14 @@ impl MetalRenderer {
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         )?;
+        let ycbcr_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces",
+            "surface_vertex",
+            "surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        )?;
         let bgra_surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -870,6 +897,8 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+        let core_video_texture_cache =
+            CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
         let device_ptr = device.as_ptr() as *mut std::ffi::c_void;
         let queue_ptr = command_queue.as_ptr() as *mut std::ffi::c_void;
@@ -892,10 +921,12 @@ impl MetalRenderer {
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
+            ycbcr_surfaces_pipeline_state,
             bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
+            core_video_texture_cache,
             last_render_group_counters: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -2965,18 +2996,91 @@ impl MetalRenderer {
         );
 
         for surface in surfaces {
-            let PaintSurfaceSource::MetalTexture(texture) = &surface.source else {
-                panic!("direct Metal GPUI renderer cannot draw wgpu texture surfaces");
-            };
-            let texture_size = size(
-                DevicePixels::from(texture.width() as i32),
-                DevicePixels::from(texture.height() as i32),
-            );
-
             align_offset(instance_offset);
-            let next_offset = *instance_offset + mem::size_of::<Surface>();
+            let next_offset = *instance_offset + mem::size_of::<SurfaceBounds>();
             if next_offset > instance_buffer.size {
                 return false;
+            }
+
+            match &surface.source {
+                PaintSurfaceSource::Surface(image_buffer) => {
+                    let texture_size = size(
+                        DevicePixels::from(image_buffer.get_width() as i32),
+                        DevicePixels::from(image_buffer.get_height() as i32),
+                    );
+
+                    assert_eq!(
+                        image_buffer.get_pixel_format(),
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                    );
+
+                    let y_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::R8Unorm,
+                            image_buffer.get_width_of_plane(0),
+                            image_buffer.get_height_of_plane(0),
+                            0,
+                        )
+                        .unwrap();
+                    let cb_cr_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::RG8Unorm,
+                            image_buffer.get_width_of_plane(1),
+                            image_buffer.get_height_of_plane(1),
+                            1,
+                        )
+                        .unwrap();
+
+                    command_encoder.set_vertex_bytes(
+                        SurfaceInputIndex::TextureSize as u64,
+                        mem::size_of_val(&texture_size) as u64,
+                        &texture_size as *const Size<DevicePixels> as *const _,
+                    );
+                    command_encoder.set_render_pipeline_state(&self.ycbcr_surfaces_pipeline_state);
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::CbCrTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                }
+                PaintSurfaceSource::MetalTexture(texture) => {
+                    let texture_size = size(
+                        DevicePixels::from(texture.width() as i32),
+                        DevicePixels::from(texture.height() as i32),
+                    );
+
+                    command_encoder.set_vertex_bytes(
+                        SurfaceInputIndex::TextureSize as u64,
+                        mem::size_of_val(&texture_size) as u64,
+                        &texture_size as *const Size<DevicePixels> as *const _,
+                    );
+                    command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        Some(texture.as_ref()),
+                    );
+                    command_encoder
+                        .set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, None);
+                }
+                PaintSurfaceSource::WgpuTexture(_) => {
+                    panic!("direct Metal GPUI renderer cannot draw wgpu texture surfaces");
+                }
             }
 
             command_encoder.set_vertex_buffer(
@@ -2984,15 +3088,6 @@ impl MetalRenderer {
                 Some(&instance_buffer.metal_buffer),
                 *instance_offset as u64,
             );
-            command_encoder.set_vertex_bytes(
-                SurfaceInputIndex::TextureSize as u64,
-                mem::size_of_val(&texture_size) as u64,
-                &texture_size as *const Size<DevicePixels> as *const _,
-            );
-            command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
-            command_encoder
-                .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(texture.as_ref()));
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, None);
 
             unsafe {
                 let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)

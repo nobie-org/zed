@@ -1,0 +1,139 @@
+use super::super::solver::{LayoutSolver, SolverNodeId, SolverStyle};
+use super::artifacts::{ArtifactCacheKey, ArtifactStore, LayoutArtifact, LayoutArtifactKey};
+use super::*;
+use crate::px;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TestArtifactKey(&'static str);
+
+fn test_artifact_key(key: TestArtifactKey) -> LayoutArtifactKey {
+    LayoutArtifactKey::new(
+        key,
+        |_key, known_dimensions, available_space, _window, _cx| {
+            let width = known_dimensions
+                .width
+                .unwrap_or(match available_space.width {
+                    AvailableSpace::Definite(width) => width,
+                    AvailableSpace::MinContent | AvailableSpace::MaxContent => px(10.0),
+                });
+            let height = known_dimensions.height.unwrap_or(px(20.0));
+            size(width, height)
+        },
+    )
+}
+
+fn test_artifact(key: TestArtifactKey, measured_width: f32) -> LayoutArtifact {
+    test_artifact_with_size(key, size(px(measured_width), px(20.0)))
+}
+
+fn test_artifact_with_size(key: TestArtifactKey, measured_size: Size<Pixels>) -> LayoutArtifact {
+    LayoutArtifact::new(test_artifact_key(key), measured_size)
+}
+
+fn artifact_summary(artifact: Option<LayoutArtifact>) -> Option<(LayoutArtifactKey, Size<Pixels>)> {
+    artifact.map(|artifact| (artifact.key().clone(), artifact.size()))
+}
+
+fn solver_node_id() -> SolverNodeId {
+    let mut solver = LayoutSolver::new();
+    solver.new_leaf(SolverStyle::default())
+}
+
+fn artifact_cache_key(
+    node_id: SolverNodeId,
+    key: TestArtifactKey,
+    available_width: f32,
+) -> (ArtifactCacheKey, LayoutArtifactKey) {
+    let artifact_key = test_artifact_key(key);
+    (
+        ArtifactCacheKey::new(
+            node_id,
+            artifact_key.clone(),
+            size(None, None),
+            size(
+                AvailableSpace::Definite(px(available_width)),
+                AvailableSpace::MaxContent,
+            ),
+        ),
+        artifact_key,
+    )
+}
+
+#[test]
+fn artifact_cache_key_distinguishes_solver_query() {
+    let node_id = solver_node_id();
+    let (narrow, _) = artifact_cache_key(node_id, TestArtifactKey("same facts"), 80.0);
+    let (wide, _) = artifact_cache_key(node_id, TestArtifactKey("same facts"), 160.0);
+
+    assert_ne!(narrow, wide);
+}
+
+#[test]
+fn artifact_cache_key_distinguishes_solver_node() {
+    let mut solver = LayoutSolver::new();
+    let first_node = solver.new_leaf(SolverStyle::default());
+    let second_node = solver.new_leaf(SolverStyle::default());
+    let (first, _) = artifact_cache_key(first_node, TestArtifactKey("same facts"), 80.0);
+    let (second, _) = artifact_cache_key(second_node, TestArtifactKey("same facts"), 80.0);
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn artifact_store_drops_cached_query_without_current_callback_use() {
+    let mut store = ArtifactStore::new();
+    let key = TestArtifactKey("same facts");
+    let (cache_key, artifact_key) = artifact_cache_key(solver_node_id(), key.clone(), 80.0);
+    let artifact = test_artifact(key, 80.0);
+    let expected = Some((artifact_key, size(px(80.0), px(20.0))));
+
+    store.cache_artifact(cache_key.clone(), artifact);
+    assert_eq!(
+        artifact_summary(store.artifact_for_query(&cache_key)),
+        expected
+    );
+
+    store.begin_frame();
+    assert_eq!(
+        artifact_summary(store.artifact_for_query(&cache_key)),
+        expected
+    );
+
+    store.finish_frame();
+    assert_eq!(artifact_summary(store.artifact_for_query(&cache_key)), None);
+}
+
+#[test]
+fn artifact_store_retains_only_current_exact_callback_query_cache() {
+    let mut store = ArtifactStore::new();
+    let node_id = solver_node_id();
+    let (narrow, narrow_artifact_key) =
+        artifact_cache_key(node_id, TestArtifactKey("same facts"), 80.0);
+    let (wide, wide_artifact_key) =
+        artifact_cache_key(node_id, TestArtifactKey("same facts"), 160.0);
+    let narrow_artifact = test_artifact(TestArtifactKey("same facts"), 80.0);
+    let wide_artifact = test_artifact(TestArtifactKey("same facts"), 160.0);
+    let expected_narrow = Some((narrow_artifact_key, size(px(80.0), px(20.0))));
+    let expected_wide = Some((wide_artifact_key, size(px(160.0), px(20.0))));
+
+    store.cache_artifact(narrow.clone(), narrow_artifact.clone());
+    store.cache_artifact(wide.clone(), wide_artifact);
+    assert_eq!(
+        (
+            artifact_summary(store.artifact_for_query(&narrow)),
+            artifact_summary(store.artifact_for_query(&wide)),
+        ),
+        (expected_narrow.clone(), expected_wide)
+    );
+
+    store.begin_frame();
+    store.record_for_query(narrow.clone(), &narrow_artifact);
+    store.finish_frame();
+    assert_eq!(
+        (
+            artifact_summary(store.artifact_for_query(&narrow)),
+            artifact_summary(store.artifact_for_query(&wide)),
+        ),
+        (expected_narrow, None)
+    );
+}

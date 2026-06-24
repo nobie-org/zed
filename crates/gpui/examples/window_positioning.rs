@@ -14,7 +14,11 @@ struct WindowContent {
 }
 
 impl Render for WindowContent {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        window: &mut gpui::BuildCx<'_>,
+        _: &mut Context<Self>,
+    ) -> impl IntoElement {
         let window_bounds = window.bounds();
 
         div()

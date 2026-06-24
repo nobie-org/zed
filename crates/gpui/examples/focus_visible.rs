@@ -60,7 +60,11 @@ impl Example {
 }
 
 impl Render for Example {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         fn button_base(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
             div()
                 .id(id)

@@ -31,7 +31,11 @@ impl KeyRepeatPresent {
 }
 
 impl Render for KeyRepeatPresent {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         eprintln!(
             "gpui-key-repeat-example event=render generation={} blue={} render_sleep_ms={}",
             self.generation, self.blue, self.render_sleep_ms

@@ -1690,6 +1690,19 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene)
     }
 
+    fn capture_scene(&self, scene: &Scene) -> gpui::Result<gpui::SceneCapture> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut this = self.0.lock();
+            this.renderer.capture_scene(scene)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let _ = scene;
+            anyhow::bail!("scene capture is not available without test-support")
+        }
+    }
+
     fn request_frame_capture(&self) {
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -2449,6 +2462,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
+                let _trace = RequestFrameTraceGuard::without_display_link();
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
@@ -2556,6 +2570,49 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     };
 }
 
+struct RequestFrameTraceGuard {
+    preserve_display_link_signal_id: bool,
+}
+
+impl RequestFrameTraceGuard {
+    fn without_display_link() -> Self {
+        nobie_platform_trace::clear_current_display_link_observation();
+        let request_frame_id = nobie_platform_trace::next_request_frame_id();
+        nobie_platform_trace::set_current_request_frame_id(request_frame_id);
+        Self {
+            preserve_display_link_signal_id: false,
+        }
+    }
+
+    fn with_display_link() -> Self {
+        let request_frame_id = nobie_platform_trace::next_request_frame_id();
+        nobie_platform_trace::set_current_request_frame_id(request_frame_id);
+        Self {
+            preserve_display_link_signal_id: true,
+        }
+    }
+}
+
+impl Drop for RequestFrameTraceGuard {
+    fn drop(&mut self) {
+        if self.preserve_display_link_signal_id {
+            // Leave the signal id in the thread-local so the next step()
+            // can compute its own coalesced delta against this run. Other
+            // observation fields (wall_us, ca_time, request_frame_id) are
+            // scoped to this callback and zeroed so observers outside the
+            // callback do not read stale data attributed to a different
+            // service path.
+            nobie_platform_trace::set_current_display_link_coalesced_count(0);
+            nobie_platform_trace::set_current_display_link_callback_wall_us(0);
+            nobie_platform_trace::set_current_display_link_callback_ca_time(0.0);
+            nobie_platform_trace::set_current_display_link_output_ca_time(0.0);
+        } else {
+            nobie_platform_trace::clear_current_display_link_observation();
+        }
+        nobie_platform_trace::clear_current_request_frame_id();
+    }
+}
+
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
@@ -2563,6 +2620,7 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
+        let _trace = RequestFrameTraceGuard::without_display_link();
         callback(Default::default());
 
         let mut lock = window_state.lock();
@@ -2608,28 +2666,11 @@ extern "C" fn step(view: *mut c_void) {
         nobie_platform_trace::set_current_display_link_output_ca_time(
             nobie_platform_trace::latest_display_link_output_ca_time(),
         );
-        // Mint a fresh request-frame id for the callback's lifetime so any
-        // tracing inside the callback can correlate its work with this
-        // specific step invocation. The request-frame cadence probe joins
-        // this id back to the display-link signal id above.
-        let request_frame_id = nobie_platform_trace::next_request_frame_id();
-        nobie_platform_trace::set_current_request_frame_id(request_frame_id);
+        let _trace = RequestFrameTraceGuard::with_display_link();
 
         drop(lock);
         callback(Default::default());
         window_state.lock().request_frame_callback = Some(callback);
-
-        // Leave the signal id in the thread-local so the next step()
-        // can compute its own coalesced delta against this run. Other
-        // observation fields (wall_us, ca_time, request_frame_id) are
-        // scoped to this step's callback and zeroed so observers outside
-        // the callback do not read stale data attributed to a different
-        // step.
-        nobie_platform_trace::set_current_display_link_coalesced_count(0);
-        nobie_platform_trace::set_current_display_link_callback_wall_us(0);
-        nobie_platform_trace::set_current_display_link_callback_ca_time(0.0);
-        nobie_platform_trace::set_current_display_link_output_ca_time(0.0);
-        nobie_platform_trace::clear_current_request_frame_id();
     }
 }
 

@@ -1,0 +1,5 @@
+error[E0599]: no method named `measure_scratch_root` found for mutable reference `&mut BuildCx<'_>` in the current scope
+ --> tests/retained_layout_lifecycle/render_cannot_solve_scratch_root.rs:7:16
+  |
+7 |         window.measure_scratch_root(
+  |         -------^^^^^^^^^^^^^^^^^^^^ method not found in `&mut BuildCx<'_>`

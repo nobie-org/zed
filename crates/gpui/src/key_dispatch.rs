@@ -14,7 +14,7 @@
 //! }
 //!
 //! impl Render for Editor {
-//!   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+//!   fn render(&mut self, window: &mut crate::BuildCx<'_>, cx: &mut Context<Self>) -> impl IntoElement {
 //!     div()
 //!       .track_focus(&self.focus_handle(cx))
 //!       .key_context("Editor")
@@ -51,7 +51,7 @@
 
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
-    Keystroke, ModifiersChangedEvent, Window,
+    Keystroke, LayoutRequestCx, ModifiersChangedEvent, PaintCx, PrepaintCx, Window,
 };
 use collections::FxHashMap;
 use smallvec::SmallVec;
@@ -622,7 +622,7 @@ impl DispatchTree {
 mod tests {
     use crate::{
         self as gpui, AppContext, DispatchResult, Element, ElementId, GlobalElementId,
-        InspectorElementId, Keystroke, LayoutId, Style,
+        InspectorElementId, Keystroke, LayoutId, LayoutRequestCx, PaintCx, PrepaintCx, Style,
     };
     use core::panic;
     use smallvec::SmallVec;
@@ -798,7 +798,7 @@ mod tests {
                 &mut self,
                 _: Option<&GlobalElementId>,
                 _: Option<&InspectorElementId>,
-                window: &mut Window,
+                window: &mut LayoutRequestCx<'_>,
                 cx: &mut App,
             ) -> (LayoutId, Self::RequestLayoutState) {
                 (window.request_layout(Style::default(), [], cx), ())
@@ -810,7 +810,7 @@ mod tests {
                 _: Option<&InspectorElementId>,
                 _: Bounds<Pixels>,
                 _: &mut Self::RequestLayoutState,
-                window: &mut Window,
+                window: &mut PrepaintCx<'_>,
                 cx: &mut App,
             ) -> Self::PrepaintState {
                 window.set_focus_handle(&self.focus_handle, cx);
@@ -823,7 +823,7 @@ mod tests {
                 _: Bounds<Pixels>,
                 _: &mut Self::RequestLayoutState,
                 _: &mut Self::PrepaintState,
-                window: &mut Window,
+                window: &mut PaintCx<'_>,
                 cx: &mut App,
             ) {
                 let mut key_context = KeyContext::default();
@@ -915,7 +915,11 @@ mod tests {
         }
 
         impl Render for CustomElement {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _: &mut crate::BuildCx<'_>,
+                _: &mut Context<Self>,
+            ) -> impl IntoElement {
                 self.clone()
             }
         }
@@ -1001,7 +1005,7 @@ mod tests {
                 &mut self,
                 _: Option<&GlobalElementId>,
                 _: Option<&InspectorElementId>,
-                window: &mut Window,
+                window: &mut LayoutRequestCx<'_>,
                 cx: &mut App,
             ) -> (LayoutId, Self::RequestLayoutState) {
                 (window.request_layout(Style::default(), [], cx), ())
@@ -1012,7 +1016,7 @@ mod tests {
                 _: Option<&InspectorElementId>,
                 _: Bounds<Pixels>,
                 _: &mut Self::RequestLayoutState,
-                window: &mut Window,
+                window: &mut PrepaintCx<'_>,
                 cx: &mut App,
             ) -> Self::PrepaintState {
                 window.set_focus_handle(&self.focus_handle, cx);
@@ -1024,7 +1028,7 @@ mod tests {
                 _: Bounds<Pixels>,
                 _: &mut Self::RequestLayoutState,
                 _: &mut Self::PrepaintState,
-                window: &mut Window,
+                window: &mut PaintCx<'_>,
                 cx: &mut App,
             ) {
                 let mut key_context = KeyContext::default();
@@ -1114,7 +1118,11 @@ mod tests {
             }
         }
         impl Render for CustomElement {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _: &mut crate::BuildCx<'_>,
+                _: &mut Context<Self>,
+            ) -> impl IntoElement {
                 self.clone()
             }
         }

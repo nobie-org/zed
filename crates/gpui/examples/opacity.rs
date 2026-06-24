@@ -59,7 +59,11 @@ impl HelloWorld {
 }
 
 impl Render for HelloWorld {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         if self.animating {
             self.opacity += 0.005;
             if self.opacity >= 1.0 {

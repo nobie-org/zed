@@ -9,7 +9,11 @@ use gpui_platform::application;
 struct HolyGrailExample {}
 
 impl Render for HolyGrailExample {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let block = |color: Hsla| {
             div()
                 .size_full()

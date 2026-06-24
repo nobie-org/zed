@@ -1,20 +1,23 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
 use gpui::{
-    App, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
-    uniform_list,
+    App, Bounds, Context, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_platform::application;
 
 struct UniformListExample {}
 
 impl Render for UniformListExample {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div().size_full().bg(rgb(0xffffff)).child(
             uniform_list(
                 "entries",
                 50,
-                cx.processor(|_this, range, _window, _cx| {
+                cx.processor_build(|_this, range, _window, _cx| {
                     let mut items = Vec::new();
                     for ix in range {
                         let item = ix + 1;

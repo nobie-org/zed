@@ -29,7 +29,7 @@ impl DragInfo {
 }
 
 impl Render for DragInfo {
-    fn render(&mut self, _: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut gpui::BuildCx<'_>, _: &mut Context<'_, Self>) -> impl IntoElement {
         let size = gpui::size(px(120.), px(50.));
 
         div()
@@ -62,7 +62,11 @@ impl DragDrop {
 }
 
 impl Render for DragDrop {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        _window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let items = [gpui::blue(), gpui::red(), gpui::green()];
 
         div()

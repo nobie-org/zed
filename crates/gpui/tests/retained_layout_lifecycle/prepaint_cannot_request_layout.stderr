@@ -1,0 +1,5 @@
+error[E0599]: no method named `request_layout` found for mutable reference `&mut PrepaintCx<'_>` in the current scope
+  --> tests/retained_layout_lifecycle/prepaint_cannot_request_layout.rs:47:16
+   |
+47 |         window.request_layout(Style::default(), [], cx);
+   |                ^^^^^^^^^^^^^^ method not found in `&mut PrepaintCx<'_>`

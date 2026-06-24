@@ -745,6 +745,20 @@ impl<'a> LayoutRequestCx<'a> {
         }
     }
 
+    pub(crate) fn has_element_state<S: 'static>(&self, global_id: &GlobalElementId) -> bool {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.window.next_frame.element_states.contains_key(&key)
+            || self.window.rendered_frame.element_states.contains_key(&key)
+    }
+
+    pub(crate) fn is_view_dirty(&self, view_id: EntityId) -> bool {
+        self.window.dirty_views.contains(&view_id)
+    }
+
+    pub(crate) fn is_refreshing(&self) -> bool {
+        self.window.refreshing
+    }
+
     /// A variant of `with_element_state` for elements whose id is optional.
     ///
     /// Layout may create/update element state that affects layout facts, such as

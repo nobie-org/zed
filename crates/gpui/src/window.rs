@@ -309,6 +309,11 @@ impl<'a> BuildCx<'a> {
             .on_next_frame(move |window, cx| view.update(cx, |view, cx| f(view, window, cx)));
     }
 
+    /// Schedule work after this frame without exposing [`Window`] during build.
+    pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        self.window.on_next_frame(callback);
+    }
+
     /// Schedule an entity update after the current effect cycle without
     /// exposing raw [`Window`] or retained-layout solve authority to build
     /// code.
@@ -326,6 +331,11 @@ impl<'a> BuildCx<'a> {
     /// Returns the layout work sample for the most recently completed draw.
     pub fn last_layout_work_sample(&self) -> Option<LayoutWorkSample> {
         self.window.last_layout_work_sample()
+    }
+
+    /// Returns the render-group work observation for the most recently completed draw.
+    pub fn last_render_group_draw_observation(&self) -> Option<&RenderGroupDrawObservation> {
+        self.window.last_render_group_draw_observation()
     }
 
     pub fn bindings_for_action_in_context(

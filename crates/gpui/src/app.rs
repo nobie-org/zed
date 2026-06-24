@@ -47,9 +47,9 @@ use crate::{
     KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels,
     Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
     PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
-    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
-    Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem, ThermalState, Window,
-    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+    RenderablePromptHandle, Reservation, SceneCapture, ScreenCaptureSource, SharedString,
+    SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem, ThermalState,
+    Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -1109,6 +1109,34 @@ impl App {
             .keys()
             .flat_map(|window_id| self.window_handles.get(&window_id).copied())
             .collect()
+    }
+
+    /// Force a redraw of one window through the app-owned frame lifecycle.
+    ///
+    /// This is the public app authority for explicit frame production. Raw
+    /// drawing remains private to `window.rs` so framework code cannot execute
+    /// retained layout merely because it has `&mut Window`.
+    pub fn draw_window_frame(&mut self, handle: AnyWindowHandle) -> Result<()> {
+        self.update_window(handle, |_, window, cx| {
+            let mut frame_authority = WindowFrameAuthority::new();
+            window.draw_for_app(&mut frame_authority, cx).clear();
+        })
+        .map(|_| ())
+    }
+
+    /// Draw, present, and capture one window through the app-owned frame lifecycle.
+    ///
+    /// Screenshot and visual-test harnesses use this when the operation's
+    /// meaning is "publish the current app frame and observe the presented
+    /// scene." It deliberately does not expose a `Window`-owned solve/draw
+    /// primitive.
+    pub fn draw_window_frame_present_and_capture(
+        &mut self,
+        handle: AnyWindowHandle,
+    ) -> Result<SceneCapture> {
+        self.update_window(handle, |_, window, cx| {
+            window.draw_app_frame_present_and_capture(cx)
+        })?
     }
 
     /// Returns the window handles ordered by their appearance on screen, front to back.

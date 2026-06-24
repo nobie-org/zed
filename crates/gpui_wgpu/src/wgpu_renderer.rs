@@ -1,16 +1,15 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    get_gamma_correction_ratios, point,
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs,
+    MAX_SURFACE_SILHOUETTE_PRIMITIVES, Point, RenderGroupShadowMode, ScaledPixels, SceneCapture,
+    SceneCaptureBackend, Size, get_gamma_correction_ratios, point,
     scene_protocol::{
         CompositeEffectPlan, MonochromeSprite, PaintGroup, PaintSurface, PaintSurfaceSource, Path,
         PolychromeSprite, PrimitiveBatch, Quad, RenderGroupBackendCounters,
         RenderGroupPhysicalPlanKind, Scene, Shadow, SubpixelSprite, SurfaceSilhouetteSpriteData,
         Underline,
     },
-    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, Point,
-    RenderGroupShadowMode, ScaledPixels, SceneCapture, SceneCaptureBackend, Size,
-    MAX_SURFACE_SILHOUETTE_PRIMITIVES,
 };
 use log::{info, warn};
 #[cfg(not(target_family = "wasm"))]

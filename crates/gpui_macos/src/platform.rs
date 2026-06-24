@@ -410,6 +410,7 @@ impl MacPlatform {
                     name,
                     action,
                     os_action,
+                    icon,
                     checked,
                     disabled,
                 } => {
@@ -501,6 +502,9 @@ impl MacPlatform {
                     if *checked {
                         item.setState_(NSVisualEffectState::Active);
                     }
+                    if let Some(image) = Self::image_for_menu_item_icon(icon) {
+                        let _: () = msg_send![item, setImage: image];
+                    }
                     item.setEnabled_(if *disabled { NO } else { YES });
 
                     let tag = actions.len() as NSInteger;
@@ -540,6 +544,24 @@ impl MacPlatform {
 
                     item
                 }
+            }
+        }
+    }
+
+    unsafe fn image_for_menu_item_icon(icon: &Option<gpui::MenuItemIcon>) -> Option<id> {
+        unsafe {
+            match icon {
+                Some(gpui::MenuItemIcon::SystemSymbol(symbol))
+                    if Self::os_version() >= Version::new(11, 0, 0) =>
+                {
+                    let image: id = msg_send![
+                        class!(NSImage),
+                        imageWithSystemSymbolName: ns_string(symbol.as_ref())
+                        accessibilityDescription: nil
+                    ];
+                    (!image.is_null()).then_some(image)
+                }
+                _ => None,
             }
         }
     }

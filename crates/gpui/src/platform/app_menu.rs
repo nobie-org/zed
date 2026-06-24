@@ -72,6 +72,20 @@ pub enum SystemMenuType {
     Services,
 }
 
+/// A visual icon to show next to a menu item.
+#[derive(Clone, Eq, PartialEq)]
+pub enum MenuItemIcon {
+    /// An operating-system named symbol. On macOS this maps to an SF Symbol.
+    SystemSymbol(SharedString),
+}
+
+impl MenuItemIcon {
+    /// Creates a system-symbol menu icon.
+    pub fn system_symbol(name: impl Into<SharedString>) -> Self {
+        Self::SystemSymbol(name.into())
+    }
+}
+
 /// The different kinds of items that can be in a menu
 pub enum MenuItem {
     /// A separator between items
@@ -94,6 +108,9 @@ pub enum MenuItem {
         /// The OS Action that corresponds to this action, if any
         /// See [`OsAction`] for more information
         os_action: Option<OsAction>,
+
+        /// The icon to show next to this action, if any
+        icon: Option<MenuItemIcon>,
 
         /// Whether this action is checked
         checked: bool,
@@ -128,6 +145,7 @@ impl MenuItem {
             name: name.into(),
             action: Box::new(action),
             os_action: None,
+            icon: None,
             checked: false,
             disabled: false,
         }
@@ -143,9 +161,18 @@ impl MenuItem {
             name: name.into(),
             action: Box::new(action),
             os_action: Some(os_action),
+            icon: None,
             checked: false,
             disabled: false,
         }
+    }
+
+    /// Set a visual icon for this menu item.
+    pub fn icon(mut self, icon: MenuItemIcon) -> Self {
+        if let MenuItem::Action { icon: old, .. } = &mut self {
+            *old = Some(icon);
+        }
+        self
     }
 
     /// Create an OwnedMenuItem from this MenuItem
@@ -157,12 +184,14 @@ impl MenuItem {
                 name,
                 action,
                 os_action,
+                icon,
                 checked,
                 disabled,
             } => OwnedMenuItem::Action {
                 name: name.into(),
                 action,
                 os_action,
+                icon,
                 checked,
                 disabled,
             },
@@ -269,6 +298,9 @@ pub enum OwnedMenuItem {
         /// See [`OsAction`] for more information
         os_action: Option<OsAction>,
 
+        /// The icon to show next to this action, if any
+        icon: Option<MenuItemIcon>,
+
         /// Whether this action is checked
         checked: bool,
 
@@ -286,12 +318,14 @@ impl Clone for OwnedMenuItem {
                 name,
                 action,
                 os_action,
+                icon,
                 checked,
                 disabled,
             } => OwnedMenuItem::Action {
                 name: name.clone(),
                 action: action.boxed_clone(),
                 os_action: *os_action,
+                icon: icon.clone(),
                 checked: *checked,
                 disabled: *disabled,
             },
@@ -459,9 +493,10 @@ mod tests {
 
     #[test]
     fn test_menu_item_builder() {
-        use super::MenuItem;
+        use super::{MenuItem, MenuItemIcon};
 
-        let item = MenuItem::action("Test Action", gpui::NoAction);
+        let item = MenuItem::action("Test Action", gpui::NoAction)
+            .icon(MenuItemIcon::system_symbol("printer"));
         assert_eq!(
             match &item {
                 MenuItem::Action { name, .. } => name.as_ref(),
@@ -474,8 +509,19 @@ mod tests {
             MenuItem::Action {
                 checked: false,
                 disabled: false,
+                icon: Some(MenuItemIcon::SystemSymbol(symbol)),
                 ..
-            }
+            } if symbol.as_ref() == "printer"
+        ));
+
+        let owned = item.owned();
+        let owned_clone = owned.clone();
+        assert!(matches!(
+            owned_clone,
+            super::OwnedMenuItem::Action {
+                icon: Some(MenuItemIcon::SystemSymbol(symbol)),
+                ..
+            } if symbol.as_ref() == "printer"
         ));
 
         assert!(

@@ -309,6 +309,11 @@ impl<'a> BuildCx<'a> {
             .on_next_frame(move |window, cx| view.update(cx, |view, cx| f(view, window, cx)));
     }
 
+    /// Schedule work after this frame without exposing [`Window`] during build.
+    pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        self.window.on_next_frame(callback);
+    }
+
     /// Schedule an entity update after the current effect cycle without
     /// exposing raw [`Window`] or retained-layout solve authority to build
     /// code.
@@ -326,6 +331,11 @@ impl<'a> BuildCx<'a> {
     /// Returns the layout work sample for the most recently completed draw.
     pub fn last_layout_work_sample(&self) -> Option<LayoutWorkSample> {
         self.window.last_layout_work_sample()
+    }
+
+    /// Returns the render-group work observation for the most recently completed draw.
+    pub fn last_render_group_draw_observation(&self) -> Option<&RenderGroupDrawObservation> {
+        self.window.last_render_group_draw_observation()
     }
 
     pub fn bindings_for_action_in_context(
@@ -733,6 +743,20 @@ impl<'a> LayoutRequestCx<'a> {
             );
             result
         }
+    }
+
+    pub(crate) fn has_element_state<S: 'static>(&self, global_id: &GlobalElementId) -> bool {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        self.window.next_frame.element_states.contains_key(&key)
+            || self.window.rendered_frame.element_states.contains_key(&key)
+    }
+
+    pub(crate) fn is_view_dirty(&self, view_id: EntityId) -> bool {
+        self.window.dirty_views.contains(&view_id)
+    }
+
+    pub(crate) fn is_refreshing(&self) -> bool {
+        self.window.refreshing
     }
 
     /// A variant of `with_element_state` for elements whose id is optional.
@@ -1831,6 +1855,11 @@ impl<'a> PaintCx<'a> {
         self.window.is_window_active()
     }
 
+    /// Returns whether the current draw is expected to be presented.
+    pub fn current_draw_will_present(&self) -> bool {
+        self.window.current_draw_will_present()
+    }
+
     pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
     where
         R: 'static,
@@ -2535,6 +2564,47 @@ impl LayoutFrame {
         let mut layout_engine = window.layout_engine.take().unwrap();
         layout_engine.compute_retained_layout(retained_root, available_space, window, cx);
         window.layout_engine = Some(layout_engine);
+    }
+}
+
+impl Window {
+    pub(crate) fn measure_scratch_root(
+        &mut self,
+        element: AnyElement,
+        root_site: RetainedLayoutRootSite,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        self.with_scratch_layout_engine(cx, |window, cx| {
+            let mut layout_frame = LayoutFrame::new();
+            layout_frame
+                .layout_visible_root_with_identity(
+                    window,
+                    element,
+                    root_site,
+                    available_space,
+                    None,
+                    cx,
+                )
+                .size()
+        })
+    }
+
+    fn with_scratch_layout_engine<R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut App) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+
+        let retained_layout_engine = self.layout_engine.take().unwrap();
+        self.layout_engine = Some(LayoutEngine::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, cx)));
+        self.layout_engine = Some(retained_layout_engine);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
 

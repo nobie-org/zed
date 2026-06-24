@@ -683,7 +683,6 @@ pretty_assertions = { version = "1.3.0", features = ["unstable"] }
 proc-macro2 = "1.0.93"
 profiling = "1"
 proptest = { version = "1.11.0", default-features = false, features = [
-    "attr-macro",
     "bit-set",
     "std",
 ] }

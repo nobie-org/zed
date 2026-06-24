@@ -279,11 +279,17 @@ fn subtree_probe_attributes_measured_callbacks_to_tagged_parent() {
         .unwrap();
 
     let samples = engine.retained_subtree_work_samples_for_tests();
-    assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].global_id, "tracked-measured-parent");
-    assert_eq!(samples[0].node_count, 2);
-    assert_eq!(samples[0].measured_callbacks, 1);
-    assert!(samples[0].no_work_total() > 0);
+    let expected_sample = RetainedSubtreeWorkSample {
+        global_id: "tracked-measured-parent".to_string(),
+        layout_id: root.0,
+        node_count: 2,
+        retained_misses: 1,
+        mirror_node_creates: 2,
+        measured_callbacks: 2,
+        ..RetainedSubtreeWorkSample::default()
+    };
+    assert_eq!(samples, std::slice::from_ref(&expected_sample));
+    assert_eq!(samples[0].no_work_total(), 5);
 }
 
 #[test]
@@ -333,19 +339,15 @@ fn subtree_probe_counts_uncached_text_artifact_callbacks_as_work() {
         .unwrap();
 
     let samples = engine.retained_subtree_work_samples_for_tests();
-    assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].global_id, "tracked-text-parent");
-    assert_eq!(samples[0].node_count, 2);
-    assert_eq!(samples[0].measured_callbacks, 1);
-    assert_eq!(samples[0].conservative_text_measured_callbacks, 0);
-    assert_eq!(
-        samples[0].no_work_total(),
-        samples[0].retained_misses
-            + samples[0].mirror_node_creates
-            + samples[0].mirror_node_removes
-            + samples[0].mirror_set_style
-            + samples[0].mirror_set_children
-            + samples[0].mirror_measured_context_clears
-            + 1
-    );
+    let expected_sample = RetainedSubtreeWorkSample {
+        global_id: "tracked-text-parent".to_string(),
+        layout_id: root.0,
+        node_count: 2,
+        retained_misses: 1,
+        mirror_node_creates: 2,
+        measured_callbacks: 2,
+        ..RetainedSubtreeWorkSample::default()
+    };
+    assert_eq!(samples, std::slice::from_ref(&expected_sample));
+    assert_eq!(samples[0].no_work_total(), 5);
 }

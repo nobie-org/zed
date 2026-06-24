@@ -732,6 +732,26 @@ impl AnyElement {
         self.0.paint(window, cx);
     }
 
+    /// Measures this element in an isolated scratch layout engine and returns its size.
+    ///
+    /// This consumes the element so a caller cannot prepaint or paint state produced by the
+    /// scratch solve. Visible detached roots must be registered through the visible-root APIs
+    /// instead, where the private frame owner solves and publishes the root.
+    #[track_caller]
+    pub fn measure_as_root(
+        self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        window.measure_scratch_root(
+            self,
+            crate::layout::RetainedLayoutRootSite::caller(core::panic::Location::caller()),
+            available_space,
+            cx,
+        )
+    }
+
     pub(crate) fn request_detached_root_layout(
         &mut self,
         available_space: Size<AvailableSpace>,

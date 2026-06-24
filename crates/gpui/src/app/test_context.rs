@@ -727,6 +727,11 @@ impl VisualTestContext {
             .unwrap()
     }
 
+    /// Force a redraw of this test window through the app-owned frame lifecycle.
+    pub fn draw_window(&mut self) -> Result<()> {
+        self.cx.draw_window(self.window)
+    }
+
     /// Creates a new VisualTestContext. You would typically shadow the passed in
     /// TestAppContext with this, as this is typically more useful.
     /// `let cx = VisualTestContext::from_window(window, cx);`

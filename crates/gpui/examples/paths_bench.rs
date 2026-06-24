@@ -54,7 +54,11 @@ impl PaintingViewer {
 }
 
 impl Render for PaintingViewer {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        window: &mut gpui::BuildCx<'_>,
+        _: &mut Context<Self>,
+    ) -> impl IntoElement {
         window.request_animation_frame();
         let lines = self.default_lines.clone();
         div().size_full().child(

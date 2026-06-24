@@ -324,7 +324,7 @@ fn button(
 }
 
 impl Render for PaintingViewer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut gpui::BuildCx<'_>, cx: &mut Context<Self>) -> impl IntoElement {
         let default_lines = self.default_lines.clone();
         let background_quads = self.background_quads.clone();
         let lines = self.lines.clone();

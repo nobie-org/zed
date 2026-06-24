@@ -607,7 +607,7 @@ impl ExternalPaths {
 }
 
 impl Render for ExternalPaths {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut crate::BuildCx<'_>, _: &mut Context<Self>) -> impl IntoElement {
         // the platform will render icons for the dragged files
         Empty
     }
@@ -723,7 +723,11 @@ mod test {
     actions!(test_only, [TestAction]);
 
     impl Render for TestView {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(
+            &mut self,
+            _: &mut crate::BuildCx<'_>,
+            cx: &mut Context<Self>,
+        ) -> impl IntoElement {
             div().id("testview").child(
                 div()
                     .key_context("parent")

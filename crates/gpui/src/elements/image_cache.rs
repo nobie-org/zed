@@ -1,8 +1,8 @@
 use crate::{
     AnyElement, AnyEntity, App, AppContext, Asset, AssetLogger, Bounds, Element, ElementId, Entity,
-    GlobalElementId, ImageAssetLoader, ImageCacheError, InspectorElementId, IntoElement, LayoutId,
-    ParentElement, Pixels, RenderImage, Resource, Style, StyleRefinement, Styled, Task, Window,
-    hash,
+    EntityId, GlobalElementId, ImageAssetLoader, ImageCacheError, InspectorElementId, IntoElement,
+    LayoutId, LayoutRequestCx, PaintCx, ParentElement, Pixels, PrepaintCx, RenderImage, Resource,
+    Style, StyleRefinement, Styled, Task, Window, hash,
 };
 
 use futures::{FutureExt, future::Shared};
@@ -24,10 +24,10 @@ pub fn image_cache(image_cache_provider: impl ImageCacheProvider) -> ImageCacheE
 #[derive(Clone)]
 pub struct AnyImageCache {
     image_cache: AnyEntity,
-    load_fn: fn(
+    load_fn: for<'a, 'w> fn(
         image_cache: &AnyEntity,
         resource: &Resource,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'a, 'w>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>,
 }
@@ -47,10 +47,88 @@ impl AnyImageCache {
     pub fn load(
         &self,
         resource: &Resource,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         (self.load_fn)(&self.image_cache, resource, window, cx)
+    }
+}
+
+/// Narrow image-loading authority used by image elements and image caches.
+///
+/// Image loading may read assets and schedule a redraw for the current view. It
+/// must not expose layout, prepaint, paint, or retained-solver authority.
+pub struct ImageLoadCx<'a, 'w> {
+    inner: ImageLoadCxInner<'a, 'w>,
+}
+
+enum ImageLoadCxInner<'a, 'w> {
+    Window(&'a mut Window),
+    Layout(&'a mut LayoutRequestCx<'w>),
+    Paint(&'a mut PaintCx<'w>),
+}
+
+impl<'a, 'w> ImageLoadCx<'a, 'w> {
+    pub(crate) fn from_window(window: &'a mut Window) -> Self {
+        Self {
+            inner: ImageLoadCxInner::Window(window),
+        }
+    }
+
+    pub(crate) fn from_layout_request(window: &'a mut LayoutRequestCx<'w>) -> Self {
+        Self {
+            inner: ImageLoadCxInner::Layout(window),
+        }
+    }
+
+    pub(crate) fn from_paint(window: &'a mut PaintCx<'w>) -> Self {
+        Self {
+            inner: ImageLoadCxInner::Paint(window),
+        }
+    }
+
+    pub fn current_view(&self) -> EntityId {
+        match &self.inner {
+            ImageLoadCxInner::Window(window) => window.current_view(),
+            ImageLoadCxInner::Layout(window) => window.current_view(),
+            ImageLoadCxInner::Paint(window) => window.current_view(),
+        }
+    }
+
+    pub fn is_window_active(&self) -> bool {
+        match &self.inner {
+            ImageLoadCxInner::Window(window) => window.is_window_active(),
+            ImageLoadCxInner::Layout(window) => window.is_window_active(),
+            ImageLoadCxInner::Paint(window) => window.is_window_active(),
+        }
+    }
+
+    pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        match &mut self.inner {
+            ImageLoadCxInner::Window(window) => window.use_asset::<A>(source, cx),
+            ImageLoadCxInner::Layout(window) => window.use_asset::<A>(source, cx),
+            ImageLoadCxInner::Paint(window) => window.use_asset::<A>(source, cx),
+        }
+    }
+
+    pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        match &mut self.inner {
+            ImageLoadCxInner::Window(window) => window.get_asset::<A>(source, cx),
+            ImageLoadCxInner::Layout(window) => window.get_asset::<A>(source, cx),
+            ImageLoadCxInner::Paint(window) => window.get_asset::<A>(source, cx),
+        }
+    }
+
+    pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
+    where
+        R: 'static,
+        AsyncFn: AsyncFnOnce(&mut crate::AsyncWindowContext) -> R + 'static,
+    {
+        match &self.inner {
+            ImageLoadCxInner::Window(window) => window.spawn(cx, f),
+            ImageLoadCxInner::Layout(window) => window.spawn(cx, f),
+            ImageLoadCxInner::Paint(window) => window.spawn(cx, f),
+        }
     }
 }
 
@@ -60,7 +138,7 @@ mod any_image_cache {
     pub(crate) fn load<I: 'static + ImageCache>(
         image_cache: &AnyEntity,
         resource: &Resource,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         let image_cache = image_cache.clone().downcast::<I>().unwrap();
@@ -96,7 +174,7 @@ impl IntoElement for ImageCacheElement {
 }
 
 impl Element for ImageCacheElement {
-    type RequestLayoutState = SmallVec<[LayoutId; 4]>;
+    type RequestLayoutState = ImageCacheElementFrameState;
     type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
@@ -111,20 +189,20 @@ impl Element for ImageCacheElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let image_cache = self.image_cache_provider.provide(window, cx);
-        window.with_image_cache(Some(image_cache), |window| {
+        window.with_image_cache(Some(image_cache.clone()), |window| {
             let child_layout_ids = self
                 .children
                 .iter_mut()
                 .map(|child| child.request_layout(window, cx))
-                .collect::<SmallVec<_>>();
+                .collect::<SmallVec<[LayoutId; 4]>>();
             let mut style = Style::default();
             style.refine(&self.style);
             let layout_id = window.request_layout(style, child_layout_ids.iter().copied(), cx);
-            (layout_id, child_layout_ids)
+            (layout_id, ImageCacheElementFrameState { image_cache })
         })
     }
 
@@ -133,13 +211,15 @@ impl Element for ImageCacheElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        for child in &mut self.children {
-            child.prepaint(window, cx);
-        }
+        window.with_image_cache(Some(request_layout.image_cache.clone()), |window| {
+            for child in &mut self.children {
+                child.prepaint(window, cx);
+            }
+        });
     }
 
     fn paint(
@@ -147,18 +227,21 @@ impl Element for ImageCacheElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
-        let image_cache = self.image_cache_provider.provide(window, cx);
-        window.with_image_cache(Some(image_cache), |window| {
+        window.with_image_cache(Some(request_layout.image_cache.clone()), |window| {
             for child in &mut self.children {
                 child.paint(window, cx);
             }
         })
     }
+}
+
+pub struct ImageCacheElementFrameState {
+    image_cache: AnyImageCache,
 }
 
 /// An image loading task associated with an image cache.
@@ -206,7 +289,7 @@ pub trait ImageCache: 'static {
     fn load(
         &mut self,
         resource: &Resource,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>;
 }
@@ -215,11 +298,11 @@ pub trait ImageCache: 'static {
 /// See the ImageCache trait for more information.
 pub trait ImageCacheProvider: 'static {
     /// Called during the request_layout phase to create an ImageCache.
-    fn provide(&mut self, _window: &mut Window, _cx: &mut App) -> AnyImageCache;
+    fn provide(&mut self, _window: &mut LayoutRequestCx<'_>, _cx: &mut App) -> AnyImageCache;
 }
 
 impl<T: ImageCache> ImageCacheProvider for Entity<T> {
-    fn provide(&mut self, _window: &mut Window, _cx: &mut App) -> AnyImageCache {
+    fn provide(&mut self, _window: &mut LayoutRequestCx<'_>, _cx: &mut App) -> AnyImageCache {
         self.clone().into()
     }
 }
@@ -257,7 +340,7 @@ impl RetainAllImageCache {
     pub fn load(
         &mut self,
         source: &Resource,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         let hash = hash(source);
@@ -319,7 +402,7 @@ impl ImageCache for RetainAllImageCache {
     fn load(
         &mut self,
         resource: &Resource,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         RetainAllImageCache::load(self, resource, window, cx)
@@ -337,7 +420,7 @@ pub struct RetainAllImageCacheProvider {
 }
 
 impl ImageCacheProvider for RetainAllImageCacheProvider {
-    fn provide(&mut self, window: &mut Window, cx: &mut App) -> AnyImageCache {
+    fn provide(&mut self, window: &mut LayoutRequestCx<'_>, cx: &mut App) -> AnyImageCache {
         window
             .with_global_id(self.id.clone(), |global_id, window| {
                 window.with_element_state::<Entity<RetainAllImageCache>, _>(

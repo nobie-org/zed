@@ -2,6 +2,7 @@
 //! can be used to describe common units, concepts, and the relationships
 //! between them.
 
+use crate::{App, DisplayId};
 use anyhow::{Context as _, anyhow};
 use core::fmt::Debug;
 use derive_more::{Add, AddAssign, Div, DivAssign, Mul, Neg, Sub, SubAssign};
@@ -16,9 +17,6 @@ use std::{
     hash::Hash,
     ops::{Add, Div, Mul, MulAssign, Neg, Sub},
 };
-use taffy::prelude::{TaffyGridLine, TaffyGridSpan};
-
-use crate::{App, DisplayId};
 
 /// Axis in a 2D cartesian space.
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -3795,16 +3793,6 @@ pub enum GridPlacement {
     /// Automatically determine the placement, equivalent to Span(1)
     #[default]
     Auto,
-}
-
-impl From<GridPlacement> for taffy::GridPlacement {
-    fn from(placement: GridPlacement) -> Self {
-        match placement {
-            GridPlacement::Line(index) => taffy::GridPlacement::from_line_index(index),
-            GridPlacement::Span(span) => taffy::GridPlacement::from_span(span),
-            GridPlacement::Auto => taffy::GridPlacement::Auto,
-        }
-    }
 }
 
 /// Provides a trait for types that can calculate half of their value.

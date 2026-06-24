@@ -31,11 +31,11 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    FontStyle, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout,
-    Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderGroupDrawOutcome, RenderImage,
-    RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
-    SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point,
-    px, size,
+    FontStyle, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageLoadCx, ImageSource, Keymap,
+    LineLayout, Pixels, PlatformInput, Point, Priority, RenderGlyphParams, RenderGroupDrawOutcome,
+    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+    Size, SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash,
+    point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -695,6 +695,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene) -> RenderGroupDrawOutcome;
+    fn capture_scene(&self, _scene: &Scene) -> Result<SceneCapture> {
+        anyhow::bail!("scene capture is not implemented for this platform window")
+    }
     fn request_frame_capture(&self) {}
     fn capture_presented_frame(&self) -> Result<SceneCapture> {
         anyhow::bail!("presented-frame capture is not implemented for this platform window")
@@ -2880,8 +2883,9 @@ impl Image {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Arc<RenderImage>> {
+        let mut image_cx = ImageLoadCx::from_window(window);
         ImageSource::Image(self)
-            .use_data(None, window, cx)
+            .use_data(None, &mut image_cx, cx)
             .and_then(|result| result.ok())
     }
 
@@ -2891,8 +2895,9 @@ impl Image {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Arc<RenderImage>> {
+        let mut image_cx = ImageLoadCx::from_window(window);
         ImageSource::Image(self)
-            .get_data(None, window, cx)
+            .get_data(None, &mut image_cx, cx)
             .and_then(|result| result.ok())
     }
 

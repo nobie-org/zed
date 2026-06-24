@@ -1,6 +1,6 @@
 use crate::{
     AnyElement, App, Bounds, Element, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Window,
+    LayoutRequestCx, PaintCx, Pixels, PrepaintCx, Window,
 };
 
 /// Builds a `Deferred` element, which delays the layout and paint of its child.
@@ -44,7 +44,7 @@ impl Element for Deferred {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let layout_id = self.child.as_mut().unwrap().request_layout(window, cx);
@@ -57,7 +57,7 @@ impl Element for Deferred {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         _cx: &mut App,
     ) {
         let child = self.child.take().unwrap();
@@ -72,7 +72,7 @@ impl Element for Deferred {
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        _window: &mut Window,
+        _window: &mut PaintCx<'_>,
         _cx: &mut App,
     ) {
     }

@@ -1,0 +1,11 @@
+error[E0432]: unresolved import `gpui::CustomLayoutCx`
+ --> tests/retained_layout_lifecycle/custom_layout_cx_is_not_public_api.rs:1:5
+  |
+1 | use gpui::CustomLayoutCx;
+  |     ^^^^^^^^^^^^^^^^^^^^ no `CustomLayoutCx` in the root
+  |
+help: a similar name exists in the module
+  |
+1 - use gpui::CustomLayoutCx;
+1 + use gpui::CustomLayoutRoot;
+  |

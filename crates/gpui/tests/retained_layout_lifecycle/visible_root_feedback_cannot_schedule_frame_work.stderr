@@ -1,0 +1,5 @@
+error[E0599]: no method named `frame_prepaint_plan` found for mutable reference `&mut VisibleRootFeedbackCx<'_>` in the current scope
+ --> tests/retained_layout_lifecycle/visible_root_feedback_cannot_schedule_frame_work.rs:4:14
+  |
+4 |     feedback.frame_prepaint_plan(|_, _| ());
+  |              ^^^^^^^^^^^^^^^^^^^ method not found in `&mut VisibleRootFeedbackCx<'_>`

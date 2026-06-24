@@ -44,7 +44,7 @@ fn line(color: Hsla) -> Div {
 impl HelloWorld {
     fn render_secondary_popover(
         &mut self,
-        _window: &mut Window,
+        _window: &mut gpui::BuildCx<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         button("secondary-btn")
@@ -79,7 +79,11 @@ impl HelloWorld {
 }
 
 impl Render for HelloWorld {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(
+        &mut self,
+        window: &mut gpui::BuildCx<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()

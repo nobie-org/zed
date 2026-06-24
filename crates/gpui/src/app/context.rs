@@ -1,8 +1,8 @@
 use crate::{
-    AnyEntity, AnyView, AnyWindowHandle, AppContext, AsyncApp, DispatchPhase, Effect, ElementId,
-    EntityId, EntityReadContext, EventEmitter, FocusHandle, FocusOutEvent, Focusable, Global,
-    KeystrokeObserver, Priority, Reservation, SubscriberSet, Subscription, Task, TextSystem,
-    WeakEntity, WeakFocusHandle, Window, WindowHandle,
+    AnyEntity, AnyView, AnyWindowHandle, AppContext, AsyncApp, BuildCx, DispatchPhase, Effect,
+    ElementId, EntityId, EntityReadContext, EventEmitter, FocusHandle, FocusOutEvent, Focusable,
+    Global, KeystrokeObserver, Priority, Reservation, SubscriberSet, Subscription, Task,
+    TextSystem, WeakEntity, WeakFocusHandle, Window, WindowHandle,
 };
 use anyhow::Result;
 use futures::FutureExt;
@@ -92,12 +92,12 @@ impl<'a, T: 'static> RenderContext<'a, T> {
         self.app.text_system()
     }
 
-    /// Use window-owned element state while rendering an entity.
+    /// Use element-scoped state while constructing current-frame layout facts.
     pub fn use_keyed_element_state<S: 'static>(
         &mut self,
-        window: &mut Window,
+        window: &mut BuildCx<'_>,
         key: impl Into<ElementId>,
-        init: impl FnOnce(&mut Window, &mut Context<S>) -> S,
+        init: impl FnOnce(&mut BuildCx<'_>, &mut Context<S>) -> S,
     ) -> Entity<S> {
         window.use_keyed_state(key, self.app, init)
     }
@@ -142,6 +142,17 @@ impl<'a, T: 'static> RenderContext<'a, T> {
     ) -> impl Fn(E, &mut Window, &mut App) -> R + 'static {
         let view = self.entity();
         move |e: E, window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
+
+    /// Convenience method for producing view state in build-only callbacks.
+    pub fn processor_build<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut crate::BuildCx<'_>, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut crate::BuildCx<'_>, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut crate::BuildCx<'_>, cx: &mut App| {
             view.update(cx, |view, cx| f(view, e, window, cx))
         }
     }
@@ -383,6 +394,18 @@ impl<'a, T: 'static> Context<'a, T> {
     ) -> impl Fn(E, &mut Window, &mut App) -> R + 'static {
         let view = self.entity();
         move |e: E, window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| f(view, e, window, cx))
+        }
+    }
+
+    /// Convenience method for producing view state in build-only callbacks.
+    /// See `processor` for the full-window callback variant.
+    pub fn processor_build<E, R>(
+        &self,
+        f: impl Fn(&mut T, E, &mut crate::BuildCx<'_>, &mut Context<T>) -> R + 'static,
+    ) -> impl Fn(E, &mut crate::BuildCx<'_>, &mut App) -> R + 'static {
+        let view = self.entity();
+        move |e: E, window: &mut crate::BuildCx<'_>, cx: &mut App| {
             view.update(cx, |view, cx| f(view, e, window, cx))
         }
     }

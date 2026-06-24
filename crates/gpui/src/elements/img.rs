@@ -1,8 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
+    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageLoadCx, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, LayoutRequestCx, Length, ObjectFit,
+    PaintCx, Pixels, PrepaintCx, RenderImage, Resource, SharedString, SharedUri, StyleRefinement,
+    Styled, Task, Window, px,
 };
 use anyhow::Result;
 
@@ -46,7 +47,14 @@ pub enum ImageSource {
     /// Cached image data
     Image(Arc<Image>),
     /// A custom loading function to use
-    Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
+    Custom(
+        Arc<
+            dyn for<'a, 'w> Fn(
+                &mut ImageLoadCx<'a, 'w>,
+                &mut App,
+            ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>,
+        >,
+    ),
 }
 
 fn is_uri(uri: &str) -> bool {
@@ -117,7 +125,11 @@ impl From<Arc<Image>> for ImageSource {
 
 impl<F> From<F> for ImageSource
 where
-    F: Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>> + 'static,
+    F: for<'a, 'w> Fn(
+            &mut ImageLoadCx<'a, 'w>,
+            &mut App,
+        ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>
+        + 'static,
 {
     fn from(value: F) -> Self {
         Self::Custom(Arc::new(value))
@@ -277,7 +289,7 @@ impl Element for Img {
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
+        window: &mut LayoutRequestCx<'_>,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut layout_state = ImgLayoutState {
@@ -307,8 +319,8 @@ impl Element for Img {
                     match self.source.use_data(
                         self.image_cache
                             .clone()
-                            .or_else(|| window.image_cache_stack.last().cloned()),
-                        window,
+                            .or_else(|| window.current_image_cache()),
+                        &mut ImageLoadCx::from_layout_request(window),
                         cx,
                     ) {
                         Some(Ok(data)) => {
@@ -345,33 +357,46 @@ impl Element for Img {
                             }
 
                             let image_size = data.render_size(frame_index);
-                            style.aspect_ratio = Some(image_size.width / image_size.height);
+                            let has_intrinsic_aspect_ratio =
+                                image_size.width.0 > 0. && image_size.height.0 > 0.;
+
+                            if has_intrinsic_aspect_ratio {
+                                style.aspect_ratio = Some(image_size.width / image_size.height);
+                            }
 
                             if let Length::Auto = style.size.width {
-                                style.size.width = match style.size.height {
-                                    Length::Definite(DefiniteLength::Absolute(abs_length)) => {
-                                        let height_px = abs_length.to_pixels(window.rem_size());
-                                        Length::Definite(
-                                            px(image_size.width.0 * height_px.0
-                                                / image_size.height.0)
-                                            .into(),
-                                        )
+                                style.size.width = if has_intrinsic_aspect_ratio {
+                                    match style.size.height {
+                                        Length::Definite(DefiniteLength::Absolute(abs_length)) => {
+                                            let height_px = abs_length.to_pixels(window.rem_size());
+                                            Length::Definite(
+                                                px(image_size.width.0 * height_px.0
+                                                    / image_size.height.0)
+                                                .into(),
+                                            )
+                                        }
+                                        _ => Length::Definite(image_size.width.into()),
                                     }
-                                    _ => Length::Definite(image_size.width.into()),
+                                } else {
+                                    Length::Definite(image_size.width.into())
                                 };
                             }
 
                             if let Length::Auto = style.size.height {
-                                style.size.height = match style.size.width {
-                                    Length::Definite(DefiniteLength::Absolute(abs_length)) => {
-                                        let width_px = abs_length.to_pixels(window.rem_size());
-                                        Length::Definite(
-                                            px(image_size.height.0 * width_px.0
-                                                / image_size.width.0)
-                                            .into(),
-                                        )
+                                style.size.height = if has_intrinsic_aspect_ratio {
+                                    match style.size.width {
+                                        Length::Definite(DefiniteLength::Absolute(abs_length)) => {
+                                            let width_px = abs_length.to_pixels(window.rem_size());
+                                            Length::Definite(
+                                                px(image_size.height.0 * width_px.0
+                                                    / image_size.width.0)
+                                                .into(),
+                                            )
+                                        }
+                                        _ => Length::Definite(image_size.height.into()),
                                     }
-                                    _ => Length::Definite(image_size.height.into()),
+                                } else {
+                                    Length::Definite(image_size.height.into())
                                 };
                             }
 
@@ -433,7 +458,7 @@ impl Element for Img {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        window: &mut PrepaintCx<'_>,
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.interactivity.prepaint(
@@ -460,7 +485,7 @@ impl Element for Img {
         bounds: Bounds<Pixels>,
         layout_state: &mut Self::RequestLayoutState,
         hitbox: &mut Self::PrepaintState,
-        window: &mut Window,
+        window: &mut PaintCx<'_>,
         cx: &mut App,
     ) {
         let source = self.source.clone();
@@ -475,8 +500,8 @@ impl Element for Img {
                 if let Some(Ok(data)) = source.use_data(
                     self.image_cache
                         .clone()
-                        .or_else(|| window.image_cache_stack.last().cloned()),
-                    window,
+                        .or_else(|| window.current_image_cache()),
+                    &mut ImageLoadCx::from_paint(window),
                     cx,
                 ) {
                     if data.frame_count() == 0 {
@@ -533,7 +558,7 @@ impl ImageSource {
     pub(crate) fn use_data(
         &self,
         cache: Option<AnyImageCache>,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         match self {
@@ -553,7 +578,7 @@ impl ImageSource {
     pub(crate) fn get_data(
         &self,
         cache: Option<AnyImageCache>,
-        window: &mut Window,
+        window: &mut ImageLoadCx<'_, '_>,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         match self {

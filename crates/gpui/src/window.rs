@@ -2538,6 +2538,47 @@ impl LayoutFrame {
     }
 }
 
+impl Window {
+    pub(crate) fn measure_scratch_root(
+        &mut self,
+        element: AnyElement,
+        root_site: RetainedLayoutRootSite,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        self.with_scratch_layout_engine(cx, |window, cx| {
+            let mut layout_frame = LayoutFrame::new();
+            layout_frame
+                .layout_visible_root_with_identity(
+                    window,
+                    element,
+                    root_site,
+                    available_space,
+                    None,
+                    cx,
+                )
+                .size()
+        })
+    }
+
+    fn with_scratch_layout_engine<R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut App) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+
+        let retained_layout_engine = self.layout_engine.take().unwrap();
+        self.layout_engine = Some(LayoutEngine::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, cx)));
+        self.layout_engine = Some(retained_layout_engine);
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
 

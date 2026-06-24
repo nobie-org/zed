@@ -1831,6 +1831,11 @@ impl<'a> PaintCx<'a> {
         self.window.is_window_active()
     }
 
+    /// Returns whether the current draw is expected to be presented.
+    pub fn current_draw_will_present(&self) -> bool {
+        self.window.current_draw_will_present()
+    }
+
     pub fn spawn<AsyncFn, R>(&self, cx: &App, f: AsyncFn) -> Task<R>
     where
         R: 'static,

@@ -683,9 +683,13 @@ impl MacWindow {
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
-            } else {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
             }
+            // When tabbing_identifier is None we leave the class-level setting at its
+            // macOS default (YES). Setting it to NO removes "Select Next Tab" /
+            // "Select Previous Tab" from the Window menu globally, breaking Cmd+`/Cmd+~
+            // for window cycling. The per-window merge guard (addTabbedWindow:ordered:)
+            // is still gated on `allows_automatic_window_tabbing`, so no automatic
+            // tab merging occurs when tabbing_identifier is None.
 
             let mut style_mask;
             if let Some(titlebar) = titlebar.as_ref() {
@@ -1171,9 +1175,9 @@ impl PlatformWindow for MacWindow {
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
                 let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: YES];
-            } else {
-                let () = msg_send![class!(NSWindow), setAllowsAutomaticWindowTabbing: NO];
             }
+            // Same rationale as in create_window: do not set NO when tabbing_identifier
+            // is None — that breaks Cmd+`/Cmd+~ window cycling globally.
 
             if let Some(tabbing_identifier) = tabbing_identifier {
                 let tabbing_id = ns_string(tabbing_identifier.as_str());
